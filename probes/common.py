@@ -24,7 +24,8 @@ JOB_ID_RE = re.compile(r"^[a-z0-9-]+$")
 NOTE_MAX = 500
 METRIC_STR_MAX = 1000  # metrics strings (e.g. the box-containers running list) are not bounded by the contract; note is
 
-DEFAULT_DASHBOARD_URL = "http://100.101.1.28:8081"
+# There is deliberately NO default dashboard URL: the box's Tailscale IP is deployment-specific
+# and stays out of the repo. DASHBOARD_URL must come from the env file or the environment.
 DEFAULT_ENV_FILE = os.path.expanduser("~/.config/hopper-dashboard/env")
 DEFAULT_STATE_FILE = os.path.expanduser("~/.config/hopper-dashboard/state.json")
 DEFAULT_LOG_FILE = os.path.expanduser("~/Library/Logs/hopper-dashboard-probe.log")
@@ -101,8 +102,18 @@ def load_config(env_path: str = DEFAULT_ENV_FILE) -> Dict[str, str]:
     for k, v in os.environ.items():
         if k in ("DASHBOARD_URL", "INGEST_TOKEN") or k.startswith("PROBE_"):
             cfg[k] = v
-    cfg.setdefault("DASHBOARD_URL", DEFAULT_DASHBOARD_URL)
     return cfg
+
+
+def require_dashboard_url(cfg: Dict[str, str], env_path: str = "") -> str:
+    """Return DASHBOARD_URL or raise ProbeError with a clear message (no baked-in default)."""
+    url = (cfg.get("DASHBOARD_URL") or "").strip()
+    if not url:
+        where = " (env file %s)" % env_path if env_path else ""
+        raise ProbeError("DASHBOARD_URL is not set%s — e.g. DASHBOARD_URL=http://<box-tailscale-ip>:8081" % where)
+    if not url.startswith(("http://", "https://")):
+        raise ProbeError("DASHBOARD_URL must start with http:// or https:// (got %r)" % url)
+    return url
 
 
 # ---------------------------------------------------------------------------

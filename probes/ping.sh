@@ -11,7 +11,7 @@
 #
 # Intended for the manual jobs with nothing to compute on a timer — taste-twin-publish,
 # jjho-refresh, baby-pool-sync — call it as the LAST step of the manual run, e.g.
-#   python scripts/publish.py mhgaillo && ~/code/hopper-dashboard/probes/ping.sh taste-twin-publish ok "mhgaillo"
+#   python scripts/publish.py <letterboxd-user> && ~/code/hopper-dashboard/probes/ping.sh taste-twin-publish ok "<letterboxd-user>"
 #   ... || ~/code/hopper-dashboard/probes/ping.sh taste-twin-publish fail "publish.py exited $?"
 #
 # Reads DASHBOARD_URL + INGEST_TOKEN from the env file (KEY=VALUE, chmod 600). Never echoes the token.
@@ -37,8 +37,10 @@ if [[ -r "$ENV_FILE" ]]; then
     case "$key" in DASHBOARD_URL|INGEST_TOKEN) [[ -z "${!key:-}" ]] && printf -v "$key" '%s' "$val" ;; esac
   done < "$ENV_FILE"
 fi
-DASHBOARD_URL="${DASHBOARD_URL:-http://100.101.1.28:8081}"
+DASHBOARD_URL="${DASHBOARD_URL:-}"
 INGEST_TOKEN="${INGEST_TOKEN:-}"
+# No baked-in default URL: the box's Tailscale IP is deployment-specific and lives only in the env file.
+[[ -n "$DASHBOARD_URL" ]] || { echo "ERROR: DASHBOARD_URL not set (env file: $ENV_FILE) — e.g. DASHBOARD_URL=http://<box-tailscale-ip>:8081" >&2; exit 2; }
 [[ -n "$INGEST_TOKEN" || -n "${DRY_RUN:-}" ]] || { echo "ERROR: INGEST_TOKEN not set (env file: $ENV_FILE)" >&2; exit 2; }
 
 # JSON-escape a string: backslash, double quote, control chars → spaces. Truncate note to 500.

@@ -65,14 +65,14 @@ def make_db(path, pending=0, queued=0, deletes=0, mismatched=0, roots=("Document
 
 @pytest.fixture
 def drivefs_dir(tmp_path):
-    acct = tmp_path / "DriveFS" / "102791939742096881960"
+    acct = tmp_path / "DriveFS" / "100000000000000000001"
     acct.mkdir(parents=True)
     (tmp_path / "DriveFS" / "Logs").mkdir()  # non-numeric siblings must be ignored
     return tmp_path / "DriveFS"
 
 
 def test_caught_up(drivefs_dir):
-    make_db(str(drivefs_dir / "102791939742096881960" / "mirror_sqlite.db"))
+    make_db(str(drivefs_dir / "100000000000000000001" / "mirror_sqlite.db"))
     st = drivefs.probe_drive_mirror(str(drivefs_dir))
     assert st.caught_up
     assert st.pending == 0 and st.mismatch == 0 and st.items == 13
@@ -84,7 +84,7 @@ def test_caught_up(drivefs_dir):
 
 
 def test_pending_and_mismatch(drivefs_dir):
-    make_db(str(drivefs_dir / "102791939742096881960" / "mirror_sqlite.db"), pending=2, queued=3, deletes=1, mismatched=4)
+    make_db(str(drivefs_dir / "100000000000000000001" / "mirror_sqlite.db"), pending=2, queued=3, deletes=1, mismatched=4)
     st = drivefs.probe_drive_mirror(str(drivefs_dir))
     assert not st.caught_up
     assert (st.pending_uploads, st.queued_uploads, st.pending_deletes) == (2, 3, 1)
@@ -95,16 +95,16 @@ def test_pending_and_mismatch(drivefs_dir):
 def test_null_sizes_on_roots_do_not_count_as_mismatch(drivefs_dir):
     # roots/folders have NULL local_size/cloud_size; NULL != NULL is NULL (falsy) in SQL, so they
     # must not inflate `mismatch` — pin that behaviour.
-    make_db(str(drivefs_dir / "102791939742096881960" / "mirror_sqlite.db"), roots=("Documents",))
+    make_db(str(drivefs_dir / "100000000000000000001" / "mirror_sqlite.db"), roots=("Documents",))
     st = drivefs.probe_drive_mirror(str(drivefs_dir))
     assert st.mismatch == 0 and st.roots == ["Documents"]
 
 
 def test_wal_and_shm_are_copied_not_opened_in_place(drivefs_dir, monkeypatch):
-    db = drivefs_dir / "102791939742096881960" / "mirror_sqlite.db"
+    db = drivefs_dir / "100000000000000000001" / "mirror_sqlite.db"
     make_db(str(db))
-    (drivefs_dir / "102791939742096881960" / "mirror_sqlite.db-wal").write_bytes(b"")
-    (drivefs_dir / "102791939742096881960" / "mirror_sqlite.db-shm").write_bytes(b"")
+    (drivefs_dir / "100000000000000000001" / "mirror_sqlite.db-wal").write_bytes(b"")
+    (drivefs_dir / "100000000000000000001" / "mirror_sqlite.db-shm").write_bytes(b"")
     opened = []
     real_connect = drivefs.sqlite3.connect
 
@@ -127,7 +127,7 @@ def test_missing_db_raises_clear_error(tmp_path):
 
 
 def test_picks_newest_account_when_several(drivefs_dir):
-    a = drivefs_dir / "102791939742096881960" / "mirror_sqlite.db"
+    a = drivefs_dir / "100000000000000000001" / "mirror_sqlite.db"
     b_dir = drivefs_dir / "555"
     b_dir.mkdir()
     b = b_dir / "mirror_sqlite.db"
@@ -139,7 +139,7 @@ def test_picks_newest_account_when_several(drivefs_dir):
 
 
 def test_schema_drift_raises(drivefs_dir):
-    db = drivefs_dir / "102791939742096881960" / "mirror_sqlite.db"
+    db = drivefs_dir / "100000000000000000001" / "mirror_sqlite.db"
     conn = sqlite3.connect(str(db))
     conn.execute("CREATE TABLE mirror_item (x)")
     conn.commit()
@@ -150,6 +150,6 @@ def test_schema_drift_raises(drivefs_dir):
 
 
 def test_not_a_database_raises(drivefs_dir):
-    (drivefs_dir / "102791939742096881960" / "mirror_sqlite.db").write_bytes(b"this is not sqlite" * 10)
+    (drivefs_dir / "100000000000000000001" / "mirror_sqlite.db").write_bytes(b"this is not sqlite" * 10)
     with pytest.raises(ProbeError):
         drivefs.probe_drive_mirror(str(drivefs_dir))

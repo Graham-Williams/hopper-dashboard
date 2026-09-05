@@ -56,7 +56,7 @@ def test_clean_metrics_types():
 
 
 def test_ping_url_and_job_id_validation():
-    assert common.ping_url("http://100.101.1.28:8081/", "km-backup") == "http://100.101.1.28:8081/api/v1/ping/km-backup"
+    assert common.ping_url("http://h:8081/", "km-backup") == "http://h:8081/api/v1/ping/km-backup"
     for bad in ("KM", "a_b", "a b", "", "../x"):
         with pytest.raises(ValueError):
             common.validate_job_id(bad)
@@ -71,7 +71,7 @@ def test_slug():
 def test_parse_env_text():
     text = """
 # comment
-DASHBOARD_URL=http://100.101.1.28:8081
+DASHBOARD_URL=http://h:8081
 export INGEST_TOKEN="abc def"
 QUOTED='single'
 TRAILING=value  # trailing comment
@@ -83,7 +83,7 @@ LAST=two
 """
     env = common.parse_env_text(text)
     assert env == {
-        "DASHBOARD_URL": "http://100.101.1.28:8081",
+        "DASHBOARD_URL": "http://h:8081",
         "INGEST_TOKEN": "abc def",
         "QUOTED": "single",
         "TRAILING": "value",
@@ -95,14 +95,21 @@ def test_load_env_file_missing(tmp_path):
     assert common.load_env_file(str(tmp_path / "nope")) == {}
 
 
-def test_load_config_defaults_url(tmp_path, monkeypatch):
+def test_load_config_has_no_default_url(tmp_path, monkeypatch):
+    """The box's Tailscale IP is deployment-specific: no URL is baked into the code."""
     monkeypatch.delenv("DASHBOARD_URL", raising=False)
     monkeypatch.delenv("INGEST_TOKEN", raising=False)
     p = tmp_path / "env"
     p.write_text("INGEST_TOKEN=t\n")
     cfg = common.load_config(str(p))
-    assert cfg["DASHBOARD_URL"] == common.DEFAULT_DASHBOARD_URL
+    assert "DASHBOARD_URL" not in cfg
     assert cfg["INGEST_TOKEN"] == "t"
+    with pytest.raises(common.ProbeError) as ei:
+        common.require_dashboard_url(cfg, str(p))
+    assert "DASHBOARD_URL is not set" in str(ei.value) and str(p) in str(ei.value)
+    with pytest.raises(common.ProbeError):
+        common.require_dashboard_url({"DASHBOARD_URL": "h:8081"})
+    assert common.require_dashboard_url({"DASHBOARD_URL": " http://h:8081 "}) == "http://h:8081"
 
 
 # --- state ----------------------------------------------------------------------

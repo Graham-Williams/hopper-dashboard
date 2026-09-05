@@ -1,10 +1,12 @@
 #!/bin/bash
 # Install the hourly hopper-dashboard Mac probe as a launchd user agent. Idempotent.
 #
-#   deploy/mac/install.sh [--url http://100.101.1.28:8081] [--token <INGEST_TOKEN>]
+#   deploy/mac/install.sh [--url http://<box-tailscale-ip>:8081]
 #
-# 1. writes ~/.config/hopper-dashboard/env (chmod 600) if it doesn't exist — prompts for the token
-#    (silent read) unless --token is given; an existing file is never overwritten
+# 1. writes ~/.config/hopper-dashboard/env (chmod 600) if it doesn't exist — prompts for the URL
+#    (unless --url is given) and for the token with a HIDDEN read (never pass the token on the
+#    command line: it would land in shell history and `ps`); an existing file is never overwritten.
+#    There is deliberately no default URL: the box's Tailscale IP stays out of the repo.
 # 2. renders deploy/mac/com.hopper.dashboard-probe.plist (absolute paths) into ~/Library/LaunchAgents
 # 3. launchctl bootout (ignore "not loaded") + bootstrap, so a re-run picks up plist changes
 # 4. runs the probe once with --dry-run and prints the pings it WOULD send
@@ -20,13 +22,13 @@ CONF_DIR="$HOME/.config/hopper-dashboard"
 ENV_FILE="$CONF_DIR/env"
 PLIST_SRC="$HERE/$LABEL.plist"
 PLIST_DST="$HOME/Library/LaunchAgents/$LABEL.plist"
-URL="http://100.101.1.28:8081"; TOKEN=""
+URL=""; TOKEN=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --url)   URL="$2"; shift 2 ;;
-    --token) TOKEN="$2"; shift 2 ;;
-    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+    --token) echo "ERROR: --token is not accepted (it would leak into shell history / ps); the script prompts with a hidden read" >&2; exit 2 ;;
+    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -39,9 +41,11 @@ mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR"
 if [[ -f "$ENV_FILE" ]]; then
   echo "env file exists, leaving it alone: $ENV_FILE"
 else
-  if [[ -z "$TOKEN" ]]; then
-    read -r -s -p "INGEST_TOKEN (from the box's ~/hopper-dashboard/.env; input hidden): " TOKEN; echo
+  if [[ -z "$URL" ]]; then
+    read -r -p "DASHBOARD_URL (http://<box-tailscale-ip>:8081): " URL
   fi
+  [[ "$URL" =~ ^https?:// ]] || { echo "ERROR: DASHBOARD_URL must start with http:// or https://"; exit 2; }
+  read -r -s -p "INGEST_TOKEN (from the box's ~/hopper-dashboard/.env; input hidden): " TOKEN; echo
   [[ -n "$TOKEN" ]] || { echo "ERROR: empty token"; exit 2; }
   umask 077
   cat > "$ENV_FILE" <<EOF

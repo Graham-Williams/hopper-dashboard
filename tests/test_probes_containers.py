@@ -78,12 +78,22 @@ def test_gather_raises_when_docker_fails(monkeypatch):
 def test_main_dry_run_from_stdin(monkeypatch, capsys):
     monkeypatch.setattr("sys.stdin", __import__("io").StringIO("a Up 1s\nb Exited (0)\n"))
     monkeypatch.delenv("INGEST_TOKEN", raising=False)
+    monkeypatch.setenv("DASHBOARD_URL", "http://h:8081")
     rc = containers_probe.main(["--dry-run", "--stdin"])
     out = capsys.readouterr().out
     assert rc == 0 and "/api/v1/ping/box-containers" in out and '"running": "a"' in out and '"status": "ok"' in out
 
 
-def test_main_dry_run_docker_missing_is_fail_ping(capsys):
+def test_main_dry_run_docker_missing_is_fail_ping(monkeypatch, capsys):
+    monkeypatch.setenv("DASHBOARD_URL", "http://h:8081")
     rc = containers_probe.main(["--dry-run", "--docker", "/nonexistent/docker"])
     out = capsys.readouterr().out
     assert rc == 0 and '"status": "fail"' in out and "docker ps failed" in out
+
+
+def test_main_without_dashboard_url_is_config_error(monkeypatch, capsys):
+    """No default URL baked into the code — a missing DASHBOARD_URL exits 2 with a clear message."""
+    monkeypatch.delenv("DASHBOARD_URL", raising=False)
+    monkeypatch.setattr("sys.stdin", __import__("io").StringIO("a Up 1s\n"))
+    rc = containers_probe.main(["--dry-run", "--stdin"])
+    assert rc == 2 and "DASHBOARD_URL is not set" in capsys.readouterr().err

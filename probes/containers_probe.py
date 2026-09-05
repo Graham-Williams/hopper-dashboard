@@ -21,7 +21,7 @@ from typing import List, Optional
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from probes import containers  # noqa: E402
-from probes.common import DEFAULT_DASHBOARD_URL, ProbeError, build_ping, now_iso, run_cmd, send_ping  # noqa: E402
+from probes.common import ProbeError, build_ping, now_iso, require_dashboard_url, run_cmd, send_ping  # noqa: E402
 
 JOB_ID = "box-containers"
 
@@ -40,7 +40,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--docker", default=os.environ.get("DOCKER_BIN", "docker"))
     args = ap.parse_args(argv)
 
-    url = os.environ.get("DASHBOARD_URL", DEFAULT_DASHBOARD_URL)
+    try:
+        url = require_dashboard_url(dict(os.environ))
+    except ProbeError as e:
+        print("ERROR: %s" % e, file=sys.stderr)
+        return 2
     token = os.environ.get("INGEST_TOKEN", "")
     started = now_iso()
 
