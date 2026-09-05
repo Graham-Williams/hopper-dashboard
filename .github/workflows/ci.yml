@@ -6,34 +6,51 @@ on:
   pull_request:
     branches: [main]
 
+# Least privilege for the workflow token: nothing here writes to the repo.
+permissions:
+  contents: read
+
+# Actions are pinned by commit SHA (a moving tag can be re-pointed at malicious code).
+# Refresh with: gh api repos/actions/<action>/git/ref/tags/<tag> --jq .object.sha
+
 jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
       - name: Install dependencies
         run: pip install -r requirements-dev.txt
       - name: Run tests
         run: python -m pytest -q
+      - name: Probe tests must stay stdlib-only
+        # Same interpreter, but with the app's third-party deps hidden: the Mac/box probes run
+        # under a stock python3 with no venv, so they must import nothing but the stdlib.
+        run: |
+          python -m venv /tmp/bare && /tmp/bare/bin/pip install -q pytest==9.0.3
+          /tmp/bare/bin/python -m pytest -q tests/test_probes_*.py
 
   docker-build:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build image
         run: docker build -t hopper-dashboard:ci .
       - name: Smoke both roles
         run: |
           set -eu
           cp jobs.example.yml jobs.yml
-          docker run -d --name hd --read-only --tmpfs /tmp -v /app/data \
-            -v "$PWD/jobs.yml:/app/jobs.yml:ro" \
-            -e INGEST_TOKEN=ci-token -e APP_PASSWORD=ci-pass -e SESSION_SECRET=ci-secret \
+          # A root-owned 0600 rclone.conf, exactly like the box: the entrypoint must stage it
+          # as root and then drop to the app user.
+          printf '[gdrive]\ntype = drive\nscope = drive.readonly\n' > rclone.conf
+          sudo chown root:root rclone.conf && sudo chmod 0600 rclone.conf
+          docker run -d --name hd --read-only --tmpfs /tmp:mode=1777,size=64m -v /app/data \
+            -v "$PWD/jobs.yml:/app/jobs.yml:ro" -v "$PWD/rclone.conf:/rclone/rclone.conf:ro" \
+            -e INGEST_TOKEN=ci-token -e READ_TOKEN=ci-read -e APP_PASSWORD=ci-pass -e SESSION_SECRET=ci-secret \
             -e DASHBOARD_NO_SCHEDULER=1 \
             -p 8080:8080 -p 8081:8081 hopper-dashboard:ci
           for i in $(seq 1 30); do
@@ -44,9 +61,36 @@ jobs:
           done
           curl -sf http://127.0.0.1:8080/healthz
           curl -sf http://127.0.0.1:8081/healthz
-          # Gate redirects the board; a ping without a token is 401.
+          # Gate redirects the board; a ping without a token is 401; a token'd ping is 200.
           test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/)" = "302"
           test "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8081/api/v1/ping/km-backup)" = "401"
           test "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Authorization: Bearer ci-token' -d result=success http://127.0.0.1:8081/api/v1/ping/km-backup)" = "200"
+          # The read role has no ping route (ingest isolation); the ingest role has no static route.
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Authorization: Bearer ci-read' http://127.0.0.1:8080/api/v1/ping/km-backup)" = "404"
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8081/static/app.css)" = "404"
+          # Nothing runs as root after start-up; the staged conf belongs to the app user.
+          docker exec hd sh -c 'for p in /proc/[0-9]*; do stat -c %u "$p"; done | sort -u' | tee /tmp/uids
+          test "$(grep -vc '^0$' /tmp/uids)" -ge 1
+          docker exec hd sh -c 'for p in /proc/[0-9]*; do [ "$(stat -c %u $p)" = 0 ] && cat $p/comm; done' | grep -v '^sh$' | { ! grep -q .; }
+          docker exec hd stat -c '%u %a' /tmp/rclone/rclone.conf | grep -q '^10001 600$'
           docker logs hd
           docker rm -f hd
+
+  read-role-fails-fast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build image
+        run: docker build -t hopper-dashboard:ci .
+      - name: Prod without APP_PASSWORD must not come up
+        run: |
+          set -eu
+          cp jobs.example.yml jobs.yml
+          docker run -d --name hd2 --read-only --tmpfs /tmp -v /app/data -v "$PWD/jobs.yml:/app/jobs.yml:ro" \
+            -e INGEST_TOKEN=ci-token -e DASHBOARD_NO_SCHEDULER=1 hopper-dashboard:ci
+          sleep 8
+          # entrypoint exits when a gunicorn dies → container is not running
+          test "$(docker inspect -f '{{.State.Running}}' hd2)" = "false"
+          docker logs hd2 2>&1 | grep -q "APP_PASSWORD is empty"
+          docker rm -f hd2

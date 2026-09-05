@@ -1,7 +1,12 @@
 # hopper-dashboard — two gunicorn processes (read :8080, ingest :8081) in one
-# container, non-root, with a pinned + checksum-verified rclone for the
-# in-container destination probes.
-FROM python:3.12-slim
+# container, with a pinned + checksum-verified rclone for the in-container
+# destination probes. PID 1 starts as root only to stage the 0600 host
+# rclone.conf, then setpriv's to the `dashboard` user (see entrypoint.sh) —
+# so there is deliberately no USER directive here.
+#
+# Base image pinned by digest (supply chain). Refresh with:
+#   docker buildx imagetools inspect python:3.12-slim   → Digest: sha256:…
+FROM python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea
 
 # --- rclone (pinned; SHA256 from https://downloads.rclone.org/<ver>/SHA256SUMS)
 # (named RCLONE_REL, not RCLONE_VERSION: rclone reads RCLONE_* env vars as flags, so
@@ -26,7 +31,8 @@ RUN set -eux; \
     rm -rf /tmp/rclone "/tmp/$zip"; \
     apt-get purge -y --auto-remove curl unzip; \
     rm -rf /var/lib/apt/lists/*; \
-    rclone version
+    rclone version; \
+    command -v setpriv   # entrypoint.sh depends on it (util-linux)
 
 RUN useradd --create-home --uid 10001 dashboard
 WORKDIR /app
@@ -36,14 +42,16 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY dashboard/ ./dashboard/
 COPY entrypoint.sh ./entrypoint.sh
-RUN chmod 0755 entrypoint.sh && mkdir -p /app/data && chown -R dashboard:dashboard /app
+RUN chmod 0755 entrypoint.sh \
+    && mkdir -p /app/data && mkdir -p -m 0700 /tmp/rclone \
+    && chown -R dashboard:dashboard /app /tmp/rclone
 
 ENV DASHBOARD_DATA=/app/data \
     JOBS_FILE=/app/jobs.yml \
     RCLONE_CONFIG=/tmp/rclone/rclone.conf \
     PYTHONUNBUFFERED=1
 
-USER dashboard
+# No USER: entrypoint.sh drops to `dashboard` itself (see header comment).
 EXPOSE 8080 8081
 
 HEALTHCHECK --interval=60s --timeout=10s --retries=3 --start-period=30s \

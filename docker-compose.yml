@@ -3,12 +3,19 @@
 # - Read side (:8080) has NO host port: the tunnel routes
 #   dashboard.graham-williams.com -> http://hopper-dashboard:8080 over the
 #   external `km-tracker_default` network; the shared APP_PASSWORD gates it.
+#   NOTE: every other container on km-tracker_default can also reach BOTH
+#   ports by service name (read side: password/READ_TOKEN gate; ingest:
+#   INGEST_TOKEN gate) — the network is shared, not private to this app.
 # - Ingest (:8081) is published on INGEST_BIND only — set it to the box's
-#   Tailscale IP (100.101.1.28) in .env. ufw is inactive on the box, so never
-#   publish on 0.0.0.0. Default 127.0.0.1 = box-local only.
-# - Host rclone.conf and the two backup state dirs are bind-mounted read-only;
-#   the entrypoint copies rclone.conf to tmpfs, so nothing is written back.
+#   Tailscale IP in .env. ufw is inactive on the box, so never publish on
+#   0.0.0.0. Default 127.0.0.1 = box-local only.
+# - The host rclone config (a READ-ONLY-scope remote, see DEPLOY.md §1b) and
+#   the two backup state dirs are bind-mounted read-only; the entrypoint copies
+#   rclone.conf to tmpfs as root, chowns it to the app user and drops
+#   privileges, so nothing is written back and nothing runs as root afterwards.
 # - Root filesystem is read-only; only the data volume and /tmp are writable.
+# - `${VAR:?}` makes compose refuse to start without the four secrets rather
+#   than bringing up an unprotected read side or a fail-closed ingest.
 services:
   hopper-dashboard:
     build: .
@@ -18,14 +25,15 @@ services:
     tmpfs:
       - /tmp:mode=1777,size=64m
     environment:
-      APP_PASSWORD: ${APP_PASSWORD:-}
-      SESSION_SECRET: ${SESSION_SECRET:-}
-      INGEST_TOKEN: ${INGEST_TOKEN:-}
-      READ_TOKEN: ${READ_TOKEN:-}
+      APP_PASSWORD: ${APP_PASSWORD:?set APP_PASSWORD in .env (shared house password)}
+      SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET in .env (openssl rand -hex 32)}
+      INGEST_TOKEN: ${INGEST_TOKEN:?set INGEST_TOKEN in .env (openssl rand -hex 32)}
+      READ_TOKEN: ${READ_TOKEN:?set READ_TOKEN in .env (openssl rand -hex 32)}
       NTFY_URL: ${NTFY_URL:-}
       NTFY_TOPIC: ${NTFY_TOPIC:-}
       APP_HOST: ${APP_HOST:-}
       APP_ENV: ${APP_ENV:-prod}
+      TRUSTED_PROXY_CIDR: ${TRUSTED_PROXY_CIDR:-}
       PROBE_INTERVAL_S: ${PROBE_INTERVAL_S:-300}
       JOBS_FILE: /app/jobs.yml
       DASHBOARD_DATA: /app/data
@@ -34,7 +42,7 @@ services:
     volumes:
       - hopper-dashboard-data:/app/data
       - ./jobs.yml:/app/jobs.yml:ro
-      - ${RCLONE_CONF:-~/.config/rclone/rclone.conf}:/rclone/rclone.conf:ro
+      - ${RCLONE_CONF:-~/.config/rclone/dashboard-ro.conf}:/rclone/rclone.conf:ro
       - ${KM_STATE:-~/km-backups/state}:/state/km:ro
       - ${TODOIST_STATE:-~/todoist-points/data/.backup-state}:/state/todoist:ro
     networks:
