@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Run tests
+        run: python -m pytest -q
+
+  docker-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t hopper-dashboard:ci .
+      - name: Smoke both roles
+        run: |
+          set -eu
+          cp jobs.example.yml jobs.yml
+          docker run -d --name hd --read-only --tmpfs /tmp -v /app/data \
+            -v "$PWD/jobs.yml:/app/jobs.yml:ro" \
+            -e INGEST_TOKEN=ci-token -e APP_PASSWORD=ci-pass -e SESSION_SECRET=ci-secret \
+            -e DASHBOARD_NO_SCHEDULER=1 \
+            -p 8080:8080 -p 8081:8081 hopper-dashboard:ci
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8080/healthz >/dev/null && curl -sf http://127.0.0.1:8081/healthz >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:8080/healthz
+          curl -sf http://127.0.0.1:8081/healthz
+          # Gate redirects the board; a ping without a token is 401.
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/)" = "302"
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8081/api/v1/ping/km-backup)" = "401"
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Authorization: Bearer ci-token' -d result=success http://127.0.0.1:8081/api/v1/ping/km-backup)" = "200"
+          docker logs hd
+          docker rm -f hd

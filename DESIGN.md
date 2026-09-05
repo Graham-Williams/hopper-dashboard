@@ -123,16 +123,28 @@ Ingest (Tailscale-only port, default 8081):
 - `POST /api/v1/ping/<job_id>` — `Authorization: Bearer <JOB_TOKEN>` (one shared ingest token in v1,
   `INGEST_TOKEN` env; per-job tokens are a later hardening). Body JSON, all optional except `status`:
   ```json
-  {"status": "ok|fail|skipped", "started_at": "<iso8601>", "finished_at": "<iso8601>",
+  {"status": "ok|fail|skipped|metric", "started_at": "<iso8601>", "finished_at": "<iso8601>",
    "reason": "pushed|skipped-unchanged|skipped-throttle|timeout|error|...", "exit_code": 0,
    "note": "free text ≤ 500 chars",
    "metrics": {"bytes": 0, "files": 0, "db_sha256": "…", "lag_bytes": 0, "lag_files": 0,
                "dest_newest_iso": "…", "dest_count": 0, "disk_free_bytes": 0, "<anything>": 1}}
   ```
+  `status: "metric"` is a **metrics-only update**: it shallow-merges `metrics` into the job's
+  `last_metrics` (so the Mac probe can report offload lag / dest freshness) but is NOT a run — it never
+  counts as a heartbeat or a success, never resets `last_run`/`last_success`, and LATE is always computed
+  from the last real run. `skipped` IS a heartbeat and counts as a success (a backup that ran, found the DB
+  unchanged and skipped the push did its job). `metrics` values must be numbers, booleans, null, strings
+  ≤ 1000 chars, or flat lists of those (≤ 100 items); nested objects are rejected (400). `note` is
+  truncated to 500 chars; the whole body is capped at 64 KB (413). `last_metrics` is a shallow merge across
+  pings, so a bare systemd form ping never wipes the `db_sha256` a richer script heartbeat sent earlier.
   Also accepts `application/x-www-form-urlencoded` with `result=` + `exit=` (what a systemd
-  `ExecStopPost` curl sends): `result=success` → ok; anything else → fail, `reason=<result>`.
+  `ExecStopPost` curl sends): `result=success` → ok; anything else → fail, `reason=<result>`. A non-numeric
+  `exit=` (signal name) and an `exit_code=exited|killed|dumped` field are accepted and folded into `note`,
+  never rejected.
+  Auth is checked BEFORE the job lookup, so an unauthenticated caller can't enumerate ids (401, empty body).
   Unknown `job_id` → 404 (jobs must be declared in `jobs.yml`; no auto-registration, so a typo can't
-  create a phantom "healthy" job). Responds `{"ok": true, "state": "<computed state>"}`.
+  create a phantom "healthy" job). Per-IP rate limit 120 pings/min → 429.
+  Responds `{"ok": true, "state": "<computed state>"}`.
 - `GET /healthz` → 200 on both ports.
 
 Read side (behind the tunnel + password gate; also accepts `Authorization: Bearer <READ_TOKEN>` for Hopper):
@@ -140,7 +152,13 @@ Read side (behind the tunnel + password gate; also accepts `Authorization: Beare
   "jobs": [{"id", "name", "machine", "kind", "state", "since", "last_run", "last_success",
             "cadence_s", "grace_s", "destination", "protects", "method", "lag": {...}|null,
             "dest": {"newest": …, "count": …, "fresh": true|false|null}, "last_metrics": {...}}]}`
-- `GET /api/v1/jobs/<id>?limit=100` → job + recent runs + state changes.
+  `last_run` / `last_success` are ISO-8601 UTC strings (server receive time) or null; `lag` is null except for
+  manual jobs (always present) and any job that reported `lag_bytes`/`missing_bytes`; `dest.fresh` is null when
+  the destination cannot be judged yet. Additive, non-contract fields the app also emits (safe to ignore):
+  `last_run_status`, `last_run_reason`, `last_run_note`, `late_means`, `informational`, `expect`,
+  `summary.total`, `summary.computed_at` (newest state recompute — a stale value means the scheduler is down).
+  Unauthenticated API calls get a JSON 401, not a redirect.
+- `GET /api/v1/jobs/<id>?limit=100` → `{generated_at, job, runs, state_changes, probes|null}`.
 - `GET /` HTML board; `GET /jobs/<id>` HTML detail.
 
 `jobs.yml` schema (gitignored on the box; `jobs.example.yml` committed):
@@ -161,7 +179,30 @@ jobs:
     manual:                       # only for kind: manual
       max_age_s: 604800
       max_lag_bytes: 10737418240
+    expect: [km-tracker-app-1]    # only for kind: container — names that must appear in metrics.running
+    late_means: Mac offline or asleep   # optional text shown instead of the generic LATE reason
 ```
-State computation runs on every ping and on a 60 s ticker (so LATE fires without traffic). Every state
-transition is written to `state_changes` and dispatched to ntfy (`NTFY_URL` + `NTFY_TOPIC` env; disabled
-when empty) with title `[dashboard] <job> → <STATE>` and priority high for FAIL/STALE_DEST, default otherwise.
+Validation is strict and fails startup with the job id + field: ids `^[a-z0-9-]+$` (unique, ≤64), `machine`
+∈ box|mac, `kind` ∈ the six kinds, `cadence_s`+`grace_s` required for every kind except `manual` (and
+forbidden on manual), `db_snapshot` requires `probe.rclone_path`, `rclone_copy_tree` requires `destination`,
+`container` requires a non-empty `expect`, unknown keys anywhere are errors.
+State computation runs on every ping (for ALL jobs, so LATE keeps firing even if the ticker thread dies) and
+on a 60 s ticker (so LATE fires without traffic). Every state transition is written to `state_changes` and
+dispatched to ntfy (`NTFY_URL` + `NTFY_TOPIC` env; disabled when empty) with title `[dashboard] <job> → <STATE>`
+and priority high for FAIL/STALE_DEST, default otherwise. The very first `UNKNOWN → OK` is recorded but not
+alerted (it is not a recovery). ntfy failures are logged and swallowed — they never reach request handling.
+
+### State precedence (as implemented)
+Scheduled kinds (`db_snapshot`, `rclone_copy_tree`, `drive_mirror`, `container`, `probe`):
+`UNKNOWN` (no run yet — metrics alone don't count) → `LATE` (silence > cadence+grace, judged on server receive
+time; wins even if the last word was "fail", because silence is the more urgent fact) → `FAIL` (last run
+status=fail, or a `container` job whose `metrics.running` lacks an `expect` name) → kind-specific →
+`OK`. Kind-specific: `db_snapshot` → `STALE_DEST` when newest Drive object is older than `cadence*12` AND
+(state-file `last_drive.sha256` ≠ heartbeat `metrics.db_sha256`, or — with no heartbeat sha — the state
+file's `last_drive_push.epoch` is >1 h newer than anything on Drive); an unchanged DB with an old newest file
+is OK (dedup-aware), and with neither sha nor epoch available we don't guess. `rclone_copy_tree` →
+`STALE_DEST` when the run said ok but reported `missing_bytes`/`lag_bytes` > 0. `drive_mirror` → `BEHIND`
+when `pending + mismatch > 0`. `manual`: never LATE; `FAIL` if last run failed; `BEHIND` if age of last
+success > `max_age_s` or `lag_bytes` > `max_lag_bytes`; no thresholds = informational, never alerts.
+`dashboard-probes` is the scheduler's own heartbeat: a run is recorded every probe cycle, `fail` (with the
+error in `note`) if any rclone probe errored — so a broken probe shows up as a FAIL card, never a crash.

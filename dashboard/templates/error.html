@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}{{ code }} — Hopper Dashboard{% endblock %}
+{% block content %}
+<section class="panel">
+  <h1>{{ code }}</h1>
+  <p>{{ message }}</p>
+  <p><a href="{{ url_for('web.index') }}">← Back to the board</a></p>
+</section>
+{% endblock %}

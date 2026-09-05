@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>{% block title %}Hopper Dashboard{% endblock %}</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+<link rel="icon" href="{{ url_for('static', filename='favicon.svg') }}" type="image/svg+xml">
+{% block head %}{% endblock %}
+</head>
+<body>
+<nav class="top">
+  <a class="brand" href="{{ url_for('web.index') }}">
+    <span class="dot" aria-hidden="true"></span> Hopper Dashboard
+    {% if app_env != 'prod' %}<span class="env">{{ app_env }}</span>{% endif %}
+  </a>
+  <span class="spacer"></span>
+  <a href="{{ url_for('web.api_status') }}">JSON</a>
+  <a href="{{ url_for('web.logout') }}">Sign out</a>
+</nav>
+<main>
+{% block content %}{% endblock %}
+</main>
+<footer class="foot">
+  hopper-dashboard v{{ app_version }} · observe-only · actions stay with Hopper over SSH
+</footer>
+</body>
+</html>

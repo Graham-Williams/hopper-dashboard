@@ -1,0 +1,55 @@
+# hopper-dashboard on the box, behind the existing km-tracker Cloudflare tunnel.
+#
+# - Read side (:8080) has NO host port: the tunnel routes
+#   dashboard.graham-williams.com -> http://hopper-dashboard:8080 over the
+#   external `km-tracker_default` network; the shared APP_PASSWORD gates it.
+# - Ingest (:8081) is published on INGEST_BIND only — set it to the box's
+#   Tailscale IP (100.101.1.28) in .env. ufw is inactive on the box, so never
+#   publish on 0.0.0.0. Default 127.0.0.1 = box-local only.
+# - Host rclone.conf and the two backup state dirs are bind-mounted read-only;
+#   the entrypoint copies rclone.conf to tmpfs, so nothing is written back.
+# - Root filesystem is read-only; only the data volume and /tmp are writable.
+services:
+  hopper-dashboard:
+    build: .
+    container_name: hopper-dashboard
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=64m
+    environment:
+      APP_PASSWORD: ${APP_PASSWORD:-}
+      SESSION_SECRET: ${SESSION_SECRET:-}
+      INGEST_TOKEN: ${INGEST_TOKEN:-}
+      READ_TOKEN: ${READ_TOKEN:-}
+      NTFY_URL: ${NTFY_URL:-}
+      NTFY_TOPIC: ${NTFY_TOPIC:-}
+      APP_HOST: ${APP_HOST:-}
+      APP_ENV: ${APP_ENV:-prod}
+      PROBE_INTERVAL_S: ${PROBE_INTERVAL_S:-300}
+      JOBS_FILE: /app/jobs.yml
+      DASHBOARD_DATA: /app/data
+    ports:
+      - "${INGEST_BIND:-127.0.0.1}:8081:8081"
+    volumes:
+      - hopper-dashboard-data:/app/data
+      - ./jobs.yml:/app/jobs.yml:ro
+      - ${RCLONE_CONF:-~/.config/rclone/rclone.conf}:/rclone/rclone.conf:ro
+      - ${KM_STATE:-~/km-backups/state}:/state/km:ro
+      - ${TODOIST_STATE:-~/todoist-points/data/.backup-state}:/state/todoist:ro
+    networks:
+      - km-tracker_default
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request as u; u.urlopen('http://127.0.0.1:8080/healthz', timeout=5); u.urlopen('http://127.0.0.1:8081/healthz', timeout=5)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  hopper-dashboard-data:
+
+networks:
+  km-tracker_default:
+    external: true

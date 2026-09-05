@@ -1,0 +1,24 @@
+{% macro chip(state, late_means=None) -%}
+<span class="chip chip-{{ state|lower }}" title="{{ state }}">
+  <span class="glyph" aria-hidden="true">{{ {'OK':'●','LATE':'◔','FAIL':'✕','STALE_DEST':'◆','BEHIND':'▲','UNKNOWN':'○'}[state] }}</span>
+  {{ state.replace('_', ' ') }}
+</span>
+{%- endmacro %}
+
+{% macro when(iso, now) -%}
+{% if iso %}<time datetime="{{ iso }}" title="{{ iso|absolute }}">{{ iso|relative(now) }}</time>{% else %}<span class="muted">never</span>{% endif %}
+{%- endmacro %}
+
+{% macro history_strip(history) -%}
+{% set n = history|length %}
+<svg class="strip" viewBox="0 0 {{ 30 * 6 }} 12" width="180" height="12" role="img"
+     aria-label="Last {{ n }} runs">
+  <title>Last {{ n }} runs (oldest → newest)</title>
+  {% for h in history %}
+  {% set x = (30 - n + loop.index0) * 6 %}
+  <rect class="bar bar-{{ h.status }}" x="{{ x }}" y="0" width="5" height="12" rx="1">
+    <title>{{ h.status }} · {{ h.at|absolute }}</title>
+  </rect>
+  {% endfor %}
+</svg>
+{%- endmacro %}
