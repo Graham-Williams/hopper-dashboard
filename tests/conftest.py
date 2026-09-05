@@ -35,6 +35,22 @@ INGEST_TOKEN = "test-ingest-token"
 READ_TOKEN = "test-read-token"
 PASSWORD = "test-password"
 
+# jobs.created_at drives "never pinged → LATE after cadence+grace". The suites
+# use fixed clocks (2027) and the real clock; pinning created_at far in the
+# future keeps never-pinged jobs UNKNOWN everywhere except the tests that set
+# it explicitly (see tests/test_state.py / test_services.py).
+PINNED_CREATED_AT = "2030-03-17T17:46:40Z"
+
+
+def pin_created_at(settings, iso: str = PINNED_CREATED_AT) -> None:
+    from dashboard import db
+    conn = db.connect(settings.db_path)
+    try:
+        with conn:
+            conn.execute("UPDATE jobs SET created_at=?", (iso,))
+    finally:
+        conn.close()
+
 # One job per kind + the dashboard's own probe job. Cadences are short so
 # LATE arithmetic is easy to reason about in tests.
 JOBS_DOC = {
@@ -105,17 +121,22 @@ def notifier():
 def core(settings, registry, notifier):
     c = Core(settings, registry, notifier)
     c.init_store()
+    pin_created_at(settings)
     return c
 
 
 @pytest.fixture
 def ingest_app(settings, registry, notifier):
-    return create_app("ingest", settings, registry, notifier)
+    app = create_app("ingest", settings, registry, notifier)
+    pin_created_at(settings)
+    return app
 
 
 @pytest.fixture
 def read_app(settings, registry, notifier):
-    return create_app("read", settings, registry, notifier)
+    app = create_app("read", settings, registry, notifier)
+    pin_created_at(settings)
+    return app
 
 
 @pytest.fixture

@@ -49,10 +49,16 @@ jobs:
       - km-tracker-app-1
       - km-tracker-staging-app-1
       - km-tracker-cloudflared-1
-      - todoist-points
+      - todoist-points-todoist-points-1   # compose project + service name (verified with `docker ps`)
       - taste-twin
       - baby-pool
       - jjho-fan-almanac
+      # The SMS bridge stack is sunset (2026-08-03) but its containers are `restart: unless-stopped`
+      # and still running; if they vanish something happened on the box (reboot without restart,
+      # a `docker compose down`, disk pressure) — that is a box event worth seeing, so they stay listed.
+      - hopper-messaging-synapse-1
+      - hopper-messaging-postgres-1
+      - hopper-messaging-gmessages-1
 
   - id: dashboard-probes
     name: Dashboard probe cycle
@@ -71,18 +77,18 @@ jobs:
     protects: Visibility into everything Mac-side (backup log, offload lag, disk, Drive mirror)
     method: launchd com.hopper.dashboard-probe hourly (+ RunAtLoad) posts metrics over Tailscale
     cadence_s: 3600
-    grace_s: 7200
-    late_means: Not heard from the Mac in 3 hours — it is probably offline or asleep, not broken.
+    grace_s: 50400              # 14 h: the Mac sleeps overnight; LATE only past a full night + a working day
+    late_means: Not heard from the Mac in 15 hours — it is probably offline or asleep, not broken.
 
   - id: pa-backup
     name: personal-assistant → Drive
     machine: mac
     kind: rclone_copy_tree
     protects: Hopper's docs, memory, scripts and logs (~/personal-assistant)
-    method: nightly launchd rclone copy → gdrive:Backups; Mac probe reports missing bytes via rclone check
+    method: nightly launchd rclone copy → gdrive:Backups; Mac probe reports missing (never uploaded) vs differ (edited since) via rclone check
     destination: gdrive:Backups
     cadence_s: 86400
-    grace_s: 21600
+    grace_s: 50400              # 14 h: a missed 03:00 run fires on wake; only LATE if the whole next day passes
 
   - id: drive-mirror
     name: Google Drive mirror
@@ -91,7 +97,8 @@ jobs:
     protects: Documents, Desktop and minecraft-channel mirrored by Drive for Desktop
     method: Mac probe reads DriveFS mirror_sqlite.db (pending uploads + local/cloud mismatches); BEHIND if any
     cadence_s: 3600
-    grace_s: 7200
+    grace_s: 50400              # 14 h, same reasoning as mac-probe (nightly sleep). While mac-probe is LATE the
+                                # dashboard sends ONE "Mac offline" alert and suppresses LATE alerts for the other Mac jobs.
 
   - id: minecraft-offload
     name: Minecraft recordings offload
@@ -101,6 +108,8 @@ jobs:
     method: /offload-recordings skill (rclone copy → verify → stage); Mac probe reports bytes not yet on Drive
     destination: gdrive:Gremlins
     manual:
+      # max_age_s is inert until the FIRST real run ping (there is no "last success" to age). After the
+      # first successful offload, seed one: probes/ping.sh minecraft-offload ok "seeded" (DEPLOY.md §4).
       max_age_s: 1209600          # 14 days
       max_lag_bytes: 21474836480  # 20 GB
 

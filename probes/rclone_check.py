@@ -36,6 +36,37 @@ PA_BACKUP_FILTERS: List[str] = [
     "- minecraft-channel/recordings/**",
 ]
 
+# Filters copied VERBATIM from the third `rclone copy` in scripts/backup-personal-assistant.sh
+# (~/.claude → gdrive:Backups/claude-config). Secrets (sessions/**, *.key) and churn dirs are excluded
+# there for good reasons; the check must mirror them or it would report "missing" forever.
+CLAUDE_CONFIG_FILTERS: List[str] = [
+    "- sessions/**",
+    "- cache/**",
+    "- paste-cache/**",
+    "- shell-snapshots/**",
+    "- file-history/**",
+    "- session-env/**",
+    "- downloads/**",
+    "- jobs/**",
+    "- plugins/**",
+    "- backups/**",
+    "- daemon/**",
+    "- daemon*",
+    "- .last-*",
+    "- *.key",
+    "- .DS_Store",
+]
+
+# The trees the nightly backup script copies (name, local path relative to $HOME, remote subpath
+# under the Backups remote, filters). The 4th copy in the script (dotfiles: an --include allowlist at
+# --max-depth 1 of $HOME, ~1.5 KB) is deliberately NOT checked here — a whole-$HOME listing for four
+# files is not worth it and its filter semantics differ from the other three.
+PA_BACKUP_TREES: List[Tuple[str, str, str, List[str]]] = [
+    ("personal-assistant", "personal-assistant", "personal-assistant", PA_BACKUP_FILTERS),
+    ("hopper-memory", ".claude/projects/-Users-graham-personal-assistant/memory", "hopper-memory", []),
+    ("claude-config", ".claude", "claude-config", CLAUDE_CONFIG_FILTERS),
+]
+
 # Excludes copied from scripts/offload-recordings.sh (COMMON array) + its --min-age default.
 OFFLOAD_EXCLUDES: List[str] = [".DS_Store", ".tmp*/**", "delete-after-confirm/**"]
 OFFLOAD_MIN_AGE = "15m"
@@ -80,6 +111,8 @@ class CheckResult:
 
     @property
     def lag_files(self) -> int:
+        """missing + differ. For manual offload jobs both count as "not safely on Drive"; for the
+        nightly copy tree the dashboard treats only ``missing`` as stale (see mac_probe.probe_pa_backup)."""
         return len(self.missing) + len(self.differ)
 
     @property

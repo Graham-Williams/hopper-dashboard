@@ -8,11 +8,18 @@ testable with a fixed ``now``:
 - ``FAIL``       last heartbeat status=fail, or a container job missing an expected container
 - ``STALE_DEST`` heartbeat says ok but the destination disagrees
 - ``BEHIND``     manual job over its lag/age target, or a Drive mirror with pending work
-- ``UNKNOWN``    never heard from
+- ``UNKNOWN``    never heard from — but only for ``cadence+grace`` after the job was
+                 first registered (``jobs.created_at``); a scheduled job that has NEVER
+                 pinged then goes LATE, so a mis-installed heartbeat can't stay silent forever
 
 Precedence for scheduled kinds: LATE > FAIL > kind-specific (STALE_DEST / BEHIND) > OK.
 A silent job is reported LATE even if its last word was "fail" — the silence is the
 more urgent fact, and the last-run status stays visible on the card either way.
+
+``rclone_copy_tree`` distinguishes **missing** (never uploaded → STALE_DEST) from
+**differ** (edited locally since the last copy → informational lag, shown on the card).
+The nightly copy always trails a busy working tree by a few edited files; only bytes that
+have never reached the destination are a stale destination.
 """
 
 from __future__ import annotations
@@ -25,6 +32,11 @@ from .registry import Job
 # Metric keys the Mac probe / scripts may use for "how far behind".
 LAG_BYTES_KEYS = ("lag_bytes", "missing_bytes")
 LAG_FILES_KEYS = ("lag_files", "missing_files")
+# rclone_copy_tree: only never-uploaded bytes make the destination stale.
+MISSING_BYTES_KEYS = ("missing_bytes",)
+MISSING_FILES_KEYS = ("missing_files",)
+DIFFER_BYTES_KEYS = ("differ_bytes",)
+DIFFER_FILES_KEYS = ("differ_files",)
 
 
 @dataclass
@@ -34,6 +46,7 @@ class Facts:
     last_metrics: dict = field(default_factory=dict)
     last_metrics_at: str | None = None
     probe: dict | None = None           # newest probes row for this job
+    created_at: str | None = None       # jobs.created_at (first seen in jobs.yml)
 
 
 def _num(value) -> float | None:
@@ -130,17 +143,42 @@ def db_snapshot_stale(job: Job, f: Facts, now: float) -> tuple[bool | None, str]
     return False, "newest object is old but no sha/push state to compare"
 
 
+def copy_tree_missing(metrics: dict) -> tuple[float | None, float | None]:
+    """(missing_bytes, missing_files) for an rclone_copy_tree job — never
+    uploaded, as opposed to `differ` (edited since the last copy)."""
+    return (_first_num(metrics, MISSING_BYTES_KEYS),
+            _first_num(metrics, MISSING_FILES_KEYS))
+
+
+def copy_tree_stale(metrics: dict) -> bool | None:
+    """None = can't judge (no missing_* reported), else True when anything is
+    missing at the destination. ``differ`` never makes the destination stale."""
+    b, n = copy_tree_missing(metrics)
+    if b is None and n is None:
+        return None
+    return (b or 0) > 0 or (n or 0) > 0
+
+
 def lag_info(job: Job, f: Facts, now: float) -> dict | None:
     """Lag block for the JSON + card. Always present for manual jobs; present
-    for other kinds only when lag metrics were reported."""
-    bytes_ = _first_num(f.last_metrics, LAG_BYTES_KEYS)
-    files = _first_num(f.last_metrics, LAG_FILES_KEYS)
+    for other kinds only when lag metrics were reported. For
+    ``rclone_copy_tree`` the headline ``bytes``/``files`` are the MISSING
+    (never-uploaded) figures and ``differ_*`` carry the informational lag."""
+    differ_bytes = differ_files = None
+    if job.kind == "rclone_copy_tree":
+        bytes_, files = copy_tree_missing(f.last_metrics)
+        differ_bytes = _first_num(f.last_metrics, DIFFER_BYTES_KEYS)
+        differ_files = _first_num(f.last_metrics, DIFFER_FILES_KEYS)
+    else:
+        bytes_ = _first_num(f.last_metrics, LAG_BYTES_KEYS)
+        files = _first_num(f.last_metrics, LAG_FILES_KEYS)
     age_s = None
     if f.last_success:
         ts = from_iso(f.last_success.get("received_at"))
         if ts is not None:
             age_s = max(0, int(now - ts))
-    if job.kind != "manual" and bytes_ is None and files is None:
+    if (job.kind != "manual" and bytes_ is None and files is None
+            and differ_bytes is None and differ_files is None):
         return None
     behind_reasons = []
     if job.max_age_s is not None and age_s is not None and age_s > job.max_age_s:
@@ -151,6 +189,8 @@ def lag_info(job: Job, f: Facts, now: float) -> dict | None:
     return {
         "bytes": int(bytes_) if bytes_ is not None else None,
         "files": int(files) if files is not None else None,
+        "differ_bytes": int(differ_bytes) if differ_bytes is not None else None,
+        "differ_files": int(differ_files) if differ_files is not None else None,
         "age_s": age_s,
         "max_bytes": job.max_lag_bytes,
         "max_age_s": job.max_age_s,
@@ -168,9 +208,9 @@ def dest_info(job: Job, f: Facts, now: float) -> dict:
         stale, _ = db_snapshot_stale(job, f, now)
         fresh = None if stale is None else (not stale)
     elif job.kind == "rclone_copy_tree":
-        lag = _first_num(f.last_metrics, LAG_BYTES_KEYS)
-        if lag is not None:
-            fresh = lag == 0
+        stale = copy_tree_stale(f.last_metrics)
+        if stale is not None:
+            fresh = not stale
         elif newest is not None and job.dest_fresh_s:
             fresh = (now - newest) <= job.dest_fresh_s
     elif job.kind == "drive_mirror":
@@ -188,9 +228,23 @@ def dest_info(job: Job, f: Facts, now: float) -> dict:
                             else None)}
 
 
+def _never_pinged_late(job: Job, f: Facts, now: float) -> bool:
+    """A scheduled job with no run yet is UNKNOWN only until cadence+grace
+    has elapsed since it was registered; after that its silence is LATE
+    (a heartbeat that was never wired up must not look merely "new" forever)."""
+    if not job.scheduled or job.deadline_s is None:
+        return False
+    created = from_iso(f.created_at)
+    return created is not None and now - created > job.deadline_s
+
+
 def compute_state(job: Job, f: Facts, now: float) -> tuple[str, str]:
     """Return (STATE, human reason)."""
     lr = f.last_run
+    if lr is None and _never_pinged_late(job, f, now):
+        return "LATE", (job.late_means
+                        or f"never pinged, and registered more than {job.deadline_s}s ago"
+                        " — is the heartbeat installed?")
     if lr is None and not f.last_metrics:
         return "UNKNOWN", "never heard from"
 
@@ -239,8 +293,12 @@ def compute_state(job: Job, f: Facts, now: float) -> tuple[str, str]:
         if stale is False:
             return "OK", f"heartbeat on time; {why}"
     elif job.kind == "rclone_copy_tree":
-        lag = _first_num(f.last_metrics, LAG_BYTES_KEYS)
-        if lag is not None and lag > 0:
-            return "STALE_DEST", (f"job reported ok but {int(lag)} bytes are "
-                                  f"missing at the destination")
+        if copy_tree_stale(f.last_metrics):
+            mb, mf = copy_tree_missing(f.last_metrics)
+            return "STALE_DEST", (f"job reported ok but {int(mf or 0)} file(s) / "
+                                  f"{int(mb or 0)} bytes have never reached the destination")
+        df = _first_num(f.last_metrics, DIFFER_FILES_KEYS)
+        if df:
+            return "OK", (f"heartbeat on time; {int(df)} file(s) edited since the "
+                          f"last copy (normal lag, not stale)")
     return "OK", "heartbeat on time"

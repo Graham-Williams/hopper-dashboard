@@ -66,6 +66,7 @@ class Core:
             last_metrics=row.get("last_metrics") or {},
             last_metrics_at=row.get("last_metrics_at"),
             probe=db.last_probe(conn, job.id) if job.has_probe else None,
+            created_at=row.get("created_at"),
         )
 
     # -- state ------------------------------------------------------------- #
@@ -81,9 +82,44 @@ class Core:
             return state, None
         return state, (prev, state, reason)
 
-    def _dispatch(self, transitions: list[tuple[Job, tuple]]) -> None:
+    def _machine_probe(self, machine: str) -> Job | None:
+        """The ``probe``-kind job that stands for "this machine is reachable"
+        (e.g. ``mac-probe``). The dashboard's own probe job never counts."""
+        for j in self.registry:
+            if (j.kind == "probe" and j.machine == machine
+                    and j.id != SELF_JOB_ID):
+                return j
+        return None
+
+    def _suppressed_offline(self, job: Job, prev: str, state: str,
+                            states: dict[str, str],
+                            transitions: dict[str, tuple]) -> bool:
+        """Machine-offline rule: while a machine's probe job is LATE, the other
+        jobs on that machine going LATE is the same single fact ("the Mac is
+        asleep"), so only the probe's own alert is sent. The sibling
+        transitions are still recorded and shown. Their LATE→x recoveries are
+        likewise muted when the probe job recovers in the same batch."""
+        probe = self._machine_probe(job.machine)
+        if probe is None or probe.id == job.id:
+            return False
+        probe_state = states.get(probe.id)
+        if state == "LATE" and probe_state == "LATE":
+            return True
+        probe_tr = transitions.get(probe.id)
+        if prev == "LATE" and probe_tr is not None and probe_tr[0] == "LATE":
+            return True
+        return False
+
+    def _dispatch(self, transitions: list[tuple[Job, tuple]],
+                  states: dict[str, str] | None = None) -> None:
+        states = states or {}
+        by_id = {job.id: tr for job, tr in transitions}
         for job, (prev, state, reason) in transitions:
             log.info("state %s: %s -> %s (%s)", job.id, prev, state, reason)
+            if self._suppressed_offline(job, prev, state, states, by_id):
+                log.info("alert for %s suppressed: its machine's probe job is "
+                         "offline (one alert for the machine instead)", job.id)
+                continue
             try:
                 self.notifier.notify_transition(job.name, job.id, prev, state,
                                                 reason)
@@ -105,7 +141,7 @@ class Core:
                         transitions.append((job, tr))
         finally:
             conn.close()
-        self._dispatch(transitions)
+        self._dispatch(transitions, states)
         return states
 
     # -- ingest ------------------------------------------------------------ #
@@ -140,15 +176,17 @@ class Core:
                 # Recompute the whole board so LATE keeps firing for other
                 # jobs even if the ticker thread ever dies.
                 state = "UNKNOWN"
+                states: dict[str, str] = {}
                 for j in self.registry:
                     s, tr = self._recompute_locked(conn, j, now)
+                    states[j.id] = s
                     if j.id == job.id:
                         state = s
                     if tr:
                         transitions.append((j, tr))
         finally:
             conn.close()
-        self._dispatch(transitions)
+        self._dispatch(transitions, states)
         return state
 
     # -- probes ------------------------------------------------------------ #

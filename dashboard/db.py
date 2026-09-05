@@ -17,6 +17,11 @@ from datetime import datetime, timezone
 from typing import Any, Iterable
 
 ISO = "%Y-%m-%dT%H:%M:%SZ"
+# Epoch range we accept from any ISO input: 1970-01-01 .. 9999-12-31T23:59:59Z.
+# Anything outside (e.g. a poisoned "0001-01-01T00:00:00+14:00", which makes
+# datetime.timestamp() raise OverflowError) is treated as unparseable.
+EPOCH_MIN = 0.0
+EPOCH_MAX = 253402300799.0
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -26,7 +31,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     state_reason    TEXT,
     last_metrics    TEXT,               -- JSON object, shallow-merged over time
     last_metrics_at TEXT,
-    updated_at      TEXT
+    updated_at      TEXT,
+    created_at      TEXT                -- first seen in jobs.yml; drives UNKNOWN -> LATE for never-pinged jobs
 );
 CREATE TABLE IF NOT EXISTS runs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -76,19 +82,26 @@ def to_iso(epoch: float) -> str:
 
 def from_iso(text: str | None) -> float | None:
     """Parse ISO-8601 (with or without offset / fractional seconds) to epoch.
-    Returns None for empty or unparseable input."""
-    if not text:
+    Returns None for empty, unparseable, or out-of-range input (outside
+    ``[EPOCH_MIN, EPOCH_MAX]``) — never raises, so a poisoned timestamp in a
+    metric or probe row can't 500 the board."""
+    if not text or not isinstance(text, str):
         return None
     s = text.strip()
+    if len(s) > 64:
+        return None
     if s.endswith("Z") or s.endswith("z"):
         s = s[:-1] + "+00:00"
     try:
         dt = datetime.fromisoformat(s)
-    except ValueError:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        epoch = dt.timestamp()
+    except (ValueError, OverflowError, OSError):
         return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.timestamp()
+    if not (EPOCH_MIN <= epoch <= EPOCH_MAX):
+        return None
+    return epoch
 
 
 def now_iso() -> str:
@@ -116,6 +129,12 @@ def init_schema(conn: sqlite3.Connection) -> None:
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(jobs)")}
     if "state_reason" not in cols:  # pre-0.1 databases
         conn.execute("ALTER TABLE jobs ADD COLUMN state_reason TEXT")
+    if "created_at" not in cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN created_at TEXT")
+    # Backfill: the best "first seen" we have for an old row is its UNKNOWN
+    # `since`, else updated_at, else now.
+    conn.execute("UPDATE jobs SET created_at = COALESCE(since, updated_at, ?) "
+                 "WHERE created_at IS NULL", (now_iso(),))
 
 
 def ensure_jobs(conn: sqlite3.Connection, job_ids: Iterable[str]) -> None:
@@ -124,8 +143,8 @@ def ensure_jobs(conn: sqlite3.Connection, job_ids: Iterable[str]) -> None:
     with conn:
         for jid in job_ids:
             conn.execute(
-                "INSERT OR IGNORE INTO jobs (id, state, since, updated_at) "
-                "VALUES (?, 'UNKNOWN', ?, ?)", (jid, now, now))
+                "INSERT OR IGNORE INTO jobs (id, state, since, updated_at, "
+                "created_at) VALUES (?, 'UNKNOWN', ?, ?, ?)", (jid, now, now, now))
 
 
 # --------------------------------------------------------------------------- #

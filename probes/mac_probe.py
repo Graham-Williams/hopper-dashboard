@@ -4,7 +4,9 @@
 Computes, on the Mac, what only the Mac can see, and POSTs it to the dashboard's Tailscale-only
 ingest port:
   pa-backup          last outcome of the nightly backup (log tail, reported once per run) +
-                     destination lag vs gdrive:Backups/personal-assistant (rclone check)
+                     destination lag for the three trees the script copies (personal-assistant,
+                     hopper-memory, claude-config) vs gdrive:Backups/<tree> (rclone check), split into
+                     MISSING (never uploaded → stale) and DIFFER (edited since → informational)
   minecraft-offload  bytes/files under ~/minecraft-channel not yet on Drive, per pair + disk free
   drive-mirror       DriveFS mirror queue/mismatch counts (copied sqlite)
   mac-probe          the probe's own heartbeat: ok, or fail + which sub-probes errored
@@ -46,6 +48,7 @@ from probes.common import (  # noqa: E402
     load_config,
     load_state,
     now_iso,
+    require_dashboard_url,
     save_state,
     send_ping,
     slug,
@@ -66,10 +69,12 @@ def load_settings(env_path: str) -> Dict[str, str]:
         "PROBE_RCLONE": "",
         "PROBE_RCLONE_TIMEOUT": str(RCLONE_TIMEOUT_S),
         "PROBE_HTTP_TIMEOUT": str(HTTP_TIMEOUT_S),
-        # pa-backup
+        # pa-backup. PROBE_PA_REMOTE is the Backups REMOTE ROOT (the script's $REMOTE); each tree in
+        # rclone_check.PA_BACKUP_TREES is checked against <root>/<subpath>. PROBE_PA_HOME lets tests
+        # point the tree list at a scratch $HOME.
         "PROBE_PA_LOG": os.path.join(home, "Library/Logs/hopper-backup.log"),
-        "PROBE_PA_SRC": os.path.join(home, "personal-assistant"),
-        "PROBE_PA_REMOTE": "gdrive:Backups/personal-assistant",
+        "PROBE_PA_HOME": home,
+        "PROBE_PA_REMOTE": "gdrive:Backups",
         # minecraft-offload
         "PROBE_MC_BASE": os.path.join(home, "minecraft-channel"),
         "PROBE_MC_REMOTE": "gdrive",
@@ -103,38 +108,68 @@ def probe_pa_backup(cfg: Dict[str, str], state: Dict[str, object], log: Logger) 
     else:
         log.log("pa-backup: last log line already reported (%s)" % entry.raw[:60])
 
-    # (2) destination freshness — every run
+    # (2) destination freshness — every run, for each tree the backup script copies.
+    #     MISSING = on the Mac, never reached Drive (→ the dashboard's STALE_DEST).
+    #     DIFFER  = on both sides but edited locally since the last nightly copy (informational
+    #               lag: a working tree always trails its 03:00 snapshot; NOT stale).
+    #     Summed across trees; per-tree breakdown under *_<tree> keys.
     rclone = find_rclone(cfg.get("PROBE_RCLONE") or None)
     if not rclone:
         raise ProbeError("rclone not found (checked /opt/homebrew/bin, /usr/local/bin, PATH)")
     timeout = float(cfg["PROBE_RCLONE_TIMEOUT"])
+    remote_root = cfg["PROBE_PA_REMOTE"].rstrip("/")
+    home = cfg["PROBE_PA_HOME"]
+    totals = {"missing_files": 0, "missing_bytes": 0, "differ_files": 0, "differ_bytes": 0,
+              "matched_files": 0, "check_errors": 0, "trees": len(rclone_check.PA_BACKUP_TREES),
+              "trees_checked": 0, "trees_errored": 0}
     metrics: Dict[str, object] = {}
-    try:
-        res = rclone_check.rclone_check(
-            rclone, cfg["PROBE_PA_SRC"], cfg["PROBE_PA_REMOTE"],
-            filters=rclone_check.PA_BACKUP_FILTERS, timeout=timeout,
-        )
-        lag_bytes, _ = rclone_check.sum_local_sizes(cfg["PROBE_PA_SRC"], res.lag_paths)
-        metrics.update({
-            "lag_files": res.lag_files,
-            "lag_bytes": lag_bytes,
-            "missing_files": len(res.missing),
-            "differ_files": len(res.differ),
-            "matched_files": len(res.matched),
-            "check_errors": len(res.errors),
-        })
-        if res.lag_paths:
-            metrics["lag_sample"] = ",".join(res.lag_paths[:5])
-    except ProbeError as e:
-        errors.append(str(e))
-    try:
-        count, size = rclone_check.rclone_size(rclone, cfg["PROBE_PA_REMOTE"], timeout=timeout)
-        if count is not None:
-            metrics["dest_count"] = count
-        if size is not None:
-            metrics["dest_bytes"] = size
-    except ProbeError as e:
-        errors.append(str(e))
+    missing_sample: List[str] = []
+    dest_count = 0
+    dest_bytes = 0
+    dest_seen = 0
+    for name, rel, sub, filters in rclone_check.PA_BACKUP_TREES:
+        src = os.path.join(home, rel)
+        dst = "%s/%s" % (remote_root, sub)
+        key = slug(name)
+        if not os.path.isdir(src):
+            log.log("pa-backup: %s not found locally, skipping" % src)
+            continue
+        try:
+            res = rclone_check.rclone_check(rclone, src, dst, filters=filters or None, timeout=timeout)
+        except ProbeError as e:
+            errors.append(str(e))
+            totals["trees_errored"] += 1
+            continue
+        missing_bytes, _ = rclone_check.sum_local_sizes(src, res.missing)
+        differ_bytes, _ = rclone_check.sum_local_sizes(src, res.differ)
+        metrics["missing_files_" + key] = len(res.missing)
+        metrics["missing_bytes_" + key] = missing_bytes
+        metrics["differ_files_" + key] = len(res.differ)
+        totals["missing_files"] += len(res.missing)
+        totals["missing_bytes"] += missing_bytes
+        totals["differ_files"] += len(res.differ)
+        totals["differ_bytes"] += differ_bytes
+        totals["matched_files"] += len(res.matched)
+        totals["check_errors"] += len(res.errors)
+        totals["trees_checked"] += 1
+        missing_sample.extend("%s:%s" % (key, p) for p in res.missing[:3])
+        log.log("pa-backup: %s → %d missing / %d differ / %d matched" % (name, len(res.missing), len(res.differ), len(res.matched)))
+        try:
+            count, size = rclone_check.rclone_size(rclone, dst, timeout=timeout)
+            if count is not None and size is not None:
+                dest_count += count
+                dest_bytes += size
+                dest_seen += 1
+        except ProbeError as e:
+            errors.append(str(e))
+    if totals["trees_checked"]:
+        metrics.update(totals)
+        if missing_sample:
+            metrics["missing_sample"] = ",".join(missing_sample[:6])
+    if dest_seen:
+        metrics["dest_count"] = dest_count
+        metrics["dest_bytes"] = dest_bytes
+        metrics["dest_trees"] = dest_seen
     if metrics:
         pings.append(("pa-backup", build_ping("metric", note=join_nonempty(errors) or None, metrics=metrics)))
     if errors and not metrics:
@@ -195,15 +230,19 @@ def probe_minecraft_offload(cfg: Dict[str, str], log: Logger) -> List[Ping]:
 
 
 def probe_drive_mirror(cfg: Dict[str, str], log: Logger) -> List[Ping]:
+    """Reading the mirror DB IS the check for this job (there is no separate scheduled task on
+    the Mac), so a successful read is an ``ok`` RUN with finished_at — not a metrics-only update.
+    Otherwise the job could never leave UNKNOWN/LATE. No DB at all → ``fail`` run."""
+    started = now_iso()
     try:
         st = drivefs.probe_drive_mirror(cfg["PROBE_DRIVEFS_DIR"])
     except ProbeError as e:
         # Not an exception of the probe itself: Drive genuinely isn't there → tell the dashboard.
         log.error("drive-mirror: " + str(e))
-        return [("drive-mirror", build_ping("fail", reason="error", note=str(e), finished_at=now_iso()))]
+        return [("drive-mirror", build_ping("fail", reason="error", note=str(e), started_at=started, finished_at=now_iso()))]
     log.log("drive-mirror: pending=%d mismatch=%d roots=%s" % (st.pending, st.mismatch, ",".join(st.roots)))
     note = None if st.caught_up else "not caught up: pending=%d mismatch=%d" % (st.pending, st.mismatch)
-    return [("drive-mirror", build_ping("metric", note=note, metrics=st.metrics()))]
+    return [("drive-mirror", build_ping("ok", reason="probed", note=note, started_at=started, finished_at=now_iso(), metrics=st.metrics()))]
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +283,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if not args.dry_run and not cfg.get("INGEST_TOKEN"):
         log.error("INGEST_TOKEN missing (env file %s) — nothing sent" % args.env)
+        return 2
+    try:
+        cfg["DASHBOARD_URL"] = require_dashboard_url(cfg, args.env)
+    except ProbeError as e:
+        log.error("%s — nothing sent" % e)
         return 2
 
     state = load_state(cfg["PROBE_STATE_FILE"])

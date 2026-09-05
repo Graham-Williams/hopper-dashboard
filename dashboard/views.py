@@ -24,6 +24,7 @@ def _facts(conn, job: Job, row: dict | None) -> Facts:
         last_metrics=row.get("last_metrics") or {},
         last_metrics_at=row.get("last_metrics_at"),
         probe=db.last_probe(conn, job.id) if job.has_probe else None,
+        created_at=row.get("created_at"),
     )
 
 
@@ -57,6 +58,8 @@ def job_entry(conn, job: Job, row: dict | None, now: float,
         "late_means": job.late_means,
         "informational": job.informational,
         "expect": list(job.expect) if job.expect else None,
+        "never_run": lr == {},
+        "created_at": row.get("created_at"),
     }
     if history is not None:
         entry["history"] = [{"status": h["status"], "at": h["received_at"]}
