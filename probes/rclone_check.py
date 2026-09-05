@@ -1,0 +1,178 @@
+"""Destination-lag probes built on ``rclone check --one-way --combined -``.
+
+``--combined -`` prints one line per file to stdout:
+  ``= path``  identical on both sides
+  ``- path``  missing on the destination (the lag we care about)
+  ``* path``  present on both but different (edited since last upload)
+  ``+ path``  only on destination (not emitted with --one-way)
+  ``! path``  error reading/hashing
+Exit code is 1 when differences exist — that is NOT a failure of the probe. Anything else
+non-zero (or a timeout) is.
+
+Nothing here uploads: ``check`` is read-only on both sides.
+"""
+from __future__ import annotations
+
+import os
+import re
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+from probes.common import RCLONE_TIMEOUT_S, ProbeError, run_cmd
+
+# Filters copied VERBATIM from scripts/backup-personal-assistant.sh (personal-assistant → Drive).
+# The two '+' rules MUST precede '- .env*' so the template and example survive the secret sweep.
+PA_BACKUP_FILTERS: List[str] = [
+    "+ .env.1pass",
+    "+ .env.example",
+    "- .env*",
+    "- .DS_Store",
+    "- .git/**",
+    "- __pycache__/**",
+    "- node_modules/**",
+    "- *.mov",
+    "- *.mp4",
+    "- *.mkv",
+    "- minecraft-channel/recordings/**",
+]
+
+# Excludes copied from scripts/offload-recordings.sh (COMMON array) + its --min-age default.
+OFFLOAD_EXCLUDES: List[str] = [".DS_Store", ".tmp*/**", "delete-after-confirm/**"]
+OFFLOAD_MIN_AGE = "15m"
+
+# Fallback if the offload script can't be read/parsed. Keep in sync with its PAIRS array.
+DEFAULT_OFFLOAD_PAIRS: List[Tuple[str, str, str]] = [
+    ("recordings", "Gremlins/recordings", "stage"),
+    ("world backups", "Gremlins/world backups", "nostage"),
+    ("replays", "Gremlins/replays", "nostage"),
+]
+
+PAIR_RE = re.compile(r'^\s*"([^"|]+)\|([^"|]+)\|(stage|nostage)"\s*$', re.M)
+
+
+def parse_pairs_from_script(text: str) -> List[Tuple[str, str, str]]:
+    """Extract the PAIRS=( "local|remote|stage" ... ) entries from offload-recordings.sh."""
+    m = re.search(r"PAIRS=\((.*?)\)", text, re.S)
+    if not m:
+        return []
+    return [(a.strip(), b.strip(), c) for a, b, c in PAIR_RE.findall(m.group(1))]
+
+
+def load_offload_pairs(script_path: Optional[str]) -> List[Tuple[str, str, str]]:
+    if script_path and os.path.exists(script_path):
+        try:
+            with open(script_path, "r", encoding="utf-8") as fh:
+                pairs = parse_pairs_from_script(fh.read())
+            if pairs:
+                return pairs
+        except OSError:
+            pass
+    return list(DEFAULT_OFFLOAD_PAIRS)
+
+
+@dataclass
+class CheckResult:
+    matched: List[str] = field(default_factory=list)
+    missing: List[str] = field(default_factory=list)   # '-' missing on destination
+    differ: List[str] = field(default_factory=list)    # '*' differ
+    errors: List[str] = field(default_factory=list)    # '!' could not check
+    extra: List[str] = field(default_factory=list)     # '+' only on destination
+
+    @property
+    def lag_files(self) -> int:
+        return len(self.missing) + len(self.differ)
+
+    @property
+    def lag_paths(self) -> List[str]:
+        return self.missing + self.differ
+
+
+def parse_combined(text: str) -> CheckResult:
+    res = CheckResult()
+    buckets = {"=": res.matched, "-": res.missing, "*": res.differ, "!": res.errors, "+": res.extra}
+    for line in text.splitlines():
+        if len(line) < 3 or line[1] != " ":
+            continue
+        marker, path = line[0], line[2:]
+        if marker in buckets and path:
+            buckets[marker].append(path)
+    return res
+
+
+def sum_local_sizes(src_dir: str, rel_paths: List[str]) -> Tuple[int, int]:
+    """Total bytes of the given files under src_dir. Returns (bytes, files_counted); files that
+    vanished between the check and the stat are skipped."""
+    total = 0
+    counted = 0
+    for rel in rel_paths:
+        p = os.path.join(src_dir, rel)
+        try:
+            total += os.path.getsize(p)
+            counted += 1
+        except OSError:
+            continue
+    return total, counted
+
+
+def parse_size_json(text: str) -> Tuple[Optional[int], Optional[int]]:
+    """``rclone size --json`` → (count, bytes)."""
+    import json
+
+    try:
+        d = json.loads(text)
+        return int(d.get("count")), int(d.get("bytes"))
+    except (ValueError, TypeError, AttributeError):
+        return None, None
+
+
+def summarize_stderr(stderr: str, limit: int = 3) -> str:
+    """Pick the useful NOTICE/ERROR lines out of rclone's stderr for a note."""
+    keep = []
+    for line in stderr.splitlines():
+        if "NOTICE:" in line or "ERROR" in line or "Failed" in line:
+            keep.append(re.sub(r"^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} ", "", line).strip())
+    return " | ".join(keep[:limit])
+
+
+# ---------------------------------------------------------------------------
+# rclone invocations (thin; the parsing above is what gets unit-tested)
+# ---------------------------------------------------------------------------
+def rclone_check(
+    rclone: str,
+    src: str,
+    dst: str,
+    filters: Optional[List[str]] = None,
+    excludes: Optional[List[str]] = None,
+    min_age: Optional[str] = None,
+    timeout: float = RCLONE_TIMEOUT_S,
+) -> CheckResult:
+    argv = [rclone, "check", src, dst, "--one-way", "--combined", "-"]
+    for f in filters or []:
+        argv += ["--filter", f]
+    for e in excludes or []:
+        argv += ["--exclude", e]
+    if min_age:
+        argv += ["--min-age", min_age]
+    rc, out, err = run_cmd(argv, timeout=timeout)
+    if rc not in (0, 1):
+        raise ProbeError("rclone check %s → %s failed (rc=%s): %s" % (src, dst, rc, summarize_stderr(err) or err.strip()[-300:]))
+    res = parse_combined(out)
+    if rc == 1 and res.lag_files == 0 and not res.errors:
+        # differences reported but nothing in the combined list: surface stderr so it's debuggable
+        raise ProbeError("rclone check %s → %s rc=1 with empty combined output: %s" % (src, dst, summarize_stderr(err)))
+    return res
+
+
+def rclone_size(rclone: str, remote_path: str, timeout: float = RCLONE_TIMEOUT_S) -> Tuple[Optional[int], Optional[int]]:
+    rc, out, err = run_cmd([rclone, "size", remote_path, "--json"], timeout=timeout)
+    if rc != 0:
+        raise ProbeError("rclone size %s failed (rc=%s): %s" % (remote_path, rc, summarize_stderr(err) or err.strip()[-300:]))
+    return parse_size_json(out)
+
+
+def disk_free(path: str) -> Dict[str, int]:
+    st = os.statvfs(path)
+    return {
+        "disk_free_bytes": st.f_bavail * st.f_frsize,
+        "disk_total_bytes": st.f_blocks * st.f_frsize,
+    }

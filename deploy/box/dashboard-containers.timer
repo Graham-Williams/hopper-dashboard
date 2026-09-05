@@ -1,0 +1,12 @@
+# Fires dashboard-containers.service every 5 minutes (matches the backup timers' cadence, so the
+# box-containers job can use the same cadence/grace in jobs.yml).
+[Unit]
+Description=Run hopper-dashboard container heartbeat every 5 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
