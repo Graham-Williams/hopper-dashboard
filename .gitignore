@@ -1,0 +1,29 @@
+# secrets & deploy-local config — never commit
+.env
+.env.*
+!.env.example
+jobs.yml
+*.token
+
+# runtime state
+data/
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# os / editor
+.DS_Store
+.idea/
+.vscode/
