@@ -12,11 +12,22 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from dashboard import create_app  # noqa: E402
-from dashboard.config import Settings  # noqa: E402
-from dashboard.notify import Notifier  # noqa: E402
-from dashboard.registry import parse_registry  # noqa: E402
-from dashboard.services import Core  # noqa: E402
+# The probe tests (tests/test_probes_*.py) must run under a bare stdlib
+# interpreter (macOS /usr/bin/python3, no venv). The app fixtures below need
+# Flask/PyYAML, so import them lazily: if the deps are missing, only the app
+# fixtures become unusable, and the probe tests still collect and run.
+try:
+    from dashboard import create_app  # noqa: E402
+    from dashboard.config import Settings  # noqa: E402
+    from dashboard.notify import Notifier  # noqa: E402
+    from dashboard.registry import parse_registry  # noqa: E402
+    from dashboard.services import Core  # noqa: E402
+except ImportError as _exc:  # pragma: no cover - stdlib-only runs
+    create_app = Settings = parse_registry = Core = None  # type: ignore
+    Notifier = object  # type: ignore  # lets RecordingNotifier still be defined
+    _APP_IMPORT_ERROR = _exc
+else:
+    _APP_IMPORT_ERROR = None
 
 EXAMPLE_JOBS = os.path.join(ROOT, "jobs.example.yml")
 
