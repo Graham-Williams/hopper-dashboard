@@ -117,8 +117,8 @@ nav.top a { color: var(--muted); padding: .4rem 0; }
 .card dl { display: grid; grid-template-columns: max-content 1fr; gap: .25rem .7rem; margin: 0; font-size: .9rem; }
 .card dt { color: var(--muted); }
 .card dd { margin: 0; min-width: 0; }
-.card dd .names code { display: inline-block; margin: 0 .25rem .25rem 0; padding: 0 .3rem; border-radius: 4px; background: var(--panel-2); }
-.card dd .names code.missing { background: var(--fail); color: var(--on-state); }
+.card dd.names code { display: inline-block; margin: 0 .25rem .25rem 0; padding: 0 .3rem; border-radius: 4px; background: var(--panel-2); }
+.card dd.names code.missing { background: var(--fail); color: var(--on-state); }
 .card footer { display: flex; align-items: center; justify-content: space-between; gap: .6rem; margin-top: .7rem; padding-top: .55rem; border-top: 1px solid var(--rule); flex-wrap: wrap; }
 .card.detail { padding: 1.1rem 1.2rem .9rem; }
 .card.detail h1 { font-size: 1.4rem; flex: 1 1 auto; }

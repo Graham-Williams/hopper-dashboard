@@ -155,7 +155,8 @@ Read side (behind the tunnel + password gate; also accepts `Authorization: Beare
   `last_run` / `last_success` are ISO-8601 UTC strings (server receive time) or null; `lag` is null except for
   manual jobs (always present) and any job that reported `lag_bytes`/`missing_bytes`; `dest.fresh` is null when
   the destination cannot be judged yet. Additive, non-contract fields the app also emits (safe to ignore):
-  `last_run_status`, `last_run_reason`, `last_run_note`, `late_means`, `informational`, `expect`,
+  `state_reason` (why the job is in its current state), `last_run_status`, `last_run_reason`, `last_run_note`,
+  `late_means`, `informational`, `expect`,
   `summary.total`, `summary.computed_at` (newest state recompute — a stale value means the scheduler is down).
   Unauthenticated API calls get a JSON 401, not a redirect.
 - `GET /api/v1/jobs/<id>?limit=100` → `{generated_at, job, runs, state_changes, probes|null}`.

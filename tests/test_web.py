@@ -258,3 +258,11 @@ def test_container_card_marks_missing_names(authed, core, registry):
     core.record_ping(registry.get("containers"), {"status": "ok", "metrics": {"running": "app-1"}}, now=NOW)
     html = authed.get("/").data.decode()
     assert 'class="missing">tunnel-1' in html
+
+
+def test_state_reason_exposed_and_shown(authed, read, core, registry):
+    core.record_ping(registry.get("containers"), {"status": "ok", "metrics": {"running": "app-1"}}, now=NOW)
+    j = {x["id"]: x for x in read.get("/api/v1/status", headers=bearer()).get_json()["jobs"]}["containers"]
+    assert j["state"] == "FAIL" and "tunnel-1" in j["state_reason"]
+    html = authed.get("/").data.decode()
+    assert "not running: tunnel-1" in html

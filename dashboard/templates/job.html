@@ -9,7 +9,7 @@
     <h1>{{ job.name }}</h1>
     <span class="kind">{{ job.machine }} · {{ job.kind.replace('_',' ') }} · <code>{{ job.id }}</code></span>
   </header>
-  {% if job.state == 'LATE' and job.late_means %}<p class="hint">{{ job.late_means }}</p>{% endif %}
+  {% if job.state_reason %}<p class="hint">{{ job.state_reason }}</p>{% endif %}
   <dl>
     <dt>Protects</dt><dd>{{ job.protects }}</dd>
     <dt>Method</dt><dd>{{ job.method }}</dd>

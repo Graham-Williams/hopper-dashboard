@@ -50,6 +50,7 @@ def job_entry(conn, job: Job, row: dict | None, now: float,
         "dest": dest_info(job, f, now),
         "last_metrics": f.last_metrics,
         # Additive (not in the frozen contract, safe to ignore):
+        "state_reason": row.get("state_reason"),
         "last_run_status": lr.get("status"),
         "last_run_reason": lr.get("reason"),
         "last_run_note": lr.get("note"),

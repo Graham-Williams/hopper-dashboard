@@ -4,7 +4,9 @@
 FROM python:3.12-slim
 
 # --- rclone (pinned; SHA256 from https://downloads.rclone.org/<ver>/SHA256SUMS)
-ARG RCLONE_VERSION=v1.75.1
+# (named RCLONE_REL, not RCLONE_VERSION: rclone reads RCLONE_* env vars as flags, so
+#  RCLONE_VERSION="v1.75.1" would be parsed as --version and crash the build.)
+ARG RCLONE_REL=v1.75.1
 ARG RCLONE_SHA256_AMD64=982b5aa772841168f8e380f139e9e787b2a105403e32b94da8676a0e1c0a13ab
 ARG RCLONE_SHA256_ARM64=03f2504174034b6d004152ed7369251c9a9ec1f7e0836eda420f5c7a5ec0dff9
 RUN set -eux; \
@@ -16,11 +18,11 @@ RUN set -eux; \
       arm64) sum="$RCLONE_SHA256_ARM64" ;; \
       *) echo "unsupported arch: $arch" >&2; exit 1 ;; \
     esac; \
-    zip="rclone-${RCLONE_VERSION}-linux-${arch}.zip"; \
-    curl -fsSLo "/tmp/$zip" "https://downloads.rclone.org/${RCLONE_VERSION}/${zip}"; \
+    zip="rclone-${RCLONE_REL}-linux-${arch}.zip"; \
+    curl -fsSLo "/tmp/$zip" "https://downloads.rclone.org/${RCLONE_REL}/${zip}"; \
     echo "${sum}  /tmp/$zip" | sha256sum -c -; \
     unzip -q "/tmp/$zip" -d /tmp/rclone; \
-    install -m 0755 "/tmp/rclone/rclone-${RCLONE_VERSION}-linux-${arch}/rclone" /usr/local/bin/rclone; \
+    install -m 0755 "/tmp/rclone/rclone-${RCLONE_REL}-linux-${arch}/rclone" /usr/local/bin/rclone; \
     rm -rf /tmp/rclone "/tmp/$zip"; \
     apt-get purge -y --auto-remove curl unzip; \
     rm -rf /var/lib/apt/lists/*; \

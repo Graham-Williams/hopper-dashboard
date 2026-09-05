@@ -34,10 +34,8 @@
         <h3><a href="{{ url_for('web.job_page', job_id=j.id) }}">{{ j.name }}</a></h3>
         <span class="kind">{{ j.kind.replace('_',' ') }}</span>
       </header>
-      {% if j.state == 'LATE' and j.late_means %}
-      <p class="hint">{{ j.late_means }}</p>
-      {% elif j.state in ('FAIL','STALE_DEST','BEHIND') and j.last_run_reason and j.state == 'FAIL' %}
-      <p class="hint">{{ j.last_run_reason }}{% if j.last_run_note %} — {{ j.last_run_note }}{% endif %}</p>
+      {% if j.state not in ('OK', 'UNKNOWN') and j.state_reason %}
+      <p class="hint">{{ j.state_reason }}{% if j.state == 'FAIL' and j.last_run_note %} — {{ j.last_run_note }}{% endif %}</p>
       {% endif %}
       <dl>
         <dt>Protects</dt><dd>{{ j.protects }}</dd>

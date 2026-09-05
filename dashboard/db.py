@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     id              TEXT PRIMARY KEY,
     state           TEXT NOT NULL DEFAULT 'UNKNOWN',
     since           TEXT,
+    state_reason    TEXT,
     last_metrics    TEXT,               -- JSON object, shallow-merged over time
     last_metrics_at TEXT,
     updated_at      TEXT
@@ -112,6 +113,9 @@ def connect(db_path: str) -> sqlite3.Connection:
 
 def init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(jobs)")}
+    if "state_reason" not in cols:  # pre-0.1 databases
+        conn.execute("ALTER TABLE jobs ADD COLUMN state_reason TEXT")
 
 
 def ensure_jobs(conn: sqlite3.Connection, job_ids: Iterable[str]) -> None:
@@ -177,11 +181,12 @@ def set_state(conn: sqlite3.Connection, job_id: str, new_state: str,
                        (job_id,)).fetchone()
     prev = row["state"] if row else "UNKNOWN"
     if prev == new_state:
-        conn.execute("UPDATE jobs SET updated_at=? WHERE id=?", (at, job_id))
+        conn.execute("UPDATE jobs SET updated_at=?, state_reason=? WHERE id=?",
+                     (at, reason, job_id))
         return None
     conn.execute(
-        "UPDATE jobs SET state=?, since=?, updated_at=? WHERE id=?",
-        (new_state, at, at, job_id))
+        "UPDATE jobs SET state=?, since=?, state_reason=?, updated_at=? WHERE id=?",
+        (new_state, at, reason, at, job_id))
     conn.execute(
         "INSERT INTO state_changes (job_id, changed_at, from_state, to_state, "
         "reason) VALUES (?,?,?,?,?)", (job_id, at, prev, new_state, reason))
