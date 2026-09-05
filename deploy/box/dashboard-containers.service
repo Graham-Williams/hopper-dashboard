@@ -1,0 +1,20 @@
+# hopper-dashboard: host-side container heartbeat (box-containers job).
+# TEMPLATE — deploy/box/install.sh replaces @@REPO@@ with the checkout path (~/hopper-dashboard).
+#
+# The dashboard container deliberately has NO docker socket; this oneshot, driven by
+# dashboard-containers.timer every 5 min, is the only thing that reads `docker ps`. Runs as
+# graham (in the docker group). Token + URL come from /etc/hopper-dashboard/ingest.env, read by
+# systemd as root and handed to the process as environment.
+[Unit]
+Description=hopper-dashboard container heartbeat (docker ps → box-containers)
+Wants=network-online.target
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+User=graham
+EnvironmentFile=-/etc/hopper-dashboard/ingest.env
+ExecStart=@@REPO@@/deploy/box/containers_probe.sh
+TimeoutStartSec=60
+NoNewPrivileges=true
+PrivateTmp=true
