@@ -259,8 +259,16 @@ card, never a crash.
 - **Machine-offline rule:** each machine's `kind: probe` job (`mac-probe`; the dashboard's own
   `dashboard-probes` never counts) stands for "this machine is reachable". While it is LATE, the other jobs on
   that machine going LATE is the same single fact — the Mac is asleep — so their `→ LATE` alerts are
-  suppressed and only the probe job's alert goes out ("Mac offline"). Their `LATE → x` recoveries are muted
-  too when the probe job recovers in the same recompute batch. Box jobs are never suppressed (the box has no
-  standalone probe job). Graces on the hourly Mac jobs are 14 h so an ordinary night's sleep never pages.
+  suppressed and only the probe job's alert goes out ("Mac offline"). Recovery mirrors it: a sibling's plain
+  `LATE → OK` is muted while the probe job is still LATE **or** recovers in the same recompute batch. The
+  "still LATE" half is the one that matters in practice — `mac_probe.py` posts `pa-backup`, `drive-mirror`,
+  then its own heartbeat as three separate HTTP requests (three recomputes), so the siblings always recover
+  one batch *before* the probe. Net effect, tested end-to-end against `jobs.example.yml`: **one alert when the
+  Mac goes quiet, one when it comes back.** A sibling waking into `FAIL` / `STALE_DEST` / `BEHIND` is not a
+  plain recovery and alerts normally. Box jobs are never suppressed (the box has no standalone probe job).
+  Graces on the hourly Mac jobs are 14 h so an ordinary night's sleep never pages, and every Mac sibling's
+  `grace_s` is ≥ `mac-probe`'s + 120 s: the siblings are pinged seconds *before* the probe, so with equal
+  graces their deadline would fall first and a 60 s ticker tick landing in that gap would page for the
+  sibling (probe still OK → nothing to suppress against) and then again for the probe.
 - ntfy body is `job_id: FROM → TO` only; title `[dashboard] <job name> → <STATE>`; priority high for
   FAIL/STALE_DEST.

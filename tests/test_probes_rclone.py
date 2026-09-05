@@ -115,6 +115,25 @@ def test_rclone_check_rc1_with_differences(monkeypatch):
     assert a[a.index("--filter") + 1] == "- .git/**" and a[a.index("--exclude") + 1] == ".DS_Store"
     assert a[a.index("--min-age") + 1] == "15m"
     assert "copy" not in a and "sync" not in a  # read-only, always
+    assert "--size-only" not in a               # default is the full checksum check (small pa-backup trees)
+
+
+def test_rclone_check_size_only_flag(monkeypatch):
+    """The multi-GB recording trees are compared by size only: an hourly MD5 of tens of GB against the
+    120 s probe timeout produced spurious `mac-probe FAIL`s."""
+    calls = {}
+
+    def fake_run(argv, timeout, cwd=None):
+        calls["argv"] = argv
+        return 0, "= a\n", ""
+
+    monkeypatch.setattr(rclone_check, "run_cmd", fake_run)
+    rclone_check.rclone_check("/x/rclone", "/src", "gdrive:dst", excludes=[".DS_Store"], min_age="15m", size_only=True)
+    a = calls["argv"]
+    assert a[:4] == ["/x/rclone", "check", "/src", "gdrive:dst"]
+    assert "--size-only" in a and "--one-way" in a and a[a.index("--combined") + 1] == "-"
+    assert "--checksum" not in a and "copy" not in a and "sync" not in a
+    assert a.count("--size-only") == 1
 
 
 def test_rclone_check_other_rc_raises(monkeypatch):

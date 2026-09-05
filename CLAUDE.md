@@ -66,8 +66,11 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   `db_snapshot_stale` (dedup-aware), `copy_tree_stale` (missing vs differ), never-pinged → LATE via
   `Facts.created_at`. Unit-tested with a fixed clock.
 - `services.py` — `Core`: record ping → shallow-merge metrics → recompute ALL jobs → persist transitions →
-  notify (with the **machine-offline rule**: sibling LATE alerts muted while the machine's `probe` job is
-  LATE); `run_probe_cycle` (probes + the `dashboard-probes` self-heartbeat + `prune`).
+  notify (with the **machine-offline rule**: sibling `→ LATE` alerts muted while the machine's `probe` job is
+  LATE, and sibling plain `LATE → OK` recoveries muted while the probe is still LATE or recovers in the same
+  batch — the Mac probe posts its sub-jobs before its own heartbeat, so siblings recover one batch early;
+  FAIL/STALE_DEST/BEHIND after LATE always alert); `run_probe_cycle` (probes + the `dashboard-probes`
+  self-heartbeat + `prune` — one `DELETE … NOT IN (… ORDER BY id DESC LIMIT n)` per table, not O(n²)).
 - `scheduler.py` — daemon thread; `step()` is exposed for tests; never lets an exception kill the loop.
 - `probes.py` — `rclone lsjson --recursive --files-only` (argv, 90 s timeout) + state-file reader.
 - `notify.py` — ntfy `Notifier`; body is `job_id: FROM → TO` only (no reason text leaves the box);
@@ -131,8 +134,12 @@ there is no default URL in the code, by design.
   `~/.config/hopper-dashboard/state.json`, + rclone check of the THREE trees the backup script copies —
   `rclone_check.PA_BACKUP_TREES`, filters copied verbatim from `scripts/backup-personal-assistant.sh` —
   reporting `missing_*` (never uploaded → stale) separately from `differ_*` (edited since → informational)),
-  `minecraft-offload` (rclone lag per pair + disk free), `drive-mirror` (copied DriveFS sqlite, reported as
-  an `ok` RUN because reading it is the check), then its own `mac-probe` heartbeat. `--dry-run` prints.
+  `minecraft-offload` (rclone lag per pair with `--size-only` — tens of GB of video can't be MD5'd hourly
+  inside the 120 s timeout; the small pa-backup trees keep the checksum check — + disk free), `drive-mirror`
+  (copied DriveFS sqlite, reported as an `ok` RUN because reading it is the check), then its own `mac-probe`
+  heartbeat. `--dry-run` prints. Order matters for alerting: the siblings land BEFORE the probe's own
+  heartbeat, which is why `jobs.example.yml` gives them `grace_s` ≥ mac-probe's + 120 and why `services.py`
+  mutes their `LATE → OK` while the probe is still LATE.
 - Box: systemd drop-ins `deploy/box/*.service.d/heartbeat.conf` (`ExecStopPost` curl with
   `$SERVICE_RESULT`/`$EXIT_STATUS`) + `dashboard-containers.timer` (`OnCalendar=*:0/5`, `Persistent=true`) →
   `dashboard-containers.service` (`User=@@USER@@` rendered by `install.sh`, default `$SUDO_USER`) →

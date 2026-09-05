@@ -177,9 +177,16 @@ def rclone_check(
     filters: Optional[List[str]] = None,
     excludes: Optional[List[str]] = None,
     min_age: Optional[str] = None,
+    size_only: bool = False,
     timeout: float = RCLONE_TIMEOUT_S,
 ) -> CheckResult:
+    """``size_only`` compares sizes instead of hashes. Use it for the multi-GB recording trees: hashing tens
+    of GB of .mkv every hour blows the probe timeout and shows up as a spurious ``mac-probe FAIL``, and a
+    recording is either fully on Drive or not there at all. The small pa-backup trees keep the checksum check
+    so a silently corrupted copy is still caught."""
     argv = [rclone, "check", src, dst, "--one-way", "--combined", "-"]
+    if size_only:
+        argv.append("--size-only")
     for f in filters or []:
         argv += ["--filter", f]
     for e in excludes or []:

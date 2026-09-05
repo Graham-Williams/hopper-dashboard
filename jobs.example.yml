@@ -88,7 +88,9 @@ jobs:
     method: nightly launchd rclone copy → gdrive:Backups; Mac probe reports missing (never uploaded) vs differ (edited since) via rclone check
     destination: gdrive:Backups
     cadence_s: 86400
-    grace_s: 50400              # 14 h: a missed 03:00 run fires on wake; only LATE if the whole next day passes
+    grace_s: 50520              # 14 h + 2 min: a missed 03:00 run fires on wake; only LATE if the whole next day
+                                # passes. Mac sibling jobs keep grace_s >= mac-probe's + 120 so their deadline can
+                                # never land BEFORE the probe's (see drive-mirror).
 
   - id: drive-mirror
     name: Google Drive mirror
@@ -97,8 +99,14 @@ jobs:
     protects: Documents, Desktop and minecraft-channel mirrored by Drive for Desktop
     method: Mac probe reads DriveFS mirror_sqlite.db (pending uploads + local/cloud mismatches); BEHIND if any
     cadence_s: 3600
-    grace_s: 50400              # 14 h, same reasoning as mac-probe (nightly sleep). While mac-probe is LATE the
-                                # dashboard sends ONE "Mac offline" alert and suppresses LATE alerts for the other Mac jobs.
+    grace_s: 50520              # 14 h + 2 min, same reasoning as mac-probe (nightly sleep). While mac-probe is LATE the
+                                # dashboard sends ONE "Mac offline" alert and suppresses the other Mac jobs' LATE alerts
+                                # (and their plain LATE→OK recoveries until mac-probe itself recovers).
+                                # Why +120 s over mac-probe's grace: the probe posts this job's ping a few seconds
+                                # BEFORE its own heartbeat, so with equal graces this deadline falls first, and a
+                                # ticker tick landing in that gap would alert "drive-mirror → LATE" while mac-probe
+                                # is still OK — then a second alert for mac-probe. A strictly later deadline (≥ one
+                                # 60 s tick + margin) makes the suppression unconditional.
 
   - id: minecraft-offload
     name: Minecraft recordings offload

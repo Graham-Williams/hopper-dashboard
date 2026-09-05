@@ -97,17 +97,29 @@ class Core:
         """Machine-offline rule: while a machine's probe job is LATE, the other
         jobs on that machine going LATE is the same single fact ("the Mac is
         asleep"), so only the probe's own alert is sent. The sibling
-        transitions are still recorded and shown. Their LATE→x recoveries are
-        likewise muted when the probe job recovers in the same batch."""
+        transitions are still recorded and shown.
+
+        Recovery is mirrored: a sibling's ``LATE → OK`` is muted while the
+        probe job is still LATE *or* recovers in the same batch. The Mac probe
+        posts its sub-jobs first (pa-backup, drive-mirror, …) and its own
+        heartbeat last, each as a separate HTTP request and therefore a
+        separate recompute — so the siblings always recover one batch *before*
+        the probe does, while it is still LATE. Without this the wake-up would
+        page once per Mac job plus once for the probe. Only plain recoveries
+        are muted: a sibling waking into FAIL / STALE_DEST / BEHIND is news of
+        its own and alerts normally."""
         probe = self._machine_probe(job.machine)
         if probe is None or probe.id == job.id:
             return False
         probe_state = states.get(probe.id)
         if state == "LATE" and probe_state == "LATE":
             return True
-        probe_tr = transitions.get(probe.id)
-        if prev == "LATE" and probe_tr is not None and probe_tr[0] == "LATE":
-            return True
+        if prev == "LATE" and state == "OK":
+            if probe_state == "LATE":
+                return True
+            probe_tr = transitions.get(probe.id)
+            if probe_tr is not None and probe_tr[0] == "LATE":
+                return True
         return False
 
     def _dispatch(self, transitions: list[tuple[Job, tuple]],

@@ -199,9 +199,11 @@ def probe_minecraft_offload(cfg: Dict[str, str], log: Logger) -> List[Ping]:
             metrics["lag_files_" + key] = 0
             continue
         try:
+            # --size-only: these trees are tens of GB of video; an hourly MD5 pass would blow the timeout.
             res = rclone_check.rclone_check(
                 rclone, src, "%s:%s" % (remote, dst),
-                excludes=rclone_check.OFFLOAD_EXCLUDES, min_age=cfg["PROBE_MC_MIN_AGE"], timeout=timeout,
+                excludes=rclone_check.OFFLOAD_EXCLUDES, min_age=cfg["PROBE_MC_MIN_AGE"],
+                size_only=True, timeout=timeout,
             )
         except ProbeError as e:
             errors.append(str(e))

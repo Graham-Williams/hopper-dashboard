@@ -146,6 +146,7 @@ def test_probe_pa_backup_dedups_and_reports_missing_vs_differ(tmp_path, monkeypa
 
     def fake_check(rclone, src, dst, filters=None, **k):
         seen.append((src, dst, tuple(filters or [])))
+        assert not k.get("size_only")   # small trees keep the checksum check so a corrupted copy is caught
         if src.endswith("personal-assistant"):
             return mac_probe.rclone_check.parse_combined("= a\n* CLAUDE.md\n- new-note.txt\n")
         if src.endswith("memory"):
@@ -217,6 +218,7 @@ def test_probe_minecraft_offload_per_pair_metrics(tmp_path, monkeypatch):
 
     def fake_check(rclone, src, dst, **k):
         assert dst.startswith("gdrive:Gremlins/") and k["min_age"] == "15m"
+        assert k["size_only"] is True   # tens of GB of video: never hash hourly (spurious timeouts → FAIL)
         return mac_probe.rclone_check.parse_combined("- new.mkv\n" if src.endswith("recordings") else "= world.tgz\n")
 
     monkeypatch.setattr(mac_probe.rclone_check, "rclone_check", fake_check)

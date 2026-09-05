@@ -171,18 +171,89 @@ def test_mac_offline_suppression_covers_late_transitions_after_probe_already_lat
 
 
 def test_mac_comes_back_one_recovery_alert(core, notifier):
+    """Real wake order: mac_probe.py posts pa-backup, then drive-mirror, then its own heartbeat — three
+    HTTP requests, three recomputes. The siblings therefore recover while the probe is STILL LATE; those
+    plain LATE→OK recoveries are muted and the probe's own recovery is the one alert."""
+    mac, tree, mirror = REG.get("macprobe"), REG.get("tree"), REG.get("mirror")
+    for j in (mac, tree, mirror):
+        core.record_ping(j, {"status": "ok"}, now=NOW)
+    core.recompute_all(now=NOW + 100_000)          # everything on the Mac is LATE
+    assert [t for t, _, _ in notifier.sent] == ["[dashboard] Mac probe → LATE"]
+    notifier.sent.clear()
+    core.record_ping(tree, {"status": "ok"}, now=NOW + 100_100)     # recovers while probe still LATE
+    core.record_ping(mirror, {"status": "ok"}, now=NOW + 100_101)   # recovers while probe still LATE
+    assert notifier.sent == []
+    core.record_ping(mac, {"status": "ok"}, now=NOW + 100_102)
+    assert [t for t, _, _ in notifier.sent] == ["[dashboard] Mac probe → OK"]
+    conn = core.connect()   # the muted recoveries are still persisted and visible
+    assert db.job_row(conn, "tree")["state"] == "OK" and db.job_row(conn, "mirror")["state"] == "OK"
+    assert [c["to_state"] for c in db.recent_state_changes(conn, "mirror")][:2] == ["OK", "LATE"]
+
+
+def test_mac_sibling_waking_into_fail_still_alerts(core, notifier):
+    """Only plain LATE→OK recoveries ride on the probe's alert; a sibling that comes back FAILED is news."""
+    mac, tree = REG.get("macprobe"), REG.get("tree")
+    core.record_ping(mac, {"status": "ok"}, now=NOW)
+    core.record_ping(tree, {"status": "ok"}, now=NOW)
+    core.recompute_all(now=NOW + 100_000)
+    notifier.sent.clear()
+    core.record_ping(tree, {"status": "fail", "reason": "rclone exit 1"}, now=NOW + 100_100)
+    assert [t for t, _, _ in notifier.sent] == ["[dashboard] Tree copy → FAIL"]
+    core.record_ping(mac, {"status": "ok"}, now=NOW + 100_101)
+    assert [t for t, _, _ in notifier.sent][-1] == "[dashboard] Mac probe → OK"
+
+
+def test_mac_offline_rule_is_a_pure_function_of_probe_state(core, notifier):
+    """Sibling LATE→OK with the probe already OK (not LATE, no probe transition) alerts normally — the
+    muting is tied to the machine being offline, not to the sibling having been LATE."""
     mac, mirror = REG.get("macprobe"), REG.get("mirror")
     core.record_ping(mac, {"status": "ok"}, now=NOW)
     core.record_ping(mirror, {"status": "ok"}, now=NOW)
-    core.recompute_all(now=NOW + 20_000)
+    core.recompute_all(now=NOW + 5000)             # mirror LATE (4200), probe still OK (10800)
+    assert [t for t, _, _ in notifier.sent] == ["[dashboard] Drive mirror → LATE"]
+    core.record_ping(mirror, {"status": "ok"}, now=NOW + 5001)
+    assert [t for t, _, _ in notifier.sent][-1] == "[dashboard] Drive mirror → OK"
+
+
+def test_example_jobs_sleep_and_wake_produce_exactly_one_alert_each(settings, notifier):
+    """End-to-end against the shipped jobs.example.yml: a night's sleep pages once (mac-probe → LATE) and
+    the morning's three sequential pings page once (mac-probe → OK). Also exercises the tick-straddle: the
+    ticker runs every 60 s, so with equal graces a tick could land between drive-mirror's deadline (pinged
+    a few seconds before the probe) and mac-probe's; the example file gives siblings grace_s >= probe + 120
+    so drive-mirror's deadline is always strictly AFTER the probe's."""
+    from dashboard.registry import load_registry
+    from dashboard.services import Core
+    from tests.conftest import EXAMPLE_JOBS
+    reg = load_registry(EXAMPLE_JOBS)
+    core = Core(settings, reg, notifier)
+    core.init_store()
+    pin_created_at(settings)                       # never-pinged box jobs must not go LATE during the test
+    mac, pa, mirror = reg.get("mac-probe"), reg.get("pa-backup"), reg.get("drive-mirror")
+    assert pa.grace_s >= mac.grace_s + 120 and mirror.grace_s >= mac.grace_s + 120
+    # Wake order over HTTP: pa-backup, drive-mirror, then the probe's own heartbeat (seconds apart).
+    core.record_ping(pa, {"status": "ok", "metrics": {"missing_files": 0}}, now=NOW)
+    core.record_ping(mirror, {"status": "ok", "metrics": {"pending": 0, "mismatch": 0}}, now=NOW + 3)
+    core.record_ping(mac, {"status": "ok"}, now=NOW + 5)
     notifier.sent.clear()
-    # The Mac wakes: its probe posts, and in the same batch the mirror posts too.
-    core.record_ping(mirror, {"status": "ok"}, now=NOW + 20_100)   # mirror recovers while probe still LATE
-    core.record_ping(mac, {"status": "ok"}, now=NOW + 20_101)
-    titles = [t for t, _, _ in notifier.sent]
-    # mirror's recovery came in its own batch, before the probe recovered → a normal recovery alert;
-    # the probe's own recovery alerts; nothing is duplicated.
-    assert titles == ["[dashboard] Drive mirror → OK", "[dashboard] Mac probe → OK"]
+    # Mac sleeps. Tick every 60 s across every Mac deadline (probe: 3600+50400 after its ping; the
+    # siblings' deadlines are later by construction; pa-backup's is a day later still).
+    t = NOW
+    while t < NOW + 86400 + 50520 + 120:
+        core.recompute_all(now=t)
+        t += 60
+    conn = core.connect()
+    assert {jid: db.job_row(conn, jid)["state"] for jid in ("mac-probe", "pa-backup", "drive-mirror")} \
+        == {"mac-probe": "LATE", "pa-backup": "LATE", "drive-mirror": "LATE"}
+    assert [t_ for t_, _, _ in notifier.sent] == ["[dashboard] Mac probe → LATE"]
+    notifier.sent.clear()
+    # Mac wakes: three sequential pings, each its own recompute.
+    wake = t
+    core.record_ping(pa, {"status": "ok", "metrics": {"missing_files": 0}}, now=wake)
+    core.record_ping(mirror, {"status": "ok", "metrics": {"pending": 0, "mismatch": 0}}, now=wake + 3)
+    core.record_ping(mac, {"status": "ok"}, now=wake + 5)
+    assert [t_ for t_, _, _ in notifier.sent] == ["[dashboard] Mac probe → OK"]
+    assert {jid: db.job_row(conn, jid)["state"] for jid in ("mac-probe", "pa-backup", "drive-mirror")} \
+        == {"mac-probe": "OK", "pa-backup": "OK", "drive-mirror": "OK"}
 
 
 def test_mac_sibling_recovery_in_same_batch_as_probe_is_muted(core, notifier, monkeypatch):
