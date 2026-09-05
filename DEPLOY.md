@@ -58,22 +58,56 @@ cp jobs.example.yml jobs.yml
 The host's `~/.config/rclone/rclone.conf` (`gdrive`, `scope = drive.file`, 0600, owned by the login) is the
 **backup writer's** credential. Do not hand it to the dashboard: a compromised container could then delete
 the backups it is supposed to watch. Create a **second remote in its own file** with `scope = drive.readonly`
-and mount THAT. Honest procedure (the box is headless, so the OAuth step happens on the Mac's browser):
+and mount THAT. The box is headless, so the OAuth step happens on the **Mac's** browser and the finished
+config file is shipped over. This procedure is **version-proof** — it does not depend on the box's rclone at
+all. (The older `rclone config create … config_is_local false` dance does NOT work with the box's rclone
+1.60: it neither prompts nor prints the authorize command there; don't use it.)
 
 ```bash
-# on the box — creates ~/.config/rclone/dashboard-ro.conf with a readonly-scope remote, no token yet.
-# rclone prints an `rclone authorize "drive" "<blob>"` command for a machine with a browser:
-RCLONE_CONFIG=~/.config/rclone/dashboard-ro.conf rclone config create gdrive-ro drive scope drive.readonly config_is_local false
-# ... then on the MAC (browser opens; sign in as the Drive account; approve READ-ONLY access) ...
-rclone authorize "drive" "<blob printed above>"
-# ... it prints a `{"access_token": …}` JSON — paste that back into the box prompt.
-chmod 600 ~/.config/rclone/dashboard-ro.conf
-RCLONE_CONFIG=~/.config/rclone/dashboard-ro.conf rclone lsd gdrive-ro: | head            # must list Drive
-RCLONE_CONFIG=~/.config/rclone/dashboard-ro.conf rclone lsf gdrive-ro:km-tracker-backups | head -2
+# --- 1. on the MAC: run the OAuth flow with the read-only scope baked into the request.
+#        A browser tab opens; sign in as the Drive account and approve READ-ONLY access.
+rclone authorize drive "$(printf '{"scope":"drive.readonly"}' | base64 | tr -d '=\n')"
+# rclone then prints a base64 "config token" blob between two marker lines:
+#     Paste the following into your remote machine --->
+#     <blob>
+#     <---End paste
+# --- 2. decode the blob. It is base64 of JSON like {"token": "<json string>", ...}; the base64 may lack
+#        '=' padding, so re-pad before decoding (plain `base64 -d` works once padded).
+BLOB='<paste the blob here>'
+TOKEN="$(python3 -c 'import base64,json,sys; b=sys.argv[1]; b+="="*(-len(b)%4); print(json.loads(base64.b64decode(b))["token"])' "$BLOB")"
+echo "$TOKEN" | head -c 40; echo   # {"access_token":"ya29…  — a JSON string, keep it verbatim
+# --- 3. build the conf locally with a 0600 umask, ship it, remove the local copy.
+( umask 077; printf '[gdrive-ro]\ntype = drive\nscope = drive.readonly\ntoken = %s\n' "$TOKEN" > ~/dashboard-ro.conf )
+ssh <user>@<box-tailscale-ip> 'install -d -m 0700 ~/.config/rclone'
+scp ~/dashboard-ro.conf <user>@<box-tailscale-ip>:~/.config/rclone/dashboard-ro.conf
+ssh <user>@<box-tailscale-ip> 'chmod 600 ~/.config/rclone/dashboard-ro.conf'
+rm -P ~/dashboard-ro.conf 2>/dev/null || rm ~/dashboard-ro.conf
+unset TOKEN BLOB
+```
+
+Verify on the box — it must **read** the backup folder and must **fail to write**:
+
+```bash
+RC=~/.config/rclone/dashboard-ro.conf
+RCLONE_CONFIG=$RC rclone lsf gdrive-ro:km-tracker-backups | head -2          # lists snapshot files
+RCLONE_CONFIG=$RC rclone lsf gdrive-ro:todoist-points-backups | head -2
+# Prove read-only: a write must be refused (403 insufficientPermissions). If this SUCCEEDS the scope is
+# wrong — stop, delete the stray folder with the writer remote (`rclone rmdir gdrive:write-test`), redo step 1.
+RCLONE_CONFIG=$RC rclone mkdir gdrive-ro:write-test && echo "STOP: remote can WRITE" || echo "read-only confirmed"
 ```
 
 Then point every `probe.rclone_path` / `destination` in `jobs.yml` at `gdrive-ro:` instead of `gdrive:`
 (`sed -i 's|gdrive:|gdrive-ro:|g' jobs.yml`). `.env` already defaults `RCLONE_CONF` to this file.
+
+> **⚠️ Follow-up (not a blocker): rclone's shared Google Drive `client_id` is being retired during 2026.**
+> rclone 1.75 prints a warning about it. Every remote that relies on the built-in client — this `gdrive-ro`,
+> **and** the existing backup writers `gdrive` on the box and on the Mac — will stop authenticating when it
+> goes, i.e. all Drive backups and the probes that watch them fail together. The fix is an OAuth **Desktop**
+> client of our own in GCP (enable the Drive API on the existing project, create the client, keep the secret
+> in 1Password): add `client_id = …` / `client_secret = …` to each remote's section in its conf and pass them
+> in the authorize blob — `printf '{"scope":"drive.readonly","client_id":"…","client_secret":"…"}' | base64`
+> — then re-authorize each remote once. Track it as a repo issue + an INVENTORY.md follow-up; nothing here
+> depends on it today.
 
 Trade-off, stated plainly: `drive.readonly` can **read the whole Drive** (the writer's `drive.file` scope only
 sees files rclone itself created), but it can **never write or delete**. For a watcher that is the right
@@ -89,6 +123,12 @@ Chrome) on the Mac; nothing else in this file does.
 
 ```bash
 docker compose config >/dev/null                                 # `${VAR:?}` catches a missing secret here
+# PRE-FLIGHT — the rclone conf must EXIST as a file before the first `up`. Compose bind-mounts it; if the
+# path is missing Docker silently creates a root-owned DIRECTORY there, the entrypoint's `cp` fails, the
+# container restart-loops, and the later `rclone authorize` step can't write the file until the dir is
+# removed (`sudo rmdir`). Same path as RCLONE_CONF in .env:
+RCLONE_CONF_PATH="${RCLONE_CONF_PATH:-$HOME/.config/rclone/dashboard-ro.conf}"
+test -f "$RCLONE_CONF_PATH" || { echo "STOP: rclone conf missing (Docker would create a root-owned DIRECTORY there)"; exit 1; }
 docker compose up -d --build
 docker ps --filter name=hopper-dashboard --format '{{.Names}} {{.Status}}'   # (healthy) after ~30 s
 # curl is purged from the image — probe from inside with python:
@@ -96,9 +136,11 @@ docker exec hopper-dashboard python -c "import urllib.request as u; print(u.urlo
 docker exec hopper-dashboard python -c "import urllib.request as u; print(u.urlopen('http://127.0.0.1:8081/healthz', timeout=5).read())"
 # the ingest port from the host, on the published address:
 curl -fsS "http://${TS_IP}:8081/healthz"
-# nothing runs as root after start-up (only the staging step did); the staged conf belongs to uid 10001:
-docker exec hopper-dashboard sh -c 'for p in /proc/[0-9]*; do echo "$(stat -c %u $p) $(cat $p/comm)"; done | sort | uniq -c'
-docker exec hopper-dashboard stat -c '%u %a' /tmp/rclone/rclone.conf        # 10001 600
+# nothing runs as root after start-up (only the staging step did); the staged conf belongs to uid 10001.
+# `-u 10001` matters: `docker exec` itself runs as root by default, so without it the checker shows up
+# as the one root process and the check can never come back clean.
+docker exec -u 10001 hopper-dashboard sh -c 'for p in /proc/[0-9]*; do echo "$(stat -c %u $p) $(cat $p/comm)"; done | sort | uniq -c'
+docker exec -u 10001 hopper-dashboard stat -c '%u %a' /tmp/rclone/rclone.conf        # 10001 600
 ```
 
 If the container restart-loops, `docker logs hopper-dashboard`: a `ConfigError` means `.env` is missing
@@ -179,8 +221,17 @@ ssh <user>@<box-tailscale-ip> 'ss -ltnp | grep 8081'             # only <box-tai
 
 ## 4. Mac — hourly probe + phone alerts
 
+**The durable Mac checkout is `~/code/hopper-dashboard`.** Every Mac path in this file assumes it. For the
+preview the feature branch is checked out *there* (`git fetch && git checkout feature/dashboard-app`);
+after the merge it goes back to `main` (`git checkout main && git pull`). Do **not** install from a worktree
+(e.g. `~/code/hopper-dashboard-app`): `deploy/mac/install.sh` bakes the **absolute repo directory** into the
+launchd plist at install time (`@@REPO@@` → the checkout it is run from), so a plist rendered from a worktree
+points at a directory that vanishes when the worktree is removed and the hourly probe dies silently
+(`launchctl list` shows a non-zero exit). Switching branches in place needs no reinstall (same path);
+moving the checkout does (re-run `install.sh`).
+
 ```bash
-cd ~/code/hopper-dashboard && git pull
+cd ~/code/hopper-dashboard && git pull                              # on the branch being deployed
 deploy/mac/install.sh --url http://<box-tailscale-ip>:8081        # then type the INGEST_TOKEN at the HIDDEN prompt
 ```
 
@@ -190,9 +241,9 @@ prompts for that too (there is no default URL in the code).
 
 What it does (idempotent): writes `~/.config/hopper-dashboard/env` (chmod 600, never overwritten if present),
 renders `deploy/mac/com.hopper.dashboard-probe.plist` → `~/Library/LaunchAgents/` with absolute paths
-(`/usr/bin/python3`, this checkout), `launchctl bootout` + `bootstrap`, then runs `probes/mac_probe.py
---dry-run` and prints the pings it would send. `RunAtLoad` means the first real run happens immediately;
-then hourly (`StartInterval 3600`), and again after every login/wake.
+(`/usr/bin/python3`, `~/code/hopper-dashboard/probes/mac_probe.py`), `launchctl bootout` + `bootstrap`, then
+runs `probes/mac_probe.py --dry-run` and prints the pings it would send. `RunAtLoad` means the first real run
+happens immediately; then hourly (`StartInterval 3600`), and again after every login/wake.
 
 The probe posts:
 - `pa-backup` — last line of `~/Library/Logs/hopper-backup.log` as an `ok`/`fail` run (**once per new line**,
@@ -205,9 +256,11 @@ The probe posts:
   `matched_files`, `check_errors`, `trees_checked`, and `dest_count`/`dest_bytes` summed over the three
   destinations.
 - `minecraft-offload` — `metric`: bytes/files under `~/minecraft-channel/{recordings,world backups,replays}`
-  not yet on `gdrive:Gremlins/…` (`rclone check --one-way --min-age 15m`; pairs parsed live from
+  not yet on `gdrive:Gremlins/…` (`rclone check --one-way --size-only --min-age 15m`; pairs parsed live from
   `scripts/offload-recordings.sh`), per-pair keys `lag_bytes_<pair>`, plus `disk_free_bytes` for
-  `/System/Volumes/Data`. Never uploads.
+  `/System/Volumes/Data`. Never uploads. `--size-only` is deliberate: these trees are tens of GB of video,
+  and an hourly MD5 pass against the 120 s probe timeout produced spurious `mac-probe FAIL`s; the small
+  `pa-backup` trees keep the full checksum check.
 - `drive-mirror` — an **`ok` run** (reading the mirror DB *is* the check, so it counts as a heartbeat) with
   metrics: DriveFS mirror queue (`pending`), `mismatch`, `roots`, `roots_list`, `db_age_s` from a **copy** of
   `mirror_sqlite.db{,-wal,-shm}`; a `fail` run if no mirror db exists.
@@ -237,7 +290,15 @@ secret — anyone who knows it can read alerts, so don't paste it anywhere else.
 
 **Overnight sleep is not an incident.** The hourly Mac jobs carry a 14 h grace, and while `mac-probe` is
 LATE the dashboard sends one "Mac probe → LATE" alert and suppresses the LATE alerts of the other Mac jobs
-(states still recorded and shown). Expect exactly one alert if the Mac is away for more than ~15 h.
+(states still recorded and shown). When the Mac wakes, `mac_probe.py` posts `pa-backup`, then
+`drive-mirror`, then its own heartbeat — three requests, three recomputes — and the siblings' plain
+`LATE → OK` recoveries are muted while `mac-probe` is still LATE, so the wake-up is one alert too
+("Mac probe → OK"). **Expect exactly two alerts per long absence: one when the Mac goes quiet, one when it
+comes back** (tested end-to-end against `jobs.example.yml`). A sibling that wakes into `FAIL` / `STALE_DEST`
+/ `BEHIND` still alerts on its own — that is news, not the Mac coming back. Keep every Mac sibling's
+`grace_s` ≥ `mac-probe`'s + 120 (as `jobs.example.yml` does): the probe posts the siblings *before* itself,
+so with equal graces a sibling's deadline falls a few seconds earlier and a ticker tick landing in that gap
+would page for the sibling first, then again for the probe.
 
 ### Manual jobs: `probes/ping.sh`
 
@@ -265,7 +326,8 @@ script, but that is per-repo work).
 ## 5. Verification checklist
 
 - [ ] `docker ps` shows `hopper-dashboard` healthy; `ss -ltnp | grep 8081` shows only `<box-tailscale-ip>:8081`.
-- [ ] No root process in the container after start-up; `/tmp/rclone/rclone.conf` is `10001 600`.
+- [ ] No root process in the container after start-up (check with `docker exec -u 10001 …`, §1c);
+      `/tmp/rclone/rclone.conf` is `10001 600`.
 - [ ] `https://dashboard.graham-williams.com/` → login page; `/healthz` → 200; `POST /api/v1/ping/x` via the
       public host **with the READ_TOKEN** is 404/405 (ingest isn't tunnelled; see §3 for why 401 proves nothing).
 - [ ] `/api/v1/status` (READ_TOKEN) lists all 11 jobs; after ≤5 min box jobs are `OK`, after ≤1 h Mac jobs are
@@ -307,7 +369,9 @@ restore data; the dashboard's own SQLite is derived state that repopulates withi
 | Backup script exit 0 on skipped push | Heartbeat says `ok` while Drive hasn't received anything new | That's what the app's destination probe (`db_snapshot` newest object vs `db_sha256`) is for → `STALE_DEST` |
 | Read-only rclone remote's token revoked/expired | Every `db_snapshot` probe errors → `dashboard-probes` `FAIL` with `rclone exit …` in the note; `dest.probe_error` on the cards | Re-run the `rclone authorize` flow in §1b; `RCLONE_CONFIG=~/.config/rclone/dashboard-ro.conf rclone lsd gdrive-ro:` on the box |
 | `dashboard-containers.timer` stopped / user dropped from `docker` group | `box-containers` `LATE`; or `fail` ping with "permission denied" in the note | `systemctl list-timers`; `journalctl -u dashboard-containers.service` |
-| Mac asleep / logged out | `mac-probe` LATE after 15 h; the other Mac jobs go LATE too but their alerts are suppressed — you get ONE alert | That IS the signal (Mac offline). If only some Mac jobs are late, read the `mac-probe` note — it names the sub-probe that errored. |
+| Mac asleep / logged out | `mac-probe` LATE after 15 h; the other Mac jobs go LATE too but their alerts are suppressed — you get ONE alert, and ONE more (`mac-probe → OK`) when it wakes; the siblings' `LATE → OK` are muted while the probe is still LATE | That IS the signal (Mac offline). If only some Mac jobs are late, read the `mac-probe` note — it names the sub-probe that errored. |
+| Sibling Mac job pages "→ LATE" a tick before `mac-probe` does | Two alerts for one night's sleep | A sibling's `grace_s` dropped below `mac-probe`'s + 120 in `jobs.yml` (the probe posts siblings before itself). Restore the margin. |
+| rclone's shared Google `client_id` retired (2026) | Every Drive remote using the built-in client fails to refresh at once — probes AND the backup writers on box + Mac | `rclone lsd` interactively shows the OAuth error; rclone 1.75+ warns ahead of time. Fix = own GCP OAuth Desktop client in each conf (§1b follow-up). |
 | launchd job unloaded (plist edited by hand, Mac migrated) | Same as asleep, but permanent | `launchctl list \| grep com.hopper.dashboard-probe`; re-run `deploy/mac/install.sh` |
 | rclone missing/moved (Homebrew relink) | `pa-backup`/`minecraft-offload` metrics stop; `mac-probe` `fail` with "rclone not found" | `mac-probe` note; `~/Library/Logs/hopper-dashboard-probe.log` |
 | rclone Drive token expired (Mac) | `rclone check` errors → sub-probe `fail`, lag unknown | Same log; `rclone lsd gdrive:` interactively |

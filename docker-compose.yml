@@ -21,6 +21,13 @@ services:
     build: .
     container_name: hopper-dashboard
     restart: unless-stopped
+    # Two gunicorn access logs on stdout forever would otherwise grow the json-file
+    # log without bound (the box has no daemon-wide log rotation configured).
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     read_only: true
     tmpfs:
       - /tmp:mode=1777,size=64m

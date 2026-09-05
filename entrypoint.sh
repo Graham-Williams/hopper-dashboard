@@ -28,7 +28,21 @@ stage_rclone_conf() {
   chmod 0600 "$RCLONE_CONFIG"
 }
 
+# Re-entered after the setpriv re-exec below but still uid 0 → the drop did
+# not happen (APP_USER names root, or setpriv misbehaved). Refuse rather than
+# run gunicorn as root; without this check APP_USER=root would also loop
+# forever through the root branch.
+if [ "${HOPPER_PRIVS_DROPPED:-}" = "1" ] && [ "$(id -u)" = "0" ]; then
+  echo "entrypoint: still uid 0 after dropping privileges (APP_USER=$APP_USER resolves to root?) — refusing to start" >&2
+  exit 1
+fi
+
 if [ "$(id -u)" = "0" ]; then
+  app_uid="$(id -u "$APP_USER" 2>/dev/null || true)"
+  if [ -z "$app_uid" ] || [ "$app_uid" = "0" ]; then
+    echo "entrypoint: APP_USER=$APP_USER must be an existing non-root user — refusing to start" >&2
+    exit 1
+  fi
   if [ -f "$RCLONE_SRC" ]; then
     stage_rclone_conf
     chown -R "$APP_USER:$APP_USER" "$(dirname "$RCLONE_CONFIG")"
@@ -36,13 +50,19 @@ if [ "$(id -u)" = "0" ]; then
     echo "entrypoint: no $RCLONE_SRC mounted — destination probes will fail" >&2
   fi
   # Drop privileges for good: new uid/gid, supplementary groups from the passwd
-  # entry (none for `dashboard`), no way back to root. setpriv ships in the
-  # base image (util-linux).
+  # entry (none for `dashboard`), the capability bounding set emptied so no
+  # capability can ever be re-acquired, and no_new_privs so setuid binaries
+  # can't raise them either. setpriv ships in the base image (util-linux).
+  export HOPPER_PRIVS_DROPPED=1
   exec setpriv --reuid="$APP_USER" --regid="$APP_USER" --init-groups \
-       --no-new-privs "$0" "$@"
+       --bounding-set=-all --no-new-privs "$0" "$@"
 fi
 
 # ---- from here on we are the unprivileged app user --------------------------
+if [ "$(id -u)" = "0" ]; then
+  echo "entrypoint: refusing to run the app as root" >&2
+  exit 1
+fi
 if [ -r "$RCLONE_CONFIG" ]; then
   : # staged by the root phase above (or by a previous run)
 elif [ -r "$RCLONE_SRC" ]; then

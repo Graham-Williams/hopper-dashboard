@@ -69,10 +69,20 @@ jobs:
           test "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Authorization: Bearer ci-read' http://127.0.0.1:8080/api/v1/ping/km-backup)" = "404"
           test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8081/static/app.css)" = "404"
           # Nothing runs as root after start-up; the staged conf belongs to the app user.
-          docker exec hd sh -c 'for p in /proc/[0-9]*; do stat -c %u "$p"; done | sort -u' | tee /tmp/uids
+          # `-u 10001`: docker exec itself runs as root by default, so the checker would otherwise be the
+          # one root process it finds. Run it as the app user and require that uid 0 is simply absent.
+          docker exec -u 10001 hd sh -c 'for p in /proc/[0-9]*; do stat -c %u "$p"; done | sort -u' | tee /tmp/uids
           test "$(grep -vc '^0$' /tmp/uids)" -ge 1
-          docker exec hd sh -c 'for p in /proc/[0-9]*; do [ "$(stat -c %u $p)" = 0 ] && cat $p/comm; done' | grep -v '^sh$' | { ! grep -q .; }
-          docker exec hd stat -c '%u %a' /tmp/rclone/rclone.conf | grep -q '^10001 600$'
+          ! grep -qx 0 /tmp/uids
+          docker exec -u 10001 hd stat -c '%u %a' /tmp/rclone/rclone.conf | grep -q '^10001 600$'
+          # The privilege drop emptied the bounding set: no capability can ever be re-acquired.
+          docker exec -u 10001 hd sh -c 'grep -E "^Cap(Bnd|Eff|Prm)" /proc/1/status' | tee /tmp/caps
+          test "$(grep -c ':\s*0000000000000000$' /tmp/caps)" = 3
+          # APP_USER=root must be refused, not looped through the root branch forever.
+          docker run --rm --read-only --tmpfs /tmp -v "$PWD/jobs.yml:/app/jobs.yml:ro" \
+            -e APP_USER=root -e INGEST_TOKEN=x -e READ_TOKEN=x -e APP_PASSWORD=x -e SESSION_SECRET=x \
+            hopper-dashboard:ci 2>&1 | tee /tmp/root-run || true
+          grep -q 'must be an existing non-root user' /tmp/root-run
           docker logs hd
           docker rm -f hd
 
