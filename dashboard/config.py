@@ -85,7 +85,7 @@ class Settings:
             ntfy_url=os.environ.get("NTFY_URL", "").rstrip("/"),
             ntfy_topic=os.environ.get("NTFY_TOPIC", "").strip(),
             app_host=os.environ.get("APP_HOST", "").strip().lower(),
-            app_env=os.environ.get("APP_ENV", "prod"),
+            app_env=(os.environ.get("APP_ENV", "prod").strip().lower() or "prod"),
             probe_interval_s=_env_int("PROBE_INTERVAL_S", 300),
             tick_interval_s=_env_int("TICK_INTERVAL_S", 60),
             start_scheduler=os.environ.get("DASHBOARD_NO_SCHEDULER", "") == "",

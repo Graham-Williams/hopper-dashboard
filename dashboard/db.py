@@ -214,12 +214,19 @@ def set_state(conn: sqlite3.Connection, job_id: str, new_state: str,
 
 def prune(conn: sqlite3.Connection, keep_runs: int = 2000,
           keep_probes: int = 2000) -> None:
-    """Bound table growth per job (a 5-minute job writes ~105k rows/year)."""
+    """Bound table growth per job (a 5-minute job writes ~105k rows/year).
+
+    One statement per table: delete every row whose id is not among the
+    newest ``keep`` ids of its own job. The correlated ``LIMIT`` subquery
+    walks each job's rows once via the ``(job_id, …)`` index — the previous
+    "count the rows newer than me" form was O(n²) per job and got slower with
+    every probe cycle.
+    """
     for table, keep in (("runs", keep_runs), ("probes", keep_probes)):
         conn.execute(
-            f"DELETE FROM {table} WHERE id IN (SELECT id FROM {table} t "
-            f"WHERE (SELECT COUNT(*) FROM {table} u WHERE u.job_id=t.job_id "
-            f"AND u.id>t.id) >= ?)", (keep,))
+            f"DELETE FROM {table} WHERE id NOT IN ("
+            f"  SELECT k.id FROM {table} k WHERE k.job_id = {table}.job_id "
+            f"  ORDER BY k.id DESC LIMIT ?)", (keep,))
 
 
 # --------------------------------------------------------------------------- #

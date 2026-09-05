@@ -24,6 +24,8 @@ have never reached the destination are a stale destination.
 
 from __future__ import annotations
 
+import math
+
 from dataclasses import dataclass, field
 
 from .db import from_iso
@@ -50,16 +52,25 @@ class Facts:
 
 
 def _num(value) -> float | None:
+    """Coerce a metric to a finite float, or None.
+
+    Strings are accepted (probes may send numbers as text) but ``"nan"``,
+    ``"inf"`` and ``"1e999"`` parse to non-finite floats that later blow up
+    ``int()`` in the state computation and 500 every reader until the metric
+    is overwritten — so anything non-finite is treated as absent.
+    """
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
+        f = float(value)
+    elif isinstance(value, str):
         try:
-            return float(value.strip())
+            f = float(value.strip())
         except ValueError:
             return None
-    return None
+    else:
+        return None
+    return f if math.isfinite(f) else None
 
 
 def _first_num(metrics: dict, keys) -> float | None:

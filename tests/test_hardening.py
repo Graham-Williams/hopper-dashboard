@@ -256,6 +256,64 @@ def test_dev_without_password_is_allowed(settings, registry, notifier):
     assert create_app("read", settings, registry, notifier).test_client().get("/").status_code == 200
 
 
+def test_app_env_is_normalised_so_prod_cannot_be_dodged_by_case_or_whitespace(monkeypatch, tmp_path):
+    """`APP_ENV=" PROD"` (a stray space / capital in .env) must still be prod: the read role has to refuse
+    to start without a password, not quietly come up ungated because ' PROD' != 'prod'."""
+    from dashboard import ConfigError
+    from dashboard.config import Settings
+    monkeypatch.setenv("DASHBOARD_DATA", str(tmp_path))
+    monkeypatch.setenv("JOBS_FILE", "jobs.example.yml")
+    monkeypatch.setenv("DASHBOARD_NO_SCHEDULER", "1")
+    monkeypatch.setenv("APP_ENV", " PROD")
+    for var in ("APP_PASSWORD", "SESSION_SECRET", "SECRET_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    assert Settings.from_env().app_env == "prod"
+    with pytest.raises(ConfigError, match="APP_PASSWORD"):
+        create_app("read")
+    monkeypatch.setenv("APP_ENV", "   ")          # blank collapses to the default, which is prod
+    assert Settings.from_env().app_env == "prod"
+    with pytest.raises(ConfigError, match="APP_PASSWORD"):
+        create_app("read")
+
+
+# --------------------------------------------------------------------------- #
+# 19. non-finite metric values must not poison the board
+# --------------------------------------------------------------------------- #
+
+def test_num_treats_non_finite_as_absent():
+    from dashboard.state import _num
+    assert _num("nan") is None and _num("inf") is None and _num("-inf") is None
+    assert _num("1e999") is None and _num(float("inf")) is None and _num(float("nan")) is None
+    assert _num(" 42 ") == 42.0 and _num(7) == 7.0 and _num(True) is None and _num(None) is None
+
+
+@pytest.mark.parametrize("metrics", [
+    {"dest_count": "nan"},
+    {"missing_bytes": "inf"},
+    {"missing_bytes": "1e999", "missing_files": "-inf"},
+    {"dest_count": "NaN", "differ_files": "Infinity"},
+])
+def test_non_finite_string_metrics_never_500_the_readers(ingest, authed, core, registry, metrics):
+    """JSON can't carry NaN, but a probe may send numbers as strings; "nan"/"inf"/"1e999" parse as floats
+    and used to blow up int() in the state computation, 500ing every reader until the metric was
+    overwritten. The ping may be accepted (200) or rejected (400) — but the board must keep rendering."""
+    tree = registry.get("tree")                     # unprobed rclone_copy_tree: reads dest_count/missing_* from metrics
+    core.record_ping(tree, {"status": "ok", "metrics": {"missing_files": 0}}, now=NOW)
+    r = ingest.post("/api/v1/ping/tree", json={"status": "metric", "metrics": metrics}, headers=auth())
+    assert r.status_code in (200, 400), r.data
+    assert authed.get("/").status_code == 200
+    assert authed.get("/api/v1/status").status_code == 200
+    assert authed.get("/jobs/tree").status_code == 200
+    assert authed.get("/api/v1/jobs/tree").status_code == 200
+    # A run ping carrying the same metrics must not poison the row either.
+    r = ingest.post("/api/v1/ping/tree", json={"status": "ok", "metrics": metrics}, headers=auth())
+    assert r.status_code in (200, 400), r.data
+    assert authed.get("/").status_code == 200 and authed.get("/jobs/tree").status_code == 200
+    body = authed.get("/api/v1/status").get_json()
+    tree_row = next(j for j in body["jobs"] if j["id"] == "tree")
+    assert tree_row["state"] in ("OK", "STALE_DEST")   # computed, not crashed
+
+
 # --------------------------------------------------------------------------- #
 # 21. client IP: header trusted only from TRUSTED_PROXY_CIDR; global login cap
 # --------------------------------------------------------------------------- #

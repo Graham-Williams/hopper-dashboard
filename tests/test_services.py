@@ -188,3 +188,31 @@ def test_prune_bounds_rows(core, registry):
         db.prune(conn, keep_runs=10, keep_probes=10)
     assert len(db.recent_runs(conn, "snap", 100)) == 10
     assert db.last_run(conn, "snap")["received_at"] == db.to_iso(NOW + 29)
+
+
+def test_prune_is_per_job_and_per_table(core, registry):
+    """The cap applies to each job independently (a chatty job must not evict a quiet job's history) and
+    to runs and probes independently; a job under the cap is untouched; the newest rows are the ones kept."""
+    conn = core.connect()
+    with conn:
+        for i in range(30):
+            db.insert_run(conn, "snap", received_at=db.to_iso(NOW + i), status="ok")
+            db.insert_run(conn, "tree", received_at=db.to_iso(NOW + i), status="fail" if i == 29 else "ok")
+            db.insert_probe(conn, "snap", probed_at=db.to_iso(NOW + i), ok=True, count=i)
+        for i in range(3):
+            db.insert_run(conn, "mirror", received_at=db.to_iso(NOW + i), status="ok")
+            db.insert_probe(conn, "tree", probed_at=db.to_iso(NOW + i), ok=True, count=i)
+        db.prune(conn, keep_runs=10, keep_probes=5)
+    assert len(db.recent_runs(conn, "snap", 100)) == 10
+    assert len(db.recent_runs(conn, "tree", 100)) == 10
+    assert len(db.recent_runs(conn, "mirror", 100)) == 3          # under the cap: untouched
+    assert db.last_run(conn, "tree")["status"] == "fail"           # newest kept, oldest dropped
+    assert [r["received_at"] for r in db.recent_runs(conn, "tree", 100)][-1] == db.to_iso(NOW + 20)
+    assert conn.execute("SELECT COUNT(*) FROM probes WHERE job_id='snap'").fetchone()[0] == 5
+    assert conn.execute("SELECT COUNT(*) FROM probes WHERE job_id='tree'").fetchone()[0] == 3
+    assert db.last_probe(conn, "snap")["count"] == 29
+    # Idempotent: a second prune deletes nothing.
+    before = conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+    with conn:
+        db.prune(conn, keep_runs=10, keep_probes=5)
+    assert conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == before
