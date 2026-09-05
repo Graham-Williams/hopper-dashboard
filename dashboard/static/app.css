@@ -114,6 +114,7 @@ nav.top a { color: var(--muted); padding: .4rem 0; }
 .card header h3 a { color: var(--ink); }
 .card .kind { font-size: .74rem; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
 .card .hint { margin: 0 0 .5rem; padding: .4rem .6rem; border-radius: 6px; background: var(--panel-2); font-size: .9rem; }
+.card .hint.never-run { border-left: 3px solid var(--unknown); }
 .card dl { display: grid; grid-template-columns: max-content 1fr; gap: .25rem .7rem; margin: 0; font-size: .9rem; }
 .card dt { color: var(--muted); }
 .card dd { margin: 0; min-width: 0; }

@@ -37,6 +37,10 @@
       {% if j.state not in ('OK', 'UNKNOWN') and j.state_reason %}
       <p class="hint">{{ j.state_reason }}{% if j.state == 'FAIL' and j.last_run_note %} — {{ j.last_run_note }}{% endif %}</p>
       {% endif %}
+      {% if j.kind == 'manual' and j.never_run %}
+      <p class="hint never-run"><strong>Never run.</strong> No completion has been pinged yet
+        {% if j.lag and j.lag.max_age_s %}— the {{ j.lag.max_age_s|human_duration }} max-age target is inert until the first <code>ping.sh {{ j.id }} ok</code>{% endif %}.</p>
+      {% endif %}
       <dl>
         <dt>Protects</dt><dd>{{ j.protects }}</dd>
         <dt>Method</dt><dd>{{ j.method }}</dd>
@@ -48,11 +52,13 @@
         <dt>Cadence</dt><dd>every {{ j.cadence_s|human_duration }} <span class="muted">(+{{ j.grace_s|human_duration }} grace)</span></dd>
         {% endif %}
         {% if j.lag %}
-        <dt>Behind</dt>
+        <dt>{{ 'Missing' if j.kind == 'rclone_copy_tree' else 'Behind' }}</dt>
         <dd>
           {% if j.lag.bytes is not none %}{{ j.lag.bytes|human_bytes }}{% if j.lag.max_bytes %} <span class="muted">of {{ j.lag.max_bytes|human_bytes }} allowed</span>{% endif %}{% endif %}
           {% if j.lag.files is not none %}<span class="muted">· {{ j.lag.files }} file{{ '' if j.lag.files == 1 else 's' }}</span>{% endif %}
+          {% if j.kind == 'rclone_copy_tree' and j.lag.bytes is not none %}<span class="muted">never uploaded</span>{% endif %}
           {% if j.lag.bytes is none and j.lag.files is none %}<span class="muted">no lag reported</span>{% endif %}
+          {% if j.lag.differ_files is not none %}<br><span class="muted">{{ j.lag.differ_files }} file{{ '' if j.lag.differ_files == 1 else 's' }}{% if j.lag.differ_bytes is not none %} / {{ j.lag.differ_bytes|human_bytes }}{% endif %} edited since last copy (normal lag)</span>{% endif %}
           {% if j.lag.max_age_s %}<br><span class="muted">target: done within {{ j.lag.max_age_s|human_duration }}{% if j.lag.age_s is not none %} · currently {{ j.lag.age_s|human_duration }}{% endif %}</span>{% endif %}
           {% if j.informational %}<br><span class="muted">informational — never alerts</span>{% endif %}
         </dd>

@@ -18,10 +18,15 @@
     <dt>Last run</dt><dd>{{ when(job.last_run, now) }}{% if job.last_run_status %} <span class="pill pill-{{ job.last_run_status }}">{{ job.last_run_status }}</span>{% endif %}</dd>
     <dt>Last success</dt><dd>{{ when(job.last_success, now) }}</dd>
     {% if job.cadence_s %}<dt>Cadence</dt><dd>every {{ job.cadence_s|human_duration }} (+{{ job.grace_s|human_duration }} grace)</dd>{% endif %}
+    {% if job.kind == 'manual' and job.never_run %}
+    <dt>Status</dt><dd><strong>Never run</strong> — no completion pinged yet{% if job.lag and job.lag.max_age_s %}; the max-age target is inert until the first <code>ping.sh {{ job.id }} ok</code>{% endif %}</dd>
+    {% endif %}
     {% if job.lag %}
-    <dt>Behind</dt><dd>{{ job.lag.bytes|human_bytes if job.lag.bytes is not none else '—' }}
+    <dt>{{ 'Missing' if job.kind == 'rclone_copy_tree' else 'Behind' }}</dt><dd>{{ job.lag.bytes|human_bytes if job.lag.bytes is not none else '—' }}
+      {% if job.lag.files is not none %}<span class="muted">· {{ job.lag.files }} file{{ '' if job.lag.files == 1 else 's' }}{% if job.kind == 'rclone_copy_tree' %} never uploaded{% endif %}</span>{% endif %}
       {% if job.lag.max_bytes %}<span class="muted">of {{ job.lag.max_bytes|human_bytes }}</span>{% endif %}
-      {% if job.lag.age_s is not none %}<span class="muted">· age {{ job.lag.age_s|human_duration }}{% if job.lag.max_age_s %} / {{ job.lag.max_age_s|human_duration }}{% endif %}</span>{% endif %}</dd>
+      {% if job.lag.age_s is not none %}<span class="muted">· age {{ job.lag.age_s|human_duration }}{% if job.lag.max_age_s %} / {{ job.lag.max_age_s|human_duration }}{% endif %}</span>{% endif %}
+      {% if job.lag.differ_files is not none %}<br><span class="muted">{{ job.lag.differ_files }} file{{ '' if job.lag.differ_files == 1 else 's' }}{% if job.lag.differ_bytes is not none %} / {{ job.lag.differ_bytes|human_bytes }}{% endif %} edited since last copy (informational, never stale)</span>{% endif %}</dd>
     {% endif %}
     {% if job.dest.newest or job.dest.count is not none or job.dest.probe_error %}
     <dt>Destination</dt>

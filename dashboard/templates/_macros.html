@@ -6,7 +6,8 @@
 {%- endmacro %}
 
 {% macro when(iso, now) -%}
-{% if iso %}<time datetime="{{ iso }}" title="{{ iso|absolute }}">{{ iso|relative(now) }}</time>{% else %}<span class="muted">never</span>{% endif %}
+{# <time datetime> is what base.html's nonce'd script localizes (title → "local (UTC)"). #}
+{% if iso and (iso|absolute) %}<time datetime="{{ iso }}" title="{{ iso|absolute }}">{{ iso|relative(now) }}</time>{% elif iso %}<span class="muted" title="unparseable timestamp">?</span>{% else %}<span class="muted">never</span>{% endif %}
 {%- endmacro %}
 
 {% macro history_strip(history) -%}
