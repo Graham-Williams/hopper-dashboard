@@ -13,7 +13,7 @@ target) or **UNKNOWN** (never heard from). Every transition is recorded and push
 ```
 uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -r requirements-dev.txt
 cp jobs.example.yml jobs.yml
-export INGEST_TOKEN=devtoken READ_TOKEN=devread          # leave APP_PASSWORD unset to browse without the gate
+export INGEST_TOKEN=devtoken READ_TOKEN=devread APP_ENV=dev   # APP_ENV=dev + no APP_PASSWORD = gate off (prod refuses)
 .venv/bin/python -m dashboard                             # board: http://127.0.0.1:8080  ingest: :8081
 curl -X POST -H 'Authorization: Bearer devtoken' -d result=success http://127.0.0.1:8081/api/v1/ping/km-backup
 ```
@@ -23,12 +23,14 @@ curl -X POST -H 'Authorization: Bearer devtoken' -d result=success http://127.0.
 - **Heartbeats** — `POST /api/v1/ping/<job_id>` with `Authorization: Bearer $INGEST_TOKEN`, either JSON
   (`{"status":"ok|fail|skipped|metric", "reason":…, "metrics":{…}}`) or the form body a systemd
   `ExecStopPost` curl sends (`result=$SERVICE_RESULT&exit=$EXIT_STATUS`). Ingest is published only on the
-  box's Tailscale IP.
+  box's Tailscale IP. A scheduled job that has never pinged goes LATE after its cadence+grace, so a heartbeat
+  that was never wired up can't hide as "new".
 - **Destination probes** — the container runs `rclone lsjson` against each `db_snapshot` job's Drive folder
   and cross-checks the backup script's state files, so "the backup said ok" and "Drive has the bytes" are
   verified independently.
 - **Mac probe** — an hourly launchd job posts what only the Mac can see (offload lag, Drive mirror state,
-  nightly backup outcome). If the Mac is asleep the card says so instead of paging.
+  nightly backup outcome, split into never-uploaded vs edited-since). If the Mac is asleep you get one
+  "Mac offline" alert, not one per Mac job.
 
 See `DESIGN.md` for the design and API contract, `CLAUDE.md` for how to run and test, `DEPLOY.md` for the box
 recipe. Jobs are declared in `jobs.yml` (gitignored; start from `jobs.example.yml`).
