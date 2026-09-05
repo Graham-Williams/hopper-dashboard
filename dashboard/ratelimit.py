@@ -2,13 +2,24 @@
 
 Process-local (a restart clears them). Two flavours share one implementation:
 the login limiter counts *failures* (so a correct password resets the IP), the
-ping limiter counts *requests*. Bounded memory even under spoofed client IPs.
+ping limiter counts *requests*. Bounded memory even under spoofed client IPs:
+keys are truncated to ``KEY_MAX_LEN`` and the number of tracked keys is a hard
+cap — when a sweep of expired keys is not enough, the key with the oldest
+newest-event is evicted (a burst of fresh keys can therefore forget an old
+offender, which is the memory-safe side to err on).
 """
 
 from __future__ import annotations
 
 import threading
 import time
+
+KEY_MAX_LEN = 64
+
+
+def _norm_key(key: str) -> str:
+    key = key if isinstance(key, str) else str(key)
+    return key[:KEY_MAX_LEN]
 
 
 class SlidingWindowLimiter:
@@ -33,25 +44,36 @@ class SlidingWindowLimiter:
                   if all(now - t >= self.window for t in ts)]:
             self._events.pop(k, None)
 
+    def _make_room(self, key: str, now: float) -> None:
+        """Enforce ``max_tracked_keys`` before inserting ``key``: sweep expired
+        keys first, then evict the stalest keys until there is room."""
+        if key in self._events or len(self._events) < self.max_tracked_keys:
+            return
+        self._sweep(now)
+        while self._events and len(self._events) >= self.max_tracked_keys:
+            stalest = min(self._events, key=lambda k: max(self._events[k]))
+            self._events.pop(stalest, None)
+
     def is_blocked(self, key: str, now: float | None = None) -> bool:
         now = time.time() if now is None else now
+        key = _norm_key(key)
         with self._lock:
             return len(self._prune(key, now)) >= self.max_events
 
     def record(self, key: str, now: float | None = None) -> None:
         now = time.time() if now is None else now
+        key = _norm_key(key)
         with self._lock:
-            if len(self._events) >= self.max_tracked_keys:
-                self._sweep(now)
+            self._make_room(key, now)
             self._prune(key, now)
             self._events.setdefault(key, []).append(now)
 
     def hit(self, key: str, now: float | None = None) -> bool:
         """Record one event and return True if the caller is still allowed."""
         now = time.time() if now is None else now
+        key = _norm_key(key)
         with self._lock:
-            if len(self._events) >= self.max_tracked_keys:
-                self._sweep(now)
+            self._make_room(key, now)
             events = self._prune(key, now)
             if len(events) >= self.max_events:
                 return False
@@ -60,7 +82,11 @@ class SlidingWindowLimiter:
 
     def reset(self, key: str) -> None:
         with self._lock:
-            self._events.pop(key, None)
+            self._events.pop(_norm_key(key), None)
+
+    def tracked(self) -> int:
+        with self._lock:
+            return len(self._events)
 
 
 class LoginRateLimiter(SlidingWindowLimiter):

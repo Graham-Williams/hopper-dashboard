@@ -77,6 +77,7 @@ def test_login_page_renders_and_redirects_when_authed(read_app, authed):
 def test_gate_off_when_no_password(settings, registry, notifier):
     from dashboard import create_app
     settings.app_password = ""
+    settings.app_env = "dev"   # prod refuses to start without a password (see test_misc)
     app = create_app("read", settings, registry, notifier)
     c = app.test_client()
     assert c.get("/").status_code == 200
@@ -125,8 +126,18 @@ def test_security_headers(authed):
     assert h["Referrer-Policy"] == "same-origin"
     assert h["X-Frame-Options"] == "DENY"
     csp = h["Content-Security-Policy"]
-    assert "default-src 'self'" in csp and "script-src 'none'" in csp
-    assert "https://" not in csp
+    assert "default-src 'self'" in csp and "https://" not in csp
+    # Exactly one inline script is allowed, by a per-request nonce; no 'self', no unsafe-inline.
+    import re
+    m = re.search(r"script-src 'nonce-([A-Za-z0-9_-]{16,})'", csp)
+    assert m, csp
+    assert "'unsafe-inline'" not in csp and "script-src 'self'" not in csp
+    html = r.data.decode()
+    assert html.count("<script") == 1 and f'<script nonce="{m.group(1)}">' in html
+    assert "src=" not in html.split("<script", 1)[1].split(">", 1)[0]   # inline, no external src
+    # The nonce is fresh per request.
+    r2 = authed.get("/")
+    assert re.search(r"nonce-([A-Za-z0-9_-]+)", r2.headers["Content-Security-Policy"]).group(1) != m.group(1)
 
 
 def test_host_pin_and_csrf(settings, registry, notifier):
@@ -222,7 +233,7 @@ def test_board_renders_every_state(authed, core, registry):
     assert "5.0 GB" in html                          # human bytes for manual lag
     assert 'class="strip"' in html                   # history sparkline
     assert "informational" in html
-    assert "<script" not in html                     # no JS at all
+    assert html.count("<script") == 1                # only the nonce'd timestamp localizer
     assert 'href="/static/app.css"' in html
     assert "cdn" not in html.lower()
 

@@ -21,6 +21,23 @@ def _env_int(name: str, default: int) -> int:
         raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
 
 
+def _env_cidrs(name: str) -> tuple[str, ...]:
+    """Comma-separated CIDR list; validated so a typo fails at startup, not silently."""
+    import ipaddress
+    raw = os.environ.get(name, "")
+    out = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ipaddress.ip_network(part, strict=False)
+        except ValueError as exc:
+            raise ValueError(f"{name}: {part!r} is not a valid CIDR") from exc
+        out.append(part)
+    return tuple(out)
+
+
 @dataclass
 class Settings:
     data_dir: str = "/app/data"
@@ -42,6 +59,12 @@ class Settings:
     ping_rate_window_s: int = 60
     login_rate_max: int = 10
     login_rate_window_s: int = 900
+    # Global (all clients together) failed-login cap — defeats per-IP limiter
+    # evasion via many source addresses / spoofed proxy headers.
+    login_global_max: int = 100
+    # CIDRs whose CF-Connecting-IP header the READ role trusts (the tunnel
+    # container's network). Empty = never trust the header.
+    trusted_proxy_cidrs: tuple[str, ...] = ()
     max_body_bytes: int = 64 * 1024
     extra: dict = field(default_factory=dict)
 
@@ -66,4 +89,5 @@ class Settings:
             probe_interval_s=_env_int("PROBE_INTERVAL_S", 300),
             tick_interval_s=_env_int("TICK_INTERVAL_S", 60),
             start_scheduler=os.environ.get("DASHBOARD_NO_SCHEDULER", "") == "",
+            trusted_proxy_cidrs=_env_cidrs("TRUSTED_PROXY_CIDR"),
         )

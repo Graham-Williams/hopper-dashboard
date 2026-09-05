@@ -12,14 +12,16 @@ from __future__ import annotations
 
 import hmac
 import logging
+import secrets
 import time
 from urllib.parse import urlsplit
 
-from flask import (Blueprint, Response, abort, current_app, jsonify, redirect,
-                   render_template, request, session, url_for)
+from flask import (Blueprint, Response, abort, current_app, g, jsonify,
+                   redirect, render_template, request, session, url_for)
 
 from . import db
-from .password_gate import client_ip, safe_next
+from .password_gate import client_ip as _client_ip
+from .password_gate import safe_next
 from .views import build_job_detail, build_status
 
 log = logging.getLogger(__name__)
@@ -29,13 +31,28 @@ bp = Blueprint("web", __name__)
 SESSION_KEY = "dashboard_authed"
 GATE_EXEMPT = {"/login", "/logout", "/healthz"}
 
-_CSP = ("default-src 'self'; img-src 'self' data:; style-src 'self'; "
-        "script-src 'none'; object-src 'none'; base-uri 'self'; "
-        "form-action 'self'; frame-ancestors 'none'")
+# script-src allows exactly ONE inline script — the per-request nonce'd
+# timestamp localizer in base.html. No 'self', no 'unsafe-inline', no hosts:
+# nothing else can execute. Everything else stays locked.
+_CSP_TEMPLATE = ("default-src 'self'; img-src 'self' data:; style-src 'self'; "
+                 "script-src 'nonce-{nonce}'; object-src 'none'; base-uri 'self'; "
+                 "form-action 'self'; frame-ancestors 'none'")
+GLOBAL_LOGIN_KEY = "*"
 
 
 def _settings():
     return current_app.config["SETTINGS"]
+
+
+def client_ip() -> str:
+    return _client_ip(_settings().trusted_proxy_cidrs)
+
+
+def csp_nonce() -> str:
+    nonce = getattr(g, "csp_nonce", None)
+    if nonce is None:
+        nonce = g.csp_nonce = secrets.token_urlsafe(16)
+    return nonce
 
 
 def _gate_enabled() -> bool:
@@ -108,7 +125,8 @@ def _security_headers(resp: Response) -> Response:
     # same-origin, NOT no-referrer: under no-referrer browsers send Origin: null
     # on the app's own form POST and the CSRF pin would reject the login.
     resp.headers.setdefault("Referrer-Policy", "same-origin")
-    resp.headers.setdefault("Content-Security-Policy", _CSP)
+    resp.headers.setdefault("Content-Security-Policy",
+                            _CSP_TEMPLATE.format(nonce=csp_nonce()))
     resp.headers.setdefault("Cache-Control", "no-store")
     return resp
 
@@ -139,7 +157,8 @@ def login_post():
     next_target = request.form.get("next", "")
     ip = client_ip()
     limiter = current_app.extensions["login_limiter"]
-    if limiter.is_blocked(ip):
+    global_limiter = current_app.extensions["login_global_limiter"]
+    if limiter.is_blocked(ip) or global_limiter.is_blocked(GLOBAL_LOGIN_KEY):
         log.warning("login blocked (rate limit) for %s", ip)
         return render_template(
             "login.html", next=next_target,
@@ -152,6 +171,7 @@ def login_post():
         limiter.reset(ip)
         return redirect(safe_next(next_target))
     limiter.record_failure(ip)
+    global_limiter.record_failure(GLOBAL_LOGIN_KEY)
     log.warning("failed login attempt from %s", ip)  # never log the password
     return render_template("login.html", next=next_target,
                            error="Incorrect password."), 401

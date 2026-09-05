@@ -37,10 +37,12 @@ class Notifier:
         attempted and succeeded."""
         if not self.enabled or not self.should_notify(from_state, to_state):
             return False
+        # Only the transition goes to ntfy.sh (a third party): never the
+        # free-text reason, which can carry container names, client-supplied
+        # notes or rclone stderr. The reason stays on the board.
+        del reason
         title = f"[dashboard] {job_name} → {to_state}"
         body = f"{job_id}: {from_state} → {to_state}"
-        if reason:
-            body += f"\n{reason}"
         priority = "high" if to_state in HIGH_PRIORITY_STATES else "default"
         return self.send(title, body, priority)
 

@@ -25,5 +25,26 @@
 <footer class="foot">
   hopper-dashboard v{{ app_version }} · observe-only · actions stay with Hopper over SSH
 </footer>
+{# The ONLY script on the site, allowed by a per-request CSP nonce (script-src 'nonce-…').
+   It localizes every <time datetime> to the viewer's clock: the visible relative text is left
+   alone; the hover title becomes "local (UTC)", and elements marked .abs get local text.
+   Without JS the server-rendered UTC text/title remain — nothing depends on this running. #}
+<script nonce="{{ csp_nonce() }}">
+(function () {
+  var fmt;
+  try {
+    fmt = new Intl.DateTimeFormat(undefined, {year:'numeric', month:'short', day:'2-digit',
+      hour:'2-digit', minute:'2-digit', second:'2-digit', timeZoneName:'short'});
+  } catch (e) { return; }
+  var nodes = document.querySelectorAll('time[datetime]');
+  for (var i = 0; i < nodes.length; i++) {
+    var el = nodes[i], d = new Date(el.getAttribute('datetime'));
+    if (isNaN(d.getTime())) continue;
+    var local = fmt.format(d), utc = el.getAttribute('title');
+    el.setAttribute('title', utc ? local + ' (' + utc + ')' : local);
+    if (el.classList.contains('abs')) el.textContent = local;
+  }
+})();
+</script>
 </body>
 </html>

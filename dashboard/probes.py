@@ -45,8 +45,9 @@ class ProbeError(RuntimeError):
 def run_rclone_lsjson(path: str, timeout: int = RCLONE_TIMEOUT_S
                       ) -> tuple[str | None, int]:
     """Return (newest ModTime as ISO, file count) for an rclone path."""
+    # "--" ends option parsing so a path from jobs.yml can never be read as a flag.
     argv = ["rclone", "lsjson", "--recursive", "--files-only",
-            "--no-mimetype", path]
+            "--no-mimetype", "--", path]
     try:
         proc = subprocess.run(argv, capture_output=True, text=True,
                               timeout=timeout, check=False)

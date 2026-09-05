@@ -18,7 +18,7 @@ import re
 from flask import Blueprint, Response, abort, current_app, jsonify, request
 
 from .db import from_iso
-from .password_gate import client_ip
+from .password_gate import remote_ip
 
 log = logging.getLogger(__name__)
 
@@ -27,10 +27,11 @@ bp = Blueprint("ingest", __name__)
 STATUSES = ("ok", "fail", "skipped", "metric")
 NOTE_MAX = 500
 REASON_MAX = 100
-METRIC_KEY_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+METRIC_KEY_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")   # used with fullmatch
 METRIC_MAX_KEYS = 50
 METRIC_STR_MAX = 1000
 METRIC_LIST_MAX = 100
+INT_ABS_MAX = 2 ** 63   # SQLite INTEGER / JSON consumers; bigger ints are rejected
 
 
 class PayloadError(ValueError):
@@ -45,6 +46,8 @@ def _scalar(value, where: str):
     if value is None or isinstance(value, bool):
         return value
     if isinstance(value, int):
+        if abs(value) > INT_ABS_MAX:
+            raise PayloadError(f"{where}: integer out of range")
         return value
     if isinstance(value, float):
         if not math.isfinite(value):
@@ -66,7 +69,7 @@ def parse_metrics(raw) -> dict:
         raise PayloadError(f"metrics: more than {METRIC_MAX_KEYS} keys")
     out: dict = {}
     for key, value in raw.items():
-        if not isinstance(key, str) or not METRIC_KEY_RE.match(key):
+        if not isinstance(key, str) or not METRIC_KEY_RE.fullmatch(key):
             raise PayloadError("metrics: bad key (use [A-Za-z0-9_.-], ≤64 chars)")
         if isinstance(value, dict):
             raise PayloadError(f"metrics.{key}: nested objects are not allowed")
@@ -187,7 +190,7 @@ def healthz():
 def ping(job_id: str):
     settings = current_app.config["SETTINGS"]
     limiter = current_app.extensions["ping_limiter"]
-    ip = client_ip()
+    ip = remote_ip()   # peer only: no proxy in front of the ingest port
     if not limiter.hit(ip):
         log.warning("ping rate-limited for %s", ip)
         return jsonify({"ok": False, "error": "rate limited"}), 429
@@ -205,7 +208,11 @@ def ping(job_id: str):
             payload = parse_form_payload(request.form)
             source = "form"
         else:
-            doc = request.get_json(force=True, silent=True)
+            try:
+                doc = request.get_json(force=True, silent=True)
+            except RecursionError:
+                # Deeply nested JSON (e.g. 100k "[") blows the parser's stack.
+                doc = None
             if doc is None:
                 raise PayloadError("body must be valid JSON")
             payload = parse_json_payload(doc)

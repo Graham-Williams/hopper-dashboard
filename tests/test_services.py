@@ -30,7 +30,8 @@ def test_fail_transition_alerts_high_priority(core, notifier, registry):
     assert len(notifier.sent) == 1
     title, body, priority = notifier.sent[0]
     assert title == "[dashboard] Snap DB → FAIL" and priority == "high"
-    assert "OK → FAIL" in body and "timeout" in body
+    # Body is the bare transition: the free-text reason never goes to ntfy.sh.
+    assert body == "snap: OK → FAIL" and "timeout" not in body
 
 
 def test_recovery_alerts_default_priority(core, notifier, registry):

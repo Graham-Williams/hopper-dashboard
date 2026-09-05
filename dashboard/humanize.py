@@ -56,8 +56,13 @@ def relative(iso: str | None, now: float) -> str:
 
 
 def absolute(iso: str | None) -> str:
+    """UTC wall-clock text, or "" for anything unparseable/out of range.
+    Never raises: this runs inside templates over untrusted metric values."""
     epoch = from_iso(iso)
     if epoch is None:
         return ""
-    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime(
-        "%Y-%m-%d %H:%M:%S UTC")
+    try:
+        return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S UTC")
+    except (ValueError, OverflowError, OSError):
+        return ""
