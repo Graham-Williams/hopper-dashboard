@@ -98,6 +98,14 @@ jobs:
     kind: drive_mirror
     protects: Documents, Desktop and minecraft-channel mirrored by Drive for Desktop
     method: Mac probe reads DriveFS mirror_sqlite.db (pending uploads + local/cloud mismatches); BEHIND if any
+    # Operator notes (NOT config — unknown keys are rejected; the probe discovers roots from the DriveFS DB).
+    # Drive folder ids of the mirrored roots, for the independent cross-check
+    #   rclone size gdrive: --drive-root-folder-id <id> --json     (DESIGN.md → drive_mirror)
+    # Fill in from the operator notes in the real jobs.yml; never commit real ids.
+    #   My Mac (computer root):  <my-mac-root-id>
+    #   Documents:               <documents-root-id>
+    #   Desktop:                 <desktop-root-id>
+    #   minecraft-channel:       <minecraft-channel-root-id>
     cadence_s: 3600
     grace_s: 50520              # 14 h + 2 min, same reasoning as mac-probe (nightly sleep). While mac-probe is LATE the
                                 # dashboard sends ONE "Mac offline" alert and suppresses the other Mac jobs' LATE alerts

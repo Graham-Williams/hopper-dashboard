@@ -107,7 +107,7 @@ echo "enabled dashboard-containers.timer"
 echo; echo "=== systemd-analyze verify ==="
 systemd-analyze verify --man=no "$SYSD/dashboard-containers.service" "${UNITS[@]/%/.service}" && echo "ok"
 echo; echo "=== drop-ins as systemd sees them ==="
-for u in "${UNITS[@]}"; do systemctl cat "$u.service" | grep -A3 'heartbeat.conf' || echo "!! $u.service has no heartbeat drop-in"; done
+for u in "${UNITS[@]}"; do systemctl cat "$u.service" | grep -E 'heartbeat.conf|ExecStopPost' || echo "!! $u.service has no heartbeat drop-in"; done
 echo; echo "=== timers ==="
 systemctl list-timers --no-pager | grep -E 'NEXT|km-backup|todoist-points-backup|dashboard-containers' || true
 echo; echo "=== container probe dry run (as $RUN_USER) ==="
@@ -116,5 +116,7 @@ echo
 echo "First heartbeats: box-containers within 5 min (or now: systemctl start dashboard-containers.service);"
 echo "km-backup / todoist-points-backup on their next timer tick (≤5 min). Check with:"
 echo "  journalctl -u dashboard-containers.service -n 5 --no-pager"
-echo "  # read side (curl is not in the image; use python inside the container):"
-echo "  docker exec hopper-dashboard python -c \"import urllib.request as u; r=u.Request('http://127.0.0.1:8080/api/v1/status', headers={'Authorization': 'Bearer '+open('/dev/stdin').read().strip()}); print(u.urlopen(r, timeout=5).read()[:400])\" <<<\"\$(grep '^READ_TOKEN=' ~/hopper-dashboard/.env | cut -d= -f2-)\""
+echo "  # read side (curl is not in the image; use python inside the container). Host MUST equal APP_HOST —"
+echo "  # the read role pins Host on everything but /healthz, so without the header this is a 403:"
+echo "  docker exec -e RT=\"\$(grep '^READ_TOKEN=' ~/hopper-dashboard/.env | cut -d= -f2-)\" -e AH=\"\$(grep '^APP_HOST=' ~/hopper-dashboard/.env | cut -d= -f2-)\" hopper-dashboard python -c \"import os,json,urllib.request as u; r=u.Request('http://127.0.0.1:8080/api/v1/status', headers={'Authorization':'Bearer '+os.environ['RT'],'Host':os.environ['AH']}); print(json.loads(u.urlopen(r, timeout=5).read())['summary'])\""
+echo "  # (once Cloudflare is wired, read via the public hostname instead: https://<APP_HOST>/api/v1/status)"
