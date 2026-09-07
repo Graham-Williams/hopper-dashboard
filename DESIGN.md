@@ -39,9 +39,12 @@ Inputs:
    `~/todoist-points/data/.backup-state` are bind-mounted `:ro` so `last_drive.sha256` /
    `last_drive_push.epoch` can be cross-checked against the newest Drive object. Container probes for
    `container` type use `docker ps` output pushed by a tiny host-side heartbeat instead of a socket mount
-   (NO docker socket in the container). ⚠️ SCOPE: the box's `gdrive:` remote sees ONLY `km-tracker-backups/`
-   and `todoist-points-backups/` — `Backups/` (Hopper docs) and `Gremlins/` (Minecraft) are only visible from
-   the Mac's remote, so those destination probes run in the MAC probe (input 3) and arrive as metrics.
+   (NO docker socket in the container). ⚠️ SCOPE: the box's *writer* `gdrive:` remote sees ONLY
+   `km-tracker-backups/` and `todoist-points-backups/`, so the missing/differ verdicts for `Backups/` (Hopper
+   docs) and `Gremlins/` (Minecraft) run in the MAC probe (input 3) and arrive as metrics. The container's
+   read-only `gdrive-ro` remote (scope `drive.readonly`, DEPLOY.md §1b) CAN list those folders, so a
+   `rclone_copy_tree` or `manual` job may *optionally* carry `probe.rclone_path` (e.g. `gdrive-ro:Backups`)
+   to get newest-object time + count from the box; without it the card shows only the Mac-reported count.
    Per job type:
    - `rclone_copy_tree`: `rclone check --one-way <src> <dst>` semantics → missing/differ counts. For Mac-sourced
      trees (recordings, personal-assistant) the box can't see the source, so the MAC probe reports
@@ -214,7 +217,7 @@ jobs:
     destination: gdrive:km-tracker-backups
     cadence_s: 300
     grace_s: 600
-    probe:                        # optional, only for kinds the box container can probe itself
+    probe:                        # required for db_snapshot; optional for rclone_copy_tree / manual (box lists the dest)
       rclone_path: gdrive:km-tracker-backups
       state_dir: /state/km        # bind-mounted :ro host state dir
     manual:                       # only for kind: manual
@@ -226,7 +229,8 @@ jobs:
 Validation is strict and fails startup with the job id + field: ids `^[a-z0-9-]+$` (unique, ≤64), `machine`
 ∈ box|mac, `kind` ∈ the six kinds, `cadence_s`+`grace_s` required for every kind except `manual` (and
 forbidden on manual), `db_snapshot` requires `probe.rclone_path`, `rclone_copy_tree` requires `destination`,
-`container` requires a non-empty `expect`, unknown keys anywhere are errors.
+a `probe` block is accepted only on `db_snapshot` / `rclone_copy_tree` / `manual`, `container` requires a
+non-empty `expect`, unknown keys anywhere are errors.
 State computation runs on every ping (for ALL jobs, so LATE keeps firing even if the ticker thread dies) and
 on a 60 s ticker (so LATE fires without traffic). Every state transition is written to `state_changes` and
 dispatched to ntfy (`NTFY_URL` + `NTFY_TOPIC` env; disabled when empty) with title `[dashboard] <job> → <STATE>`

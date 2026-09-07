@@ -231,3 +231,44 @@ def test_dest_from_metrics_for_unprobed_jobs():
     f = Facts(last_metrics={"dest_newest_iso": "garbage", "dest_count": "x"})
     d = dest_info(job, f, NOW)
     assert d["newest"] is None and d["count"] is None
+
+
+# -- optional box probe on copy trees / manual jobs ---------------------------
+
+def _probed(job_id, path="gdrive-ro:x"):
+    import copy
+    from dashboard.registry import parse_registry
+    from tests.conftest import JOBS_DOC
+    doc = copy.deepcopy(JOBS_DOC)
+    for j in doc["jobs"]:
+        if j["id"] == job_id:
+            j["probe"] = {"rclone_path": path}
+    return parse_registry(doc).get(job_id)
+
+
+def test_copy_tree_probe_supplies_newest_and_count():
+    job = _probed("tree")
+    metrics = {"missing_bytes": 0, "dest_count": 1032}       # Mac reports a count, no newest time
+    f = Facts(last_run=run(), last_success=run(), last_metrics=metrics,
+              probe=probe(newest_ago=3600, count=1040))
+    d = dest_info(job, f, NOW)
+    assert d["newest"] == to_iso(NOW - 3600) and d["count"] == 1040 and d["probed_at"]
+    assert compute_state(job, f, NOW)[0] == "OK"        # freshness verdict still comes from missing_*
+
+
+def test_copy_tree_probe_pending_falls_back_to_metrics():
+    job = _probed("tree")
+    metrics = {"missing_bytes": 0, "dest_count": 1032}
+    for pr in (None, probe(newest_ago=10, ok=False, error="rclone exit 3")):
+        d = dest_info(job, Facts(last_run=run(), last_success=run(), last_metrics=metrics, probe=pr), NOW)
+        assert d["newest"] is None and d["count"] == 1032, pr
+    assert d["probe_error"] == "rclone exit 3"
+
+
+def test_manual_probe_drives_freshness_pill():
+    job = _probed("offload")
+    f = Facts(last_metrics={"lag_bytes": 0}, probe=probe(newest_ago=15 * 86400, count=9))
+    d = dest_info(job, f, NOW)
+    assert d["count"] == 9 and d["fresh"] is False      # older than max_age_s (14 d)
+    f = Facts(last_metrics={"lag_bytes": 0}, probe=probe(newest_ago=86400, count=9))
+    assert dest_info(job, f, NOW)["fresh"] is True

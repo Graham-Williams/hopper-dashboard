@@ -38,8 +38,9 @@
       <p class="hint">{{ j.state_reason }}{% if j.state == 'FAIL' and j.last_run_note %} — {{ j.last_run_note }}{% endif %}</p>
       {% endif %}
       {% if j.kind == 'manual' and j.never_run %}
-      <p class="hint never-run"><strong>Never run.</strong> No completion has been pinged yet
-        {% if j.lag and j.lag.max_age_s %}— the {{ j.lag.max_age_s|human_duration }} max-age target is inert until the first <code>ping.sh {{ j.id }} ok</code>{% endif %}.</p>
+      {# Keep the optional clause and the closing period on ONE line: template whitespace between them
+         renders as a stray space before the "." when the clause is absent. #}
+      <p class="hint never-run"><strong>Never run.</strong> No completion has been pinged yet{% if j.lag and j.lag.max_age_s %} — the {{ j.lag.max_age_s|human_duration }} max-age target is inert until the first <code>ping.sh {{ j.id }} ok</code>{% endif %}.</p>
       {% endif %}
       <dl>
         <dt>Protects</dt><dd>{{ j.protects }}</dd>
@@ -68,8 +69,12 @@
         <dd>
           {% if j.dest.probe_error %}<span class="bad">probe failed:</span> {{ j.dest.probe_error }}
           {% else %}
-            newest {{ when(j.dest.newest, now) }}{% if j.dest.count is not none %} · {{ j.dest.count }} object{{ '' if j.dest.count == 1 else 's' }}{% endif %}
-            {% if j.dest.fresh is true %}<span class="pill pill-ok">fresh</span>{% elif j.dest.fresh is false %}<span class="pill pill-fail">stale</span>{% endif %}
+            {# An unknown newest-object time is OMITTED, never rendered as "never" (the Mac probe reports
+               dest_count without a newest time for copy trees). #}
+            {% if j.dest.newest %}newest {{ when(j.dest.newest, now) }}{% endif %}{% if j.dest.count is not none %}{% if j.dest.newest %} · {% endif %}{{ j.dest.count }} object{{ '' if j.dest.count == 1 else 's' }}{% endif %}
+            {# rclone_copy_tree freshness is the missing-bytes verdict already shown by the state chip and the
+               Missing row, so the pill would only repeat it there. #}
+            {% if j.kind != 'rclone_copy_tree' %}{% if j.dest.fresh is true %}<span class="pill pill-ok">fresh</span>{% elif j.dest.fresh is false %}<span class="pill pill-fail">stale</span>{% endif %}{% endif %}
           {% endif %}
         </dd>
         {% endif %}

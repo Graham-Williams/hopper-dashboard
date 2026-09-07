@@ -16,8 +16,11 @@
     {% if app_env != 'prod' %}<span class="env">{{ app_env }}</span>{% endif %}
   </a>
   <span class="spacer"></span>
+  {# login.html overrides this block to empty: a signed-out visitor has nothing to sign out of. #}
+  {% block nav %}
   <a href="{{ url_for('web.api_status') }}">JSON</a>
   <a href="{{ url_for('web.logout') }}">Sign out</a>
+  {% endblock %}
 </nav>
 <main>
 {% block content %}{% endblock %}

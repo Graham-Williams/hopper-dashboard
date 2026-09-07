@@ -58,8 +58,9 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
 - `__init__.py` — `create_app(role, settings=None, registry=None, notifier=None)`; wires limiters, filters.
 - `__main__.py` — local dev runner (both roles, Werkzeug).
 - `config.py` — `Settings` dataclass (`from_env()`); tests construct it directly.
-- `registry.py` — `jobs.yml` schema + strict validation → `Registry` of frozen `Job`s. Kinds, states, and
-  `DEST_FRESH_MULTIPLIER` (12) live here.
+- `registry.py` — `jobs.yml` schema + strict validation → `Registry` of frozen `Job`s. Kinds, states,
+  `PROBEABLE_KINDS` (`probe` block: required on db_snapshot, optional on rclone_copy_tree / manual — the
+  box's `gdrive-ro` remote can list `Backups/` and `Gremlins/`), and `DEST_FRESH_MULTIPLIER` (12) live here.
 - `db.py` — schema (`jobs` incl. `created_at`, `runs`, `probes`, `state_changes`), WAL connection, all
   queries, ISO helpers (`from_iso` clamps to 1970..9999 and never raises).
 - `state.py` — pure state machine: `compute_state(job, Facts, now)`, `lag_info`, `dest_info`,

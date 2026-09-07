@@ -23,6 +23,12 @@ KINDS = ("db_snapshot", "rclone_copy_tree", "drive_mirror", "container",
 SCHEDULED_KINDS = ("db_snapshot", "rclone_copy_tree", "drive_mirror",
                    "container", "probe")
 STATES = ("OK", "LATE", "FAIL", "STALE_DEST", "BEHIND", "UNKNOWN")
+# Kinds that may carry a ``probe`` block (the container lists the destination
+# itself). Required for db_snapshot; optional for copy trees and manual jobs
+# whose destination the box's read-only remote can see — when present, the
+# card's newest-object time + count come from the box instead of the Mac's
+# heartbeat metrics (which carry a count but no newest time).
+PROBEABLE_KINDS = ("db_snapshot", "rclone_copy_tree", "manual")
 
 _TOP_KEYS = {"id", "name", "machine", "kind", "protects", "method",
              "destination", "cadence_s", "grace_s", "probe", "manual",
@@ -200,7 +206,7 @@ def parse_job(raw: Any, index: int) -> Job:
         state_dir = _opt_str(probe_raw, "state_dir", ref)
         if rclone_path is None:
             raise _err(ref, "'probe.rclone_path' is required when 'probe' is given")
-        if kind not in ("db_snapshot", "rclone_copy_tree"):
+        if kind not in PROBEABLE_KINDS:
             raise _err(ref, f"kind {kind} cannot have a 'probe' block")
     if kind == "db_snapshot" and rclone_path is None:
         raise _err(ref, "db_snapshot requires probe.rclone_path")

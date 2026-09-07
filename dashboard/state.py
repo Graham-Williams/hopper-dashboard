@@ -95,28 +95,30 @@ def running_names(metrics: dict) -> set[str] | None:
     return None
 
 
+def _probe_ok(job: Job, f: Facts) -> bool:
+    """A probed job with a good box listing to read newest/count from. Until the
+    first successful probe (or after a failed one) the heartbeat metrics stand in
+    — so a copy tree keeps its Mac-reported ``dest_count`` and a db_snapshot
+    (whose heartbeat carries no dest_* metrics) simply has nothing to judge."""
+    return bool(job.has_probe and f.probe and f.probe.get("ok"))
+
+
 def _newest_epoch(job: Job, f: Facts) -> float | None:
-    if job.has_probe:
-        if f.probe and f.probe.get("ok") and f.probe.get("newest_iso"):
-            return from_iso(f.probe["newest_iso"])
-        return None
+    if _probe_ok(job, f):
+        return from_iso(f.probe.get("newest_iso"))
     return from_iso(f.last_metrics.get("dest_newest_iso"))
 
 
 def _newest_iso(job: Job, f: Facts) -> str | None:
-    if job.has_probe:
-        if f.probe and f.probe.get("ok"):
-            return f.probe.get("newest_iso")
-        return None
+    if _probe_ok(job, f):
+        return f.probe.get("newest_iso")
     v = f.last_metrics.get("dest_newest_iso")
     return v if isinstance(v, str) and from_iso(v) is not None else None
 
 
 def _dest_count(job: Job, f: Facts) -> int | None:
-    if job.has_probe:
-        if f.probe and f.probe.get("ok"):
-            return f.probe.get("count")
-        return None
+    if _probe_ok(job, f):
+        return f.probe.get("count")
     v = _num(f.last_metrics.get("dest_count"))
     return int(v) if v is not None else None
 

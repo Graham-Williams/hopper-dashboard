@@ -31,8 +31,8 @@
     {% if job.dest.newest or job.dest.count is not none or job.dest.probe_error %}
     <dt>Destination</dt>
     <dd>{% if job.dest.probe_error %}<span class="bad">probe failed:</span> {{ job.dest.probe_error }}{% else %}
-      newest {{ when(job.dest.newest, now) }}{% if job.dest.count is not none %} · {{ job.dest.count }} objects{% endif %}
-      {% if job.dest.fresh is true %}<span class="pill pill-ok">fresh</span>{% elif job.dest.fresh is false %}<span class="pill pill-fail">stale</span>{% endif %}
+      {% if job.dest.newest %}newest {{ when(job.dest.newest, now) }}{% endif %}{% if job.dest.count is not none %}{% if job.dest.newest %} · {% endif %}{{ job.dest.count }} object{{ '' if job.dest.count == 1 else 's' }}{% endif %}
+      {% if job.kind != 'rclone_copy_tree' %}{% if job.dest.fresh is true %}<span class="pill pill-ok">fresh</span>{% elif job.dest.fresh is false %}<span class="pill pill-fail">stale</span>{% endif %}{% endif %}
       {% if job.dest.probed_at %}<span class="muted">· probed {{ when(job.dest.probed_at, now) }}</span>{% endif %}{% endif %}</dd>
     {% endif %}
   </dl>

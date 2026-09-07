@@ -277,3 +277,51 @@ def test_state_reason_exposed_and_shown(authed, read, core, registry):
     assert j["state"] == "FAIL" and "tunnel-1" in j["state_reason"]
     html = authed.get("/").data.decode()
     assert "not running: tunnel-1" in html
+
+
+# --------------------------------------------------------------------------- #
+# Copy / layout fixes from browser QA
+# --------------------------------------------------------------------------- #
+
+def test_never_run_hint_is_well_formed_with_and_without_clause(authed):
+    html = authed.get("/").data.decode()
+    # 'info' has no max_age → sentence ends right after "yet"; 'offload' has one → the em-dash clause.
+    assert "No completion has been pinged yet.</p>" in html
+    assert "No completion has been pinged yet — the 14d max-age target is inert until the first" in html
+    assert "yet .</p>" not in html and " .</p>" not in html
+
+
+def test_dest_row_omits_unknown_newest_and_copy_tree_pill(authed, core, registry, read):
+    # Mac probe shape for a copy tree: a count but no newest-object time, with bytes missing.
+    core.record_ping(registry.get("tree"), {"status": "ok",
+                     "metrics": {"missing_bytes": 4096, "missing_files": 1, "dest_count": 1032}}, now=NOW)
+    for html in (authed.get("/").data.decode(), authed.get("/jobs/tree").data.decode()):
+        card = html[html.index('state-stale_dest'):]
+        row = card[card.index("1032 object"):card.index("</dd>", card.index("1032 object"))]
+        assert "newest" not in card[card.index("Dest") if "Dest" in card else 0:card.index("1032 object")]
+        assert "never" not in row and "1032 objects" in row
+        assert 'pill-fail">stale' not in row                   # STALE_DEST chip + Missing row already say it
+    j = {x["id"]: x for x in read.get("/api/v1/status", headers=bearer()).get_json()["jobs"]}["tree"]
+    assert j["dest"] == {"newest": None, "count": 1032, "fresh": False, "probed_at": None, "probe_error": None}
+
+
+def test_non_copy_tree_dest_row_keeps_pill_and_newest(authed, core, registry):
+    core.record_ping(registry.get("offload"), {"status": "metric", "metrics": {
+        "lag_bytes": 0, "dest_newest_iso": db.to_iso(NOW - 3600), "dest_count": 140}}, now=NOW)
+    html = authed.get("/").data.decode()
+    assert "newest <time" in html and "140 objects" in html and 'pill-ok">fresh' in html
+
+
+def test_login_page_has_no_nav_links_but_board_does(read_app, authed):
+    login = read_app.test_client().get("/login").data.decode()   # fresh, signed-out client
+    assert "Sign out" not in login and 'href="/api/v1/status"' not in login
+    assert "hopper-dashboard v" in login                       # footer stays
+    board = authed.get("/").data.decode()
+    assert "Sign out" in board and 'href="/api/v1/status"' in board
+
+
+def test_summary_timestamps_are_localizable_time_elements(authed, core):
+    core.recompute_all(now=time.time())
+    html = authed.get("/").data.decode()
+    assert "states computed <time datetime=" in html and "just now" in html
+    assert "generated <time datetime=" in html

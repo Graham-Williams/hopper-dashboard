@@ -118,3 +118,22 @@ def test_probe_block_only_for_probeable_kinds():
     doc["jobs"][2]["probe"] = {"rclone_path": "g:x"}
     with pytest.raises(RegistryError, match="cannot have a 'probe' block"):
         parse_registry(doc)
+
+
+def test_probe_block_optional_on_copy_tree_and_manual():
+    doc = copy.deepcopy(JOBS_DOC)
+    doc["jobs"][1]["probe"] = {"rclone_path": "gdrive-ro:Backups"}     # rclone_copy_tree
+    doc["jobs"][4]["probe"] = {"rclone_path": "gdrive-ro:Gremlins"}    # manual
+    reg = parse_registry(doc)
+    assert reg.get("tree").has_probe and reg.get("offload").has_probe
+    assert [j.id for j in reg.probed()] == ["snap", "tree", "offload"]
+    # Still optional: the same jobs without a probe block parse as before.
+    assert not parse_registry(JOBS_DOC).get("tree").has_probe
+
+
+@pytest.mark.parametrize("idx", [2, 3, 6])  # drive_mirror, container, probe
+def test_probe_block_rejected_on_other_kinds(idx):
+    doc = copy.deepcopy(JOBS_DOC)
+    doc["jobs"][idx]["probe"] = {"rclone_path": "g:x"}
+    with pytest.raises(RegistryError, match="cannot have a 'probe' block"):
+        parse_registry(doc)

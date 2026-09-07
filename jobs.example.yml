@@ -4,8 +4,10 @@
 # Fields: id ([a-z0-9-]+), name, machine (box|mac), kind, protects, method,
 #   destination (optional), cadence_s + grace_s (required for every kind except
 #   manual; LATE fires after cadence+grace of silence), probe.rclone_path +
-#   probe.state_dir (db_snapshot / rclone_copy_tree only — the container probes
-#   the destination itself), manual.max_age_s / manual.max_lag_bytes (manual
+#   probe.state_dir (required for db_snapshot; OPTIONAL for rclone_copy_tree and
+#   manual — the container lists the destination itself, so newest-object time +
+#   count come from the box; without it the card shows only what the Mac probe
+#   reports), manual.max_age_s / manual.max_lag_bytes (manual
 #   only; omit both for an informational job that never alerts), expect (container
 #   only — names that must appear in metrics.running), late_means (optional text
 #   shown when the job is LATE, e.g. "Mac offline or asleep").
@@ -91,6 +93,13 @@ jobs:
     grace_s: 50520              # 14 h + 2 min: a missed 03:00 run fires on wake; only LATE if the whole next day
                                 # passes. Mac sibling jobs keep grace_s >= mac-probe's + 120 so their deadline can
                                 # never land BEFORE the probe's (see drive-mirror).
+    # Optional box-side probe: the Mac heartbeat reports dest_count but no newest-object time, so the card
+    # says only "N objects". Uncomment to have the container list the destination itself (newest + count,
+    # plus a "Destination probes" table on the job page). The box remote MUST be able to see the path —
+    # the read-only gdrive-ro (scope drive.readonly, DEPLOY.md §1b) can; a drive.file-scope remote cannot.
+    # Check first: RCLONE_CONFIG=~/.config/rclone/dashboard-ro.conf rclone lsd gdrive-ro:Backups
+    # probe:
+    #   rclone_path: gdrive-ro:Backups
 
   - id: drive-mirror
     name: Google Drive mirror
@@ -128,6 +137,11 @@ jobs:
       # first successful offload, seed one: probes/ping.sh minecraft-offload ok "seeded" (DEPLOY.md §4).
       max_age_s: 1209600          # 14 days
       max_lag_bytes: 21474836480  # 20 GB
+    # Optional box-side probe (same rule as pa-backup: the box remote must see the path — gdrive-ro can).
+    # Adds newest-object time + count from Drive; the fresh/stale pill then compares newest against
+    # max_age_s. ~1 GB+ of recordings is many objects, so the listing takes a few seconds per cycle.
+    # probe:
+    #   rclone_path: gdrive-ro:Gremlins
 
   - id: taste-twin-publish
     name: taste-twin report publish
