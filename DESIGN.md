@@ -60,9 +60,11 @@ Inputs:
      (weekly, from either machine): `rclone size gdrive: --drive-root-folder-id <root-id> --json` per root vs
      local byte count (skip symlinks, `.DS_Store`, 0-byte). The four folder ids involved — the computer
      root `<my-mac-root-id>` and the mirrored folders `<documents-root-id>`, `<desktop-root-id>`,
-     `<minecraft-channel-root-id>` — live ONLY in the gitignored `jobs.yml` / operator notes, never in this
-     repo (they are not credentials, but they identify a private Drive layout). Discovery command for a
-     fresh setup:
+     `<minecraft-channel-root-id>` — live ONLY as a YAML **comment** under `drive-mirror` in the gitignored
+     `jobs.yml` and in the operator notes (Hopper's memory), never in this repo (they are not credentials,
+     but they identify a private Drive layout). They are notes, not config: the schema has no field for them
+     (`registry.py` rejects unknown keys) and `probes/drivefs.py` discovers the roots from the DriveFS DB, so
+     the ids only serve this manual `rclone size` cross-check. Discovery command for a fresh setup:
      `rclone backend query gdrive: "mimeType='application/vnd.google-apps.folder' and 'me' in owners and trashed=false"`
      → keep entries with no `parents`. Bytes matched exactly local↔cloud on 2026-09-04 for all three roots;
      the only recurring log errors are 3 symlinks in a venv that Drive can't upload (benign).
@@ -180,7 +182,9 @@ Ingest (Tailscale-only port, default 8081):
   Responds `{"ok": true, "state": "<computed state>"}`.
 - `GET /healthz` → 200 on both ports.
 
-Read side (behind the tunnel + password gate; also accepts `Authorization: Bearer <READ_TOKEN>` for Hopper):
+Read side (behind the tunnel + password gate; also accepts `Authorization: Bearer <READ_TOKEN>` for Hopper —
+whose reads go through the public hostname, `https://dashboard.graham-williams.com/api/v1/status`; a loopback
+read from inside the container must send `Host: <APP_HOST>` or the Host pin answers 403):
 - `GET /api/v1/status` → `{"generated_at": …, "summary": {"ok": n, "late": n, …},
   "jobs": [{"id", "name", "machine", "kind", "state", "since", "last_run", "last_success",
             "cadence_s", "grace_s", "destination", "protects", "method", "lag": {...}|null,

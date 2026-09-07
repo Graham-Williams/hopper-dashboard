@@ -47,10 +47,17 @@ grep -E '^(APP_PASSWORD|SESSION_SECRET|INGEST_TOKEN|READ_TOKEN)=change-me' .env 
 
 # jobs.yml — never committed (real Drive folder ids + machine topology).
 cp jobs.example.yml jobs.yml
-# drive-mirror root ids (My Mac / Documents / Desktop / minecraft-channel) are NOT in the repo: take them
-# from the operator notes (personal-assistant memory) or rediscover with the `rclone backend query` in
-# DESIGN.md → drive_mirror, then add them to jobs.yml. They are folder ids, not secrets, but they stay out
-# of the public repo. Verify the container-name list under box-containers.expect against `docker ps`.
+# jobs.yml must be world-readable: the container reads it as uid 10001. A `umask 077` shell (e.g. after the
+#   rclone-conf step below) produces a 0600 file and the container restart-loops with
+#   `PermissionError: /app/jobs.yml`.
+chmod 644 jobs.yml
+# drive-mirror root ids (My Mac / Documents / Desktop / minecraft-channel) are NOT in the repo. They are NOT
+# config either: registry.py rejects unknown keys, and probes/drivefs.py discovers the mirrored roots from the
+# DriveFS DB itself. Keep them as the YAML COMMENT under drive-mirror (placeholder shipped in jobs.example.yml)
+# and in the operator notes (personal-assistant memory) — their only use is the independent
+# `rclone size gdrive: --drive-root-folder-id <id>` cross-check in DESIGN.md → drive_mirror, which is also
+# where the rediscovery command lives. Folder ids, not secrets, but they stay out of the public repo.
+# Verify the container-name list under box-containers.expect against `docker ps`.
 ```
 
 ### 1b. Read-only rclone remote for the probes (least privilege)
@@ -184,11 +191,20 @@ Verify within 5 minutes (the backup timers tick every 5 min, so all three box jo
 ```bash
 systemctl list-timers --no-pager | grep -E 'km-backup|todoist-points-backup|dashboard-containers'
 journalctl -u dashboard-containers.service -n 3 --no-pager          # "sent box-containers ok → HTTP 200"
-journalctl -u km-backup.service -n 20 --no-pager | grep -i curl      # should be silent; errors would show here
-# read side, inside the container with the READ_TOKEN (no cookie needed; curl is not in the image):
+journalctl -u km-backup.service -n 20 --no-pager | grep -i curl      # one line per run; healthy looks like:
+#   km-backup.service … curl[1234]: {"ok":true,"state":"OK"}         # -fsS prints the body on success (not silent)
+#   a wrong URL/token shows `curl: (22) The requested URL returned error: 401` (or a connection error) instead
+# read side, inside the container with the READ_TOKEN (no cookie needed; curl is not in the image).
+# The read role pins Host to APP_HOST on every route except /healthz, so a bare 127.0.0.1 request is a 403 —
+# pass the public hostname as the Host header:
 RT="$(grep '^READ_TOKEN=' ~/hopper-dashboard/.env | cut -d= -f2-)"
-docker exec -e RT="$RT" hopper-dashboard python -c "import os,json,urllib.request as u; r=u.Request('http://127.0.0.1:8080/api/v1/status', headers={'Authorization':'Bearer '+os.environ['RT']}); d=json.load(u.urlopen(r, timeout=5)); print(d['summary']); print([(j['id'], j['state']) for j in d['jobs']])"
+AH="$(grep '^APP_HOST=' ~/hopper-dashboard/.env | cut -d= -f2-)"
+docker exec -e RT="$RT" -e AH="$AH" hopper-dashboard python -c "import os,json,urllib.request as u; r=u.Request('http://127.0.0.1:8080/api/v1/status', headers={'Authorization':'Bearer '+os.environ['RT'],'Host':os.environ['AH']}); d=json.load(u.urlopen(r, timeout=5)); print(d['summary']); print([(j['id'], j['state']) for j in d['jobs']])"
 ```
+
+The in-container read is only for verifying before §3 is wired. Hopper's normal bearer read goes through the
+public hostname — `curl -sS -H "Authorization: Bearer $READ_TOKEN" https://dashboard.graham-williams.com/api/v1/status`
+— which carries the right Host by construction.
 
 `km-backup`, `todoist-points-backup`, `box-containers` should be `OK`; the Mac jobs are still `UNKNOWN` (they
 turn `LATE` on their own after cadence+grace if the Mac probe is never installed — that is the point).
@@ -230,20 +246,35 @@ points at a directory that vanishes when the worktree is removed and the hourly 
 (`launchctl list` shows a non-zero exit). Switching branches in place needs no reinstall (same path);
 moving the checkout does (re-run `install.sh`).
 
+**Non-interactive path (what the real deploy used — Hopper runs this with no prompts).** The installer leaves an
+existing env file alone, so pre-create it with the token pulled over ssh; the token never touches a command
+line, shell history or `ps` on the Mac:
+
 ```bash
 cd ~/code/hopper-dashboard && git pull                              # on the branch being deployed
-deploy/mac/install.sh --url http://<box-tailscale-ip>:8081        # then type the INGEST_TOKEN at the HIDDEN prompt
+mkdir -p ~/.config/hopper-dashboard && chmod 700 ~/.config/hopper-dashboard
+( umask 077; {
+    echo "DASHBOARD_URL=http://<box-tailscale-ip>:8081"
+    echo "INGEST_TOKEN=$(ssh <user>@<box-tailscale-ip> "grep '^INGEST_TOKEN=' ~/hopper-dashboard/.env | cut -d= -f2-")"
+  } > ~/.config/hopper-dashboard/env )
+grep -q '^INGEST_TOKEN=..*' ~/.config/hopper-dashboard/env || echo "STOP: empty token (ssh failed?)"
+ls -l ~/.config/hopper-dashboard/env                                # must be -rw------- (0600)
+deploy/mac/install.sh                                               # prints "env file exists, leaving it alone", no prompts
 ```
 
-**Never put the token on the command line** (`--token` is rejected: it would land in shell history and
-`ps`). The script prompts with a silent `read`; paste the value from the box `.env`. If `--url` is omitted it
-prompts for that too (there is no default URL in the code).
+**Interactive alternative:** `deploy/mac/install.sh --url http://<box-tailscale-ip>:8081` and type the
+`INGEST_TOKEN` at the hidden prompt. **Never put the token on the command line** (`--token` is rejected: it
+would land in shell history and `ps`). If `--url` is omitted it prompts for that too (there is no default URL
+in the code).
 
 What it does (idempotent): writes `~/.config/hopper-dashboard/env` (chmod 600, never overwritten if present),
 renders `deploy/mac/com.hopper.dashboard-probe.plist` → `~/Library/LaunchAgents/` with absolute paths
 (`/usr/bin/python3`, `~/code/hopper-dashboard/probes/mac_probe.py`), `launchctl bootout` + `bootstrap`, then
 runs `probes/mac_probe.py --dry-run` and prints the pings it would send. `RunAtLoad` means the first real run
-happens immediately; then hourly (`StartInterval 3600`), and again after every login/wake.
+is triggered by the `bootstrap` itself — it takes **~100 s** (three `rclone check` trees for `pa-backup` plus
+the minecraft pairs; `launchctl list | grep hopper` shows a PID while it runs, then exit `0`), so don't read
+"still UNKNOWN" as a failure for the first couple of minutes; then hourly (`StartInterval 3600`), and again
+after every login/wake.
 
 The probe posts:
 - `pa-backup` — last line of `~/Library/Logs/hopper-backup.log` as an `ok`/`fail` run (**once per new line**,
@@ -305,6 +336,12 @@ would page for the sibling first, then again for the probe.
 `taste-twin-publish`, `jjho-refresh` and `baby-pool-sync` have nothing to compute on a timer; they are
 `kind: manual` with a max-age target, and the run that Hopper performs by hand ends by pinging:
 
+**Day one they show `UNKNOWN` — "never heard from" / "Never run" on the card — and that is expected, not a
+defect.** Nothing pings a manual job automatically; each stays `UNKNOWN` until Hopper's next real run of that
+task ends with `probes/ping.sh <job> ok`. (The max-age target is inert until that first ping, so they don't
+alert either.) Only `minecraft-offload` is worth seeding by hand (§4); leave these three alone until the
+work actually happens.
+
 ```bash
 P=~/code/hopper-dashboard/probes/ping.sh
 # taste-twin (Mac; runs the pipeline on the residential IP then ships the report to the box)
@@ -362,9 +399,9 @@ restore data; the dashboard's own SQLite is derived state that repopulates withi
 | Component | Quiet failure mode | What catches it / how to check |
 |---|---|---|
 | App container down | Every job goes `LATE` at once; no alerts because the alerter is the thing that died | `dashboard-probes` self-heartbeat is a job — but it can't alert on itself. Hopper's weekly health watch must hit `/healthz`; `docker ps` on the box. Consider an external dead-man (Healthchecks.io) later. |
-| Container restart-looping on config | Board unreachable, `docker ps` shows `Restarting` | `docker logs hopper-dashboard` → `ConfigError` (missing APP_PASSWORD/SESSION_SECRET) or `jobs.yml:` validation error. Loud by design. |
+| Container restart-looping on config | Board unreachable, `docker ps` shows `Restarting` | `docker logs hopper-dashboard` → `ConfigError` (missing APP_PASSWORD/SESSION_SECRET), `jobs.yml:` validation error, or `PermissionError: /app/jobs.yml` (file is 0600 from a `umask 077` shell; the container reads it as uid 10001 → `chmod 644 jobs.yml`). Loud by design. |
 | Ingest bound to `0.0.0.0` | Token-only protection exposed to the LAN | `ss -ltnp \| grep 8081` on the box; `INGEST_BIND` in `.env` |
-| Drop-in not loaded (no `daemon-reload`, typo in path) | Backups run fine, dashboard shows `km-backup` `UNKNOWN` then **`LATE` after cadence+grace** — looks like a backup problem | `systemctl cat km-backup.service` must show `heartbeat.conf`; `journalctl -u km-backup.service` shows curl errors if the URL/token are wrong (`-fsS` prints them). The never-pinged → LATE rule exists so this can't stay `UNKNOWN` forever. |
+| Drop-in not loaded (no `daemon-reload`, typo in path) | Backups run fine, dashboard shows `km-backup` `UNKNOWN` then **`LATE` after cadence+grace** — looks like a backup problem | `systemctl cat km-backup.service` must show `heartbeat.conf` **and** its `ExecStopPost=` line; `journalctl -u km-backup.service` shows `curl[…]: {"ok":true,"state":"OK"}` per run when healthy and curl errors if the URL/token are wrong (`-fsS` prints both). The never-pinged → LATE rule exists so this can't stay `UNKNOWN` forever. |
 | `/etc/hopper-dashboard/ingest.env` missing/rotated token | `ExecStopPost` curl 401s, silently ignored (`-` prefix) → `LATE` | `journalctl -u km-backup.service \| grep 401`; compare token with box `.env` |
 | Backup script exit 0 on skipped push | Heartbeat says `ok` while Drive hasn't received anything new | That's what the app's destination probe (`db_snapshot` newest object vs `db_sha256`) is for → `STALE_DEST` |
 | Read-only rclone remote's token revoked/expired | Every `db_snapshot` probe errors → `dashboard-probes` `FAIL` with `rclone exit …` in the note; `dest.probe_error` on the cards | Re-run the `rclone authorize` flow in §1b; `RCLONE_CONFIG=~/.config/rclone/dashboard-ro.conf rclone lsd gdrive-ro:` on the box |

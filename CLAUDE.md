@@ -102,6 +102,9 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   only fires in the tests that set `created_at` explicitly. Remember this when a new test uses a fixed clock.
 - Machine IPs, account ids and Drive folder ids never go in code, tests or docs — use
   `<box-tailscale-ip>`-style placeholders; real values live in the gitignored `.env`/`jobs.yml`/env files.
+- Hopper's bearer reads go through the public hostname (`https://dashboard.graham-williams.com/api/v1/status`
+  with `Authorization: Bearer $READ_TOKEN`) — that is the intended path. An in-container read against
+  `127.0.0.1:8080` must also send `Host: <APP_HOST>` or the Host pin returns 403 (only `/healthz` is exempt).
 
 ## Git workflow
 Feature branches only; `main` is protected and only Graham merges (via PR). Commit/push freely on branches.
