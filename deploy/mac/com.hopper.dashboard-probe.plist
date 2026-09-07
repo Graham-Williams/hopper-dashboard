@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  hopper-dashboard Mac probe. TEMPLATE: deploy/mac/install.sh replaces @@REPO@@ and @@HOME@@ with
+  absolute paths and writes the result to ~/Library/LaunchAgents/. launchd gives the job a minimal
+  PATH, so the interpreter is the stock /usr/bin/python3 and rclone is resolved by absolute path
+  inside the probe. Hourly + RunAtLoad so it fires right after login/wake (a sleeping Mac just
+  shows up on the dashboard as "mac-probe not heard from", which is itself the signal).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.hopper.dashboard-probe</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>@@REPO@@/probes/mac_probe.py</string>
+        <string>--quiet</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>3600</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOPPER_DASHBOARD_ENV</key>
+        <string>@@HOME@@/.config/hopper-dashboard/env</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>@@HOME@@/Library/Logs/hopper-dashboard-probe.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>@@HOME@@/Library/Logs/hopper-dashboard-probe.err.log</string>
+</dict>
+</plist>

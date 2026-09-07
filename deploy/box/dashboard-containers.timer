@@ -1,0 +1,17 @@
+# Fires dashboard-containers.service every 5 minutes (matches the backup timers' cadence, so the
+# box-containers job can use the same cadence/grace in jobs.yml).
+#
+# OnCalendar (wall-clock) rather than OnUnitActiveSec: Persistent=true only has meaning for
+# calendar timers (it fires a missed tick right after boot/suspend), and OnUnitActiveSec never
+# starts on its own after enable — it needs a first activation. OnBootSec covers the first run.
+[Unit]
+Description=Run hopper-dashboard container heartbeat every 5 minutes
+
+[Timer]
+OnBootSec=3min
+OnCalendar=*:0/5
+Persistent=true
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

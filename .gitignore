@@ -4,12 +4,16 @@
 !.env.example
 jobs.yml
 *.token
+rclone.conf
+*.conf.bak
+ingest.env
 
 # runtime state
 data/
 *.db
 *.db-wal
 *.db-shm
+*.sqlite*
 *.log
 
 # python
@@ -27,3 +31,6 @@ dist/
 .DS_Store
 .idea/
 .vscode/
+
+# local scratch
+.scratch/

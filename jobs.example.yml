@@ -1,0 +1,168 @@
+# Job registry — copy to jobs.yml (gitignored) and edit. Every job that pings
+# /api/v1/ping/<id> MUST be declared here; unknown ids are rejected (404).
+#
+# Fields: id ([a-z0-9-]+), name, machine (box|mac), kind, protects, method,
+#   destination (optional), cadence_s + grace_s (required for every kind except
+#   manual; LATE fires after cadence+grace of silence), probe.rclone_path +
+#   probe.state_dir (required for db_snapshot; OPTIONAL for rclone_copy_tree and
+#   manual — the container lists the destination itself, so newest-object time +
+#   count come from the box; without it the card shows only what the Mac probe
+#   reports), manual.max_age_s / manual.max_lag_bytes (manual
+#   only; omit both for an informational job that never alerts), expect (container
+#   only — names that must appear in metrics.running), late_means (optional text
+#   shown when the job is LATE, e.g. "Mac offline or asleep").
+jobs:
+  # ------------------------------------------------------------------ box --
+  - id: km-backup
+    name: km-tracker DB → Drive
+    machine: box
+    kind: db_snapshot
+    protects: km-tracker SQLite (prod game-night history)
+    method: systemd timer every 5 min → sqlite backup API → sha256 dedup → rclone copy (additive) → Drive
+    destination: gdrive:km-tracker-backups
+    cadence_s: 300
+    grace_s: 900
+    probe:
+      rclone_path: gdrive:km-tracker-backups
+      state_dir: /state/km
+
+  - id: todoist-points-backup
+    name: todoist-points DB → Drive
+    machine: box
+    kind: db_snapshot
+    protects: todoist-points ledger SQLite (points earned/spent)
+    method: systemd timer every 5 min → sqlite backup API → sha256 dedup → rclone copy (additive) → Drive
+    destination: gdrive:todoist-points-backups
+    cadence_s: 300
+    grace_s: 900
+    probe:
+      rclone_path: gdrive:todoist-points-backups
+      state_dir: /state/todoist
+
+  - id: box-containers
+    name: Box containers
+    machine: box
+    kind: container
+    protects: Every self-hosted app + the Cloudflare tunnel that fronts them
+    method: host cron posts `docker ps` running names every 5 min; FAIL if any expected name is missing
+    cadence_s: 300
+    grace_s: 600
+    expect:
+      - km-tracker-app-1
+      - km-tracker-staging-app-1
+      - km-tracker-cloudflared-1
+      - todoist-points-todoist-points-1   # compose project + service name (verified with `docker ps`)
+      - taste-twin
+      - baby-pool
+      - jjho-fan-almanac
+      # The SMS bridge stack is sunset (2026-08-03) but its containers are `restart: unless-stopped`
+      # and still running; if they vanish something happened on the box (reboot without restart,
+      # a `docker compose down`, disk pressure) — that is a box event worth seeing, so they stay listed.
+      - hopper-messaging-synapse-1
+      - hopper-messaging-postgres-1
+      - hopper-messaging-gmessages-1
+
+  - id: dashboard-probes
+    name: Dashboard probe cycle
+    machine: box
+    kind: probe
+    protects: This dashboard's own destination probes (the watcher is watched)
+    method: in-container scheduler records a run every probe cycle; FAIL if any rclone probe errors
+    cadence_s: 300
+    grace_s: 600
+
+  # ------------------------------------------------------------------ mac --
+  - id: mac-probe
+    name: Mac probe
+    machine: mac
+    kind: probe
+    protects: Visibility into everything Mac-side (backup log, offload lag, disk, Drive mirror)
+    method: launchd com.hopper.dashboard-probe hourly (+ RunAtLoad) posts metrics over Tailscale
+    cadence_s: 3600
+    grace_s: 50400              # 14 h: the Mac sleeps overnight; LATE only past a full night + a working day
+    late_means: Not heard from the Mac in 15 hours — it is probably offline or asleep, not broken.
+
+  - id: pa-backup
+    name: personal-assistant → Drive
+    machine: mac
+    kind: rclone_copy_tree
+    protects: Hopper's docs, memory, scripts and logs (~/personal-assistant)
+    method: nightly launchd rclone copy → gdrive:Backups; Mac probe reports missing (never uploaded) vs differ (edited since) via rclone check
+    destination: gdrive:Backups
+    cadence_s: 86400
+    grace_s: 50520              # 14 h + 2 min: a missed 03:00 run fires on wake; only LATE if the whole next day
+                                # passes. Mac sibling jobs keep grace_s >= mac-probe's + 120 so their deadline can
+                                # never land BEFORE the probe's (see drive-mirror).
+    # Optional box-side probe: the Mac heartbeat reports dest_count but no newest-object time, so the card
+    # says only "N objects". Uncomment to have the container list the destination itself (newest + count,
+    # plus a "Destination probes" table on the job page). The box remote MUST be able to see the path —
+    # the read-only gdrive-ro (scope drive.readonly, DEPLOY.md §1b) can; a drive.file-scope remote cannot.
+    # Check first: RCLONE_CONFIG=~/.config/rclone/dashboard-ro.conf rclone lsd gdrive-ro:Backups
+    # probe:
+    #   rclone_path: gdrive-ro:Backups
+
+  - id: drive-mirror
+    name: Google Drive mirror
+    machine: mac
+    kind: drive_mirror
+    protects: Documents, Desktop and minecraft-channel mirrored by Drive for Desktop
+    method: Mac probe reads DriveFS mirror_sqlite.db (pending uploads + local/cloud mismatches); BEHIND if any
+    # Operator notes (NOT config — unknown keys are rejected; the probe discovers roots from the DriveFS DB).
+    # Drive folder ids of the mirrored roots, for the independent cross-check
+    #   rclone size gdrive: --drive-root-folder-id <id> --json     (DESIGN.md → drive_mirror)
+    # Fill in from the operator notes in the real jobs.yml; never commit real ids.
+    #   My Mac (computer root):  <my-mac-root-id>
+    #   Documents:               <documents-root-id>
+    #   Desktop:                 <desktop-root-id>
+    #   minecraft-channel:       <minecraft-channel-root-id>
+    cadence_s: 3600
+    grace_s: 50520              # 14 h + 2 min, same reasoning as mac-probe (nightly sleep). While mac-probe is LATE the
+                                # dashboard sends ONE "Mac offline" alert and suppresses the other Mac jobs' LATE alerts
+                                # (and their plain LATE→OK recoveries until mac-probe itself recovers).
+                                # Why +120 s over mac-probe's grace: the probe posts this job's ping a few seconds
+                                # BEFORE its own heartbeat, so with equal graces this deadline falls first, and a
+                                # ticker tick landing in that gap would alert "drive-mirror → LATE" while mac-probe
+                                # is still OK — then a second alert for mac-probe. A strictly later deadline (≥ one
+                                # 60 s tick + margin) makes the suppression unconditional.
+
+  - id: minecraft-offload
+    name: Minecraft recordings offload
+    machine: mac
+    kind: manual
+    protects: OBS recordings, world backups and Flashback replays (~/minecraft-channel)
+    method: /offload-recordings skill (rclone copy → verify → stage); Mac probe reports bytes not yet on Drive
+    destination: gdrive:Gremlins
+    manual:
+      # max_age_s is inert until the FIRST real run ping (there is no "last success" to age). After the
+      # first successful offload, seed one: probes/ping.sh minecraft-offload ok "seeded" (DEPLOY.md §4).
+      max_age_s: 1209600          # 14 days
+      max_lag_bytes: 21474836480  # 20 GB
+    # Optional box-side probe (same rule as pa-backup: the box remote must see the path — gdrive-ro can).
+    # Adds newest-object time + count from Drive; the fresh/stale pill then compares newest against
+    # max_age_s. ~1 GB+ of recordings is many objects, so the listing takes a few seconds per cycle.
+    # probe:
+    #   rclone_path: gdrive-ro:Gremlins
+
+  - id: taste-twin-publish
+    name: taste-twin report publish
+    machine: mac
+    kind: manual
+    protects: Friend-facing Letterboxd taste reports on taste-twin.graham-williams.com
+    method: python scripts/publish.py <user> from the Mac (residential IP), then docker cp into the box volume
+    destination: box volume taste-twin_taste-twin-data
+
+  - id: jjho-refresh
+    name: JJHo transcript refresh
+    machine: mac
+    kind: manual
+    protects: JJHo Fan Almanac episode index + transcripts
+    method: on-demand via Hopper — scrape/Whisper on the Mac, ship the DB to the box
+    destination: box volume jjho-fan-almanac_jjho-data
+
+  - id: baby-pool-sync
+    name: baby-pool entries sync
+    machine: mac
+    kind: manual
+    protects: Baby pool entries served at baby-pool.graham-williams.com
+    method: on-demand via Hopper — Sheet Raw tab → build_entries.py → scp entries.json to the box
+    destination: box ~/baby-pool/data/entries.json

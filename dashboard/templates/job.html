@@ -1,0 +1,111 @@
+{% extends "base.html" %}
+{% from "_macros.html" import chip, when, history_strip %}
+{% block title %}{{ job.name }} — Hopper Dashboard{% endblock %}
+{% block content %}
+<p class="crumbs"><a href="{{ url_for('web.index') }}">← Board</a></p>
+<article class="card detail state-{{ job.state|lower }}">
+  <header>
+    {{ chip(job.state) }}
+    <h1>{{ job.name }}</h1>
+    <span class="kind">{{ job.machine }} · {{ job.kind.replace('_',' ') }} · <code>{{ job.id }}</code></span>
+  </header>
+  {% if job.state_reason %}<p class="hint">{{ job.state_reason }}</p>{% endif %}
+  <dl>
+    <dt>Protects</dt><dd>{{ job.protects }}</dd>
+    <dt>Method</dt><dd>{{ job.method }}</dd>
+    {% if job.destination %}<dt>Destination</dt><dd><code>{{ job.destination }}</code></dd>{% endif %}
+    <dt>State since</dt><dd>{{ when(job.since, now) }}</dd>
+    <dt>Last run</dt><dd>{{ when(job.last_run, now) }}{% if job.last_run_status %} <span class="pill pill-{{ job.last_run_status }}">{{ job.last_run_status }}</span>{% endif %}</dd>
+    <dt>Last success</dt><dd>{{ when(job.last_success, now) }}</dd>
+    {% if job.cadence_s %}<dt>Cadence</dt><dd>every {{ job.cadence_s|human_duration }} (+{{ job.grace_s|human_duration }} grace)</dd>{% endif %}
+    {% if job.kind == 'manual' and job.never_run %}
+    <dt>Status</dt><dd><strong>Never run</strong> — no completion pinged yet{% if job.lag and job.lag.max_age_s %}; the max-age target is inert until the first <code>ping.sh {{ job.id }} ok</code>{% endif %}</dd>
+    {% endif %}
+    {% if job.lag %}
+    <dt>{{ 'Missing' if job.kind == 'rclone_copy_tree' else 'Behind' }}</dt><dd>{{ job.lag.bytes|human_bytes if job.lag.bytes is not none else '—' }}
+      {% if job.lag.files is not none %}<span class="muted">· {{ job.lag.files }} file{{ '' if job.lag.files == 1 else 's' }}{% if job.kind == 'rclone_copy_tree' %} never uploaded{% endif %}</span>{% endif %}
+      {% if job.lag.max_bytes %}<span class="muted">of {{ job.lag.max_bytes|human_bytes }}</span>{% endif %}
+      {% if job.lag.age_s is not none %}<span class="muted">· age {{ job.lag.age_s|human_duration }}{% if job.lag.max_age_s %} / {{ job.lag.max_age_s|human_duration }}{% endif %}</span>{% endif %}
+      {% if job.lag.differ_files is not none %}<br><span class="muted">{{ job.lag.differ_files }} file{{ '' if job.lag.differ_files == 1 else 's' }}{% if job.lag.differ_bytes is not none %} / {{ job.lag.differ_bytes|human_bytes }}{% endif %} edited since last copy (informational, never stale)</span>{% endif %}</dd>
+    {% endif %}
+    {% if job.dest.newest or job.dest.count is not none or job.dest.probe_error %}
+    <dt>Destination</dt>
+    <dd>{% if job.dest.probe_error %}<span class="bad">probe failed:</span> {{ job.dest.probe_error }}{% else %}
+      {% if job.dest.newest %}newest {{ when(job.dest.newest, now) }}{% endif %}{% if job.dest.count is not none %}{% if job.dest.newest %} · {% endif %}{{ job.dest.count }} object{{ '' if job.dest.count == 1 else 's' }}{% endif %}
+      {% if job.kind != 'rclone_copy_tree' %}{% if job.dest.fresh is true %}<span class="pill pill-ok">fresh</span>{% elif job.dest.fresh is false %}<span class="pill pill-fail">stale</span>{% endif %}{% endif %}
+      {% if job.dest.probed_at %}<span class="muted">· probed {{ when(job.dest.probed_at, now) }}</span>{% endif %}{% endif %}</dd>
+    {% endif %}
+  </dl>
+  <footer>{{ history_strip(job.history or []) }}</footer>
+</article>
+
+<section class="panel">
+  <h2>Last metrics</h2>
+  {% if job.last_metrics %}
+  <div class="tablewrap"><table class="kv">
+    {% for k, v in job.last_metrics.items() %}
+    <tr><th>{{ k }}</th><td><code>{{ v }}</code>{% if k.endswith('bytes') and v is number %} <span class="muted">({{ v|human_bytes }})</span>{% endif %}</td></tr>
+    {% endfor %}
+  </table></div>
+  {% else %}<p class="muted">No metrics reported yet.</p>{% endif %}
+</section>
+
+<section class="panel">
+  <h2>Runs <span class="muted">({{ d.runs|length }})</span></h2>
+  {% if d.runs %}
+  <div class="tablewrap"><table>
+    <thead><tr><th>Received</th><th>Status</th><th>Reason</th><th>Exit</th><th>Note</th><th>Source</th></tr></thead>
+    <tbody>
+    {% for r in d.runs %}
+    <tr>
+      <td>{{ when(r.received_at, now) }}</td>
+      <td><span class="pill pill-{{ r.status }}">{{ r.status }}</span></td>
+      <td>{{ r.reason or '' }}</td>
+      <td>{{ r.exit_code if r.exit_code is not none else '' }}</td>
+      <td class="note">{{ r.note or '' }}</td>
+      <td class="muted">{{ r.source }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}<p class="muted">Never heard from.</p>{% endif %}
+</section>
+
+<section class="panel">
+  <h2>State changes <span class="muted">({{ d.state_changes|length }})</span></h2>
+  {% if d.state_changes %}
+  <div class="tablewrap"><table>
+    <thead><tr><th>When</th><th>From</th><th>To</th><th>Why</th></tr></thead>
+    <tbody>
+    {% for c in d.state_changes %}
+    <tr><td>{{ when(c.changed_at, now) }}</td><td>{{ chip(c.from_state) }}</td><td>{{ chip(c.to_state) }}</td><td class="note">{{ c.reason or '' }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}<p class="muted">No transitions yet.</p>{% endif %}
+</section>
+
+{% if d.probes is not none %}
+<section class="panel">
+  <h2>Destination probes <span class="muted">({{ d.probes|length }})</span></h2>
+  {% if d.probes %}
+  <div class="tablewrap"><table>
+    <thead><tr><th>Probed</th><th>OK</th><th>Newest object</th><th>Count</th><th>State sha</th><th>Last push</th><th>Error</th></tr></thead>
+    <tbody>
+    {% for p in d.probes %}
+    <tr>
+      <td>{{ when(p.probed_at, now) }}</td>
+      <td>{{ 'yes' if p.ok else 'no' }}</td>
+      <td>{{ when(p.newest_iso, now) }}</td>
+      <td>{{ p.count if p.count is not none else '' }}</td>
+      <td><code>{{ p.state_sha[:12] if p.state_sha else '' }}</code></td>
+      <td>{{ p.state_push_epoch or '' }}</td>
+      <td class="note">{{ p.error or '' }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}<p class="muted">Not probed yet.</p>{% endif %}
+</section>
+{% endif %}
+{% endblock %}

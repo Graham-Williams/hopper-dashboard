@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% from "_macros.html" import chip, when, history_strip %}
+{% block content %}
+{% set s = status.summary %}
+<section class="summary" aria-label="Summary">
+  {% for key, label in [('ok','OK'),('late','Late'),('fail','Fail'),('stale_dest','Stale dest'),('behind','Behind'),('unknown','Unknown')] %}
+  <div class="tile tile-{{ key }} {% if s[key] == 0 %}zero{% endif %}">
+    <span class="n">{{ s[key] }}</span><span class="l">{{ label }}</span>
+  </div>
+  {% endfor %}
+  <div class="tile meta">
+    <span class="l">{{ s.total }} jobs · generated {{ when(status.generated_at, now) }}</span>
+    <span class="l">states computed {{ when(s.computed_at, now) }}</span>
+  </div>
+</section>
+
+{% if scheduler_stale %}
+<div class="banner warn">
+  <strong>Scheduler may be stale.</strong> No state was recomputed in the last 5 minutes — the ingest
+  process or its scheduler thread may be down. LATE will not fire until it recovers.
+</div>
+{% endif %}
+
+{% for machine, jobs in groups %}
+<section class="group">
+  <h2><span class="machine machine-{{ machine }}">{{ {'box':'Box','mac':'Mac'}[machine] }}</span>
+      <span class="muted">{{ jobs|length }} job{{ '' if jobs|length == 1 else 's' }}</span></h2>
+  {% if not jobs %}<p class="muted">No jobs declared for this machine.</p>{% endif %}
+  <div class="cards">
+  {% for j in jobs %}
+    <article class="card state-{{ j.state|lower }}" id="job-{{ j.id }}">
+      <header>
+        {{ chip(j.state) }}
+        <h3><a href="{{ url_for('web.job_page', job_id=j.id) }}">{{ j.name }}</a></h3>
+        <span class="kind">{{ j.kind.replace('_',' ') }}</span>
+      </header>
+      {% if j.state not in ('OK', 'UNKNOWN') and j.state_reason %}
+      <p class="hint">{{ j.state_reason }}{% if j.state == 'FAIL' and j.last_run_note %} — {{ j.last_run_note }}{% endif %}</p>
+      {% endif %}
+      {% if j.kind == 'manual' and j.never_run %}
+      {# Keep the optional clause and the closing period on ONE line: template whitespace between them
+         renders as a stray space before the "." when the clause is absent. #}
+      <p class="hint never-run"><strong>Never run.</strong> No completion has been pinged yet{% if j.lag and j.lag.max_age_s %} — the {{ j.lag.max_age_s|human_duration }} max-age target is inert until the first <code>ping.sh {{ j.id }} ok</code>{% endif %}.</p>
+      {% endif %}
+      <dl>
+        <dt>Protects</dt><dd>{{ j.protects }}</dd>
+        <dt>Method</dt><dd>{{ j.method }}</dd>
+        {% if j.destination %}<dt>Destination</dt><dd><code>{{ j.destination }}</code></dd>{% endif %}
+        <dt>Last run</dt>
+        <dd>{{ when(j.last_run, now) }}{% if j.last_run_status %} <span class="pill pill-{{ j.last_run_status }}">{{ j.last_run_status }}</span>{% endif %}</dd>
+        <dt>Last success</dt><dd>{{ when(j.last_success, now) }}</dd>
+        {% if j.cadence_s %}
+        <dt>Cadence</dt><dd>every {{ j.cadence_s|human_duration }} <span class="muted">(+{{ j.grace_s|human_duration }} grace)</span></dd>
+        {% endif %}
+        {% if j.lag %}
+        <dt>{{ 'Missing' if j.kind == 'rclone_copy_tree' else 'Behind' }}</dt>
+        <dd>
+          {% if j.lag.bytes is not none %}{{ j.lag.bytes|human_bytes }}{% if j.lag.max_bytes %} <span class="muted">of {{ j.lag.max_bytes|human_bytes }} allowed</span>{% endif %}{% endif %}
+          {% if j.lag.files is not none %}<span class="muted">· {{ j.lag.files }} file{{ '' if j.lag.files == 1 else 's' }}</span>{% endif %}
+          {% if j.kind == 'rclone_copy_tree' and j.lag.bytes is not none %}<span class="muted">never uploaded</span>{% endif %}
+          {% if j.lag.bytes is none and j.lag.files is none %}<span class="muted">no lag reported</span>{% endif %}
+          {% if j.lag.differ_files is not none %}<br><span class="muted">{{ j.lag.differ_files }} file{{ '' if j.lag.differ_files == 1 else 's' }}{% if j.lag.differ_bytes is not none %} / {{ j.lag.differ_bytes|human_bytes }}{% endif %} edited since last copy (normal lag)</span>{% endif %}
+          {% if j.lag.max_age_s %}<br><span class="muted">target: done within {{ j.lag.max_age_s|human_duration }}{% if j.lag.age_s is not none %} · currently {{ j.lag.age_s|human_duration }}{% endif %}</span>{% endif %}
+          {% if j.informational %}<br><span class="muted">informational — never alerts</span>{% endif %}
+        </dd>
+        {% endif %}
+        {% if j.dest.newest or j.dest.count is not none or j.dest.probe_error %}
+        <dt>Dest freshness</dt>
+        <dd>
+          {% if j.dest.probe_error %}<span class="bad">probe failed:</span> {{ j.dest.probe_error }}
+          {% else %}
+            {# An unknown newest-object time is OMITTED, never rendered as "never" (the Mac probe reports
+               dest_count without a newest time for copy trees). #}
+            {% if j.dest.newest %}newest {{ when(j.dest.newest, now) }}{% endif %}{% if j.dest.count is not none %}{% if j.dest.newest %} · {% endif %}{{ j.dest.count }} object{{ '' if j.dest.count == 1 else 's' }}{% endif %}
+            {# rclone_copy_tree freshness is the missing-bytes verdict already shown by the state chip and the
+               Missing row, so the pill would only repeat it there. #}
+            {% if j.kind != 'rclone_copy_tree' %}{% if j.dest.fresh is true %}<span class="pill pill-ok">fresh</span>{% elif j.dest.fresh is false %}<span class="pill pill-fail">stale</span>{% endif %}{% endif %}
+          {% endif %}
+        </dd>
+        {% endif %}
+        {% if j.kind == 'container' and j.expect %}
+        <dt>Expects</dt>
+        <dd class="names">{% for name in j.expect %}<code class="{% if j.last_metrics.running and name not in (j.last_metrics.running if j.last_metrics.running is not string else j.last_metrics.running.split(',')|map('trim')|list) %}missing{% endif %}">{{ name }}</code> {% endfor %}</dd>
+        {% endif %}
+      </dl>
+      <footer>
+        {{ history_strip(j.history or []) }}
+        <span class="muted small">since {{ when(j.since, now) }}</span>
+      </footer>
+    </article>
+  {% endfor %}
+  </div>
+</section>
+{% endfor %}
+{% endblock %}
