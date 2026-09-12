@@ -8,7 +8,9 @@
 #   manual — the container lists the destination itself, so newest-object time +
 #   count come from the box; without it the card shows only what the Mac probe
 #   reports), manual.max_age_s / manual.max_lag_bytes (manual
-#   only; omit both for an informational job that never alerts), expect (container
+#   only; omit both for an informational job that never alerts),
+#   disk.min_free_bytes / disk.max_used_pct (disk only — same rule: omit both for
+#   an informational gauge), expect (container
 #   only — names that must appear in metrics.running), late_means (optional text
 #   shown when the job is LATE, e.g. "Mac offline or asleep").
 jobs:
@@ -62,6 +64,21 @@ jobs:
       - hopper-messaging-postgres-1
       - hopper-messaging-gmessages-1
 
+  - id: box-disk
+    name: Box disk
+    machine: box
+    kind: disk
+    protects: Every container's data volume + the DB snapshots staged before upload
+    method: statvfs / on the box, posted by the same 5-min timer as box-containers
+    # A `disk` job is a GAUGE, not a scheduled job: it has no cadence_s/grace_s and never goes
+    # LATE. Liveness is already box-containers' job (same timer, same script) — a second
+    # dead-man's switch for the same silence would just double the alerts.
+    disk:
+      # 914 GB disk at ~4% used today, so these are early-warning, not crisis, levels:
+      # BEHIND at 50 GiB free (room for a rebuild + a snapshot) or 85% used.
+      min_free_bytes: 53687091200   # 50 GiB
+      max_used_pct: 85
+
   - id: dashboard-probes
     name: Dashboard probe cycle
     machine: box
@@ -81,6 +98,20 @@ jobs:
     cadence_s: 3600
     grace_s: 50400              # 14 h: the Mac sleeps overnight; LATE only past a full night + a working day
     late_means: Not heard from the Mac in 15 hours — it is probably offline or asleep, not broken.
+
+  - id: mac-disk
+    name: Mac disk
+    machine: mac
+    kind: disk
+    protects: Headroom for OBS recordings, Whisper runs and the Drive mirror's local copies
+    method: statvfs /System/Volumes/Data, posted by the hourly Mac probe
+    # No cadence_s/grace_s: a disk gauge is never LATE (mac-probe already says whether the Mac
+    # is awake, and these metrics arrive on the same hourly run).
+    disk:
+      # 25 GiB free is the documented line at which the delete-after-confirm staging folder is
+      # worth clearing; 90% matches the storage watch. Either one trips BEHIND.
+      min_free_bytes: 26843545600   # 25 GiB
+      max_used_pct: 90
 
   - id: pa-backup
     name: personal-assistant → Drive

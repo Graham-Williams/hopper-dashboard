@@ -73,9 +73,21 @@ Inputs:
      the only recurring log errors are 3 symlinks in a venv that Drive can't upload (benign).
    - `manual`: no schedule; freshness target expressed as max age and/or max lag (bytes/files behind), lag
      supplied by whichever machine can compute it.
+   - `disk`: filesystem capacity for one machine, pushed as metrics (`disk_free_bytes` /
+     `disk_total_bytes`) by that machine's existing probe — the Mac's hourly launchd run (`mac-disk`) and
+     the box's 5-minute containers timer (`box-disk`). A **gauge, not a job**: no `cadence_s`/`grace_s`,
+     no dead-man's switch, no destination probe. Liveness is already owned by `mac-probe` /
+     `box-containers`, which carry these metrics in on the same run, so a second silence alarm for the
+     same silence would only double the alerts. `BEHIND` when `disk_free_bytes < disk.min_free_bytes`
+     or used-percent > `disk.max_used_pct`; with neither threshold set it is informational (shown, never
+     alerted), exactly like a thresholdless `manual` job. `used_pct` is derived from free-vs-total as
+     `statvfs` reports them (available space, so it reads a hair higher than `df`, whose denominator
+     excludes the reserved blocks) and is `null` — never a ZeroDivisionError — when the total is
+     missing or 0.
 3. **Mac probe (push).** A launchd job (`com.hopper.dashboard-probe`, hourly, plus RunAtLoad so it fires after
    wake) that computes: recordings/world-backups/replays not yet on Drive (rclone check --one-way, byte total),
-   nightly backup last outcome (parse `~/Library/Logs/hopper-backup.log` last line), disk free, DriveFS roots
+   nightly backup last outcome (parse `~/Library/Logs/hopper-backup.log` last line), disk free (as its own
+   `mac-disk` gauge; `minecraft-offload` also keeps the same two metrics as a footnote), DriveFS roots
    state; POSTs each as a heartbeat/metrics to the box over Tailscale. If the Mac is asleep the box simply marks
    the Mac probe "not heard from" after its grace period — that itself is a signal (Mac offline).
 
@@ -84,7 +96,9 @@ Store: SQLite (`jobs`, `runs`, `probes`, `state_changes`). Job registry seeded f
 
 Outputs:
 - **HTML** `/` — one card per job grouped by machine; state chip (OK / LATE / FAIL / STALE-DEST / UNKNOWN),
-  last run, last success, destination freshness, lag for manual jobs, sparkline of recent runs. Theme-aware,
+  last run, last success, destination freshness, lag for manual jobs, a capacity gauge for disk jobs
+  (percent used + free/total in GiB + an SVG bar with the threshold marked — SVG, not a styled div, because
+  `style-src 'self'` forbids the inline width), sparkline of recent runs. Theme-aware,
   mobile-friendly, same visual language as the other apps. Password gate.
 - **JSON** `/api/v1/status` (whole board), `/api/v1/jobs/<id>` (history). Same gate (cookie) OR the
   Hopper read token. Hopper's weekly "home server health" watch reads this instead of SSH-poking six apps.
@@ -98,7 +112,10 @@ Outputs:
 - `FAIL`: last heartbeat status=fail.
 - `STALE_DEST`: heartbeat says ok but destination probe disagrees (the 2026-08 nightly-backup case). For copy
   trees only **missing** (never uploaded) bytes count; **differ** (edited since the last copy) is normal lag.
-- `BEHIND`: manual job over its lag target.
+- `BEHIND`: manual job over its lag target, or a `disk` job under its free-space floor / over its
+  used-percent ceiling. Capacity deliberately reuses `BEHIND` rather than adding a state: it is already
+  the non-urgent "you need to do something" colour, and a seventh state would touch the notifier,
+  the CSS, the summary tiles and every state test for no new meaning.
 - `UNKNOWN`: never heard from (and registered less than cadence+grace ago).
 
 ## Security posture
@@ -197,6 +214,9 @@ read from inside the container must send `Host: <APP_HOST>` or the Host pin answ
   `rclone_copy_tree` jobs `lag.bytes`/`lag.files` are the MISSING figures and `lag.differ_bytes`/
   `lag.differ_files` the informational lag; `dest.fresh` is null when the destination cannot be judged yet.
   Additive, non-contract fields the app also emits (safe to ignore):
+  `disk` (**`kind: disk` only**, `null` otherwise — `{measured_at, free_bytes, total_bytes, used_bytes,
+  used_pct, min_free_bytes, max_used_pct, low, low_on}`; `used_pct` and `used_bytes` are null when the
+  total is unknown, `low_on` lists which thresholds tripped: `free` and/or `used_pct`),
   `state_reason` (why the job is in its current state), `last_run_status`, `last_run_reason`, `last_run_note`,
   `late_means`, `informational`, `expect`, `never_run` (true until the first real run — manual cards say
   "Never run" explicitly), `created_at`,
@@ -223,14 +243,19 @@ jobs:
     manual:                       # only for kind: manual
       max_age_s: 604800
       max_lag_bytes: 10737418240
+    disk:                         # only for kind: disk; omit both keys for an informational gauge
+      min_free_bytes: 26843545600 # 25 GiB
+      max_used_pct: 90
     expect: [km-tracker-app-1]    # only for kind: container — names that must appear in metrics.running
     late_means: Mac offline or asleep   # optional text shown instead of the generic LATE reason
 ```
 Validation is strict and fails startup with the job id + field: ids `^[a-z0-9-]+$` (unique, ≤64), `machine`
-∈ box|mac, `kind` ∈ the six kinds, `cadence_s`+`grace_s` required for every kind except `manual` (and
-forbidden on manual), `db_snapshot` requires `probe.rclone_path`, `rclone_copy_tree` requires `destination`,
-a `probe` block is accepted only on `db_snapshot` / `rclone_copy_tree` / `manual`, `container` requires a
-non-empty `expect`, unknown keys anywhere are errors.
+∈ box|mac, `kind` ∈ the seven kinds, `cadence_s`+`grace_s` required for every kind except `manual` and
+`disk` (and forbidden on both), `db_snapshot` requires `probe.rclone_path`, `rclone_copy_tree` requires
+`destination`, a `probe` block is accepted only on `db_snapshot` / `rclone_copy_tree` / `manual`, a `disk`
+block only on `disk` (with `max_used_pct` bounded to 1-100, so bytes pasted into the wrong field are
+rejected rather than silently disabling the threshold), `container` requires a non-empty `expect`, unknown
+keys anywhere are errors.
 State computation runs on every ping (for ALL jobs, so LATE keeps firing even if the ticker thread dies) and
 on a 60 s ticker (so LATE fires without traffic). Every state transition is written to `state_changes` and
 dispatched to ntfy (`NTFY_URL` + `NTFY_TOPIC` env; disabled when empty) with title `[dashboard] <job> → <STATE>`
@@ -257,7 +282,11 @@ combined `lag_bytes` no longer drives staleness for this kind. `drive_mirror` �
 IS the check; no DB → `fail`). `manual`: never LATE; `FAIL` if last run failed; `BEHIND` if age of last
 success > `max_age_s` or `lag_bytes` > `max_lag_bytes`; no thresholds = informational, never alerts.
 `max_age_s` is inert until the first real run (the card says **Never run** until then — seed one ping after
-the first manual run). `dashboard-probes` is the scheduler's own heartbeat: a run is recorded every probe
+the first manual run). `disk`: never LATE and never FAIL — `UNKNOWN` until the first capacity metric
+arrives, `BEHIND` when free < `min_free_bytes` or used-percent > `max_used_pct` (both comparisons strict,
+so a threshold reads as "worse than this", not "at this"; the reason names the threshold that tripped and
+the actual figures), else `OK`. Metrics arrive as `status: "metric"` pings, so a disk gauge never records
+a run at all. `dashboard-probes` is the scheduler's own heartbeat: a run is recorded every probe
 cycle, `fail` (with the error in `note`) if any rclone probe errored — so a broken probe shows up as a FAIL
 card, never a crash.
 

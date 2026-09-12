@@ -11,6 +11,36 @@
 {% if iso and (iso|absolute) %}<time datetime="{{ iso }}" title="{{ iso|absolute }}">{{ iso|relative(now) }}</time>{% elif iso %}<span class="muted" title="unparseable timestamp">?</span>{% else %}<span class="muted">never</span>{% endif %}
 {%- endmacro %}
 
+{% macro disk_gauge(disk, now) -%}
+{#- Capacity gauge for kind: disk. The bar is decoration: the percent, the free/total figures and
+    the threshold line below it carry the same information as text (never colour alone). -#}
+{% if disk.free_bytes is none %}<span class="muted">no disk metrics reported yet</span>{% else %}
+<div class="gauge {% if disk.low %}gauge-low{% endif %}">
+  <div class="gauge-head">
+    <strong>{% if disk.used_pct is not none %}{{ disk.used_pct }}% used{% else %}capacity unknown{% endif %}</strong>
+    <span class="muted">{{ disk.free_bytes|human_gib }} free{% if disk.total_bytes %} of {{ disk.total_bytes|human_gib }}{% endif %}</span>
+  </div>
+  {% if disk.used_pct is not none %}
+  {#- SVG, not a styled <span>: the width is data, and `style-src 'self'` (no 'unsafe-inline')
+      blocks a style attribute, which would silently render every bar empty. Same trick as
+      history_strip — geometry goes in attributes, colour in the stylesheet. -#}
+  <svg class="gaugebar" viewBox="0 0 100 8" width="100%" height="8" preserveAspectRatio="none"
+       role="img" aria-label="{{ disk.used_pct }}% of the disk used">
+    <title>{{ disk.used_pct }}% used{% if disk.max_used_pct %} · ceiling {{ disk.max_used_pct }}%{% endif %}</title>
+    <rect class="track" x="0" y="0" width="100" height="8" rx="2"></rect>
+    <rect class="fill" x="0" y="0" width="{{ disk.used_pct if disk.used_pct <= 100 else 100 }}" height="8" rx="2"></rect>
+    {% if disk.max_used_pct %}<rect class="mark" x="{{ disk.max_used_pct }}" y="0" width="0.7" height="8"></rect>{% endif %}
+  </svg>
+  {% endif %}
+  <div class="gauge-foot muted small">
+    {%- if disk.min_free_bytes or disk.max_used_pct %}alerts below {{ disk.min_free_bytes|human_gib if disk.min_free_bytes else '—' }} free{% if disk.max_used_pct %} or over {{ disk.max_used_pct }}% used{% endif %}
+    {%- else %}informational — no thresholds set, never alerts{% endif %}
+    {%- if disk.measured_at %} · measured {{ when(disk.measured_at, now) }}{% endif %}
+  </div>
+</div>
+{% endif %}
+{%- endmacro %}
+
 {% macro history_strip(history) -%}
 {% set n = history|length %}
 <svg class="strip" viewBox="0 0 {{ 30 * 6 }} 12" width="180" height="12" role="img"

@@ -100,6 +100,28 @@ def test_metric_ping_can_flip_manual_job_to_behind(core, notifier, registry):
     assert notifier.sent[-1][0] == "[dashboard] Offload → BEHIND"
 
 
+def test_metric_ping_flips_disk_job_to_behind_and_alerts(core, notifier, registry):
+    job = registry.get("disk")
+    gib = 1024 ** 3
+    assert core.record_ping(job, {"status": "metric", "metrics": {
+        "disk_free_bytes": 200 * gib, "disk_total_bytes": 400 * gib}}, now=NOW) == "OK"
+    state = core.record_ping(job, {"status": "metric", "metrics": {
+        "disk_free_bytes": 10 * gib}}, now=NOW + 10)       # shallow merge keeps the total
+    assert state == "BEHIND"
+    title, body, priority = notifier.sent[-1]
+    assert body == "disk: OK → BEHIND" and priority == "default"   # not urgent, but actionable
+    assert db.job_row(core.connect(), "disk")["state_reason"].startswith("only 10.0 GiB free")
+
+
+def test_disk_job_never_goes_late(core, registry):
+    gib = 1024 ** 3
+    core.record_ping(registry.get("disk"), {"status": "metric", "metrics": {
+        "disk_free_bytes": 200 * gib, "disk_total_bytes": 400 * gib}}, now=NOW)
+    # Ten days of silence: a scheduled job would be LATE long ago; a gauge just keeps its reading
+    # (mac-probe / box-containers own the liveness signal for the machine).
+    assert core.recompute_all(now=NOW + 10 * 86400)["disk"] == "OK"
+
+
 def test_ping_recomputes_other_jobs_too(core, registry):
     core.record_ping(registry.get("snap"), ok(), now=NOW)
     core.record_ping(registry.get("tree"), ok(), now=NOW + 5000)

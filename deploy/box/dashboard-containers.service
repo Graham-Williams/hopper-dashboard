@@ -1,13 +1,15 @@
-# hopper-dashboard: host-side container heartbeat (box-containers job).
+# hopper-dashboard: host-side container heartbeat (box-containers) + disk gauge (box-disk).
 # TEMPLATE — deploy/box/install.sh replaces @@REPO@@ with the checkout path (~/hopper-dashboard)
 # and @@USER@@ with the login that runs it (default: whoever invoked sudo; must be in `docker`).
 #
 # The dashboard container deliberately has NO docker socket; this oneshot, driven by
-# dashboard-containers.timer every 5 min, is the only thing that reads `docker ps`. Runs as an
-# unprivileged user in the docker group. Token + URL come from /etc/hopper-dashboard/ingest.env,
-# read by systemd as root and handed to the process as environment.
+# dashboard-containers.timer every 5 min, is the only thing that reads `docker ps`. It also posts
+# the box's root-filesystem capacity (box-disk) — a disk gauge has no schedule of its own, so it
+# rides this timer rather than adding a second one. Runs as an unprivileged user in the docker
+# group. Token + URL come from /etc/hopper-dashboard/ingest.env, read by systemd as root and
+# handed to the process as environment.
 [Unit]
-Description=hopper-dashboard container heartbeat (docker ps → box-containers)
+Description=hopper-dashboard box probes (docker ps → box-containers, statvfs → box-disk)
 Wants=network-online.target
 After=network-online.target docker.service
 

@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import chip, when, history_strip %}
+{% from "_macros.html" import chip, when, history_strip, disk_gauge %}
 {% block title %}{{ job.name }} — Hopper Dashboard{% endblock %}
 {% block content %}
 <p class="crumbs"><a href="{{ url_for('web.index') }}">← Board</a></p>
@@ -20,6 +20,9 @@
     {% if job.cadence_s %}<dt>Cadence</dt><dd>every {{ job.cadence_s|human_duration }} (+{{ job.grace_s|human_duration }} grace)</dd>{% endif %}
     {% if job.kind == 'manual' and job.never_run %}
     <dt>Status</dt><dd><strong>Never run</strong> — no completion pinged yet{% if job.lag and job.lag.max_age_s %}; the max-age target is inert until the first <code>ping.sh {{ job.id }} ok</code>{% endif %}</dd>
+    {% endif %}
+    {% if job.disk %}
+    <dt>Capacity</dt><dd>{{ disk_gauge(job.disk, now) }}</dd>
     {% endif %}
     {% if job.lag %}
     <dt>{{ 'Missing' if job.kind == 'rclone_copy_tree' else 'Behind' }}</dt><dd>{{ job.lag.bytes|human_bytes if job.lag.bytes is not none else '—' }}

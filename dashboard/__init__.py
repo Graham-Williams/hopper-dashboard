@@ -18,7 +18,8 @@ from datetime import timedelta
 from flask import Flask
 
 from .config import Settings
-from .humanize import absolute, human_bytes, human_duration, relative
+from .humanize import (absolute, human_bytes, human_duration, human_gib,
+                       relative)
 from .notify import Notifier
 from .ratelimit import LoginRateLimiter, SlidingWindowLimiter
 from .registry import Registry, load_registry
@@ -130,6 +131,7 @@ def create_app(role: str = "read", settings: Settings | None = None,
 
     app.jinja_env.filters["human_bytes"] = human_bytes
     app.jinja_env.filters["human_duration"] = human_duration
+    app.jinja_env.filters["human_gib"] = human_gib
     app.jinja_env.filters["absolute"] = absolute
     app.jinja_env.filters["relative"] = relative
     app.jinja_env.globals["app_version"] = __version__

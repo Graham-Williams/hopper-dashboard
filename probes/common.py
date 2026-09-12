@@ -315,6 +315,18 @@ def save_state(path: str, state: Dict[str, object]) -> None:
     os.replace(tmp, path)
 
 
+def disk_free(path: str) -> Dict[str, int]:
+    """``statvfs`` capacity for the filesystem holding ``path``, as the two metric keys the
+    dashboard's ``disk`` kind reads. ``f_bavail`` is the space available to a non-root user, so
+    free + used can come out a little under the total (the reserved blocks) — that is deliberate:
+    it is the number that matters when a recording can no longer be written."""
+    st = os.statvfs(path)
+    return {
+        "disk_free_bytes": st.f_bavail * st.f_frsize,
+        "disk_total_bytes": st.f_blocks * st.f_frsize,
+    }
+
+
 def slug(name: str) -> str:
     """'world backups' → 'world_backups' (for flat metric keys)."""
     return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")

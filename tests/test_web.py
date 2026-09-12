@@ -176,6 +176,8 @@ def _seed_all_states(core, registry):
                      "metrics": {"lag_bytes": 5 * 10 ** 9, "lag_files": 12,
                                  "dest_newest_iso": db.to_iso(NOW - 3600), "dest_count": 140}}, now=NOW)
     core.record_ping(registry.get("macprobe"), {"status": "ok"}, now=NOW - 20_000)
+    core.record_ping(registry.get("disk"), {"status": "metric", "metrics": {
+        "disk_free_bytes": 100 * 1024 ** 3, "disk_total_bytes": 400 * 1024 ** 3}}, now=NOW)
     core.recompute_all(now=NOW + 1)  # snap → STALE_DEST, macprobe → LATE, info → UNKNOWN
 
 
@@ -200,9 +202,17 @@ def test_status_shape_matches_contract(read, core, registry):
     assert by_id["offload"]["last_run"] is None and by_id["offload"]["dest"]["count"] == 140
     assert by_id["macprobe"]["state"] == "LATE"
     assert by_id["info"]["state"] == "UNKNOWN" and by_id["info"]["lag"]["behind"] is False
+    # disk: a capacity gauge, OK at 75% used, and the sub-object every other kind reports as null.
+    assert by_id["disk"]["state"] == "OK" and by_id["disk"]["lag"] is None
+    assert by_id["disk"]["disk"] == {
+        "measured_at": db.to_iso(NOW), "free_bytes": 100 * 1024 ** 3,
+        "total_bytes": 400 * 1024 ** 3, "used_bytes": 300 * 1024 ** 3, "used_pct": 75.0,
+        "min_free_bytes": 25 * 1024 ** 3, "max_used_pct": 90, "low": False, "low_on": []}
+    assert by_id["disk"]["last_run"] is None and by_id["disk"]["cadence_s"] is None
+    assert all(j["disk"] is None for j in d["jobs"] if j["id"] != "disk")
     s = d["summary"]
-    assert (s["ok"], s["late"], s["fail"], s["stale_dest"], s["behind"], s["unknown"]) == (1, 1, 1, 1, 2, 2)
-    assert s["total"] == 8 and s["computed_at"]
+    assert (s["ok"], s["late"], s["fail"], s["stale_dest"], s["behind"], s["unknown"]) == (2, 1, 1, 1, 2, 2)
+    assert s["total"] == 9 and s["computed_at"]
 
 
 def test_job_detail_json(read, core, registry):
@@ -325,3 +335,47 @@ def test_summary_timestamps_are_localizable_time_elements(authed, core):
     html = authed.get("/").data.decode()
     assert "states computed <time datetime=" in html and "just now" in html
     assert "generated <time datetime=" in html
+
+
+# --------------------------------------------------------------------------- #
+# Disk capacity gauge (kind: disk)
+# --------------------------------------------------------------------------- #
+
+def _disk_ping(core, registry, free_gib, total_gib=400, now=NOW):
+    core.record_ping(registry.get("disk"), {"status": "metric", "metrics": {
+        "disk_free_bytes": free_gib * 1024 ** 3,
+        "disk_total_bytes": total_gib * 1024 ** 3}}, now=now)
+
+
+def test_disk_gauge_renders_on_board_and_job_page(authed, core, registry):
+    _disk_ping(core, registry, 100)
+    for html in (authed.get("/").data.decode(), authed.get("/jobs/disk").data.decode()):
+        card = html[html.index("Capacity"):]
+        assert "75.0% used" in card
+        assert "100.0 GiB free of 400.0 GiB" in card          # GiB, not human_bytes' decimal GB
+        assert 'class="gaugebar"' in card and 'class="fill" x="0" y="0" width="75.0"' in card
+        assert 'class="mark" x="90"' in card                  # the 90% ceiling marker
+        assert "alerts below 25.0 GiB free or over 90% used" in card
+    # The bar must not rely on an inline style attribute: style-src is 'self' with no
+    # 'unsafe-inline', so a style="width:…" bar would silently render empty.
+    assert "style=" not in authed.get("/").data.decode()
+
+
+def test_disk_gauge_marks_a_low_disk(authed, core, registry):
+    _disk_ping(core, registry, 10)
+    html = authed.get("/").data.decode()
+    assert "gauge-low" in html and "BEHIND" in html
+    assert "only 10.0 GiB free, below the 25.0 GiB floor" in html   # state_reason hint
+
+
+def test_disk_card_without_metrics_says_so(authed):
+    html = authed.get("/").data.decode()
+    assert "no disk metrics reported yet" in html and "Capacity" in html
+
+
+def test_disk_card_survives_a_zero_total(authed, core, registry):
+    """A 0-byte total (bind mount, vanished path) must not 500 the board."""
+    _disk_ping(core, registry, 10, total_gib=0)
+    html = authed.get("/").data.decode()
+    assert "capacity unknown" in html and "10.0 GiB free" in html
+    assert "gaugebar" not in html[html.index("Capacity"):html.index("Capacity") + 600]

@@ -31,8 +31,8 @@ roles in one process for local dev.
 ```
 uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -r requirements-dev.txt
 # (or: python3.12 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt)
-.venv/bin/python -m pytest -q                         # ~270 tests, no network, < 5 s
-/usr/bin/python3 -m pytest -o addopts="" tests/test_probes_*.py -q   # ~80 probe tests, MUST pass stdlib-only
+.venv/bin/python -m pytest -q                         # ~340 tests, no network, < 5 s
+/usr/bin/python3 -m pytest -o addopts="" tests/test_probes_*.py -q   # ~90 probe tests, MUST pass stdlib-only
 
 cp jobs.example.yml jobs.yml                          # local only; gitignored
 export APP_PASSWORD=devpass SESSION_SECRET=devsecret INGEST_TOKEN=devtoken READ_TOKEN=devread
@@ -61,9 +61,13 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
 - `registry.py` — `jobs.yml` schema + strict validation → `Registry` of frozen `Job`s. Kinds, states,
   `PROBEABLE_KINDS` (`probe` block: required on db_snapshot, optional on rclone_copy_tree / manual — the
   box's `gdrive-ro` remote can list `Backups/` and `Gremlins/`), and `DEST_FRESH_MULTIPLIER` (12) live here.
+  `disk` is a kind but NOT in `SCHEDULED_KINDS`/`PROBEABLE_KINDS`: it is a capacity gauge (`disk:` block,
+  `min_free_bytes` / `max_used_pct`), never LATE, never probed, and `informational` when both thresholds
+  are omitted — same rule as a thresholdless `manual` job.
 - `db.py` — schema (`jobs` incl. `created_at`, `runs`, `probes`, `state_changes`), WAL connection, all
   queries, ISO helpers (`from_iso` clamps to 1970..9999 and never raises).
-- `state.py` — pure state machine: `compute_state(job, Facts, now)`, `lag_info`, `dest_info`,
+- `state.py` — pure state machine: `compute_state(job, Facts, now)`, `lag_info`, `dest_info`, `disk_info`
+  (capacity block for `kind: disk`; `used_pct` is None on a 0/missing total — never a ZeroDivisionError),
   `db_snapshot_stale` (dedup-aware), `copy_tree_stale` (missing vs differ), never-pinged → LATE via
   `Facts.created_at`. Unit-tested with a fixed clock.
 - `services.py` — `Core`: record ping → shallow-merge metrics → recompute ALL jobs → persist transitions →
@@ -81,7 +85,8 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
 - `views.py` — builds the `/api/v1/status` contract and job detail from the store.
 - `password_gate.py`, `ratelimit.py` — gate helpers (`client_ip(trusted_cidrs)` vs `remote_ip()`) +
   sliding-window limiters (hard key cap with stalest-eviction, keys truncated to 64 chars).
-- `humanize.py` — relative/absolute times, human bytes/durations (Jinja filters).
+- `humanize.py` — relative/absolute times, human bytes/durations, `human_gib` (binary GiB, used for disk
+  capacity — `human_bytes` is decimal GB) (Jinja filters).
 - `templates/`, `static/app.css`, `static/favicon.svg` — theme-aware (light/dark tokens), mobile-first,
   Okabe–Ito state colours always paired with a text label + glyph.
 
@@ -93,8 +98,14 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   `db_sha256`).
 - Adding a job kind: extend `KINDS` + per-kind validation in `registry.py`, the branch in
   `state.compute_state`/`dest_info`, a test per transition in `tests/test_state.py`, and DESIGN.md.
+  Prefer reusing an existing state over adding one to `STATES` — `disk` capacity reuses `BEHIND` rather
+  than inventing a seventh state, which would have touched `notify.py`, `app.css`, the summary tiles and
+  every state test for no new meaning.
 - Adding a metric the UI should understand: read it via `state._first_num` with a key tuple (see
   `LAG_BYTES_KEYS`) so scripts can use either spelling.
+- No inline `style=` attributes either: the CSP is `style-src 'self'` with no `'unsafe-inline'`, so a
+  data-driven width must be an SVG attribute (see the `disk_gauge` / `history_strip` macros), not a style.
+  A styled bar would render empty in a browser while passing every server-side test.
 - JS is limited to the one nonce'd inline script in `base.html` (timestamp localization; the page must
   work identically without it). Don't add a second `<script>` — the CSP nonce is generated once per request
   via `csp_nonce()`, and anything else that needs interactivity should be reconsidered.
@@ -139,7 +150,9 @@ there is no default URL in the code, by design.
   `rclone_check.PA_BACKUP_TREES`, filters copied verbatim from `scripts/backup-personal-assistant.sh` —
   reporting `missing_*` (never uploaded → stale) separately from `differ_*` (edited since → informational)),
   `minecraft-offload` (rclone lag per pair with `--size-only` — tens of GB of video can't be MD5'd hourly
-  inside the 120 s timeout; the small pa-backup trees keep the checksum check — + disk free), `drive-mirror`
+  inside the 120 s timeout; the small pa-backup trees keep the checksum check — + disk free), `mac-disk`
+  (`statvfs PROBE_DISK_PATH` as a metrics-only ping — its own gauge job; `minecraft-offload` keeps the same
+  two metrics on purpose, don't "de-duplicate" them), `drive-mirror`
   (copied DriveFS sqlite, reported as an `ok` RUN because reading it is the check), then its own `mac-probe`
   heartbeat. `--dry-run` prints. Order matters for alerting: the siblings land BEFORE the probe's own
   heartbeat, which is why `jobs.example.yml` gives them `grace_s` ≥ mac-probe's + 120 and why `services.py`
@@ -147,7 +160,11 @@ there is no default URL in the code, by design.
 - Box: systemd drop-ins `deploy/box/*.service.d/heartbeat.conf` (`ExecStopPost` curl with
   `$SERVICE_RESULT`/`$EXIT_STATUS`) + `dashboard-containers.timer` (`OnCalendar=*:0/5`, `Persistent=true`) →
   `dashboard-containers.service` (`User=@@USER@@` rendered by `install.sh`, default `$SUDO_USER`) →
-  `probes/containers_probe.py` (`docker ps`). Credentials in `/etc/hopper-dashboard/ingest.env` (root 0600,
+  `deploy/box/containers_probe.sh`, which runs BOTH `probes/containers_probe.py` (`docker ps` →
+  `box-containers`) and `probes/disk_probe.py` (`statvfs /` → `box-disk`) off that one timer; each runs
+  even if the other fails and the service exits non-zero if either did. `disk_free` lives in
+  `probes/common.py` (re-exported from `rclone_check` for the Mac probe's existing call site) so the box
+  probe doesn't import an rclone module to call `statvfs`. Credentials in `/etc/hopper-dashboard/ingest.env` (root 0600,
   read by systemd); `install.sh --token-file <compose .env>` reads the token, never from argv.
 - Manual jobs: `probes/ping.sh <job_id> <ok|fail|skipped> [note]`. `minecraft-offload` needs one seed ping
   after the first offload or its `max_age_s` stays inert (card says "Never run").

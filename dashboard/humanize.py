@@ -26,6 +26,23 @@ def human_bytes(n: int | float | None) -> str:
     return f"{n:.1f} {units[i]}"
 
 
+GIB = 1024 ** 3
+
+
+def human_gib(n: int | float | None) -> str:
+    """Binary gibibytes — the unit disk capacity is actually discussed in
+    ("105 GiB free"), as opposed to :func:`human_bytes`' decimal GB."""
+    if n is None:
+        return "—"
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return "—"
+    if n < 0:
+        return "—"
+    return f"{n / GIB:.1f} GiB"
+
+
 def human_duration(seconds: float | None) -> str:
     if seconds is None:
         return "—"

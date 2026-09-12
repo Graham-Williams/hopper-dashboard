@@ -7,7 +7,8 @@ testable with a fixed ``now``:
 - ``LATE``       no heartbeat within cadence+grace (dead-man's switch)
 - ``FAIL``       last heartbeat status=fail, or a container job missing an expected container
 - ``STALE_DEST`` heartbeat says ok but the destination disagrees
-- ``BEHIND``     manual job over its lag/age target, or a Drive mirror with pending work
+- ``BEHIND``     manual job over its lag/age target, a Drive mirror with pending work, or a
+                 ``disk`` job under its free-space floor / over its used-percent ceiling
 - ``UNKNOWN``    never heard from — but only for ``cadence+grace`` after the job was
                  first registered (``jobs.created_at``); a scheduled job that has NEVER
                  pinged then goes LATE, so a mis-installed heartbeat can't stay silent forever
@@ -29,6 +30,7 @@ import math
 from dataclasses import dataclass, field
 
 from .db import from_iso
+from .humanize import human_gib
 from .registry import Job
 
 # Metric keys the Mac probe / scripts may use for "how far behind".
@@ -39,6 +41,10 @@ MISSING_BYTES_KEYS = ("missing_bytes",)
 MISSING_FILES_KEYS = ("missing_files",)
 DIFFER_BYTES_KEYS = ("differ_bytes",)
 DIFFER_FILES_KEYS = ("differ_files",)
+# disk capacity. The probes post the ``disk_*`` pair; the bare spelling is accepted
+# so an ad-hoc script's metrics are understood too (same rule as LAG_BYTES_KEYS).
+DISK_FREE_KEYS = ("disk_free_bytes", "free_bytes")
+DISK_TOTAL_KEYS = ("disk_total_bytes", "total_bytes")
 
 
 @dataclass
@@ -212,6 +218,43 @@ def lag_info(job: Job, f: Facts, now: float) -> dict | None:
     }
 
 
+def disk_info(job: Job, f: Facts) -> dict | None:
+    """Capacity block for the JSON + card, or None for any kind but ``disk``.
+
+    ``used_pct`` is derived from free-vs-total as ``statvfs`` reports them
+    (available space, so it can read a hair higher than ``df`` — which excludes
+    the reserved blocks from its denominator). It is None when the total is
+    absent or zero: a container bind-mount and a statvfs on a path that went
+    away both report 0 blocks, and dividing by that would 500 the whole board.
+    """
+    if job.kind != "disk":
+        return None
+    free = _first_num(f.last_metrics, DISK_FREE_KEYS)
+    total = _first_num(f.last_metrics, DISK_TOTAL_KEYS)
+    used = used_pct = None
+    if free is not None and total is not None and total > 0:
+        used = max(0.0, total - free)
+        used_pct = round(used / total * 100, 1)
+    low_on = []
+    if (job.min_free_bytes is not None and free is not None
+            and free < job.min_free_bytes):
+        low_on.append("free")
+    if (job.max_used_pct is not None and used_pct is not None
+            and used_pct > job.max_used_pct):
+        low_on.append("used_pct")
+    return {
+        "measured_at": f.last_metrics_at,
+        "free_bytes": int(free) if free is not None else None,
+        "total_bytes": int(total) if total is not None else None,
+        "used_bytes": int(used) if used is not None else None,
+        "used_pct": used_pct,
+        "min_free_bytes": job.min_free_bytes,
+        "max_used_pct": job.max_used_pct,
+        "low": bool(low_on),
+        "low_on": low_on,
+    }
+
+
 def dest_info(job: Job, f: Facts, now: float) -> dict:
     newest_iso = _newest_iso(job, f)
     newest = _newest_epoch(job, f)
@@ -260,6 +303,24 @@ def compute_state(job: Job, f: Facts, now: float) -> tuple[str, str]:
                         " — is the heartbeat installed?")
     if lr is None and not f.last_metrics:
         return "UNKNOWN", "never heard from"
+
+    if job.kind == "disk":
+        # A gauge, not a job: judged purely on the newest metrics. Never LATE
+        # (see SCHEDULED_KINDS) — the machine's probe job owns that signal.
+        d = disk_info(job, f) or {}
+        if d.get("free_bytes") is None:
+            return "UNKNOWN", "no disk metrics reported yet"
+        if d["low"]:
+            parts = []
+            if "free" in d["low_on"]:
+                parts.append(f"only {human_gib(d['free_bytes'])} free, below the "
+                             f"{human_gib(d['min_free_bytes'])} floor")
+            if "used_pct" in d["low_on"]:
+                parts.append(f"{d['used_pct']}% used, over the "
+                             f"{d['max_used_pct']}% ceiling")
+            return "BEHIND", "; ".join(parts)
+        used = f"{d['used_pct']}% used, " if d["used_pct"] is not None else ""
+        return "OK", f"{used}{human_gib(d['free_bytes'])} free"
 
     if job.kind == "manual":
         if lr and lr.get("status") == "fail":

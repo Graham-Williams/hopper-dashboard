@@ -3,7 +3,7 @@
 from dashboard.db import to_iso
 from dashboard.registry import parse_registry
 from dashboard.state import (Facts, compute_state, db_snapshot_stale, dest_info,
-                             lag_info, running_names)
+                             disk_info, lag_info, running_names)
 from tests.conftest import JOBS_DOC
 
 NOW = 1_800_000_000.0
@@ -272,3 +272,104 @@ def test_manual_probe_drives_freshness_pill():
     assert d["count"] == 9 and d["fresh"] is False      # older than max_age_s (14 d)
     f = Facts(last_metrics={"lag_bytes": 0}, probe=probe(newest_ago=86400, count=9))
     assert dest_info(job, f, NOW)["fresh"] is True
+
+
+# -- disk --------------------------------------------------------------------
+
+GIB = 1024 ** 3
+DISK = REG.get("disk")          # min_free 25 GiB, max_used_pct 90
+
+
+def disk_facts(free=None, total=None, **extra):
+    m = dict(extra)
+    if free is not None:
+        m["disk_free_bytes"] = free
+    if total is not None:
+        m["disk_total_bytes"] = total
+    return Facts(last_metrics=m, last_metrics_at=to_iso(NOW))
+
+
+def test_disk_unknown_until_metrics_arrive():
+    assert compute_state(DISK, Facts(), NOW) == ("UNKNOWN", "never heard from")
+    state, reason = compute_state(DISK, disk_facts(total=400 * GIB), NOW)
+    assert state == "UNKNOWN" and reason == "no disk metrics reported yet"
+
+
+def test_disk_ok_reports_percent_and_free():
+    state, reason = compute_state(DISK, disk_facts(free=200 * GIB, total=400 * GIB), NOW)
+    assert state == "OK" and reason == "50.0% used, 200.0 GiB free"
+
+
+def test_disk_behind_below_free_floor():
+    # 20 GiB free of 100 GiB: under the 25 GiB floor, but only 80% used — one threshold, not both.
+    state, reason = compute_state(DISK, disk_facts(free=20 * GIB, total=100 * GIB), NOW)
+    assert state == "BEHIND"
+    assert "20.0 GiB free" in reason and "25.0 GiB floor" in reason
+    assert "ceiling" not in reason              # only the threshold that tripped is named
+
+
+def test_disk_behind_over_used_ceiling():
+    # 8% free of 500 GiB = 40 GiB, over the 25 GiB floor, but 92% used.
+    state, reason = compute_state(DISK, disk_facts(free=40 * GIB, total=500 * GIB), NOW)
+    assert state == "BEHIND" and "92.0% used" in reason and "90% ceiling" in reason
+    assert "floor" not in reason
+
+
+def test_disk_behind_names_both_thresholds():
+    state, reason = compute_state(DISK, disk_facts(free=2 * GIB, total=400 * GIB), NOW)
+    assert state == "BEHIND" and "floor" in reason and "ceiling" in reason
+
+
+def test_disk_threshold_is_strict_at_the_boundary():
+    # Exactly ON the floor and exactly ON the ceiling is still OK: both comparisons are strict,
+    # so a threshold reads as "alert when worse than this", never "alert at this".
+    f = disk_facts(free=25 * GIB, total=250 * GIB)
+    assert disk_info(DISK, f)["used_pct"] == 90.0
+    assert compute_state(DISK, f, NOW)[0] == "OK"
+    assert compute_state(DISK, disk_facts(free=25 * GIB - 1, total=250 * GIB), NOW)[0] == "BEHIND"
+    assert compute_state(DISK, disk_facts(free=30 * GIB, total=400 * GIB), NOW)[0] == "BEHIND"
+
+
+def test_disk_zero_or_missing_total_never_divides_by_zero():
+    for total in (0, None, "nan"):
+        f = disk_facts(free=100 * GIB, total=total)
+        d = disk_info(DISK, f)
+        assert d["used_pct"] is None and d["used_bytes"] is None and d["low"] is False
+        assert compute_state(DISK, f, NOW) == ("OK", "100.0 GiB free")
+    # The free-space floor still works with no total to compare against.
+    assert compute_state(DISK, disk_facts(free=1 * GIB, total=0), NOW)[0] == "BEHIND"
+
+
+def test_disk_is_never_late_however_old_the_metrics():
+    f = disk_facts(free=200 * GIB, total=400 * GIB)
+    f.created_at = to_iso(NOW - 10 * 86400)
+    f.last_metrics_at = to_iso(NOW - 10 * 86400)
+    assert compute_state(DISK, f, NOW)[0] == "OK"   # liveness belongs to the machine's probe job
+
+
+def test_disk_info_payload_shape():
+    d = disk_info(DISK, disk_facts(free=100 * GIB, total=400 * GIB))
+    assert d == {"measured_at": to_iso(NOW), "free_bytes": 100 * GIB,
+                 "total_bytes": 400 * GIB, "used_bytes": 300 * GIB, "used_pct": 75.0,
+                 "min_free_bytes": 25 * GIB, "max_used_pct": 90, "low": False, "low_on": []}
+
+
+def test_disk_info_is_none_for_every_other_kind():
+    f = disk_facts(free=1, total=2)
+    for job_id in ("snap", "tree", "mirror", "containers", "offload", "info", "macprobe"):
+        assert disk_info(REG.get(job_id), f) is None, job_id
+
+
+def test_disk_accepts_the_alternate_metric_spelling():
+    f = Facts(last_metrics={"free_bytes": 200 * GIB, "total_bytes": 400 * GIB})
+    assert disk_info(DISK, f)["used_pct"] == 50.0
+
+
+def test_informational_disk_job_never_goes_behind():
+    from dashboard.registry import parse_job
+    raw = {"id": "d2", "name": "Disk", "machine": "box", "kind": "disk",
+           "protects": "space", "method": "statvfs"}
+    job = parse_job(raw, 0)
+    assert job.informational
+    state, reason = compute_state(job, disk_facts(free=1, total=400 * GIB), NOW)
+    assert state == "OK" and "free" in reason
