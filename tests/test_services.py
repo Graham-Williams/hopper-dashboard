@@ -788,3 +788,21 @@ def test_an_object_name_cannot_disguise_a_hard_error_as_transient(core,
     conn = core.connect()
     assert "transient" not in (db.last_probe(conn, "snap")["error"] or "")
     assert db.job_row(conn, "dashboard-probes")["state"] == "FAIL"
+
+
+def test_a_bare_path_in_real_rclone_stderr_cannot_disguise_a_hard_error(
+        core, notifier, monkeypatch):
+    """Real rclone prints the failing path BOTH quoted and bare, and the backup
+    trees are dated — `km_tracker-20260503-0312.db` contains `503`. A permission
+    failure on an ordinary nightly snapshot path must page on the first cycle,
+    not buy itself a cycle of damping."""
+    _rclone_raises(monkeypatch,
+                   'rclone exit 1: Failed to lsjson: failed to open directory '
+                   '"km_tracker-20260503-0312.db": open '
+                   '/srv/backups/km_tracker-20260503-0312.db: permission denied')
+    core.run_probe_cycle(now=NOW)
+    conn = core.connect()
+    assert "transient" not in (db.last_probe(conn, "snap")["error"] or "")
+    assert db.last_run(conn, "dashboard-probes")["metrics"]["failed_transient"] == 0
+    assert db.job_row(conn, "dashboard-probes")["state"] == "FAIL"
+    assert [t for t, _, _ in notifier.sent] == ["[dashboard] Probe cycle → FAIL"]

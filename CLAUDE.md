@@ -31,7 +31,7 @@ roles in one process for local dev.
 ```
 uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -r requirements-dev.txt
 # (or: python3.12 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt)
-.venv/bin/python -m pytest -q                         # ~325 tests, no network, < 5 s
+.venv/bin/python -m pytest -q                         # ~355 tests, no network, < 5 s
 /usr/bin/python3 -m pytest -o addopts="" tests/test_probes_*.py -q   # ~80 probe tests, MUST pass stdlib-only
 
 cp jobs.example.yml jobs.yml                          # local only; gitignored
@@ -99,8 +99,12 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   to `PROBE_INTERVAL_S` since probes are serial) + state-file reader; `is_transient_error` /
   `TRANSIENT_MARKERS` label a Drive rate limit or timeout in the error text and set `ProbeResult.transient`,
   so quota push-back never reads like a wrong destination. That flag is load-bearing (transient = damped,
-  hard = immediate FAIL), so rclone's echoed object names — which come from Drive — are stripped before
-  matching; don't classify on raw stderr.
+  hard = immediate FAIL), so rclone's echoed paths are stripped before matching — both the annotated/quoted
+  forms and any bare `/`-containing token, since real rclone prints the failing path unquoted as well — and
+  the HTTP statuses (429/503) only match in their real spellings (`Error 429:`, `code 503`, `503 Service
+  Unavailable`), never as bare digits. A dated snapshot name like `km_tracker-20260503-0312.db` contains
+  `503`; as bare substrings those markers made a permission-denied on an ordinary nightly path look
+  transient. Don't classify on raw stderr, and don't re-add a bare status-code substring marker.
 - `notify.py` — ntfy `Notifier`; body is `job_id: FROM → TO` only (no reason text leaves the box);
   `should_notify` suppresses `UNKNOWN→OK`; never raises.
 - `ingest.py` — blueprint + pure payload parsers (`parse_json_payload`, `parse_form_payload`, `parse_metrics`).

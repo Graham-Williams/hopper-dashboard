@@ -163,3 +163,40 @@ def test_a_real_timeout_is_classified_transient(monkeypatch):
 ])
 def test_object_names_do_not_drive_the_transient_classification(text, transient):
     assert probes.is_transient_error(text) is transient
+
+
+@pytest.mark.parametrize("text,transient", [
+    # REAL rclone stderr: the failing path appears quoted AND bare, so
+    # stripping only the quoted copy left `503`/`429` in the text. These are
+    # hard errors — revoked permission, wrong path — and must page at once.
+    ('rclone exit 1: Failed to lsjson: failed to open directory "503": '
+     'open /srv/backups/503/km: permission denied', False),
+    ('rclone exit 1: Failed to lsjson: failed to open directory "429": '
+     'open /srv/backups/429/km: permission denied', False),
+    # The real production path shape: dated snapshots. `20260503` contains
+    # `503`; `20260429` contains `429`. Nothing adversarial is needed — the
+    # backup trees generate these names every night.
+    ("rclone exit 3: directory not found: "
+     "gdrive:Backups/km-tracker/daily/km_tracker-20260503-0312.db", False),
+    ("rclone exit 1: couldn't list directory: "
+     "gdrive:Backups/todoist-points/points-20260429-0315.db: "
+     "object not found", False),
+    # A path can carry a marker WORD too, not just a status code.
+    ("rclone exit 3: directory not found: gdrive:Backups/timeout/20260503",
+     False),
+    # Genuinely transient — the two shapes actually measured in production —
+    # must stay transient.
+    ("rclone exit 7: Failed to lsjson: couldn't list directory: googleapi: "
+     "Error 403: User Rate Limit Exceeded, userRateLimitExceeded", True),
+    ("rclone exit 7: googleapi: Error 403: rateLimitExceeded", True),
+    ("rclone timed out after 240s", True),
+    ("rclone exit 7: Failed to lsjson: couldn't list directory: Get "
+     '"https://www.googleapis.com/drive/v3/files": net/http: request canceled '
+     "(Client.Timeout exceeded while awaiting headers)", True),
+    # Status codes still classify in their real HTTP spellings.
+    ("rclone exit 7: googleapi: Error 429: Too Many Requests", True),
+    ("rclone exit 7: failed to list: 503 Service Unavailable", True),
+    ("rclone exit 7: googleapi: got HTTP response code 503 with body", True),
+])
+def test_realistic_rclone_stderr_is_classified_correctly(text, transient):
+    assert probes.is_transient_error(text) is transient

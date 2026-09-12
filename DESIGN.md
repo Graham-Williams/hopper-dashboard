@@ -331,9 +331,13 @@ heartbeat `missing_*`/lag metrics, and whose freshness windows (12 d / `max_age_
 **Transient vs real:** a failure whose text matches `probes.TRANSIENT_MARKERS` (`rateLimitExceeded`, 429,
 503/backendError, timeouts, …) is prefixed `transient (Drive quota/timeout):` in the probe row's `error` and
 counted in `metrics.failed_transient`, and the self-job's `reason` names it — so "Drive pushed back" never
-reads like "the destination is missing files". rclone echoes the object it was listing (`(dir …)`, quoted
-names), and those names come from Drive, so they are stripped before classification: an object named
-`503 timeout` must not be able to buy a hard failure two probes of damping. Transients are **not** exempt
+reads like "the destination is missing files". rclone echoes the path it was working on — annotated (`(dir
+…)`), quoted, **and bare** (`open /srv/backups/…: permission denied`, usually the same name twice) — so all
+three forms are stripped before classification, and 429/503 match only in their real HTTP spellings
+(`Error 429:`, `code 503`, `503 Service Unavailable`) rather than as bare substrings. This is not only about
+hostile names from a shared folder: the backup trees are dated, and `km_tracker-20260503-0312.db` contains
+`503`, so bare-substring markers let a permission failure on an ordinary nightly snapshot buy itself damping
+instead of paging at once. Transients are **not** exempt
 from the consecutive count or the backstop: a *persistent* quota failure is a real problem — it is one way a
 nightly backup stops working — and must still reach FAIL, including for a job with its own `interval_s`.
 
