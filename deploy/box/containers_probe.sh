@@ -11,7 +11,9 @@
 # able to report any other way (see the arithmetic in dashboard-containers.service).
 #
 # Both probes run even if the other fails (a broken docker must not hide a full disk) and the
-# service's exit status is non-zero if either failed. A non-zero exit is only visible in the
+# service's exit status is non-zero if either failed — when BOTH fail it carries the containers
+# code, because a disk failure is already on the board and a containers one may not be. A
+# non-zero exit is only visible in the
 # journal, so when the disk probe fails WITHOUT having posted anything itself (rc != 3: it could
 # not start at all — moved, renamed, interpreter gone) this wrapper posts the `fail` ping for it.
 # Otherwise box-containers would keep reporting ok while box-disk silently froze at its last
@@ -48,7 +50,9 @@ post_disk_probe_failure() {
     return 0
   fi
   command -v curl >/dev/null 2>&1 || { echo "cannot report the disk probe failure: curl not found" >&2; return 0; }
-  curl -fsS -m 10 --retry 2 -X POST -H "Authorization: Bearer ${INGEST_TOKEN}" \
+  # `-H @-` reads the header from stdin (curl >= 7.55) so the token never appears in this
+  # process's argv, i.e. in /proc/<pid>/cmdline, which any local user can read.
+  curl -fsS -m 10 --retry 2 -X POST -H @- <<<"Authorization: Bearer ${INGEST_TOKEN}" \
     --data-urlencode "result=probe-failed" \
     --data-urlencode "exit=${rc}" \
     --data-urlencode "note=${note}" \
@@ -56,12 +60,21 @@ post_disk_probe_failure() {
     || echo "box-disk failure ping did not land (dashboard unreachable?)" >&2
 }
 
-rc=0
 disk_rc=0
+containers_rc=0
 "$PY" "$REPO/probes/disk_probe.py" ${DRY:+"$DRY"} || disk_rc=$?
-"$PY" "$REPO/probes/containers_probe.py" "$@" || rc=$?
-if [[ "$disk_rc" -ne 0 ]]; then
-  [[ "$disk_rc" -eq 3 ]] || post_disk_probe_failure "$disk_rc"
+"$PY" "$REPO/probes/containers_probe.py" "$@" || containers_rc=$?
+if [[ "$disk_rc" -ne 0 && "$disk_rc" -ne 3 ]]; then
+  post_disk_probe_failure "$disk_rc"
+fi
+# Surface the CONTAINERS failure in preference to the disk one when both fail: a disk
+# failure is already a `fail` ping on the board (posted by the probe itself at rc 3, or
+# by the fallback above), whereas a containers failure may exist nowhere but here.
+# Neither code is lost — both probes log their own error — but the exit status can only
+# carry one, so it carries the one the board cannot tell you about.
+if [[ "$containers_rc" -ne 0 ]]; then
+  rc="$containers_rc"
+else
   rc="$disk_rc"
 fi
 exit "$rc"

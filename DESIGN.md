@@ -86,7 +86,13 @@ Inputs:
      silence: a feeder that stops on its own (probe renamed, moved, interpreter gone) posts nothing
      at all, while the probe job it rides on keeps reporting `OK` — so without it a frozen gauge reads
      as a healthy one for ever. 48 h sits above `mac-probe`'s ~15 h LATE deadline on purpose, so a
-     machine merely switched off for a day does not page twice for one fact. `used_pct` is
+     machine merely switched off for a day does not page twice for one fact. A gauge that has NEVER
+     reported a reading is `UNKNOWN` only for `state.DISK_FIRST_READING_GRACE_S` = **6 h** after it was
+     registered, then `LATE` — the `disk` analogue of the never-pinged rule for scheduled kinds, and the
+     case where the job exists in `jobs.yml` but its feeder was never deployed (UNKNOWN is also the
+     initial stored state, so nothing would ever be alerted). Negative capacity metrics are treated as
+     absent — corrupt, not small — so the card says the capacity is unknown rather than printing an
+     invented >100% figure. `used_pct` is
      `(total - available) / total` as `statvfs` reports them, and `null` — never a ZeroDivisionError —
      when the total is missing or 0. Note that the free **bytes** equal `df`'s Avail but the
      **percentage** does not equal `df`'s `Use%`: on macOS/APFS `df` divides by a larger free figure
@@ -118,7 +124,7 @@ Outputs:
 - `OK`: last run success within cadence+grace AND (if probed) destination fresh.
 - `LATE`: no heartbeat within cadence+grace (dead-man's switch) — including a job that has NEVER pinged once
   cadence+grace has elapsed since it was registered (`jobs.created_at`); for a `disk` gauge, which has no
-  cadence, a capacity reading older than 48 h.
+  cadence, a capacity reading older than 48 h — or no reading at all more than 6 h after registration.
 - `FAIL`: last heartbeat status=fail (for a `disk` gauge, a `fail` ping no later metric has superseded).
 - `STALE_DEST`: heartbeat says ok but destination probe disagrees (the 2026-08 nightly-backup case). For copy
   trees only **missing** (never uploaded) bytes count; **differ** (edited since the last copy) is normal lag.
@@ -294,8 +300,10 @@ success > `max_age_s` or `lag_bytes` > `max_lag_bytes`; no thresholds = informat
 `max_age_s` is inert until the first real run (the card says **Never run** until then — seed one ping after
 the first manual run). `disk`, in this precedence: `FAIL` when the newest word is a `fail` ping ("capacity
 unreadable (<note>)" — the probe could not `statvfs` at all, or its wrapper reported that the probe never
-ran); `UNKNOWN` until the first capacity metric arrives; `LATE` when the newest reading is older than
-`state.DISK_METRIC_MAX_AGE_S` (48 h — a gauge nobody is feeding, see the `disk` kind above); `BEHIND` when
+ran); `UNKNOWN` until the first capacity metric arrives, but only for `state.DISK_FIRST_READING_GRACE_S`
+(6 h) after registration — after that, a gauge with no reading at all is `LATE` too; `LATE` when the newest
+reading is older than `state.DISK_METRIC_MAX_AGE_S` (48 h — a gauge nobody is feeding, or one whose
+`last_metrics_at` will not parse: both time comparisons fail safe); `BEHIND` when
 free < `min_free_bytes` or used-percent > `max_used_pct` (both comparisons strict, so a threshold reads as
 "worse than this", not "at this"; the reason names the threshold that tripped and the actual figures); else
 `OK`. Capacity arrives as `status: "metric"` pings, which are not runs — so the `fail` check compares the

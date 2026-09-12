@@ -263,14 +263,27 @@ def test_probe_mac_disk_reports_capacity_metrics(tmp_path):
     assert m["disk_path"] == str(tmp_path)
 
 
-def test_probe_mac_disk_unreadable_path_is_a_probe_error(tmp_path):
+def test_probe_mac_disk_unreadable_path_is_a_fail_ping_not_a_raise(tmp_path):
+    """A raise would be caught by main() and posted to mac-probe instead, leaving the
+    mac-disk card on its last good reading — OK for up to 48 h while the volume is gone.
+    Same contract as probe_drive_mirror and the box's disk_probe."""
     cfg = mac_probe.load_settings(_env(tmp_path, PROBE_DISK_PATH=str(tmp_path / "gone")))
-    try:
-        mac_probe.probe_mac_disk(cfg, mac_probe.Logger(None))
-    except ProbeError as e:
-        assert "statvfs" in str(e)
-    else:
-        raise AssertionError("expected ProbeError for a missing path")
+    (job, body), = mac_probe.probe_mac_disk(cfg, mac_probe.Logger(None))
+    assert job == "mac-disk" and body["status"] == "fail" and body["reason"] == "error"
+    assert "statvfs" in body["note"] and "metrics" not in body
+    assert body["started_at"] and body["finished_at"]
+
+
+def test_unreadable_mac_disk_is_delivered_rather_than_counted_as_a_failure(tmp_path, monkeypatch):
+    """End to end: the fail ping reaches the dashboard, and mac-probe's own heartbeat
+    stays ok — the gauge reports its own trouble."""
+    sent = []
+    monkeypatch.setattr(mac_probe, "send_ping",
+                        lambda url, token, job, body, timeout=None: sent.append((job, body)) or (200, "{}"))
+    rc = mac_probe.main(["--env", _env(tmp_path, PROBE_DISK_PATH=str(tmp_path / "gone")),
+                         "--only", "mac-disk", "--quiet"])
+    assert rc == 0
+    assert [(j, b["status"]) for j, b in sent] == [("mac-disk", "fail"), ("mac-probe", "ok")]
 
 
 def test_minecraft_offload_still_carries_its_own_disk_metrics(tmp_path, monkeypatch):

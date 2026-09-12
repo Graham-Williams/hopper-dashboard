@@ -18,13 +18,17 @@ Type=oneshot
 User=@@USER@@
 EnvironmentFile=-/etc/hopper-dashboard/ingest.env
 ExecStart=@@REPO@@/deploy/box/containers_probe.sh
-# Two probes run in sequence here, so the ceiling has to cover both worst cases:
+# Two probes run in sequence here, plus the wrapper's fallback ping, so the ceiling has to cover
+# all three worst cases — and they are ADDITIVE: the fallback curl only runs after the disk probe
+# has already burned its own budget failing.
 #   disk probe:       statvfs (instant) + send_ping 3 attempts × 10 s + ~4.5 s backoff  ≈  35 s
+#   fallback curl:    -m 10 --retry 2 + its ~1 s/2 s backoff                           ≈  33 s
 #   containers probe: docker ps 30 s timeout + send_ping 3 × 10 s + ~4.5 s backoff      ≈  65 s
-# ≈ 100 s, plus headroom for a slow interpreter start and a retrying curl in the wrapper's
-# fallback ping. The old 60 s could not even cover the containers probe alone: systemd SIGTERMed
-# the unit exactly when docker or the network was in trouble — i.e. when the disk reading matters
-# most — and (before the disk probe was moved first) that reading was the one silently lost.
-TimeoutStartSec=150
+# ≈ 133 s worst case, so 150 s left only ~11% headroom — not enough for a slow interpreter start
+# on a loaded box. 210 s restores ~58%, and still finishes inside the timer's 5-minute interval.
+# The original 60 s could not even cover the containers probe alone: systemd SIGTERMed the unit
+# exactly when docker or the network was in trouble — i.e. when the disk reading matters most —
+# and (before the disk probe was moved first) that reading was the one silently lost.
+TimeoutStartSec=210
 NoNewPrivileges=true
 PrivateTmp=true

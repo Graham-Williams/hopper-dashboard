@@ -2,7 +2,8 @@
 
 from dashboard.db import to_iso
 from dashboard.registry import parse_registry
-from dashboard.state import (DISK_METRIC_MAX_AGE_S, Facts, compute_state,
+from dashboard.state import (DISK_FIRST_READING_GRACE_S, DISK_METRIC_MAX_AGE_S,
+                             Facts, _disk_never_reported_late, compute_state,
                              db_snapshot_stale, dest_info, disk_info, lag_info,
                              running_names)
 from tests.conftest import JOBS_DOC
@@ -387,6 +388,71 @@ def test_disk_goes_late_when_the_feeder_stops_posting():
     f.last_metrics_at = to_iso(NOW - 49 * 3600)
     state, reason = compute_state(DISK, f, NOW)
     assert state == "LATE" and "48h" in reason
+
+
+def test_disk_never_reporting_is_late_once_the_grace_has_passed():
+    # The misinstalled-feeder case: the gauge is in jobs.yml but its probe was never
+    # deployed (or its --job id is mistyped). UNKNOWN is also the initial stored state,
+    # so no transition is recorded and no alert ever fires — the card would read
+    # "never heard from" for ever beside a happy box-containers.
+    fresh = Facts(created_at=to_iso(NOW - DISK_FIRST_READING_GRACE_S + 60))
+    assert compute_state(DISK, fresh, NOW) == ("UNKNOWN", "never heard from")
+    old = Facts(created_at=to_iso(NOW - DISK_FIRST_READING_GRACE_S - 60))
+    state, reason = compute_state(DISK, old, NOW)
+    assert state == "LATE" and "probe deployed" in reason
+
+
+def test_disk_metrics_without_a_capacity_figure_also_go_late_after_the_grace():
+    # Metrics arrived but carry no free-bytes key: same silence, same finding.
+    f = disk_facts(total=400 * GIB)
+    f.created_at = to_iso(NOW - DISK_FIRST_READING_GRACE_S - 60)
+    assert compute_state(DISK, f, NOW)[0] == "LATE"
+
+
+def test_disk_grace_does_not_apply_to_other_kinds():
+    # The snapshot job has its own cadence-based dead-man's switch; nothing here
+    # may change what an unregistered-yet scheduled job reports.
+    f = Facts(created_at=to_iso(NOW - 10 * 86400))
+    assert _disk_never_reported_late(REG.get("offload"), f, NOW) is False
+    assert _disk_never_reported_late(DISK, f, NOW) is True
+
+
+def test_disk_fail_with_an_undatable_timestamp_still_wins():
+    # Fail safe: a corrupt received_at must not resurrect the original bug (a stale
+    # good reading reading OK while the probe says the volume is gone).
+    f = disk_facts(free=200 * GIB, total=400 * GIB)
+    f.last_run = disk_fail_run()
+    f.last_run["received_at"] = "garbage"
+    assert compute_state(DISK, f, NOW)[0] == "FAIL"
+
+
+def test_disk_fail_and_reading_in_the_same_second_is_a_fail():
+    # to_iso is second-granular, so a tie is reachable in production. It breaks toward
+    # over-reporting on purpose: do not flip this comparison to a strict `>`.
+    f = disk_facts(free=200 * GIB, total=400 * GIB)     # last_metrics_at == NOW
+    f.last_run = disk_fail_run(ago=0)                   # received_at  == NOW
+    assert compute_state(DISK, f, NOW)[0] == "FAIL"
+
+
+def test_disk_reading_with_an_undatable_timestamp_is_late_not_ok():
+    # Fail safe the other way: an unparseable last_metrics_at used to disable the
+    # staleness ceiling entirely, so a ten-year-old figure read OK.
+    f = disk_facts(free=200 * GIB, total=400 * GIB)
+    f.last_metrics_at = "garbage"
+    assert compute_state(DISK, f, NOW)[0] == "LATE"
+
+
+def test_disk_negative_capacity_is_unknown_not_a_made_up_percentage():
+    # Nothing clamps a negative metric, and arithmetic on one invented
+    # "only — free, below the 25.0 GiB floor; 101.2% used" (human_gib renders a
+    # negative as an em dash). Corrupt, not small: report it as absent.
+    f = disk_facts(free=-5 * GIB, total=400 * GIB)
+    d = disk_info(DISK, f)
+    assert d["free_bytes"] is None and d["used_pct"] is None and d["low"] is False
+    assert compute_state(DISK, f, NOW) == ("UNKNOWN", "no disk metrics reported yet")
+    # A negative TOTAL likewise yields no percentage rather than a negative one.
+    d2 = disk_info(DISK, disk_facts(free=200 * GIB, total=-400 * GIB))
+    assert d2["total_bytes"] is None and d2["used_pct"] is None
 
 
 def test_disk_staleness_ceiling_clears_a_machine_that_was_off_for_a_day():

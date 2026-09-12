@@ -237,11 +237,21 @@ def probe_mac_disk(cfg: Dict[str, str], log: Logger) -> List[Ping]:
     thresholds and alert. ``minecraft-offload`` also reports these two metrics (it has since the
     first release) — that stays as it is: those are a footnote on an offload card, this is the
     gauge. A ``metric`` ping, not a run: a disk job is never LATE, and mac-probe already says
-    whether the Mac is awake."""
+    whether the Mac is awake.
+
+    An unreadable path is reported as a ``fail`` run rather than raised, exactly like
+    ``probe_drive_mirror`` below and ``disk_probe.build_disk_ping`` on the box: a raise
+    only lands in ``failures`` (mac-probe goes FAIL) and posts NOTHING here, so the
+    gauge would sit on its last good reading — OK for up to DISK_METRIC_MAX_AGE_S —
+    while the volume was gone. The failed run outranks the stored figures in
+    ``state.compute_state``'s disk branch."""
     try:
         metrics = rclone_check.disk_free(cfg["PROBE_DISK_PATH"])
     except OSError as e:
-        raise ProbeError("statvfs %s: %s" % (cfg["PROBE_DISK_PATH"], e))
+        note = "statvfs %s: %s" % (cfg["PROBE_DISK_PATH"], e)
+        log.error("mac-disk: " + note)
+        return [("mac-disk", build_ping("fail", reason="error", note=note,
+                                        started_at=now_iso(), finished_at=now_iso()))]
     metrics["disk_path"] = cfg["PROBE_DISK_PATH"]
     log.log("mac-disk: %s → %d free of %d bytes" % (
         cfg["PROBE_DISK_PATH"], metrics["disk_free_bytes"], metrics["disk_total_bytes"]))

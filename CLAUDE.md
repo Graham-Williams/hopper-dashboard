@@ -31,9 +31,9 @@ roles in one process for local dev.
 ```
 uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -r requirements-dev.txt
 # (or: python3.12 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt)
-.venv/bin/python -m pytest -q                         # ~355 tests, no network, < 5 s
+.venv/bin/python -m pytest -q                         # ~365 tests, no network, < 5 s
 /usr/bin/python3 -m pytest -o addopts="" tests/test_probes_*.py -q   # ~100 probe tests, MUST pass stdlib-only
-/usr/bin/python3 -m compileall -q probes/              # 3.9 syntax gate (CI runs this on 3.9 too)
+/usr/bin/python3 -m compileall -qf probes/             # 3.9 syntax gate (CI also RUNS the probe tests on 3.9)
 
 cp jobs.example.yml jobs.yml                          # local only; gitignored
 export APP_PASSWORD=devpass SESSION_SECRET=devsecret INGEST_TOKEN=devtoken READ_TOKEN=devread
@@ -76,7 +76,9 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   because a successful capacity ping is `status: metric` and therefore never a run — without that
   comparison one transient `statvfs` error pins the card to FAIL for ever); a reading older than
   `DISK_METRIC_MAX_AGE_S` (48 h) is LATE, which is the only signal for a feeder that stopped on its own
-  while its machine's probe job kept reporting OK; and `_num` caps metric magnitude as well as rejecting
+  while its machine's probe job kept reporting OK (and no reading at all more than
+  `DISK_FIRST_READING_GRACE_S` = 6 h after registration is LATE too — the feeder that never STARTED; both
+  time comparisons fail safe on an unparseable timestamp, and negative capacity metrics are dropped); and `_num` caps metric magnitude as well as rejecting
   non-finite values (a numeric *string* metric bypasses the ingest ceiling).
   `used_pct` is `(total-available)/total`, so it does NOT match `df`'s `Use%` — the free bytes do. Say so
   rather than "fixing" it; DESIGN.md → `disk` and `probes/common.disk_free` carry the measurement.
@@ -171,11 +173,13 @@ there is no default URL in the code, by design.
   `$SERVICE_RESULT`/`$EXIT_STATUS`) + `dashboard-containers.timer` (`OnCalendar=*:0/5`, `Persistent=true`) →
   `dashboard-containers.service` (`User=@@USER@@` rendered by `install.sh`, default `$SUDO_USER`) →
   `deploy/box/containers_probe.sh`, which runs BOTH `probes/disk_probe.py` (`statvfs /` → `box-disk`,
-  **first**: it is the cheap one, and `TimeoutStartSec=150` has to cover both) and
+  **first**: it is the cheap one, and `TimeoutStartSec=210` has to cover both plus the fallback curl) and
   `probes/containers_probe.py` (`docker ps` → `box-containers`) off that one timer; each runs even if the
   other fails and the service exits non-zero if either did. A non-zero exit is journal-only, so the wrapper
   ALSO posts the `fail` ping for a disk probe that never ran — `disk_probe.py` exits **3** when it already
   delivered a `fail` itself, and any other non-zero rc means nothing landed and the wrapper reports it.
+  When both probes fail the unit exits with the CONTAINERS code: the disk failure is already a ping on the
+  board, a containers failure may be nowhere but the journal.
   Keep that exit-code contract if you touch either file. `disk_free` lives in
   `probes/common.py` (re-exported from `rclone_check` for the Mac probe's existing call site) so the box
   probe doesn't import an rclone module to call `statvfs`. Credentials in `/etc/hopper-dashboard/ingest.env` (root 0600,

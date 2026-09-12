@@ -127,6 +127,9 @@ def test_wrapper_posts_a_fail_when_the_disk_probe_never_ran(tmp_path):
     assert "result=probe-failed" in logged and "exit=2" in logged
     # The note has to say where to look — the rc itself is only in the journal.
     assert "journalctl -u dashboard-containers.service" in logged
+    # …and the token is fed to curl on stdin (-H @-), never on its argv, which any
+    # local user can read out of /proc/<pid>/cmdline.
+    assert "tok" not in logged
 
 
 def test_wrapper_stays_quiet_when_the_probe_posted_its_own_failure(tmp_path):
@@ -141,6 +144,23 @@ def test_wrapper_does_not_blame_the_disk_for_a_containers_failure(tmp_path):
     p = _run_wrapper(env)
     assert p.returncode == 4, p.stderr
     assert not log.exists()
+
+
+def test_wrapper_surfaces_the_containers_failure_when_both_probes_fail(tmp_path):
+    """The exit status can only carry one code, so it carries the one the board cannot
+    show: the disk failure is already a `fail` ping, the containers one may be nowhere
+    else. The fallback ping still goes out for the disk probe."""
+    env, log = _wrapper_env(tmp_path, disk_rc=3, containers_rc=4)
+    p = _run_wrapper(env)
+    assert p.returncode == 4, p.stderr
+    assert not log.exists()          # rc 3 = the probe already posted its own failure
+    # …and with a disk probe that posted nothing, the fallback fires AND 4 still wins.
+    second = tmp_path / "b"
+    second.mkdir()
+    env, log = _wrapper_env(second, disk_rc=2, containers_rc=4)
+    p = _run_wrapper(env)
+    assert p.returncode == 4, p.stderr
+    assert "/api/v1/ping/box-disk" in log.read_text()
 
 
 def test_wrapper_reports_nothing_and_still_exits_nonzero_without_credentials(tmp_path):
