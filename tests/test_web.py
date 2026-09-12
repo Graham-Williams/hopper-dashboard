@@ -379,3 +379,19 @@ def test_disk_card_survives_a_zero_total(authed, core, registry):
     html = authed.get("/").data.decode()
     assert "capacity unknown" in html and "10.0 GiB free" in html
     assert "gaugebar" not in html[html.index("Capacity"):html.index("Capacity") + 600]
+
+
+def test_gauge_bar_width_is_clamped_at_both_ends(read_app):
+    """The width is data from a probe, and an SVG width="-40.0" is not a valid length.
+    Unreachable through ingest today (the percent is derived from clamped metrics), so
+    drive the macro directly rather than pretending the path exists."""
+    disk_gauge = read_app.jinja_env.get_template("_macros.html").module.disk_gauge
+
+    def render(used_pct):
+        return disk_gauge({"free_bytes": 1, "total_bytes": 2, "used_pct": used_pct,
+                           "min_free_bytes": None, "max_used_pct": None,
+                           "low": False, "measured_at": None}, NOW)
+
+    assert 'class="fill" x="0" y="0" width="0"' in render(-40.0)
+    assert 'class="fill" x="0" y="0" width="100"' in render(120.0)
+    assert 'class="fill" x="0" y="0" width="62.5"' in render(62.5)

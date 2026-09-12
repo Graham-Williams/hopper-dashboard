@@ -9,7 +9,7 @@
 # group. Token + URL come from /etc/hopper-dashboard/ingest.env, read by systemd as root and
 # handed to the process as environment.
 [Unit]
-Description=hopper-dashboard box probes (docker ps → box-containers, statvfs → box-disk)
+Description=hopper-dashboard box probes (statvfs → box-disk, docker ps → box-containers)
 Wants=network-online.target
 After=network-online.target docker.service
 
@@ -18,6 +18,13 @@ Type=oneshot
 User=@@USER@@
 EnvironmentFile=-/etc/hopper-dashboard/ingest.env
 ExecStart=@@REPO@@/deploy/box/containers_probe.sh
-TimeoutStartSec=60
+# Two probes run in sequence here, so the ceiling has to cover both worst cases:
+#   disk probe:       statvfs (instant) + send_ping 3 attempts × 10 s + ~4.5 s backoff  ≈  35 s
+#   containers probe: docker ps 30 s timeout + send_ping 3 × 10 s + ~4.5 s backoff      ≈  65 s
+# ≈ 100 s, plus headroom for a slow interpreter start and a retrying curl in the wrapper's
+# fallback ping. The old 60 s could not even cover the containers probe alone: systemd SIGTERMed
+# the unit exactly when docker or the network was in trouble — i.e. when the disk reading matters
+# most — and (before the disk probe was moved first) that reading was the one silently lost.
+TimeoutStartSec=150
 NoNewPrivileges=true
 PrivateTmp=true

@@ -76,14 +76,23 @@ Inputs:
    - `disk`: filesystem capacity for one machine, pushed as metrics (`disk_free_bytes` /
      `disk_total_bytes`) by that machine's existing probe — the Mac's hourly launchd run (`mac-disk`) and
      the box's 5-minute containers timer (`box-disk`). A **gauge, not a job**: no `cadence_s`/`grace_s`,
-     no dead-man's switch, no destination probe. Liveness is already owned by `mac-probe` /
+     no per-cadence dead-man's switch, no destination probe. Liveness is already owned by `mac-probe` /
      `box-containers`, which carry these metrics in on the same run, so a second silence alarm for the
      same silence would only double the alerts. `BEHIND` when `disk_free_bytes < disk.min_free_bytes`
      or used-percent > `disk.max_used_pct`; with neither threshold set it is informational (shown, never
-     alerted), exactly like a thresholdless `manual` job. `used_pct` is derived from free-vs-total as
-     `statvfs` reports them (available space, so it reads a hair higher than `df`, whose denominator
-     excludes the reserved blocks) and is `null` — never a ZeroDivisionError — when the total is
-     missing or 0.
+     alerted), exactly like a thresholdless `manual` job. Two things outrank the figures: a `fail` ping
+     that nothing has superseded (→ `FAIL`, "capacity unreadable"), and a reading older than
+     `state.DISK_METRIC_MAX_AGE_S` = **48 h** (→ `LATE`). That ceiling is the backstop for *partial*
+     silence: a feeder that stops on its own (probe renamed, moved, interpreter gone) posts nothing
+     at all, while the probe job it rides on keeps reporting `OK` — so without it a frozen gauge reads
+     as a healthy one for ever. 48 h sits above `mac-probe`'s ~15 h LATE deadline on purpose, so a
+     machine merely switched off for a day does not page twice for one fact. `used_pct` is
+     `(total - available) / total` as `statvfs` reports them, and `null` — never a ZeroDivisionError —
+     when the total is missing or 0. Note that the free **bytes** equal `df`'s Avail but the
+     **percentage** does not equal `df`'s `Use%`: on macOS/APFS `df` divides by a larger free figure
+     that `statvfs` never exposes (measured: 79.5% here, 78% there), so a 90% ceiling trips at roughly
+     88.5% as `df` prints it. Expected, not a bug to fix — `f_bavail` is the right number because it
+     is the space a recording can actually use.
 3. **Mac probe (push).** A launchd job (`com.hopper.dashboard-probe`, hourly, plus RunAtLoad so it fires after
    wake) that computes: recordings/world-backups/replays not yet on Drive (rclone check --one-way, byte total),
    nightly backup last outcome (parse `~/Library/Logs/hopper-backup.log` last line), disk free (as its own
@@ -108,8 +117,9 @@ Outputs:
 ## State machine (per job)
 - `OK`: last run success within cadence+grace AND (if probed) destination fresh.
 - `LATE`: no heartbeat within cadence+grace (dead-man's switch) — including a job that has NEVER pinged once
-  cadence+grace has elapsed since it was registered (`jobs.created_at`).
-- `FAIL`: last heartbeat status=fail.
+  cadence+grace has elapsed since it was registered (`jobs.created_at`); for a `disk` gauge, which has no
+  cadence, a capacity reading older than 48 h.
+- `FAIL`: last heartbeat status=fail (for a `disk` gauge, a `fail` ping no later metric has superseded).
 - `STALE_DEST`: heartbeat says ok but destination probe disagrees (the 2026-08 nightly-backup case). For copy
   trees only **missing** (never uploaded) bytes count; **differ** (edited since the last copy) is normal lag.
 - `BEHIND`: manual job over its lag target, or a `disk` job under its free-space floor / over its
@@ -282,11 +292,16 @@ combined `lag_bytes` no longer drives staleness for this kind. `drive_mirror` �
 IS the check; no DB → `fail`). `manual`: never LATE; `FAIL` if last run failed; `BEHIND` if age of last
 success > `max_age_s` or `lag_bytes` > `max_lag_bytes`; no thresholds = informational, never alerts.
 `max_age_s` is inert until the first real run (the card says **Never run** until then — seed one ping after
-the first manual run). `disk`: never LATE and never FAIL — `UNKNOWN` until the first capacity metric
-arrives, `BEHIND` when free < `min_free_bytes` or used-percent > `max_used_pct` (both comparisons strict,
-so a threshold reads as "worse than this", not "at this"; the reason names the threshold that tripped and
-the actual figures), else `OK`. Metrics arrive as `status: "metric"` pings, so a disk gauge never records
-a run at all. `dashboard-probes` is the scheduler's own heartbeat: a run is recorded every probe
+the first manual run). `disk`, in this precedence: `FAIL` when the newest word is a `fail` ping ("capacity
+unreadable (<note>)" — the probe could not `statvfs` at all, or its wrapper reported that the probe never
+ran); `UNKNOWN` until the first capacity metric arrives; `LATE` when the newest reading is older than
+`state.DISK_METRIC_MAX_AGE_S` (48 h — a gauge nobody is feeding, see the `disk` kind above); `BEHIND` when
+free < `min_free_bytes` or used-percent > `max_used_pct` (both comparisons strict, so a threshold reads as
+"worse than this", not "at this"; the reason names the threshold that tripped and the actual figures); else
+`OK`. Capacity arrives as `status: "metric"` pings, which are not runs — so the `fail` check compares the
+failed run's receive time against `last_metrics_at` rather than just reading `last_run`: without that, one
+transient `statvfs` error would pin the card to `FAIL` for ever, because a `metric` ping can never become
+the newest `runs` row. `dashboard-probes` is the scheduler's own heartbeat: a run is recorded every probe
 cycle, `fail` (with the error in `note`) if any rclone probe errored — so a broken probe shows up as a FAIL
 card, never a crash.
 

@@ -69,13 +69,14 @@ jobs:
     machine: box
     kind: disk
     protects: Every container's data volume + the DB snapshots staged before upload
-    method: statvfs / on the box, posted by the same 5-min timer as box-containers
-    # A `disk` job is a GAUGE, not a scheduled job: it has no cadence_s/grace_s and never goes
-    # LATE. Liveness is already box-containers' job (same timer, same script) — a second
-    # dead-man's switch for the same silence would just double the alerts.
+    method: statvfs / on the box (available space, so the percent reads a little off df), posted by the same 5-min timer as box-containers
+    # A `disk` job is a GAUGE, not a scheduled job: no cadence_s/grace_s, and no per-cadence
+    # dead-man's switch — box-containers, on this same timer, already carries that silence.
+    # It does go LATE if nothing refreshes the reading for 48 h (state.DISK_METRIC_MAX_AGE_S),
+    # which is the only way a feeder that stopped on its own would ever show up.
     disk:
-      # 914 GB disk at ~4% used today, so these are early-warning, not crisis, levels:
-      # BEHIND at 50 GiB free (room for a rebuild + a snapshot) or 85% used.
+      # Early-warning, not crisis, levels: BEHIND at 50 GiB free (room for an image rebuild
+      # plus a DB snapshot) or 85% used.
       min_free_bytes: 53687091200   # 50 GiB
       max_used_pct: 85
 
@@ -104,9 +105,11 @@ jobs:
     machine: mac
     kind: disk
     protects: Headroom for OBS recordings, Whisper runs and the Drive mirror's local copies
-    method: statvfs /System/Volumes/Data, posted by the hourly Mac probe
-    # No cadence_s/grace_s: a disk gauge is never LATE (mac-probe already says whether the Mac
-    # is awake, and these metrics arrive on the same hourly run).
+    method: statvfs /System/Volumes/Data (available space — df prints a lower percent, see DESIGN.md), posted by the hourly Mac probe
+    # No cadence_s/grace_s: mac-probe already says whether the Mac is awake, and these metrics
+    # arrive on the same hourly run. The gauge still goes LATE if the reading stops being
+    # refreshed for 48 h (state.DISK_METRIC_MAX_AGE_S) — comfortably past a Mac that is merely
+    # switched off for a day, which mac-probe alerts for on its own.
     disk:
       # 25 GiB free is the documented line at which the delete-after-confirm staging folder is
       # worth clearing; 90% matches the storage watch. Either one trips BEHIND.

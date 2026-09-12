@@ -33,6 +33,9 @@ from .db import from_iso
 from .humanize import human_gib
 from .registry import Job
 
+# Largest magnitude any metric may have (mirrors ingest.INT_ABS_MAX; see _num).
+METRIC_ABS_MAX = float(2 ** 63)
+
 # Metric keys the Mac probe / scripts may use for "how far behind".
 LAG_BYTES_KEYS = ("lag_bytes", "missing_bytes")
 LAG_FILES_KEYS = ("lag_files", "missing_files")
@@ -45,6 +48,23 @@ DIFFER_FILES_KEYS = ("differ_files",)
 # so an ad-hoc script's metrics are understood too (same rule as LAG_BYTES_KEYS).
 DISK_FREE_KEYS = ("disk_free_bytes", "free_bytes")
 DISK_TOTAL_KEYS = ("disk_total_bytes", "total_bytes")
+# How old a capacity reading may get before the gauge itself is the finding.
+#
+# A `disk` job has no cadence (see SCHEDULED_KINDS) because its machine's probe
+# job carries the same silence — but that only covers TOTAL silence. The box's
+# disk probe can stop running on its own (renamed, moved, interpreter gone: the
+# wrapper records a non-zero rc in the journal and that is all) while
+# box-containers, posted by a different script on the same timer, keeps saying
+# OK. Nothing is posted then, so the fail branch below cannot fire; the reading's
+# own age is the only signal left.
+#
+# 48 h is deliberately generous. The feeders run every 5 min (box) and hourly
+# (Mac), so this is ~576 / ~48 consecutive misses — unambiguous. It also sits
+# above mac-probe's ~15 h LATE deadline, so a Mac merely switched off for a day
+# does not page twice for one fact (the machine-offline rule in services.py
+# mutes the sibling alert only while the probe job is itself LATE; a 24 h
+# ceiling would reintroduce exactly the double-alerting that rule avoids).
+DISK_METRIC_MAX_AGE_S = 48 * 3600
 
 
 @dataclass
@@ -58,12 +78,18 @@ class Facts:
 
 
 def _num(value) -> float | None:
-    """Coerce a metric to a finite float, or None.
+    """Coerce a metric to a finite, plausibly-sized float, or None.
 
     Strings are accepted (probes may send numbers as text) but ``"nan"``,
     ``"inf"`` and ``"1e999"`` parse to non-finite floats that later blow up
     ``int()`` in the state computation and 500 every reader until the metric
     is overwritten — so anything non-finite is treated as absent.
+
+    Magnitude is capped for the same reason: ``ingest`` rejects a numeric
+    ``1e308``, but a metric sent as the *string* ``"1e308"`` is a legal short
+    string, and ``int()`` on it yields a 309-digit integer that lands in
+    ``/api/v1/status`` and ~310 characters in the gauge's heading. Nothing real
+    — bytes, files, seconds — comes near 9.2e18, so treat it as absent too.
     """
     if isinstance(value, bool):
         return None
@@ -76,7 +102,7 @@ def _num(value) -> float | None:
             return None
     else:
         return None
-    return f if math.isfinite(f) else None
+    return f if math.isfinite(f) and abs(f) <= METRIC_ABS_MAX else None
 
 
 def _first_num(metrics: dict, keys) -> float | None:
@@ -221,11 +247,16 @@ def lag_info(job: Job, f: Facts, now: float) -> dict | None:
 def disk_info(job: Job, f: Facts) -> dict | None:
     """Capacity block for the JSON + card, or None for any kind but ``disk``.
 
-    ``used_pct`` is derived from free-vs-total as ``statvfs`` reports them
-    (available space, so it can read a hair higher than ``df`` — which excludes
-    the reserved blocks from its denominator). It is None when the total is
-    absent or zero: a container bind-mount and a statvfs on a path that went
-    away both report 0 blocks, and dividing by that would 500 the whole board.
+    ``used_pct`` is simply ``(total - available) / total`` from what ``statvfs``
+    reported. The free BYTES match ``df``'s Avail exactly; the PERCENTAGE will
+    not match ``df``'s (on macOS/APFS, measured: 79.5% here vs 78% there — ``df``
+    divides by a larger free figure that ``statvfs`` never hands Python). That is
+    expected, not a rounding bug: a 90% ceiling here trips around 88.5% as ``df``
+    prints it. See ``probes/common.disk_free``.
+
+    It is None when the total is absent or zero: a container bind-mount and a
+    statvfs on a path that went away both report 0 blocks, and dividing by that
+    would 500 the whole board.
     """
     if job.kind != "disk":
         return None
@@ -305,11 +336,32 @@ def compute_state(job: Job, f: Facts, now: float) -> tuple[str, str]:
         return "UNKNOWN", "never heard from"
 
     if job.kind == "disk":
-        # A gauge, not a job: judged purely on the newest metrics. Never LATE
-        # (see SCHEDULED_KINDS) — the machine's probe job owns that signal.
+        # A gauge, not a job: judged on the newest metrics, with no cadence-based
+        # dead-man's switch (see SCHEDULED_KINDS). Two things still outrank the
+        # figures, in this order:
+        #   1. the probe saying it could not read the filesystem at all, and
+        #   2. the figures being too old to mean anything (DISK_METRIC_MAX_AGE_S).
         d = disk_info(job, f) or {}
+        metrics_at = from_iso(f.last_metrics_at)
+        # Newest word wins. Mirrors the `manual` branch's fail check, but a disk
+        # probe posts success as a `metric` ping — which is NOT a run — so the
+        # failed run stays the newest `runs` row for ever; without comparing it
+        # against last_metrics_at one transient statvfs error would pin the card
+        # to FAIL while healthy readings flowed in behind it.
+        failed_at = (from_iso(lr.get("received_at"))
+                     if lr and lr.get("status") == "fail" else None)
+        if failed_at is not None and (metrics_at is None or failed_at >= metrics_at):
+            why = lr.get("note") or lr.get("reason") or "no reason"
+            return "FAIL", f"capacity unreadable ({str(why)[:120]})"
         if d.get("free_bytes") is None:
             return "UNKNOWN", "no disk metrics reported yet"
+        if metrics_at is not None and now - metrics_at > DISK_METRIC_MAX_AGE_S:
+            # LATE, not FAIL: this IS a dead-man's switch, and reusing LATE gets
+            # the machine-offline alert suppression in services.py for free.
+            return "LATE", (f"no capacity reading in over "
+                            f"{DISK_METRIC_MAX_AGE_S // 3600}h — whatever feeds "
+                            f"this gauge has stopped (probe moved or renamed?) or "
+                            f"the machine has been off that long")
         if d["low"]:
             parts = []
             if "free" in d["low_on"]:

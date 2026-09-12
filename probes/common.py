@@ -317,9 +317,18 @@ def save_state(path: str, state: Dict[str, object]) -> None:
 
 def disk_free(path: str) -> Dict[str, int]:
     """``statvfs`` capacity for the filesystem holding ``path``, as the two metric keys the
-    dashboard's ``disk`` kind reads. ``f_bavail`` is the space available to a non-root user, so
-    free + used can come out a little under the total (the reserved blocks) — that is deliberate:
-    it is the number that matters when a recording can no longer be written."""
+    dashboard's ``disk`` kind reads.
+
+    ``f_bavail`` — the space actually available to a non-root user — is the deliberate choice:
+    it is the number that matters when a recording can no longer be written.
+
+    **The free BYTES match ``df``; the PERCENTAGE does not, and that is not a bug.** Measured on
+    macOS/APFS: ``statvfs`` hands Python ``f_bfree == f_bavail`` (94.23 GiB, exactly ``df``'s
+    Avail), while ``df`` gets a much larger ``f_bfree`` from ``statfs`` (~139 GiB) and computes
+    its own percentage from that, so it printed 78% where the dashboard says 79.5%. The ~45 GiB
+    gap is the OS's own accounting (purgeable and similar), NOT a reserve this code can see or
+    subtract. The dashboard's figure is simply ``(total - available) / total``; expect it to read
+    a point or two off ``df`` on the same filesystem, and do not "fix" the difference."""
     st = os.statvfs(path)
     return {
         "disk_free_bytes": st.f_bavail * st.f_frsize,

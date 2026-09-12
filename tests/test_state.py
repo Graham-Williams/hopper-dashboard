@@ -2,8 +2,9 @@
 
 from dashboard.db import to_iso
 from dashboard.registry import parse_registry
-from dashboard.state import (Facts, compute_state, db_snapshot_stale, dest_info,
-                             disk_info, lag_info, running_names)
+from dashboard.state import (DISK_METRIC_MAX_AGE_S, Facts, compute_state,
+                             db_snapshot_stale, dest_info, disk_info, lag_info,
+                             running_names)
 from tests.conftest import JOBS_DOC
 
 NOW = 1_800_000_000.0
@@ -340,11 +341,68 @@ def test_disk_zero_or_missing_total_never_divides_by_zero():
     assert compute_state(DISK, disk_facts(free=1 * GIB, total=0), NOW)[0] == "BEHIND"
 
 
-def test_disk_is_never_late_however_old_the_metrics():
+def test_disk_has_no_cadence_deadline():
+    # Liveness belongs to the machine's probe job, so a reading far older than any
+    # cadence is still OK — only the coarse staleness ceiling below applies.
     f = disk_facts(free=200 * GIB, total=400 * GIB)
     f.created_at = to_iso(NOW - 10 * 86400)
-    f.last_metrics_at = to_iso(NOW - 10 * 86400)
-    assert compute_state(DISK, f, NOW)[0] == "OK"   # liveness belongs to the machine's probe job
+    f.last_metrics_at = to_iso(NOW - 6 * 3600)
+    assert compute_state(DISK, f, NOW)[0] == "OK"
+
+
+def disk_fail_run(note="statvfs /data: [Errno 2] No such file or directory", ago=0):
+    return {"status": "fail", "reason": "error", "note": note,
+            "received_at": to_iso(NOW - ago)}
+
+
+def test_disk_fail_ping_is_not_masked_by_the_last_good_reading():
+    # The probe posted `fail` after its last good reading: the gauge is unreadable,
+    # and the stale figure must not keep the card OK (a fail ping that changes
+    # nothing is worse than no ping at all — it looks handled).
+    f = disk_facts(free=200 * GIB, total=400 * GIB)
+    f.last_metrics_at = to_iso(NOW - 7200)
+    f.last_run = disk_fail_run(ago=3600)
+    state, reason = compute_state(DISK, f, NOW)
+    assert state == "FAIL" and "statvfs" in reason
+
+
+def test_disk_fail_before_any_metrics_arrive_is_fail_not_unknown():
+    state, reason = compute_state(DISK, Facts(last_run=disk_fail_run()), NOW)
+    assert state == "FAIL" and "statvfs" in reason
+
+
+def test_disk_fail_is_cleared_by_a_newer_metric_ping():
+    # A `metric` ping is not a run, so a failed run stays the newest *runs* row for
+    # good; only comparing it against last_metrics_at lets the gauge recover.
+    f = disk_facts(free=200 * GIB, total=400 * GIB)     # measured at NOW
+    f.last_run = disk_fail_run(ago=3600)
+    assert compute_state(DISK, f, NOW)[0] == "OK"
+
+
+def test_disk_goes_late_when_the_feeder_stops_posting():
+    # Partial silence: the disk probe stops running (renamed/moved/interpreter gone)
+    # while its machine's probe job keeps reporting OK. Nothing is posted, so the
+    # fail branch cannot help — the reading's own age has to be the signal.
+    f = disk_facts(free=200 * GIB, total=400 * GIB)
+    f.last_metrics_at = to_iso(NOW - 49 * 3600)
+    state, reason = compute_state(DISK, f, NOW)
+    assert state == "LATE" and "48h" in reason
+
+
+def test_disk_staleness_ceiling_clears_a_machine_that_was_off_for_a_day():
+    # 24 h would page for a Mac merely switched off overnight and a bit — mac-probe
+    # already pages for that at ~15 h. Under the ceiling the gauge stays OK.
+    assert DISK_METRIC_MAX_AGE_S == 48 * 3600
+    f = disk_facts(free=200 * GIB, total=400 * GIB)
+    f.last_metrics_at = to_iso(NOW - 47 * 3600)
+    assert compute_state(DISK, f, NOW)[0] == "OK"
+
+
+def test_disk_staleness_outranks_a_tripped_threshold():
+    # A figure nobody has refreshed in two days is not evidence of a full disk.
+    f = disk_facts(free=1 * GIB, total=400 * GIB)
+    f.last_metrics_at = to_iso(NOW - 72 * 3600)
+    assert compute_state(DISK, f, NOW)[0] == "LATE"
 
 
 def test_disk_info_payload_shape():

@@ -16,9 +16,15 @@ Two halves:
   and a container timer on the box, an hourly launchd job on the Mac, and `probes/ping.sh` for manual jobs.
 
 Job ids are fixed and must match `jobs.yml` (unknown id → 404, by design):
-`box`: `km-backup`, `todoist-points-backup`, `box-containers`, `dashboard-probes` ·
-`mac`: `mac-probe`, `pa-backup`, `drive-mirror`, `minecraft-offload`, `taste-twin-publish`, `jjho-refresh`,
-`baby-pool-sync`.
+`box`: `km-backup`, `todoist-points-backup`, `box-containers`, `box-disk`, `dashboard-probes` ·
+`mac`: `mac-probe`, `pa-backup`, `drive-mirror`, `minecraft-offload`, `mac-disk`, `taste-twin-publish`,
+`jjho-refresh`, `baby-pool-sync`.
+
+**Adding a job id is app-first, probe-second.** The registry is loaded once at start-up, so a new id must be
+in the live (gitignored) `jobs.yml` **and the container restarted** *before* anything posts to it — `docker
+compose up -d` in `~/hopper-dashboard` after editing the file. In the other order every ping 404s, which is
+not silent: the Mac probe turns `mac-probe` into `fail` (an ntfy alert **every hour**) and the box unit exits
+non-zero every 5 minutes.
 
 ---
 

@@ -29,6 +29,8 @@ def test_human_gib():
     assert human_gib(26843545600) == "25.0 GiB"
     assert human_gib(None) == "—" and human_gib(-1) == "—" and human_gib("x") == "—"
     assert human_gib(0) == "0.0 GiB"
+    # A broken reading renders as "—", never "nan GiB" or a ~300-character number.
+    assert human_gib(float("nan")) == "—" and human_gib(float("inf")) == "—"
 
 
 def test_human_duration_and_relative():

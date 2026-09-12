@@ -28,7 +28,10 @@
        role="img" aria-label="{{ disk.used_pct }}% of the disk used">
     <title>{{ disk.used_pct }}% used{% if disk.max_used_pct %} · ceiling {{ disk.max_used_pct }}%{% endif %}</title>
     <rect class="track" x="0" y="0" width="100" height="8" rx="2"></rect>
-    <rect class="fill" x="0" y="0" width="{{ disk.used_pct if disk.used_pct <= 100 else 100 }}" height="8" rx="2"></rect>
+  {#- Clamped at BOTH ends: a negative width is not a valid SVG length (it would render
+      width="-40.0"), and the percent is data from a probe, not something this template
+      gets to assume. Unreachable today; free to guarantee. -#}
+    <rect class="fill" x="0" y="0" width="{{ [[disk.used_pct, 0]|max, 100]|min }}" height="8" rx="2"></rect>
     {% if disk.max_used_pct %}<rect class="mark" x="{{ disk.max_used_pct }}" y="0" width="0.7" height="8"></rect>{% endif %}
   </svg>
   {% endif %}

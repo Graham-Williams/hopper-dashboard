@@ -203,6 +203,25 @@ def test_parse_metrics_rejects_nan_and_too_many_keys():
         parse_metrics({f"k{i}": i for i in range(51)})
 
 
+def test_parse_metrics_rejects_an_absurdly_large_float():
+    """Ints were capped at 2**63 but floats were only checked for finiteness, so
+    `disk_free_bytes: 1e308` reached the store and rendered a ~310-character number
+    into the gauge heading (and /api/v1/status). Same ceiling for both types now."""
+    with pytest.raises(PayloadError, match="out of range"):
+        parse_metrics({"disk_free_bytes": 1e308})
+    with pytest.raises(PayloadError, match="out of range"):
+        parse_metrics({"disk_free_bytes": -1e308})
+    # A real multi-TB byte count is nowhere near the ceiling and still goes through.
+    assert parse_metrics({"disk_total_bytes": 4e12})["disk_total_bytes"] == 4e12
+
+
+def test_ping_with_an_absurd_float_metric_is_400(ingest, core):
+    r = ingest.post("/api/v1/ping/disk", headers=auth(),
+                    json={"status": "metric", "metrics": {"disk_free_bytes": 1e308}})
+    assert r.status_code == 400
+    assert db.job_row(core.connect(), "disk")["last_metrics"] in (None, {})
+
+
 def test_parse_json_payload_normalises_status_case():
     assert parse_json_payload({"status": "OK"})["status"] == "ok"
 

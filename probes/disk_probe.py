@@ -4,10 +4,19 @@
 
 ``statvfs`` on the root filesystem → POST /api/v1/ping/box-disk with ``status=metric`` and
 ``metrics.disk_free_bytes`` / ``disk_total_bytes``. A ``disk`` job is a gauge, not a scheduled
-job: it is never LATE, so the numbers ride in as metrics rather than as a run, and the box's
-liveness is still owned by box-containers on this very timer. If ``statvfs`` itself fails the
-ping is ``fail`` with the error in the note, so a vanished mount point is visible rather than a
-gauge frozen at yesterday's figure.
+job: it has no cadence-based dead-man's switch, so the numbers ride in as metrics rather than as
+a run, and the box's liveness is still owned by box-containers on this very timer. If ``statvfs``
+itself fails the ping is ``fail`` with the error in the note — and ``state.compute_state``'s disk
+branch puts that failure ahead of the stored figures, so a vanished mount point shows as FAIL
+rather than as a gauge frozen at yesterday's reading.
+
+Exit codes (the wrapper, deploy/box/containers_probe.sh, depends on them):
+  0  capacity metrics posted
+  1  nothing landed — transport error talking to the dashboard
+  2  nothing landed — misconfiguration (no DASHBOARD_URL / INGEST_TOKEN)
+  3  a ``fail`` run WAS posted (statvfs error); the dashboard already knows
+Anything non-zero other than 3 means the dashboard heard nothing, which is what makes the
+wrapper post the failure on this probe's behalf.
 
 Env: DASHBOARD_URL, INGEST_TOKEN (from /etc/hopper-dashboard/ingest.env via EnvironmentFile=),
 optional PROBE_DISK_PATH (default ``/``). Stdlib only; Python 3.9+. ``--dry-run`` prints the ping.
@@ -67,7 +76,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("ERROR: %s" % e, file=sys.stderr)
         return 1
     print("sent %s %s → HTTP %d %s" % (args.job, body["status"], code, resp.strip()[:80]))
-    return 0 if body["status"] != "fail" else 1
+    # 3, not 1: the run landed, so the wrapper must NOT post a second, vaguer failure
+    # over the specific statvfs error that is now on the board.
+    return 0 if body["status"] != "fail" else 3
 
 
 if __name__ == "__main__":
