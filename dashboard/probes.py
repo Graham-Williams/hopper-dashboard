@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 
@@ -24,8 +25,11 @@ from .registry import Job
 
 log = logging.getLogger(__name__)
 
-# Default only; the real value comes from Settings.rclone_timeout_s (env
-# RCLONE_TIMEOUT_S) and is passed in by Core.run_probe_cycle. 90 s was not
+# Default only; the real value comes from Settings.effective_rclone_timeout_s
+# (env DASHBOARD_RCLONE_TIMEOUT_S) and is passed in by Core.run_probe_cycle.
+# The env var is NOT called RCLONE_TIMEOUT_S: rclone reads `RCLONE_TIMEOUT`
+# itself (its `--timeout` flag), so a name in that namespace would one rename
+# later be reconfiguring rclone's networking instead of this limit. 90 s was not
 # enough for `gdrive:Backups` (~1000 objects): Drive pages a recursive listing
 # 1000 objects at a time and rclone's own low-level retries back off on
 # rateLimitExceeded, so the call routinely ran past the limit and the timeout
@@ -53,13 +57,23 @@ TRANSIENT_MARKERS = (
 )
 TRANSIENT_LABEL = "transient (Drive quota/timeout)"
 
+# rclone annotates an error with the object it was working on — `(dir
+# Backups/…)`, `(file "…")` — so the stderr tail can contain names chosen by
+# whoever owns the files in Drive, including a shared folder. Those names are
+# stripped before classification: a file called `503 timeout` must not be able
+# to dress a hard failure up as a rate limit (which is damped, so it would
+# delay the alert, not merely mislabel it). Only the forms rclone actually uses
+# are stripped — double quotes and `(dir …)`/`(file …)`; an apostrophe is far
+# too common in prose to treat as a quote.
+_OBJECT_NOISE_RE = re.compile(r"\((?:dir|file)\b[^)]*\)|\"[^\"]*\"")
+
 
 def is_transient_error(text: str | None) -> bool:
     """True when an error text looks like a rate limit / timeout rather than a
     real problem with the destination."""
     if not text:
         return False
-    low = text.lower()
+    low = _OBJECT_NOISE_RE.sub(" ", text).lower()
     return any(m in low for m in TRANSIENT_MARKERS)
 
 

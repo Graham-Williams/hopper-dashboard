@@ -47,7 +47,13 @@ class Scheduler:
             if (self.last_probe is None
                     or now - self.last_probe >= self.probe_interval_s):
                 self.core.run_probe_cycle(now)
-                self.last_probe = now
+                # Schedule from the END of the cycle, not its start. Probes are
+                # serial and a slow cycle can outlast the interval; measured
+                # from the start, the next cycle would already be due the moment
+                # this one returned — continuous back-to-back listing of the very
+                # remote that just rate-limited us.
+                end = self.core.last_cycle_end
+                self.last_probe = now if end is None else max(now, end)
             else:
                 self.core.recompute_all(now)
         except Exception:  # noqa: BLE001

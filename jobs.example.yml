@@ -69,9 +69,14 @@ jobs:
     machine: box
     kind: probe
     protects: This dashboard's own destination probes (the watcher is watched)
-    method: in-container scheduler records a run every probe cycle; FAIL if any rclone probe errors
-    cadence_s: 300
-    grace_s: 600
+    method: in-container scheduler records a run every probe cycle; FAIL if any probed destination is failing
+    cadence_s: 300              # = PROBE_INTERVAL_S
+    grace_s: 900                # Must cover the WORST-CASE cycle, not the typical one: probes are SERIAL, so a
+                                # cycle costs up to (cycle budget) + (one DASHBOARD_RCLONE_TIMEOUT_S) = 300 + 240
+                                # = 540 s of listing before the heartbeat is written. cadence 300 + grace 900
+                                # leaves ~360 s of headroom; with the old 600 s grace a cycle of timing-out
+                                # listings would trade FAIL flapping for LATE flapping. If you raise
+                                # DASHBOARD_RCLONE_TIMEOUT_S or PROBE_INTERVAL_S, redo this arithmetic.
 
   # ------------------------------------------------------------------ mac --
   - id: mac-probe
@@ -103,11 +108,14 @@ jobs:
     #
     # interval_s is REQUIRED IN PRACTICE on a big tree. gdrive:Backups is ~1000 objects, and a
     # recursive listing that size pages slowly and draws Drive `rateLimitExceeded` / hits the rclone
-    # timeout. Probed every 300 s cycle it failed 21 times in 4 days, and each failure used to flip
-    # `dashboard-probes` straight to FAIL — ~55 push alerts that buried the one REAL backup failure
-    # in the same window. 1800 s (every 6th cycle) is ~6x less Drive traffic and costs nothing: this
-    # job's STALE_DEST verdict comes from the Mac's missing_*/differ_* metrics, not from the probe,
-    # and its freshness window is cadence_s * 12 = 12 days, so a 30-minute-old listing is irrelevant.
+    # timeout. Probed every 300 s cycle it failed 21 times in 1159 probes, and each failure used to
+    # flip `dashboard-probes` straight to FAIL — 27 flips in 4 days with nothing broken, which is the
+    # noise that masked a real backup failure in the same window. 1800 s (every 6th cycle) is ~6x less
+    # Drive traffic and costs nothing: this job's STALE_DEST verdict comes from the Mac's
+    # missing_*/differ_* metrics, not from the probe, and its freshness window is cadence_s * 12 =
+    # 12 days, so a 30-minute-old listing is irrelevant. Note the damping counts consecutive failed
+    # probes OF THIS JOB, so a persistent failure here still reaches FAIL — on the 2nd probe, i.e.
+    # one interval later, not one cycle later (and PROBE_NO_SUCCESS_S caps the wait at an hour).
     # probe:
     #   rclone_path: gdrive-ro:Backups
     #   interval_s: 1800
@@ -151,7 +159,7 @@ jobs:
     # Optional box-side probe (same rule as pa-backup: the box remote must see the path — gdrive-ro can).
     # Adds newest-object time + count from Drive; the fresh/stale pill then compares newest against
     # max_age_s. ~1 GB+ of recordings is many objects, so the listing takes a few seconds per cycle —
-    # and it, too, drew rate limits at the 300 s cadence (6 failures in 4 days). interval_s: 1800 for
+    # and it, too, drew rate limits at the 300 s cadence (6 failures in 1159 probes). interval_s: 1800 for
     # the same reason as pa-backup; safe because a manual job's state comes from its run age and lag
     # metrics, and the fresh pill compares newest against max_age_s = 14 days.
     # probe:

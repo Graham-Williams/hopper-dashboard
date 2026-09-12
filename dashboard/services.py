@@ -22,10 +22,22 @@ log = logging.getLogger(__name__)
 
 SELF_JOB_ID = "dashboard-probes"
 NOTE_MAX = 500
-# Metric key holding the count of consecutive failed probe cycles. It lives in
-# the self-job's `last_metrics` (the `jobs` table), so the streak survives a
-# container restart and a restart mid-outage cannot reset the damping to zero.
-FAIL_STREAK_KEY = "fail_streak"
+# How far back a per-job failure streak is counted. Far above any sane
+# PROBE_FAIL_THRESHOLD; bounds the scan on a job that has been failing for
+# weeks.
+STREAK_SCAN_LIMIT = 500
+# Retired metric key. The failure streak used to live in the self-job's
+# `last_metrics`, which the ingest route can write: anything holding
+# INGEST_TOKEN could POST `{"fail_streak": 0}` and suppress alerting for good.
+# The streak is now derived per job from the `probes` table (which ingest
+# cannot write at all); the stale/forged key is dropped on every cycle so it
+# can't linger on the job page as a number nothing computes.
+LEGACY_METRIC_KEYS = ("fail_streak",)
+
+
+def _monotonic() -> float:
+    """Indirection so tests can make a probe cycle "take" wall-clock time."""
+    return time.monotonic()
 
 
 @contextmanager
@@ -47,6 +59,10 @@ class Core:
         self.notifier = notifier or Notifier(settings.ntfy_url,
                                              settings.ntfy_topic)
         self._warned_no_self_job = False
+        # Logical clock at the END of the last probe cycle (start + measured
+        # wall time). The scheduler schedules the next cycle from this, never
+        # from the pre-cycle clock.
+        self.last_cycle_end: float | None = None
 
     # -- plumbing ---------------------------------------------------------- #
 
@@ -215,58 +231,152 @@ class Core:
         The clock is the persisted ``probes.probed_at``, not an in-memory
         timer, so a restart does not re-probe a big tree early — the point of a
         long interval is to stop hammering a rate-limited remote.
+
+        Ordered least-recently-probed first: a cycle can run out of its
+        wall-clock budget part way down the list (see
+        ``Settings.probe_cycle_budget_s``), and this ordering is what stops the
+        same slow job at the tail being starved forever.
         """
-        due: list[Job] = []
+        due: list[tuple[float, Job]] = []
         for job in self.registry.probed():
             interval = job.probe_interval_s
-            if interval is None:
-                due.append(job)
-                continue
             last = db.last_probe(conn, job.id)
             ts = db.from_iso(last.get("probed_at")) if last else None
-            if ts is None or now - ts >= interval:
-                due.append(job)
-        return due
+            if interval is not None and ts is not None and now - ts < interval:
+                continue
+            # Never probed sorts first.
+            due.append((-1.0 if ts is None else ts, job))
+        due.sort(key=lambda pair: pair[0])      # stable: registry order breaks ties
+        return [job for _, job in due]
 
-    @staticmethod
-    def _fail_streak(conn) -> int:
-        row = db.job_row(conn, SELF_JOB_ID) or {}
-        val = (row.get("last_metrics") or {}).get(FAIL_STREAK_KEY)
-        try:
-            return max(0, int(val))
-        except (TypeError, ValueError):
-            return 0
+    def probe_trouble(self, conn, now: float,
+                      results: dict | None = None) -> list[dict]:
+        """Every probed job whose LATEST probe row is a failure, with the facts
+        the self-job's verdict is made from.
+
+        This is read from the ``probes`` table rather than from a counter, which
+        is what makes the damping correct and unforgeable:
+
+        - it is **per job**, so a failure on a job probed every 1800 s is not
+          erased by the five intervening cycles in which it was not due (the bug
+          this replaces: a persistent failure on an interval'd job could never
+          reach the threshold, so it never alerted at all);
+        - a job's streak clears only when **that job** probes successfully;
+        - it survives a restart, like the metric it replaces;
+        - the ingest route cannot write the ``probes`` table, so a holder of
+          INGEST_TOKEN can no longer suppress (or force) alerting.
+        """
+        results = results or {}
+        out: list[dict] = []
+        for job in self.registry.probed():
+            last = db.last_probe(conn, job.id)
+            if not last or last.get("ok"):
+                continue
+            error = last.get("error") or "probe failed"
+            # For a job probed in this cycle the classification is the one the
+            # probe itself made; for an older row, re-derive it from the text.
+            fresh = results.get(job.id)
+            transient = (fresh.transient if fresh is not None and not fresh.ok
+                         else probes.is_transient_error(error))
+            ok_row = db.last_ok_probe(conn, job.id)
+            # No successful probe ever: measure the silence from the oldest
+            # failure we still hold.
+            ref_row = ok_row or db.oldest_probe(conn, job.id) or {}
+            ref = db.from_iso(ref_row.get("probed_at"))
+            out.append({
+                "job_id": job.id,
+                "error": error,
+                "streak": db.probe_fail_streak(conn, job.id, STREAK_SCAN_LIMIT),
+                "transient": transient,
+                "ever_ok": ok_row is not None,
+                "no_success_s": None if ref is None else max(0, int(now - ref)),
+                "trip": None,
+            })
+        return out
+
+    def _classify_trouble(self, trouble: list[dict]) -> None:
+        """Decide, per failing job, whether it trips the self-job to FAIL.
+
+        Three ways in, in order of precedence:
+
+        ``hard``    the error is not a quota/timeout — a missing directory or a
+                    revoked token is not noise, it is the answer, so it is not
+                    damped at all and pages on the first failure (this is the
+                    latency the un-damped version had, kept for real errors).
+        ``streak``  ``PROBE_FAIL_THRESHOLD`` consecutive failed probes of this
+                    job. This is the damping proper: the measured noise was
+                    isolated single failures, never adjacent ones.
+        ``silence`` nothing has successfully probed this destination for
+                    ``PROBE_NO_SUCCESS_S``. The backstop: damping may delay an
+                    alert, it may never cancel one. Without it, failures that
+                    alternate with successes could be damped forever.
+        """
+        threshold = self.settings.effective_fail_threshold
+        window = self.settings.effective_no_success_s
+        for t in trouble:
+            if not t["transient"]:
+                t["trip"] = "hard"
+            elif t["streak"] >= threshold:
+                t["trip"] = "streak"
+            elif (window and t["no_success_s"] is not None
+                    and t["no_success_s"] > window):
+                t["trip"] = "silence"
 
     def run_probe_cycle(self, now: float | None = None) -> dict[str, probes.ProbeResult]:
         """Probe the jobs that are due, record results, then record a run for
         the dashboard's own ``dashboard-probes`` job and recompute.
 
-        The self-job is reported ``fail`` only after
-        ``settings.probe_fail_threshold`` **consecutive** cycles with at least
-        one probe error; a single bad cycle records ``ok`` with the error text
-        kept in ``reason``/``note`` and in the probe rows. Google Drive answers
-        ``rateLimitExceeded`` often enough on a ~1000-object listing that
-        alerting on one cycle paged 27 times in four days — noise that buried
-        the one real backup failure in the same window. Recovery stays
-        immediate: one clean cycle clears the streak. Never raises.
+        The self-job is reported ``fail`` when any probed job is in a tripped
+        failure state (:meth:`_classify_trouble`) — a verdict over the persisted
+        per-job probe history, not over this cycle alone. So a cycle in which
+        nothing was due neither invents a success nor clears a pending failure;
+        it only records the self-heartbeat that keeps the dead-man's switch fed.
+        A damped failure records ``ok`` with the error text in
+        ``reason``/``note`` and in the probe rows. Recovery stays immediate: one
+        successful probe of the offending job clears it.
+
+        Google Drive answers ``rateLimitExceeded`` on a ~1000-object listing
+        often enough that alerting on a single failure produced 27 FAIL→OK flips
+        in four days (21 failures in 1159 probes, none of them adjacent) while
+        nothing was wrong — noise that buried a real backup failure in the same
+        window. Never raises.
         """
         now = time.time() if now is None else now
         conn = self.connect()
         try:
             jobs = self.due_probes(conn, now)
-            streak = self._fail_streak(conn)
         finally:
             conn.close()
+        timeout = self.settings.effective_rclone_timeout_s
+        budget = self.settings.probe_cycle_budget_s
         results: dict[str, probes.ProbeResult] = {}
-        for job in jobs:
+        started = _monotonic()
+        skipped = 0
+        for index, job in enumerate(jobs):
+            # Probes are serial, so n × timeout can run well past a cycle. Stop
+            # when the budget is spent; the rest stay due and are picked up next
+            # cycle (oldest first). Always run at least one, so a cycle can
+            # never do nothing at all.
+            if index and _monotonic() - started >= budget:
+                skipped = len(jobs) - index
+                log.warning("probe cycle budget (%ss) spent after %d of %d "
+                            "jobs; %d deferred to the next cycle",
+                            budget, index, len(jobs), skipped)
+                break
             try:
-                results[job.id] = probes.probe_job(
-                    job, timeout=self.settings.rclone_timeout_s)
+                results[job.id] = probes.probe_job(job, timeout=timeout)
             except Exception as exc:  # noqa: BLE001
                 log.exception("probe_job %s raised", job.id)
+                text = f"{type(exc).__name__}: {exc}"[:300]
                 results[job.id] = probes.ProbeResult(
-                    ok=False, error=f"{type(exc).__name__}: {exc}"[:300])
-        at = db.to_iso(now)
+                    ok=False, error=text,
+                    transient=probes.is_transient_error(text))
+        # Stamp and judge at the END of the cycle: a cycle that spent 900 s
+        # listing Drive must not write rows (or compute LATE) against a clock
+        # from before it started.
+        end = now + max(0.0, _monotonic() - started)
+        self.last_cycle_end = end
+        at = db.to_iso(end)
         conn = self.connect()
         try:
             with transaction(conn):
@@ -278,25 +388,31 @@ class Core:
                                     error=res.error)
                 self_job = self.registry.get(SELF_JOB_ID)
                 if self_job is not None:
-                    failures = [f"{jid}: {r.error}" for jid, r in results.items()
-                                if not r.ok]
-                    transient = sum(1 for r in results.values()
-                                    if not r.ok and r.transient)
-                    streak = streak + 1 if failures else 0
-                    threshold = max(1, int(self.settings.probe_fail_threshold))
-                    tripped = bool(failures) and streak >= threshold
-                    metrics = {"probed": len(results), "failed": len(failures),
-                               "failed_transient": transient,
-                               FAIL_STREAK_KEY: streak}
+                    trouble = self.probe_trouble(conn, end, results)
+                    self._classify_trouble(trouble)
+                    tripped = any(t["trip"] for t in trouble)
+                    failed_now = [r for r in results.values() if not r.ok]
+                    metrics = {
+                        "probed": len(results),
+                        "failed": len(failed_now),
+                        "failed_transient": sum(1 for r in failed_now
+                                                if r.transient),
+                        "deferred": skipped,
+                        "probe_fail_jobs": len(trouble),
+                        "probe_fail_streak": max((t["streak"] for t in trouble),
+                                                 default=0),
+                    }
                     db.insert_run(
                         conn, self_job.id, received_at=at,
                         status="fail" if tripped else "ok",
-                        started_at=at, finished_at=at,
-                        reason=self._probe_reason(failures, transient, streak,
-                                                  threshold, tripped),
-                        note=("; ".join(failures))[:NOTE_MAX] if failures else None,
-                        metrics=metrics, source="scheduler")
+                        started_at=db.to_iso(now), finished_at=at,
+                        reason=self._probe_reason(
+                            len(results), trouble,
+                            self.settings.effective_fail_threshold),
+                        note=self._probe_note(trouble), metrics=metrics,
+                        source="scheduler")
                     db.merge_metrics(conn, self_job.id, metrics, at)
+                    db.forget_metrics(conn, self_job.id, LEGACY_METRIC_KEYS)
                 elif not self._warned_no_self_job:
                     log.warning("no %r job in jobs.yml — the scheduler's own "
                                 "heartbeat is not being recorded", SELF_JOB_ID)
@@ -305,23 +421,49 @@ class Core:
         finally:
             conn.close()
         try:
-            self.recompute_all(now)
+            self.recompute_all(end)
         except Exception:  # noqa: BLE001
             log.exception("recompute after probe cycle failed")
         return results
 
     @staticmethod
-    def _probe_reason(failures: list[str], transient: int, streak: int,
-                      threshold: int, tripped: bool) -> str:
-        """The self-job's run reason. A damped cycle says so (and says what it
-        is waiting for) and a quota/timeout failure is named as transient, so
-        "Drive pushed back" never reads like "the destination is wrong"."""
-        if not failures:
-            return "probed"
-        kind = ("transient quota/timeout" if transient == len(failures)
-                else f"{transient} transient of {len(failures)}" if transient
+    def _probe_note(trouble: list[dict]) -> str | None:
+        if not trouble:
+            return None
+        return ("; ".join(f"{t['job_id']}: {t['error']}"
+                          for t in trouble))[:NOTE_MAX]
+
+    @staticmethod
+    def _probe_reason(n_probed: int, trouble: list[dict],
+                      threshold: int) -> str:
+        """The self-job's run reason. "nothing was due" reads differently from
+        "everything probed clean" (the two used to be indistinguishable, so a
+        registry with no probes at all reported a reassuring "probed" forever);
+        a damped cycle says what it is waiting for; and a quota/timeout failure
+        is named as transient, so "Drive pushed back" never reads like "the
+        destination is wrong"."""
+        if not trouble:
+            return "probed" if n_probed else "no probes due"
+        transient = sum(1 for t in trouble if t["transient"])
+        kind = ("transient quota/timeout" if transient == len(trouble)
+                else f"{transient} transient of {len(trouble)}" if transient
                 else "probe error")
+        tripped = [t for t in trouble if t["trip"]]
         if tripped:
-            return f"probe-error ({kind}, {streak} consecutive cycles)"
-        return (f"probe-error damped ({kind}, cycle {streak} of {threshold} "
-                f"before FAIL)")
+            worst = max(tripped, key=lambda t: (t["trip"] == "hard",
+                                                t["streak"]))
+            if worst["trip"] == "hard":
+                detail = f"hard error on {worst['job_id']}, not damped"
+            elif worst["trip"] == "streak":
+                detail = (f"{worst['streak']} consecutive failed probes of "
+                          f"{worst['job_id']}")
+            elif worst["ever_ok"]:
+                detail = (f"no successful probe of {worst['job_id']} for "
+                          f"{worst['no_success_s']}s")
+            else:
+                detail = (f"no successful probe of {worst['job_id']} ever "
+                          f"(failing for {worst['no_success_s']}s)")
+            return f"probe-error ({kind}, {detail})"
+        worst = max(trouble, key=lambda t: t["streak"])
+        return (f"probe-error damped ({kind}, failure {worst['streak']} of "
+                f"{threshold} before FAIL)")

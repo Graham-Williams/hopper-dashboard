@@ -294,6 +294,62 @@ def last_probe(conn: sqlite3.Connection, job_id: str) -> dict | None:
         "LIMIT 1", (job_id,)).fetchone())
 
 
+def last_ok_probe(conn: sqlite3.Connection, job_id: str) -> dict | None:
+    """Newest successful probe row — "when was this destination last actually
+    listed", which is what the no-success backstop in services.py measures."""
+    return row_to_dict(conn.execute(
+        "SELECT * FROM probes WHERE job_id=? AND ok=1 ORDER BY probed_at DESC, "
+        "id DESC LIMIT 1", (job_id,)).fetchone())
+
+
+def oldest_probe(conn: sqlite3.Connection, job_id: str) -> dict | None:
+    """Oldest retained probe row. Used only as the reference point for a job
+    that has never had a successful probe."""
+    return row_to_dict(conn.execute(
+        "SELECT * FROM probes WHERE job_id=? ORDER BY probed_at ASC, id ASC "
+        "LIMIT 1", (job_id,)).fetchone())
+
+
+def probe_fail_streak(conn: sqlite3.Connection, job_id: str,
+                      limit: int = 500) -> int:
+    """How many of this job's most recent probes failed in an unbroken run.
+
+    This is the damping state, derived rather than stored: it is per-job, it
+    survives a restart, a cycle in which the job was not due cannot reset it
+    (no row is written), and — unlike a metric on the jobs table — the ingest
+    route cannot write the `probes` table at all, so the streak is not
+    forgeable by anything holding INGEST_TOKEN.
+    """
+    rows = conn.execute(
+        "SELECT ok FROM probes WHERE job_id=? ORDER BY probed_at DESC, id DESC "
+        "LIMIT ?", (job_id, max(1, int(limit)))).fetchall()
+    streak = 0
+    for row in rows:
+        if row["ok"]:
+            break
+        streak += 1
+    return streak
+
+
+def forget_metrics(conn: sqlite3.Connection, job_id: str,
+                   keys: Iterable[str]) -> None:
+    """Drop named keys from a job's ``last_metrics``.
+
+    Used to retire ``fail_streak``: it was load-bearing damping state stored in
+    an ingest-writable field, and a value left behind (legacy or forged) would
+    still be displayed on the job page.
+    """
+    row = conn.execute("SELECT last_metrics FROM jobs WHERE id=?",
+                       (job_id,)).fetchone()
+    current = _load_json(row["last_metrics"]) if row else {}
+    if not any(k in current for k in keys):
+        return
+    for k in keys:
+        current.pop(k, None)
+    conn.execute("UPDATE jobs SET last_metrics=? WHERE id=?",
+                 (json.dumps(current), job_id))
+
+
 def recent_state_changes(conn: sqlite3.Connection, job_id: str,
                          limit: int = 50) -> list[dict]:
     rows = conn.execute(

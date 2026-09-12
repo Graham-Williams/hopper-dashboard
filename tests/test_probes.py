@@ -151,3 +151,15 @@ def test_a_real_timeout_is_classified_transient(monkeypatch):
     monkeypatch.setattr(subprocess, "run", timeout)
     res = probe_job(REG.get("snap"))
     assert res.ok is False and res.transient is True and "timed out" in res.error
+
+
+@pytest.mark.parametrize("text,transient", [
+    # rclone names the object it was working on; those names come from Drive.
+    ('rclone exit 3: directory not found (dir "Backups/503 timeout")', False),
+    ("rclone exit 3: directory not found (dir Backups/429-rate limit)", False),
+    # …but a real quota error still classifies, object name and all.
+    ("rclone exit 1: googleapi: Error 403: userRateLimitExceeded "
+     "(dir Backups/km-tracker)", True),
+])
+def test_object_names_do_not_drive_the_transient_classification(text, transient):
+    assert probes.is_transient_error(text) is transient

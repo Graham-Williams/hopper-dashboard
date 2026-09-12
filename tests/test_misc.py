@@ -70,10 +70,25 @@ def test_probe_damping_knobs_from_env(monkeypatch, tmp_path):
     monkeypatch.setenv("DASHBOARD_DATA", str(tmp_path))
     s = Settings.from_env()
     assert s.rclone_timeout_s == 240 and s.probe_fail_threshold == 2
-    monkeypatch.setenv("RCLONE_TIMEOUT_S", "600")
+    assert s.probe_no_success_s == 3600
+    # The timeout knob is namespaced away from rclone's own RCLONE_TIMEOUT*.
+    monkeypatch.setenv("RCLONE_TIMEOUT_S", "99")
+    assert Settings.from_env().rclone_timeout_s == 240
+    monkeypatch.setenv("DASHBOARD_RCLONE_TIMEOUT_S", "600")
     monkeypatch.setenv("PROBE_FAIL_THRESHOLD", "3")
+    monkeypatch.setenv("PROBE_NO_SUCCESS_S", "7200")
     s = Settings.from_env()
     assert s.rclone_timeout_s == 600 and s.probe_fail_threshold == 3
+    assert s.probe_no_success_s == 7200
+    # …but clamped where they are used: a probe may not outlast its cycle, and
+    # a silly threshold may not switch alerting off for a week.
+    assert s.effective_rclone_timeout_s == s.probe_interval_s
+    s.probe_fail_threshold = 500
+    assert s.effective_fail_threshold == 10
+    s.probe_no_success_s = 5
+    assert s.effective_no_success_s == s.probe_interval_s
+    s.probe_no_success_s = 0
+    assert s.effective_no_success_s == 0
     monkeypatch.setenv("PROBE_FAIL_THRESHOLD", "twice")
     with pytest.raises(ValueError, match="PROBE_FAIL_THRESHOLD"):
         Settings.from_env()

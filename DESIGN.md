@@ -262,31 +262,65 @@ IS the check; no DB → `fail`). `manual`: never LATE; `FAIL` if last run failed
 success > `max_age_s` or `lag_bytes` > `max_lag_bytes`; no thresholds = informational, never alerts.
 `max_age_s` is inert until the first real run (the card says **Never run** until then — seed one ping after
 the first manual run). `dashboard-probes` is the scheduler's own heartbeat: a run is recorded every probe
-cycle, `fail` (with the error in `note`) after `PROBE_FAIL_THRESHOLD` **consecutive** cycles in which any
-rclone probe errored — so a broken probe shows up as a FAIL card, never a crash, and a single transient one
-does not page (see below).
+cycle, and it is `fail` (with the error in `note`) whenever any probed job is in a tripped failure state —
+immediately for a hard error, after `PROBE_FAIL_THRESHOLD` **consecutive failed probes of that job** for a
+transient one — so a broken probe shows up as a FAIL card, never a crash, and a single transient one does not
+page (see below).
 
 ### Probe cadence and flap damping
-Measured in production 2026-09-11: `dashboard-probes` flapped FAIL→OK **27 times in 4 days** (~55 ntfy
-pushes — nearly all of Graham's alert traffic), because Google Drive answered `rateLimitExceeded` or the
-90 s rclone timeout expired on 21/1159 `gdrive:Backups` probes (~1000 objects) and 6/1159 `gdrive:Gremlins`
-probes. The small DB-snapshot trees failed 0 times. Nothing was actually broken — but the noise buried a
-**real** `pa-backup` failure on 2026-09-10. Three changes, all aimed at making a persistent failure legible
-rather than at silencing failures:
-1. **Consecutive-cycle damping.** `PROBE_FAIL_THRESHOLD` (default **2**) consecutive cycles with ≥1 probe
-   error before `dashboard-probes` records a `fail` run. A damped cycle records `ok` with the error kept in
-   the run's `reason` ("probe-error damped (… cycle 1 of 2 …)") and `note`, and the failed probe rows are
-   written as always, so the board and job page never hide it. **Recovery is immediate** — one clean cycle.
-   The streak is persisted as `last_metrics.fail_streak` on the self job, so a container restart mid-outage
-   cannot reset the damping and let a persistent failure page forever at cycle 1.
-2. **`RCLONE_TIMEOUT_S` (default 240 s, was a hard-coded 90).** Drive pages a recursive listing 1000 objects
-   at a time and rclone backs off on rate limits; 90 s was itself a leading cause of "failure". Keep it under
-   `PROBE_INTERVAL_S` so one slow listing cannot run into the next cycle.
-3. **Per-job `probe.interval_s`.** Probe a big tree every 1800 s instead of every 300 s cycle (≈6× less Drive
+Measured in production over a 4-day window: `dashboard-probes` flapped FAIL→OK **27 times**, pushing ~55 ntfy
+alerts, because Google Drive answered `rateLimitExceeded` or the 90 s rclone timeout expired on 21 of 1159
+`gdrive:Backups` probes (~1000 objects) and 6 of 1159 `gdrive:Gremlins` probes. The small DB-snapshot trees
+failed 0 times, no failures were adjacent, and no destination was actually broken. The cost was not the noise
+itself but what it did to the signal: a genuine `pa-backup` failure landed in the same window and was
+indistinguishable from the flapping. Four mechanisms, all aimed at making a persistent failure legible rather
+than at silencing failures:
+1. **Per-job consecutive-failure damping.** `PROBE_FAIL_THRESHOLD` (default **2**, clamped to 1–10)
+   consecutive failed probes **of one job** before `dashboard-probes` records a `fail` run. A damped failure
+   records `ok` with the error kept in the run's `reason` ("probe-error damped (… failure 1 of 2 …)") and
+   `note`, and the failed probe rows are written as always, so the board and job page never hide it.
+   **Recovery is immediate** — one successful probe of the offending job.
+   The streak is **derived from the `probes` table**, not stored as a counter, which is what makes it correct:
+   it is per job, so a failure on a job probed every 1800 s is not erased by the cycles in which that job was
+   not due (a cycle counter could never reach the threshold for such a job, so a permanently broken
+   destination alerted *never*); a job's streak clears only when that job itself probes successfully; it
+   survives a container restart; and the ingest route cannot write the `probes` table, so damping state is not
+   forgeable by a holder of `INGEST_TOKEN` (it previously lived in an ingest-writable metric).
+   A cycle in which nothing was due records the self-heartbeat with `reason: no probes due` — distinct from
+   `probed` — and neither invents a success nor clears a pending failure.
+2. **Hard errors are not damped at all.** Damping exists for quota/timeout noise. A failure whose text does
+   not match `probes.TRANSIENT_MARKERS` — a missing directory, a revoked token — is not noise but the answer,
+   and trips FAIL on the **first** failure, the same latency the undamped version had.
+3. **A no-success backstop.** `PROBE_NO_SUCCESS_S` (default **3600 s**; 0 disables) trips FAIL for any probed
+   job whose newest *successful* probe is older than that, whatever the streak arithmetic says: damping may
+   delay an alert, it may never cancel one. 3600 s is 12 cycles at the 300 s default and equals the
+   `db_snapshot` destination-freshness window (`cadence_s * 12`) — past that point the destination check is no
+   longer being refreshed inside the window it is judged against, which is precisely the condition this job
+   exists to report. It is far outside observed noise (isolated single failures, never adjacent), and it is
+   what makes a threshold above 2 or a long `interval_s` safe to configure.
+4. **`DASHBOARD_RCLONE_TIMEOUT_S` (default 240 s, was a hard-coded 90).** Drive pages a recursive listing 1000
+   objects at a time and rclone backs off on rate limits; 90 s was itself a leading cause of "failure". The
+   name is deliberately prefixed: `RCLONE_TIMEOUT` is rclone's own env var for `--timeout`, so a knob in that
+   namespace would one rename later be silently reconfiguring rclone's networking. Probes are **serial**, so
+   the real invariant is `n_probed_per_cycle * timeout < PROBE_INTERVAL_S`, not `timeout < PROBE_INTERVAL_S`.
+   Two mechanisms enforce the consequence rather than leaving it to arithmetic: the effective timeout is
+   clamped to at most `PROBE_INTERVAL_S`, and each cycle has a **wall-clock budget** of one
+   `PROBE_INTERVAL_S`, after which the remaining due jobs are deferred (counted in `metrics.deferred`) and
+   picked up next cycle. `due_probes()` orders least-recently-probed first, so deferral rotates and cannot
+   starve the slowest job.
+5. **Per-job `probe.interval_s`.** Probe a big tree every 1800 s instead of every 300 s cycle (≈6× less Drive
    traffic, which also reduces the rate limiting at source); absent = every cycle, i.e. the global
    `PROBE_INTERVAL_S`. Dueness is computed from the persisted `probes.probed_at`, so a restart does not
    re-probe a big tree early, and a skipped cycle leaves the previous listing standing (the card keeps its
-   newest/count). The self-heartbeat is still recorded on a cycle in which nothing was due.
+   newest/count).
+**Cycle cost and the clock.** A cycle is stamped and judged at its **end** (`now` + measured wall time): with
+serial probes, recomputing against the start-of-cycle clock meant deadlines were judged against a clock up to
+a full cycle stale, so LATE could lag ~2× the cycle duration. The scheduler likewise re-arms from the
+**post**-cycle clock (`Core.last_cycle_end`) — from the start-of-cycle clock, an overrunning cycle made the
+next one due the instant it returned, i.e. continuous back-to-back listing of the very remote that had just
+rate-limited us. `dashboard-probes`' own `grace_s` must cover the worst-case cycle (budget + one timeout) on
+top of its cadence, or a slow cycle trades FAIL flapping for LATE flapping; see the comment on that job in
+`jobs.example.yml`.
 **Why this cannot make a destination wrongly read stale:** `dest_fresh_s` = `cadence_s * 12` is compared
 against the destination's **own newest-object timestamp**, an absolute time that does not drift as the probe
 row ages — a longer interval only delays noticing a *new* object. The only kind whose state reads that age is
@@ -297,9 +331,11 @@ heartbeat `missing_*`/lag metrics, and whose freshness windows (12 d / `max_age_
 **Transient vs real:** a failure whose text matches `probes.TRANSIENT_MARKERS` (`rateLimitExceeded`, 429,
 503/backendError, timeouts, …) is prefixed `transient (Drive quota/timeout):` in the probe row's `error` and
 counted in `metrics.failed_transient`, and the self-job's `reason` names it — so "Drive pushed back" never
-reads like "the destination is missing files". Transients are **not** exempt from the consecutive count: a
-*persistent* quota failure is a real problem (it is what broke the nightly backup on 2026-09-10) and must
-still reach FAIL.
+reads like "the destination is missing files". rclone echoes the object it was listing (`(dir …)`, quoted
+names), and those names come from Drive, so they are stripped before classification: an object named
+`503 timeout` must not be able to buy a hard failure two probes of damping. Transients are **not** exempt
+from the consecutive count or the backstop: a *persistent* quota failure is a real problem — it is one way a
+nightly backup stops working — and must still reach FAIL, including for a job with its own `interval_s`.
 
 ### Alerting rules
 - Every transition is persisted to `state_changes` and shown on the board; only *dispatch* is filtered.

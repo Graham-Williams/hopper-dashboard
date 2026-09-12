@@ -40,7 +40,8 @@ export APP_PASSWORD=devpass SESSION_SECRET=devsecret INGEST_TOKEN=devtoken READ_
 .venv/bin/python -m dashboard                         # read http://127.0.0.1:8080  ingest :8081
 # env knobs: DASHBOARD_DATA (default ./data locally, /app/data in the image), JOBS_FILE, READ_PORT,
 #            INGEST_PORT, DASHBOARD_BIND, PROBE_INTERVAL_S, TICK_INTERVAL_S, DASHBOARD_NO_SCHEDULER=1,
-#            RCLONE_TIMEOUT_S (240), PROBE_FAIL_THRESHOLD (2)
+#            DASHBOARD_RCLONE_TIMEOUT_S (240 — NOT RCLONE_TIMEOUT*, that namespace is rclone's own),
+#            PROBE_FAIL_THRESHOLD (2), PROBE_NO_SUCCESS_S (3600)
 
 curl -X POST -H 'Authorization: Bearer devtoken' -d result=success -d exit=0 localhost:8081/api/v1/ping/km-backup
 curl -X POST -H 'Authorization: Bearer devtoken' -H 'Content-Type: application/json' \
@@ -75,18 +76,31 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   batch — the Mac probe posts its sub-jobs before its own heartbeat, so siblings recover one batch early;
   FAIL/STALE_DEST/BEHIND after LATE always alert); `run_probe_cycle` (probes the jobs `due_probes()` says are
   due + the `dashboard-probes` self-heartbeat + `prune` — one `DELETE … NOT IN (… ORDER BY id DESC LIMIT n)`
-  per table, not O(n²)). **Flap damping:** the self-job records `fail` only after
-  `settings.probe_fail_threshold` (default 2) *consecutive* failing cycles; recovery is one clean cycle. The
-  streak persists as `last_metrics.fail_streak` (`FAIL_STREAK_KEY`) so a restart can't reset it. Full
-  rationale: DESIGN.md "Probe cadence and flap damping" — don't lower the threshold to 1, that is the
-  behaviour that sent ~55 pushes in 4 days.
+  per table, not O(n²)). **Flap damping** (`probe_trouble` / `_classify_trouble`): the self-job records `fail`
+  when any probed job is tripped — `hard` (error is not a quota/timeout: first failure, never damped),
+  `streak` (`settings.probe_fail_threshold`, default 2, *consecutive failed probes of that job*), or
+  `silence` (no successful probe of it for `PROBE_NO_SUCCESS_S`, default 3600 s — the backstop: damping may
+  delay an alert, never cancel one). Recovery is one successful probe of the offending job. The streak is
+  **derived from the `probes` table** (`db.probe_fail_streak`), NOT stored: per-job (so a job with
+  `interval_s` is not reset by the cycles it wasn't due for — that bug meant it could never alert at all),
+  restart-safe, and unforgeable through ingest, which cannot write `probes`. Don't move it back into
+  `last_metrics`. Cycle accounting: each cycle has a wall-clock budget (`Settings.probe_cycle_budget_s`,
+  deferrals in `metrics.deferred`, `due_probes()` ordered oldest-first so nothing starves) and is stamped and
+  recomputed at its **end** (`Core.last_cycle_end`). Full rationale: DESIGN.md "Probe cadence and flap
+  damping" — don't lower the threshold to 1, that is the behaviour that produced 27 FAIL→OK flips and ~55
+  pushes in 4 days with nothing broken.
 - `scheduler.py` — daemon thread; `step()` is exposed for tests; never lets an exception kill the loop. It
-  calls `run_probe_cycle` on the global `PROBE_INTERVAL_S`; per-job `probe.interval_s` is applied *inside*
-  the cycle (dueness from the persisted `probes.probed_at`), not here.
-- `probes.py` — `rclone lsjson --recursive --files-only` (argv, `RCLONE_TIMEOUT_S`, default 240 s — 90 s was
-  itself a leading cause of probe "failures" on a ~1000-object tree) + state-file reader;
-  `is_transient_error` / `TRANSIENT_MARKERS` label a Drive rate limit or timeout in the error text and set
-  `ProbeResult.transient`, so quota push-back never reads like a wrong destination.
+  calls `run_probe_cycle` on the global `PROBE_INTERVAL_S`, re-arming from `Core.last_cycle_end` (the
+  POST-cycle clock — from the pre-cycle clock an overrunning cycle is instantly due again, which hammers the
+  remote that just rate-limited us); per-job `probe.interval_s` is applied *inside* the cycle (dueness from
+  the persisted `probes.probed_at`), not here.
+- `probes.py` — `rclone lsjson --recursive --files-only` (argv, `DASHBOARD_RCLONE_TIMEOUT_S`, default 240 s —
+  90 s was itself a leading cause of probe "failures" on a ~1000-object tree; the effective value is clamped
+  to `PROBE_INTERVAL_S` since probes are serial) + state-file reader; `is_transient_error` /
+  `TRANSIENT_MARKERS` label a Drive rate limit or timeout in the error text and set `ProbeResult.transient`,
+  so quota push-back never reads like a wrong destination. That flag is load-bearing (transient = damped,
+  hard = immediate FAIL), so rclone's echoed object names — which come from Drive — are stripped before
+  matching; don't classify on raw stderr.
 - `notify.py` — ntfy `Notifier`; body is `job_id: FROM → TO` only (no reason text leaves the box);
   `should_notify` suppresses `UNKNOWN→OK`; never raises.
 - `ingest.py` — blueprint + pure payload parsers (`parse_json_payload`, `parse_form_payload`, `parse_metrics`).
