@@ -188,8 +188,11 @@ What it does (idempotent; never restarts a container or the backup units):
   change the backup unit's own result),
 - renders `dashboard-containers.service` (`User=` ← `--user`, default `$SUDO_USER`; must be in `docker`) and
   installs + enables `dashboard-containers.timer` (`OnCalendar=*:0/5` + `Persistent=true` → every 5 min →
-  `deploy/box/containers_probe.sh` → `docker ps` → `box-containers` ping **and** `statvfs /` → `box-disk`
-  ping; the dashboard container itself has no docker socket),
+  `deploy/box/containers_probe.sh` → `statvfs /` → `box-disk` ping **and** `docker ps` → `box-containers`
+  ping, in that order: the cheap probe goes first so `docker ps` trouble can never eat the disk reading
+  inside `TimeoutStartSec=150`. The dashboard container itself has no docker socket. If the disk probe
+  cannot run at all the wrapper posts the `fail` ping for it, so the failure reaches the board and not
+  just the journal),
 - `daemon-reload`, then prints `systemd-analyze verify`, `systemctl cat`, `list-timers` and a dry run.
 
 Verify within 5 minutes (the backup timers tick every 5 min, so all three box jobs should report):
@@ -313,8 +316,11 @@ The probe posts:
   `pa-backup` trees keep the full checksum check.
 - `mac-disk` — `metric`: `disk_free_bytes` / `disk_total_bytes` / `disk_path` for
   `/System/Volumes/Data` (`PROBE_DISK_PATH`), rendered as the capacity gauge and thresholded in
-  `jobs.yml` (`disk.min_free_bytes` 25 GiB / `disk.max_used_pct` 90 → `BEHIND`). A `disk` job is a gauge:
-  it never goes LATE, so this is metrics-only and `mac-probe` remains the Mac's liveness signal.
+  `jobs.yml` (`disk.min_free_bytes` 25 GiB / `disk.max_used_pct` 90 → `BEHIND`). A `disk` job is a gauge
+  with no cadence, so this is metrics-only and `mac-probe` remains the Mac's liveness signal — but a
+  reading nothing refreshes for 48 h still goes `LATE` (`state.DISK_METRIC_MAX_AGE_S`), and a `statvfs`
+  error posts a `fail` that the card shows as **FAIL, capacity unreadable**. Note the percentage will not
+  match `df`'s `Use%` (see DESIGN.md → `disk`): the free bytes do, the percent does not.
   `minecraft-offload` still reports the same two figures as a footnote on its own card — that is
   deliberate duplication, not drift.
 - `drive-mirror` — an **`ok` run** (reading the mirror DB *is* the check, so it counts as a heartbeat) with
@@ -431,7 +437,8 @@ restore data; the dashboard's own SQLite is derived state that repopulates withi
 | Backup script exit 0 on skipped push | Heartbeat says `ok` while Drive hasn't received anything new | That's what the app's destination probe (`db_snapshot` newest object vs `db_sha256`) is for → `STALE_DEST` |
 | Read-only rclone remote's token revoked/expired | Every `db_snapshot` probe errors → `dashboard-probes` `FAIL` with `rclone exit …` in the note; `dest.probe_error` on the cards | Re-run the `rclone authorize` flow in §1b; `RCLONE_CONFIG=~/.config/rclone/dashboard-ro.conf rclone lsd gdrive-ro:` on the box |
 | `dashboard-containers.timer` stopped / user dropped from `docker` group | `box-containers` `LATE`; or `fail` ping with "permission denied" in the note | `systemctl list-timers`; `journalctl -u dashboard-containers.service` |
-| Disk gauge stops being fed (probe moved, `statvfs` on a path that vanished) | `mac-disk` / `box-disk` keep showing the LAST reading forever — a `disk` job is a gauge and never goes LATE, so a frozen number looks like a healthy one | The card prints **measured &lt;when&gt;** under the bar — a stale timestamp there is the tell. The feeder failing is itself loud: the Mac one makes `mac-probe` `fail` with `statvfs …` in the note, the box one makes `dashboard-containers.service` exit non-zero (`journalctl -u dashboard-containers.service`), and `box-disk` goes `fail` if the path is unreadable. |
+| Disk gauge stops being fed (probe moved/renamed, `statvfs` on a path that vanished) | Was: the gauge kept showing its LAST reading for ever, because a `disk` job has no cadence — a frozen number looked like a healthy one | Three layers now, so a frozen gauge cannot read as healthy: (a) a reading older than **48 h** (`state.DISK_METRIC_MAX_AGE_S`) is `LATE`, alerted like any other dead-man's switch — suppressed only while that machine's probe job is itself LATE; (b) an unreadable path is a `fail` ping → **FAIL, "capacity unreadable (statvfs …)"**, which outranks the stored figures; (c) a box probe that never ran at all is reported by its wrapper as a `fail` on `box-disk` (`result=probe-failed`, note pointing at `journalctl -u dashboard-containers.service`) rather than only as the unit's exit status. The card still prints **measured &lt;when&gt;** under the bar. |
+| Board's used-percent does not match `df` | Looks like an arithmetic bug, invites a "fix" that would break the threshold | Expected: the free **bytes** match `df`'s Avail exactly, the **percent** does not (macOS/APFS hands `statvfs` a smaller free figure than `df` uses — measured 79.5% vs 78%, so the 90% ceiling trips near 88.5% on `df`). `f_bavail` is the right number: it is what can actually be written. DESIGN.md → `disk` and `probes/common.disk_free` both say so. |
 | Mac asleep / logged out | `mac-probe` LATE after 15 h; the other Mac jobs go LATE too but their alerts are suppressed — you get ONE alert, and ONE more (`mac-probe → OK`) when it wakes; the siblings' `LATE → OK` are muted while the probe is still LATE | That IS the signal (Mac offline). If only some Mac jobs are late, read the `mac-probe` note — it names the sub-probe that errored. |
 | Sibling Mac job pages "→ LATE" a tick before `mac-probe` does | Two alerts for one night's sleep | A sibling's `grace_s` dropped below `mac-probe`'s + 120 in `jobs.yml` (the probe posts siblings before itself). Restore the margin. |
 | rclone's shared Google `client_id` retired (2026) | Every Drive remote using the built-in client fails to refresh at once — probes AND the backup writers on box + Mac | `rclone lsd` interactively shows the OAuth error; rclone 1.75+ warns ahead of time. Fix = own GCP OAuth Desktop client in each conf (§1b follow-up). |

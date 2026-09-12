@@ -31,8 +31,9 @@ roles in one process for local dev.
 ```
 uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -r requirements-dev.txt
 # (or: python3.12 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt)
-.venv/bin/python -m pytest -q                         # ~340 tests, no network, < 5 s
-/usr/bin/python3 -m pytest -o addopts="" tests/test_probes_*.py -q   # ~90 probe tests, MUST pass stdlib-only
+.venv/bin/python -m pytest -q                         # ~355 tests, no network, < 5 s
+/usr/bin/python3 -m pytest -o addopts="" tests/test_probes_*.py -q   # ~100 probe tests, MUST pass stdlib-only
+/usr/bin/python3 -m compileall -q probes/              # 3.9 syntax gate (CI runs this on 3.9 too)
 
 cp jobs.example.yml jobs.yml                          # local only; gitignored
 export APP_PASSWORD=devpass SESSION_SECRET=devsecret INGEST_TOKEN=devtoken READ_TOKEN=devread
@@ -62,14 +63,23 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   `PROBEABLE_KINDS` (`probe` block: required on db_snapshot, optional on rclone_copy_tree / manual — the
   box's `gdrive-ro` remote can list `Backups/` and `Gremlins/`), and `DEST_FRESH_MULTIPLIER` (12) live here.
   `disk` is a kind but NOT in `SCHEDULED_KINDS`/`PROBEABLE_KINDS`: it is a capacity gauge (`disk:` block,
-  `min_free_bytes` / `max_used_pct`), never LATE, never probed, and `informational` when both thresholds
-  are omitted — same rule as a thresholdless `manual` job.
+  `min_free_bytes` / `max_used_pct`), never probed, no cadence, and `informational` when both thresholds
+  are omitted — same rule as a thresholdless `manual` job. It has no *per-cadence* dead-man's switch, but
+  it is not exempt from silence: see `state.DISK_METRIC_MAX_AGE_S`.
 - `db.py` — schema (`jobs` incl. `created_at`, `runs`, `probes`, `state_changes`), WAL connection, all
   queries, ISO helpers (`from_iso` clamps to 1970..9999 and never raises).
 - `state.py` — pure state machine: `compute_state(job, Facts, now)`, `lag_info`, `dest_info`, `disk_info`
   (capacity block for `kind: disk`; `used_pct` is None on a 0/missing total — never a ZeroDivisionError),
   `db_snapshot_stale` (dedup-aware), `copy_tree_stale` (missing vs differ), never-pinged → LATE via
-  `Facts.created_at`. Unit-tested with a fixed clock.
+  `Facts.created_at`. Unit-tested with a fixed clock. The `disk` branch has three rules worth knowing
+  before touching it: a `fail` ping outranks the stored figures (**compared against `last_metrics_at`**,
+  because a successful capacity ping is `status: metric` and therefore never a run — without that
+  comparison one transient `statvfs` error pins the card to FAIL for ever); a reading older than
+  `DISK_METRIC_MAX_AGE_S` (48 h) is LATE, which is the only signal for a feeder that stopped on its own
+  while its machine's probe job kept reporting OK; and `_num` caps metric magnitude as well as rejecting
+  non-finite values (a numeric *string* metric bypasses the ingest ceiling).
+  `used_pct` is `(total-available)/total`, so it does NOT match `df`'s `Use%` — the free bytes do. Say so
+  rather than "fixing" it; DESIGN.md → `disk` and `probes/common.disk_free` carry the measurement.
 - `services.py` — `Core`: record ping → shallow-merge metrics → recompute ALL jobs → persist transitions →
   notify (with the **machine-offline rule**: sibling `→ LATE` alerts muted while the machine's `probe` job is
   LATE, and sibling plain `LATE → OK` recoveries muted while the probe is still LATE or recovers in the same
@@ -160,9 +170,13 @@ there is no default URL in the code, by design.
 - Box: systemd drop-ins `deploy/box/*.service.d/heartbeat.conf` (`ExecStopPost` curl with
   `$SERVICE_RESULT`/`$EXIT_STATUS`) + `dashboard-containers.timer` (`OnCalendar=*:0/5`, `Persistent=true`) →
   `dashboard-containers.service` (`User=@@USER@@` rendered by `install.sh`, default `$SUDO_USER`) →
-  `deploy/box/containers_probe.sh`, which runs BOTH `probes/containers_probe.py` (`docker ps` →
-  `box-containers`) and `probes/disk_probe.py` (`statvfs /` → `box-disk`) off that one timer; each runs
-  even if the other fails and the service exits non-zero if either did. `disk_free` lives in
+  `deploy/box/containers_probe.sh`, which runs BOTH `probes/disk_probe.py` (`statvfs /` → `box-disk`,
+  **first**: it is the cheap one, and `TimeoutStartSec=150` has to cover both) and
+  `probes/containers_probe.py` (`docker ps` → `box-containers`) off that one timer; each runs even if the
+  other fails and the service exits non-zero if either did. A non-zero exit is journal-only, so the wrapper
+  ALSO posts the `fail` ping for a disk probe that never ran — `disk_probe.py` exits **3** when it already
+  delivered a `fail` itself, and any other non-zero rc means nothing landed and the wrapper reports it.
+  Keep that exit-code contract if you touch either file. `disk_free` lives in
   `probes/common.py` (re-exported from `rclone_check` for the Mac probe's existing call site) so the box
   probe doesn't import an rclone module to call `statvfs`. Credentials in `/etc/hopper-dashboard/ingest.env` (root 0600,
   read by systemd); `install.sh --token-file <compose .env>` reads the token, never from argv.

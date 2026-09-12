@@ -3,7 +3,9 @@
 #
 # Fields: id ([a-z0-9-]+), name, machine (box|mac), kind, protects, method,
 #   destination (optional), cadence_s + grace_s (required for every kind except
-#   manual; LATE fires after cadence+grace of silence), probe.rclone_path +
+#   manual and disk, and rejected on those two; LATE fires after cadence+grace of
+#   silence — a disk gauge instead goes LATE if its reading is never refreshed for
+#   48 h), probe.rclone_path +
 #   probe.state_dir (required for db_snapshot; OPTIONAL for rclone_copy_tree and
 #   manual — the container lists the destination itself, so newest-object time +
 #   count come from the box; without it the card shows only what the Mac probe
@@ -111,8 +113,8 @@ jobs:
     # refreshed for 48 h (state.DISK_METRIC_MAX_AGE_S) — comfortably past a Mac that is merely
     # switched off for a day, which mac-probe alerts for on its own.
     disk:
-      # 25 GiB free is the documented line at which the delete-after-confirm staging folder is
-      # worth clearing; 90% matches the storage watch. Either one trips BEHIND.
+      # 25 GiB free is the point at which the offload staging copies are worth clearing out;
+      # 90% is the long-standing watch level for this disk. Either one trips BEHIND.
       min_free_bytes: 26843545600   # 25 GiB
       max_used_pct: 90
 

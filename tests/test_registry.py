@@ -23,7 +23,7 @@ def test_example_file_loads_and_has_required_jobs():
     assert reg.get("minecraft-offload").max_lag_bytes == 21474836480
     assert reg.get("taste-twin-publish").informational
     assert reg.get("mac-probe").late_means
-    # 25 GiB / 90% on the Mac (the documented staging-cleanup line + the storage watch);
+    # 25 GiB / 90% on the Mac (clear-the-staging-copies level);
     # 50 GiB / 85% on the box. A disk job carries no schedule.
     mac_disk = reg.get("mac-disk")
     assert (mac_disk.min_free_bytes, mac_disk.max_used_pct) == (26843545600, 90)

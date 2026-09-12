@@ -33,6 +33,22 @@ jobs:
           python -m venv /tmp/bare && /tmp/bare/bin/pip install -q pytest==9.0.3
           /tmp/bare/bin/python -m pytest -q tests/test_probes_*.py
 
+  probes-py39:
+    # The step above proves "stdlib only" but NOT "3.9 compatible": it runs 3.12, so 3.10+ syntax
+    # (match, `X | Y` annotations without a __future__ import, …) sails through. probes/ runs under
+    # macOS's stock /usr/bin/python3 — 3.9.6, no venv — from launchd, where a SyntaxError is a silent
+    # hourly failure. compileall is the whole check: it parses every file without importing anything.
+    # If 3.9 is ever dropped from the runner image, pin `runs-on: ubuntu-22.04` rather than deleting this.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.9"
+      - name: probes/ must parse under Python 3.9
+        run: python -m compileall -q probes/
+
   docker-build:
     runs-on: ubuntu-latest
     timeout-minutes: 15
