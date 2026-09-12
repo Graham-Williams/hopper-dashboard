@@ -127,8 +127,8 @@ def test_notifier_disabled_when_env_empty():
 
 def test_probe_cycle_records_self_job_and_probe_rows(core, registry, monkeypatch):
     monkeypatch.setattr(probes, "probe_job",
-                        lambda job: ProbeResult(ok=True, newest_iso=db.to_iso(NOW - 10),
-                                                count=4, state_sha="ab" * 32))
+                        lambda job, **kw: ProbeResult(ok=True, newest_iso=db.to_iso(NOW - 10),
+                                                      count=4, state_sha="ab" * 32))
     results = core.run_probe_cycle(now=NOW)
     assert set(results) == {"snap"}
     conn = core.connect()
@@ -140,9 +140,12 @@ def test_probe_cycle_records_self_job_and_probe_rows(core, registry, monkeypatch
 
 
 def test_probe_failure_becomes_self_job_failure_with_note(core, registry, monkeypatch):
+    """Two consecutive failed cycles (the default threshold) trip FAIL, and the
+    per-job errors ride along in the note."""
     monkeypatch.setattr(probes, "probe_job",
-                        lambda job: ProbeResult(ok=False, error="rclone exit 3: not found"))
+                        lambda job, **kw: ProbeResult(ok=False, error="rclone exit 3: not found"))
     core.run_probe_cycle(now=NOW)
+    core.run_probe_cycle(now=NOW + 300)
     conn = core.connect()
     self_run = db.last_run(conn, "dashboard-probes")
     assert self_run["status"] == "fail"
@@ -152,11 +155,12 @@ def test_probe_failure_becomes_self_job_failure_with_note(core, registry, monkey
 
 
 def test_probe_that_raises_is_caught(core, registry, monkeypatch):
-    def boom(job):
+    def boom(job, **kw):
         raise RuntimeError("kaboom")
     monkeypatch.setattr(probes, "probe_job", boom)
     results = core.run_probe_cycle(now=NOW)
     assert results["snap"].ok is False and "kaboom" in results["snap"].error
+    core.run_probe_cycle(now=NOW + 300)
     assert db.job_row(core.connect(), "dashboard-probes")["state"] == "FAIL"
 
 
@@ -216,3 +220,212 @@ def test_prune_is_per_job_and_per_table(core, registry):
     with conn:
         db.prune(conn, keep_runs=10, keep_probes=5)
     assert conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == before
+
+
+# --------------------------------------------------------------------------- #
+# Flap damping: the self-job must not page on one transient rate limit
+# --------------------------------------------------------------------------- #
+
+def _probe_results(monkeypatch, *, ok: bool, error: str = "", transient: bool = False):
+    monkeypatch.setattr(
+        probes, "probe_job",
+        lambda job, **kw: ProbeResult(ok=ok, count=1 if ok else None,
+                                      error=error or None, transient=transient))
+
+
+def _streak(core) -> int:
+    return db.job_row(core.connect(), "dashboard-probes")["last_metrics"]["fail_streak"]
+
+
+def test_one_failed_cycle_does_not_trip_fail(core, notifier, monkeypatch):
+    """The production defect: a single rateLimitExceeded used to record a fail
+    run, flip the card to FAIL and push an alert."""
+    _probe_results(monkeypatch, ok=True)
+    core.run_probe_cycle(now=NOW)
+    notifier.sent.clear()
+    _probe_results(monkeypatch, ok=False,
+                   error="transient (Drive quota/timeout): rclone exit 7: "
+                         "rateLimitExceeded", transient=True)
+    core.run_probe_cycle(now=NOW + 300)
+    conn = core.connect()
+    run = db.last_run(conn, "dashboard-probes")
+    assert run["status"] == "ok"                      # damped, not a failure yet
+    assert db.job_row(conn, "dashboard-probes")["state"] == "OK"
+    assert notifier.sent == []                       # and therefore no push
+    # The error is still recorded and still legible.
+    assert "rateLimitExceeded" in run["note"]
+    assert "damped" in run["reason"] and "1 of 2" in run["reason"]
+    assert db.last_probe(conn, "snap")["ok"] is False
+    assert _streak(core) == 1
+
+
+def test_two_consecutive_failed_cycles_trip_fail_once(core, notifier, monkeypatch):
+    _probe_results(monkeypatch, ok=True)
+    core.run_probe_cycle(now=NOW)
+    notifier.sent.clear()
+    _probe_results(monkeypatch, ok=False, error="rclone exit 7: rateLimitExceeded",
+                   transient=True)
+    core.run_probe_cycle(now=NOW + 300)
+    core.run_probe_cycle(now=NOW + 600)
+    conn = core.connect()
+    assert db.last_run(conn, "dashboard-probes")["status"] == "fail"
+    assert db.job_row(conn, "dashboard-probes")["state"] == "FAIL"
+    assert [t for t, _, _ in notifier.sent] == ["[dashboard] Probe cycle → FAIL"]
+    assert _streak(core) == 2
+    # A third failing cycle is the same fact: no second alert.
+    core.run_probe_cycle(now=NOW + 900)
+    assert len(notifier.sent) == 1
+    assert _streak(core) == 3
+
+
+def test_intervening_success_resets_the_streak(core, notifier, monkeypatch):
+    _probe_results(monkeypatch, ok=False, error="rclone exit 7: rateLimitExceeded",
+                   transient=True)
+    core.run_probe_cycle(now=NOW)
+    assert _streak(core) == 1
+    _probe_results(monkeypatch, ok=True)
+    core.run_probe_cycle(now=NOW + 300)
+    assert _streak(core) == 0
+    # …so the next single failure is damped again rather than tripping FAIL.
+    _probe_results(monkeypatch, ok=False, error="rclone exit 7: rateLimitExceeded",
+                   transient=True)
+    core.run_probe_cycle(now=NOW + 600)
+    conn = core.connect()
+    assert db.last_run(conn, "dashboard-probes")["status"] == "ok"
+    assert db.job_row(conn, "dashboard-probes")["state"] == "OK"
+    assert [t for t, _, _ in notifier.sent] == []
+
+
+def test_recovery_from_fail_is_immediate(core, notifier, monkeypatch):
+    _probe_results(monkeypatch, ok=False, error="rclone exit 7: rateLimitExceeded",
+                   transient=True)
+    core.run_probe_cycle(now=NOW)
+    core.run_probe_cycle(now=NOW + 300)
+    assert db.job_row(core.connect(), "dashboard-probes")["state"] == "FAIL"
+    _probe_results(monkeypatch, ok=True)
+    core.run_probe_cycle(now=NOW + 600)          # ONE good cycle is enough
+    assert db.job_row(core.connect(), "dashboard-probes")["state"] == "OK"
+    assert notifier.sent[-1][0] == "[dashboard] Probe cycle → OK"
+
+
+def test_fail_streak_survives_a_restart(settings, registry, monkeypatch):
+    """The streak lives in the jobs table, so a container restart mid-outage
+    cannot reset the damping and hide a persistent failure forever."""
+    from dashboard.services import Core
+    _probe_results(monkeypatch, ok=False, error="rclone exit 7: rateLimitExceeded",
+                   transient=True)
+    first = Core(settings, registry, RecordingNotifier())
+    first.init_store()
+    first.run_probe_cycle(now=NOW)
+    assert _streak(first) == 1
+    fresh = Core(settings, registry, RecordingNotifier())   # new process, same DB
+    fresh.init_store()
+    fresh.run_probe_cycle(now=NOW + 300)
+    assert _streak(fresh) == 2
+    assert db.job_row(fresh.connect(), "dashboard-probes")["state"] == "FAIL"
+
+
+def test_threshold_is_configurable(settings, registry, monkeypatch):
+    from dashboard.services import Core
+    settings.probe_fail_threshold = 1            # the pre-fix behaviour
+    core = Core(settings, registry, RecordingNotifier())
+    core.init_store()
+    _probe_results(monkeypatch, ok=False, error="rclone exit 7: rateLimitExceeded",
+                   transient=True)
+    core.run_probe_cycle(now=NOW)
+    assert db.job_row(core.connect(), "dashboard-probes")["state"] == "FAIL"
+
+
+def test_transient_and_hard_failures_read_differently(core, monkeypatch):
+    """Requirement: a quota/timeout must not look like "the destination is
+    missing files" in the reason text."""
+    _probe_results(monkeypatch, ok=False, error="timed out after 240s",
+                   transient=True)
+    core.run_probe_cycle(now=NOW)
+    reason = db.last_run(core.connect(), "dashboard-probes")["reason"]
+    assert "transient quota/timeout" in reason
+    _probe_results(monkeypatch, ok=False, error="rclone exit 3: directory not found")
+    core.run_probe_cycle(now=NOW + 300)
+    row = db.last_run(core.connect(), "dashboard-probes")
+    assert "transient" not in row["reason"] and "probe error" in row["reason"]
+    assert row["metrics"]["failed_transient"] == 0
+
+
+def test_probe_cycle_passes_the_configured_timeout(core, settings, monkeypatch):
+    seen = {}
+
+    def fake(job, timeout=None):
+        seen["timeout"] = timeout
+        return ProbeResult(ok=True, count=1)
+    settings.rclone_timeout_s = 300
+    monkeypatch.setattr(probes, "probe_job", fake)
+    core.run_probe_cycle(now=NOW)
+    assert seen["timeout"] == 300
+
+
+# --------------------------------------------------------------------------- #
+# Per-job probe interval
+# --------------------------------------------------------------------------- #
+
+def _reg_with_intervals():
+    import copy
+    from dashboard.registry import parse_registry
+    from tests.conftest import JOBS_DOC
+    doc = copy.deepcopy(JOBS_DOC)
+    doc["jobs"][1]["probe"] = {"rclone_path": "gdrive-ro:Backups",
+                               "interval_s": 1800}       # tree: big, slow
+    doc["jobs"][4]["probe"] = {"rclone_path": "gdrive-ro:Gremlins",
+                               "interval_s": 1800}       # offload: big, slow
+    return parse_registry(doc)
+
+
+def test_big_trees_are_probed_on_their_own_cadence(settings, monkeypatch):
+    """snap has no interval_s → probed every cycle; the two 1800 s jobs are
+    probed once and then skipped until their interval elapses."""
+    from dashboard.services import Core
+    core = Core(settings, _reg_with_intervals(), RecordingNotifier())
+    core.init_store()
+    _probe_results(monkeypatch, ok=True)
+    assert set(core.run_probe_cycle(now=NOW)) == {"snap", "tree", "offload"}
+    assert set(core.run_probe_cycle(now=NOW + 300)) == {"snap"}
+    assert set(core.run_probe_cycle(now=NOW + 1799)) == {"snap"}
+    assert set(core.run_probe_cycle(now=NOW + 1800)) == {"snap", "tree", "offload"}
+
+
+def test_skipping_a_job_keeps_its_last_probe_row(settings, monkeypatch):
+    """A skipped cycle must not look like a missing destination: the previous
+    listing stands, so the card keeps its newest/count."""
+    from dashboard.services import Core
+    core = Core(settings, _reg_with_intervals(), RecordingNotifier())
+    core.init_store()
+    monkeypatch.setattr(probes, "probe_job",
+                        lambda job, **kw: ProbeResult(ok=True, count=7,
+                                                      newest_iso=db.to_iso(NOW - 10)))
+    core.run_probe_cycle(now=NOW)
+    core.run_probe_cycle(now=NOW + 300)
+    conn = core.connect()
+    assert db.last_probe(conn, "tree")["count"] == 7
+    assert conn.execute("SELECT COUNT(*) FROM probes WHERE job_id='tree'"
+                        ).fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM probes WHERE job_id='snap'"
+                        ).fetchone()[0] == 2
+
+
+def test_self_heartbeat_is_recorded_even_when_nothing_is_due(settings, monkeypatch):
+    """Otherwise a cycle in which every job was skipped would starve the
+    self-job's dead-man's switch and page for LATE."""
+    import copy
+    from dashboard.registry import parse_registry
+    from dashboard.services import Core
+    from tests.conftest import JOBS_DOC
+    doc = copy.deepcopy(JOBS_DOC)
+    doc["jobs"][0]["probe"]["interval_s"] = 1800
+    core = Core(settings, parse_registry(doc), RecordingNotifier())
+    core.init_store()
+    _probe_results(monkeypatch, ok=True)
+    core.run_probe_cycle(now=NOW)
+    assert core.run_probe_cycle(now=NOW + 300) == {}
+    conn = core.connect()
+    run = db.last_run(conn, "dashboard-probes")
+    assert run["status"] == "ok" and run["metrics"]["probed"] == 0
+    assert db.job_row(conn, "dashboard-probes")["state"] == "OK"

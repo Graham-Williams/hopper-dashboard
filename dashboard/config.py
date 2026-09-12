@@ -52,6 +52,13 @@ class Settings:
     app_env: str = "prod"
     probe_interval_s: int = 300
     tick_interval_s: int = 60
+    # Hard timeout for one `rclone lsjson` (per job). Big trees page slowly and
+    # rclone backs off on Drive rate limits.
+    rclone_timeout_s: int = 240
+    # Consecutive failed probe CYCLES before the dashboard's own
+    # `dashboard-probes` job is reported FAIL. 1 = the old behaviour (alert on
+    # the first transient rate limit). Recovery is always immediate.
+    probe_fail_threshold: int = 2
     # Set False in tests / when another process owns the scheduler.
     start_scheduler: bool = True
     # Per-IP sliding-window limits (count per window seconds).
@@ -88,6 +95,8 @@ class Settings:
             app_env=(os.environ.get("APP_ENV", "prod").strip().lower() or "prod"),
             probe_interval_s=_env_int("PROBE_INTERVAL_S", 300),
             tick_interval_s=_env_int("TICK_INTERVAL_S", 60),
+            rclone_timeout_s=_env_int("RCLONE_TIMEOUT_S", 240),
+            probe_fail_threshold=_env_int("PROBE_FAIL_THRESHOLD", 2),
             start_scheduler=os.environ.get("DASHBOARD_NO_SCHEDULER", "") == "",
             trusted_proxy_cidrs=_env_cidrs("TRUSTED_PROXY_CIDR"),
         )

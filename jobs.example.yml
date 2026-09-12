@@ -7,7 +7,9 @@
 #   probe.state_dir (required for db_snapshot; OPTIONAL for rclone_copy_tree and
 #   manual — the container lists the destination itself, so newest-object time +
 #   count come from the box; without it the card shows only what the Mac probe
-#   reports), manual.max_age_s / manual.max_lag_bytes (manual
+#   reports), probe.interval_s (optional — probe THIS destination only every N
+#   seconds instead of every PROBE_INTERVAL_S cycle; for big trees, see pa-backup
+#   below. Capped at half the freshness window on db_snapshot), manual.max_age_s / manual.max_lag_bytes (manual
 #   only; omit both for an informational job that never alerts), expect (container
 #   only — names that must appear in metrics.running), late_means (optional text
 #   shown when the job is LATE, e.g. "Mac offline or asleep").
@@ -98,8 +100,17 @@ jobs:
     # plus a "Destination probes" table on the job page). The box remote MUST be able to see the path —
     # the read-only gdrive-ro (scope drive.readonly, DEPLOY.md §1b) can; a drive.file-scope remote cannot.
     # Check first: RCLONE_CONFIG=~/.config/rclone/dashboard-ro.conf rclone lsd gdrive-ro:Backups
+    #
+    # interval_s is REQUIRED IN PRACTICE on a big tree. gdrive:Backups is ~1000 objects, and a
+    # recursive listing that size pages slowly and draws Drive `rateLimitExceeded` / hits the rclone
+    # timeout. Probed every 300 s cycle it failed 21 times in 4 days, and each failure used to flip
+    # `dashboard-probes` straight to FAIL — ~55 push alerts that buried the one REAL backup failure
+    # in the same window. 1800 s (every 6th cycle) is ~6x less Drive traffic and costs nothing: this
+    # job's STALE_DEST verdict comes from the Mac's missing_*/differ_* metrics, not from the probe,
+    # and its freshness window is cadence_s * 12 = 12 days, so a 30-minute-old listing is irrelevant.
     # probe:
     #   rclone_path: gdrive-ro:Backups
+    #   interval_s: 1800
 
   - id: drive-mirror
     name: Google Drive mirror
@@ -139,9 +150,13 @@ jobs:
       max_lag_bytes: 21474836480  # 20 GB
     # Optional box-side probe (same rule as pa-backup: the box remote must see the path — gdrive-ro can).
     # Adds newest-object time + count from Drive; the fresh/stale pill then compares newest against
-    # max_age_s. ~1 GB+ of recordings is many objects, so the listing takes a few seconds per cycle.
+    # max_age_s. ~1 GB+ of recordings is many objects, so the listing takes a few seconds per cycle —
+    # and it, too, drew rate limits at the 300 s cadence (6 failures in 4 days). interval_s: 1800 for
+    # the same reason as pa-backup; safe because a manual job's state comes from its run age and lag
+    # metrics, and the fresh pill compares newest against max_age_s = 14 days.
     # probe:
     #   rclone_path: gdrive-ro:Gremlins
+    #   interval_s: 1800
 
   - id: taste-twin-publish
     name: taste-twin report publish

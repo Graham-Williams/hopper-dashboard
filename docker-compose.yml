@@ -42,6 +42,8 @@ services:
       APP_ENV: ${APP_ENV:-prod}
       TRUSTED_PROXY_CIDR: ${TRUSTED_PROXY_CIDR:-}
       PROBE_INTERVAL_S: ${PROBE_INTERVAL_S:-300}
+      RCLONE_TIMEOUT_S: ${RCLONE_TIMEOUT_S:-240}
+      PROBE_FAIL_THRESHOLD: ${PROBE_FAIL_THRESHOLD:-2}
       JOBS_FILE: /app/jobs.yml
       DASHBOARD_DATA: /app/data
     ports:

@@ -33,7 +33,8 @@ Inputs:
    ingest port is token-gated, not network-private. A compromised sibling could post fake heartbeats only
    with `INGEST_TOKEN`; keep that token out of every other app's env.
 2. **Destination probes (pull).** Run INSIDE the dashboard container by a scheduler thread (every 5–10 min;
-   `rclone lsjson --recursive` on a backup folder is ~1 s). The host's `~/.config/rclone/rclone.conf` is
+   `rclone lsjson --recursive` on a small backup folder is ~1 s; a ~1000-object tree is far slower and gets
+   its own `probe.interval_s` — see "Probe cadence and flap damping"). The host's `~/.config/rclone/rclone.conf` is
    bind-mounted `:ro` and an entrypoint copies it to a writable `RCLONE_CONFIG` path (rclone rewrites the conf
    on token refresh, so a bare `:ro` mount fails). Host state dirs `~/km-backups/state` and
    `~/todoist-points/data/.backup-state` are bind-mounted `:ro` so `last_drive.sha256` /
@@ -220,6 +221,8 @@ jobs:
     probe:                        # required for db_snapshot; optional for rclone_copy_tree / manual (box lists the dest)
       rclone_path: gdrive:km-tracker-backups
       state_dir: /state/km        # bind-mounted :ro host state dir
+      interval_s: 1800            # optional: probe THIS dest every 1800 s instead of every PROBE_INTERVAL_S
+                                  # cycle (big trees; see "Probe cadence and flap damping")
     manual:                       # only for kind: manual
       max_age_s: 604800
       max_lag_bytes: 10737418240
@@ -230,7 +233,8 @@ Validation is strict and fails startup with the job id + field: ids `^[a-z0-9-]+
 ∈ box|mac, `kind` ∈ the six kinds, `cadence_s`+`grace_s` required for every kind except `manual` (and
 forbidden on manual), `db_snapshot` requires `probe.rclone_path`, `rclone_copy_tree` requires `destination`,
 a `probe` block is accepted only on `db_snapshot` / `rclone_copy_tree` / `manual`, `container` requires a
-non-empty `expect`, unknown keys anywhere are errors.
+non-empty `expect`, `probe.interval_s` is a positive int and on a `db_snapshot` may not exceed half the
+freshness window (`cadence_s * DEST_FRESH_MULTIPLIER / 2`), unknown keys anywhere are errors.
 State computation runs on every ping (for ALL jobs, so LATE keeps firing even if the ticker thread dies) and
 on a 60 s ticker (so LATE fires without traffic). Every state transition is written to `state_changes` and
 dispatched to ntfy (`NTFY_URL` + `NTFY_TOPIC` env; disabled when empty) with title `[dashboard] <job> → <STATE>`
@@ -258,8 +262,44 @@ IS the check; no DB → `fail`). `manual`: never LATE; `FAIL` if last run failed
 success > `max_age_s` or `lag_bytes` > `max_lag_bytes`; no thresholds = informational, never alerts.
 `max_age_s` is inert until the first real run (the card says **Never run** until then — seed one ping after
 the first manual run). `dashboard-probes` is the scheduler's own heartbeat: a run is recorded every probe
-cycle, `fail` (with the error in `note`) if any rclone probe errored — so a broken probe shows up as a FAIL
-card, never a crash.
+cycle, `fail` (with the error in `note`) after `PROBE_FAIL_THRESHOLD` **consecutive** cycles in which any
+rclone probe errored — so a broken probe shows up as a FAIL card, never a crash, and a single transient one
+does not page (see below).
+
+### Probe cadence and flap damping
+Measured in production 2026-09-11: `dashboard-probes` flapped FAIL→OK **27 times in 4 days** (~55 ntfy
+pushes — nearly all of Graham's alert traffic), because Google Drive answered `rateLimitExceeded` or the
+90 s rclone timeout expired on 21/1159 `gdrive:Backups` probes (~1000 objects) and 6/1159 `gdrive:Gremlins`
+probes. The small DB-snapshot trees failed 0 times. Nothing was actually broken — but the noise buried a
+**real** `pa-backup` failure on 2026-09-10. Three changes, all aimed at making a persistent failure legible
+rather than at silencing failures:
+1. **Consecutive-cycle damping.** `PROBE_FAIL_THRESHOLD` (default **2**) consecutive cycles with ≥1 probe
+   error before `dashboard-probes` records a `fail` run. A damped cycle records `ok` with the error kept in
+   the run's `reason` ("probe-error damped (… cycle 1 of 2 …)") and `note`, and the failed probe rows are
+   written as always, so the board and job page never hide it. **Recovery is immediate** — one clean cycle.
+   The streak is persisted as `last_metrics.fail_streak` on the self job, so a container restart mid-outage
+   cannot reset the damping and let a persistent failure page forever at cycle 1.
+2. **`RCLONE_TIMEOUT_S` (default 240 s, was a hard-coded 90).** Drive pages a recursive listing 1000 objects
+   at a time and rclone backs off on rate limits; 90 s was itself a leading cause of "failure". Keep it under
+   `PROBE_INTERVAL_S` so one slow listing cannot run into the next cycle.
+3. **Per-job `probe.interval_s`.** Probe a big tree every 1800 s instead of every 300 s cycle (≈6× less Drive
+   traffic, which also reduces the rate limiting at source); absent = every cycle, i.e. the global
+   `PROBE_INTERVAL_S`. Dueness is computed from the persisted `probes.probed_at`, so a restart does not
+   re-probe a big tree early, and a skipped cycle leaves the previous listing standing (the card keeps its
+   newest/count). The self-heartbeat is still recorded on a cycle in which nothing was due.
+**Why this cannot make a destination wrongly read stale:** `dest_fresh_s` = `cadence_s * 12` is compared
+against the destination's **own newest-object timestamp**, an absolute time that does not drift as the probe
+row ages — a longer interval only delays noticing a *new* object. The only kind whose state reads that age is
+`db_snapshot`, and those keep the default interval (300 s against a 3600 s window); `registry.py` refuses an
+`interval_s` above half the window for that kind so the invariant is enforced, not just reasoned about. The
+two jobs set to 1800 s are `rclone_copy_tree` and `manual`, whose `STALE_DEST`/`BEHIND` verdicts come from
+heartbeat `missing_*`/lag metrics, and whose freshness windows (12 d / `max_age_s` 14 d) dwarf 1800 s.
+**Transient vs real:** a failure whose text matches `probes.TRANSIENT_MARKERS` (`rateLimitExceeded`, 429,
+503/backendError, timeouts, …) is prefixed `transient (Drive quota/timeout):` in the probe row's `error` and
+counted in `metrics.failed_transient`, and the self-job's `reason` names it — so "Drive pushed back" never
+reads like "the destination is missing files". Transients are **not** exempt from the consecutive count: a
+*persistent* quota failure is a real problem (it is what broke the nightly backup on 2026-09-10) and must
+still reach FAIL.
 
 ### Alerting rules
 - Every transition is persisted to `state_changes` and shown on the board; only *dispatch* is filtered.

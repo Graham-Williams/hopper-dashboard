@@ -91,3 +91,63 @@ def test_probe_job_never_raises(monkeypatch, tmp_path):
     assert res.ok and res.count == 9
 
     assert probe_job(REG.get("tree")).ok is False  # no probe configured
+
+
+def test_timeout_is_configurable_and_defaults_to_the_module_constant(monkeypatch):
+    seen = {}
+
+    def fake_run(argv, **kw):
+        seen["timeout"] = kw.get("timeout")
+        return _Proc()
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    run_rclone_lsjson("g:x")
+    assert seen["timeout"] == probes.RCLONE_TIMEOUT_S == 240
+    run_rclone_lsjson("g:x", 600)
+    assert seen["timeout"] == 600
+    run_rclone_lsjson("g:x", 0)            # floored, never a zero-second probe
+    assert seen["timeout"] == 5
+    probe_job(REG.get("snap"), timeout=123)
+    assert seen["timeout"] == 123
+
+
+@pytest.mark.parametrize("text,transient", [
+    ("rclone exit 7: googleapi: Error 403: rateLimitExceeded", True),
+    ("rclone exit 7: userRateLimitExceeded, userRateLimitExceeded", True),
+    ("rclone timed out after 240s", True),
+    ("rclone exit 7: Error 429: Too Many Requests", True),
+    ("rclone exit 7: Error 503: backendError", True),
+    ("rclone exit 3: directory not found", False),
+    ("rclone binary not found", False),
+    ("rclone returned unparseable JSON", False),
+    ("", False),
+    (None, False),
+])
+def test_is_transient_error(text, transient):
+    assert probes.is_transient_error(text) is transient
+
+
+def test_transient_failures_are_labelled_in_the_error_text(monkeypatch):
+    """So a quota push-back never reads like "the destination is wrong" on the
+    card, in the probe table, or in the self-job's note."""
+    monkeypatch.setattr(
+        probes, "run_rclone_lsjson",
+        lambda p, t=None: (_ for _ in ()).throw(ProbeError("rclone exit 7: rateLimitExceeded")))
+    res = probe_job(REG.get("snap"))
+    assert res.transient is True
+    assert res.error.startswith("transient (Drive quota/timeout): ")
+    assert "rateLimitExceeded" in res.error
+
+    monkeypatch.setattr(
+        probes, "run_rclone_lsjson",
+        lambda p, t=None: (_ for _ in ()).throw(ProbeError("rclone exit 3: directory not found")))
+    res = probe_job(REG.get("snap"))
+    assert res.transient is False
+    assert res.error == "rclone exit 3: directory not found"
+
+
+def test_a_real_timeout_is_classified_transient(monkeypatch):
+    def timeout(*a, **k):
+        raise subprocess.TimeoutExpired("rclone", 240)
+    monkeypatch.setattr(subprocess, "run", timeout)
+    res = probe_job(REG.get("snap"))
+    assert res.ok is False and res.transient is True and "timed out" in res.error

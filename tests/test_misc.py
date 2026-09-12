@@ -66,6 +66,19 @@ def test_settings_from_env(monkeypatch, tmp_path):
         Settings.from_env()
 
 
+def test_probe_damping_knobs_from_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("DASHBOARD_DATA", str(tmp_path))
+    s = Settings.from_env()
+    assert s.rclone_timeout_s == 240 and s.probe_fail_threshold == 2
+    monkeypatch.setenv("RCLONE_TIMEOUT_S", "600")
+    monkeypatch.setenv("PROBE_FAIL_THRESHOLD", "3")
+    s = Settings.from_env()
+    assert s.rclone_timeout_s == 600 and s.probe_fail_threshold == 3
+    monkeypatch.setenv("PROBE_FAIL_THRESHOLD", "twice")
+    with pytest.raises(ValueError, match="PROBE_FAIL_THRESHOLD"):
+        Settings.from_env()
+
+
 def test_create_app_rejects_bad_role(settings, registry):
     with pytest.raises(ValueError, match="role"):
         create_app("admin", settings, registry)
