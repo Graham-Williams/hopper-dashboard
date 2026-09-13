@@ -36,7 +36,7 @@ PROBEABLE_KINDS = ("db_snapshot", "rclone_copy_tree", "manual")
 
 _TOP_KEYS = {"id", "name", "machine", "kind", "protects", "method",
              "destination", "cadence_s", "grace_s", "probe", "manual",
-             "disk", "expect", "late_means"}
+             "disk", "expect", "late_means", "alert_after_s", "alert"}
 _PROBE_KEYS = {"rclone_path", "state_dir", "interval_s"}
 _MANUAL_KEYS = {"max_age_s", "max_lag_bytes"}
 _DISK_KEYS = {"min_free_bytes", "max_used_pct"}
@@ -48,6 +48,42 @@ MAX_USED_PCT = 100
 # Multiplier on cadence past which a destination's newest object counts as
 # old (DESIGN.md: "newest object age < cadence*N").
 DEST_FRESH_MULTIPLIER = 12
+
+# ---------------------------------------------------------------------------
+# Alert policy (DESIGN.md "Alerting rules")
+#
+# How long a job must be CONTINUOUSLY not-OK before ONE ntfy alert is sent,
+# when jobs.yml declares nothing at all. Deliberately conservative: the failure
+# mode of the threshold layer must be a LATE page, never a silent one, so an
+# undeclared job pages a day late rather than never.
+DEFAULT_ALERT_AFTER_S = 86400
+# Upper bound, enforced as loudly as every other schema rule. Magnitude is the
+# one hostile input this validator would otherwise accept: `alert_after_s:
+# 864000000` parses as a perfectly good non-negative int and silently means
+# "never page". One extra digit is the whole failure, so a value past the point
+# of usefulness is a typo, not a policy — say `alert: never` if you mean never.
+MAX_ALERT_AFTER_S = 2_592_000   # 30 days
+# The only value `alert:` accepts today — an explicit opt-out for jobs whose
+# not-OK states are lag metrics nobody should be woken for.
+ALERT_NEVER = "never"
+# Why a job ended up with the policy it has, surfaced on /api/v1/status so the
+# resolution is inspectable rather than inferred from the file.
+ALERT_SOURCE_EXPLICIT = "alert_after_s"     # the job declared a threshold
+ALERT_SOURCE_NEVER = "alert"                # the job declared `alert: never`
+ALERT_SOURCE_INFORMATIONAL = "informational"  # a gauge/manual job with no thresholds
+ALERT_SOURCE_DEFAULT = "default"            # nothing declared → DEFAULT_ALERT_AFTER_S
+
+
+def _is_informational(kind: str, max_age_s: int | None, max_lag_bytes: int | None,
+                      min_free_bytes: int | None, max_used_pct: int | None) -> bool:
+    """A manual or disk job with no thresholds of its own: shown, never alerted
+    on. Shared by :attr:`Job.informational` and the parse-time alert-policy
+    resolution so the two can never disagree."""
+    if kind == "manual":
+        return max_age_s is None and max_lag_bytes is None
+    if kind == "disk":
+        return min_free_bytes is None and max_used_pct is None
+    return False
 
 
 class RegistryError(ValueError):
@@ -74,6 +110,11 @@ class Job:
     max_used_pct: int | None = None
     expect: tuple[str, ...] = field(default_factory=tuple)
     late_means: str | None = None
+    # Resolved alert policy — never inferred at use time (see parse_job).
+    # ``alert_never`` wins; ``alert_after_s`` is meaningless when it is set.
+    alert_after_s: int = DEFAULT_ALERT_AFTER_S
+    alert_never: bool = False
+    alert_source: str = ALERT_SOURCE_DEFAULT
 
     @property
     def scheduled(self) -> bool:
@@ -98,12 +139,16 @@ class Job:
 
     @property
     def informational(self) -> bool:
-        """A manual or disk job with no thresholds: shown, never alerted on."""
-        if self.kind == "manual":
-            return self.max_age_s is None and self.max_lag_bytes is None
-        if self.kind == "disk":
-            return self.min_free_bytes is None and self.max_used_pct is None
-        return False
+        """A manual or disk job with no thresholds: shown, never alerted on.
+
+        This used to be a promise nothing kept — no caller consulted it, so an
+        "informational" job pushed to ntfy on every transition like any other.
+        It is now real: an informational job with no explicit ``alert``/
+        ``alert_after_s`` resolves to ``alert_never`` at parse time (see
+        :func:`parse_job`). An explicit threshold still wins over it.
+        """
+        return _is_informational(self.kind, self.max_age_s, self.max_lag_bytes,
+                                 self.min_free_bytes, self.max_used_pct)
 
 
 class Registry:
@@ -172,6 +217,27 @@ def _pos_int(container: dict, key: str, ref: str, required: bool) -> int | None:
     return val
 
 
+def _nonneg_int(container: dict, key: str, ref: str) -> int | None:
+    """Like :func:`_pos_int` but 0 is a legal value.
+
+    Only ``alert_after_s`` uses it: ``0`` means "page as soon as this job
+    leaves OK" (the pre-0.2 behaviour, still capped at ONE page per episode).
+    Not recommended for a job whose destination probe can blip — that is the
+    flapping this threshold layer exists to stop.
+    """
+    if key not in container or container[key] is None:
+        return None
+    val = container[key]
+    if isinstance(val, bool) or not isinstance(val, int) or val < 0:
+        raise _err(ref, f"'{key}' must be a non-negative integer")
+    if val > MAX_ALERT_AFTER_S:
+        raise _err(ref, f"'{key}' is {val}, which is over the "
+                        f"{MAX_ALERT_AFTER_S} second (30 day) maximum — a "
+                        f"threshold that long is silence, not a policy; use "
+                        f"'alert: never' if that is what you mean")
+    return val
+
+
 def _check_keys(raw: dict, allowed: set[str], ref: str, where: str) -> None:
     unknown = sorted(set(raw) - allowed)
     if unknown:
@@ -210,6 +276,19 @@ def parse_job(raw: Any, index: int) -> Job:
     grace = _pos_int(raw, "grace_s", ref, required=scheduled)
     if not scheduled and (cadence is not None or grace is not None):
         raise _err(ref, f"{kind} jobs have no schedule; drop cadence_s/grace_s")
+
+    # Mutual exclusion is checked on the KEYS, not their parsed values: with an
+    # `is not None` test, `alert: never` + `alert_after_s: null` parsed to
+    # "never" — an accidental silence that reads, in the file, like somebody
+    # set a threshold.
+    if "alert" in raw and "alert_after_s" in raw:
+        raise _err(ref, "'alert' and 'alert_after_s' are mutually exclusive; "
+                        "keep one (even when the other is null)")
+    alert_after_s = _nonneg_int(raw, "alert_after_s", ref)
+    alert_mode = _opt_str(raw, "alert", ref, max_len=16)
+    if alert_mode is not None and alert_mode != ALERT_NEVER:
+        raise _err(ref, f"'alert' must be {ALERT_NEVER!r} (the only mode "
+                        f"today); use 'alert_after_s' for a threshold")
 
     probe_raw = raw.get("probe")
     rclone_path = state_dir = None
@@ -281,6 +360,28 @@ def parse_job(raw: Any, index: int) -> Job:
     elif expect_raw is not None:
         raise _err(ref, "'expect' is only valid for kind: container")
 
+    # Resolve the alert policy ONCE, here, so nothing downstream has to decide
+    # what an absent key means. In precedence order:
+    #   `alert: never`        → never pages
+    #   `alert_after_s: N`    → pages after N seconds continuously not-OK, and
+    #                           an explicit value wins even on an informational
+    #                           job (that is the only way to alert on one)
+    #   nothing + informational → never pages (the promise `informational` has
+    #                           always made on the board and never kept)
+    #   nothing otherwise     → DEFAULT_ALERT_AFTER_S, because a job nobody
+    #                           thought about must page late, not never.
+    informational = _is_informational(kind, max_age, max_lag, min_free, max_used)
+    if alert_mode == ALERT_NEVER:
+        alert_never, alert_secs, alert_source = True, DEFAULT_ALERT_AFTER_S, ALERT_SOURCE_NEVER
+    elif alert_after_s is not None:
+        alert_never, alert_secs, alert_source = False, alert_after_s, ALERT_SOURCE_EXPLICIT
+    elif informational:
+        alert_never, alert_secs, alert_source = (True, DEFAULT_ALERT_AFTER_S,
+                                                 ALERT_SOURCE_INFORMATIONAL)
+    else:
+        alert_never, alert_secs, alert_source = (False, DEFAULT_ALERT_AFTER_S,
+                                                 ALERT_SOURCE_DEFAULT)
+
     return Job(
         id=job_id, name=name, machine=machine, kind=kind, protects=protects,
         method=method, destination=destination, cadence_s=cadence,
@@ -288,6 +389,8 @@ def parse_job(raw: Any, index: int) -> Job:
         probe_interval_s=probe_interval,
         max_age_s=max_age, max_lag_bytes=max_lag, min_free_bytes=min_free,
         max_used_pct=max_used, expect=expect, late_means=late_means,
+        alert_after_s=alert_secs, alert_never=alert_never,
+        alert_source=alert_source,
     )
 
 
