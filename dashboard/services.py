@@ -393,6 +393,16 @@ class Core:
                             job.id)
                 bad_since = began = alerted_at = None
                 db.set_alert_episode(conn, job.id, None, None)
+            elif bad_since is None and alerted_at is not None:
+                # An `alerted_at` with no episode to belong to: nothing here ever
+                # writes that pair (a close clears both), so it is a corrupt or
+                # hand-edited row. Left alone it is a spent page attached to
+                # nothing, which is the shape that makes a job un-pageable. Drop
+                # it — the direction that can only ever page MORE.
+                log.warning("healing an alerted_at with no open episode for %s",
+                            job.id)
+                alerted_at = None
+                db.set_alert_episode(conn, job.id, None, None)
 
             if state == "OK":
                 if not (bad_since or alerted_at):

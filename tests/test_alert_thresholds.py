@@ -906,6 +906,27 @@ def test_healing_the_clock_also_drops_a_stale_alerted_at(settings, notifier):
     assert titles(notifier) == ["[dashboard] Tree copy → FAIL"]
 
 
+def test_an_alerted_at_with_no_episode_is_healed_not_trusted(settings, notifier):
+    """The other unusable shape: `alerted_at` set with `bad_since` NULL. Nothing
+    in `Core` ever writes that pair (closing an episode clears both), so it is a
+    corrupt or hand-edited row — but left alone it is a spent page attached to
+    nothing, and that is exactly the shape that makes a job un-pageable."""
+    core = core_with(settings, notifier, {"tree": {"alert_after_s": DAY}})
+    job = core.registry.get("tree")
+    conn = core.connect()
+    with conn:
+        conn.execute("UPDATE jobs SET bad_since=NULL, alerted_at=? WHERE id='tree'",
+                     (db.to_iso(NOW),))
+    conn.close()
+    core.recompute_all(now=NOW + 10)
+    assert row(core, "tree")["alerted_at"] is None       # healed, with no recovery sent
+    assert notifier.sent == []
+    # ...and the job pages normally on the next real episode.
+    core.record_ping(job, {"status": "fail"}, now=NOW + 20)
+    core.recompute_all(now=NOW + 20 + DAY)
+    assert titles(notifier) == ["[dashboard] Tree copy → FAIL"]
+
+
 def test_a_trip_through_unknown_clears_the_episode_without_a_recovery(settings, notifier):
     """UNKNOWN is not alertable, and it used to be skipped entirely — so a
     paged job that passed through it kept `bad_since`/`alerted_at` and was
