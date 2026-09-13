@@ -31,7 +31,7 @@ roles in one process for local dev.
 ```
 uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -r requirements-dev.txt
 # (or: python3.12 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt)
-.venv/bin/python -m pytest -q                         # ~425 tests, no network, ~5 s
+.venv/bin/python -m pytest -q                         # ~490 tests, no network, ~12 s
 /usr/bin/python3 -m pytest -o addopts="" tests/test_probes_*.py -q   # ~100 probe tests, MUST pass stdlib-only
 /usr/bin/python3 -m compileall -qf probes/             # 3.9 syntax gate (CI also RUNS the probe tests on 3.9)
 
@@ -70,8 +70,19 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   `min_free_bytes` / `max_used_pct`), never probed, no cadence, and `informational` when both thresholds
   are omitted — same rule as a thresholdless `manual` job. It has no *per-cadence* dead-man's switch, but
   it is not exempt from silence: see `state.DISK_METRIC_MAX_AGE_S`.
-- `db.py` — schema (`jobs` incl. `created_at`, `runs`, `probes`, `state_changes`), WAL connection, all
-  queries, ISO helpers (`from_iso` clamps to 1970..9999 and never raises).
+  **Alert policy** (`alert_after_s: N` | `alert: never`, mutually exclusive *by key presence*) is resolved
+  HERE, once, into `Job.alert_after_s` / `alert_never` / `alert_source` — `never` > explicit `N` >
+  `informational` > `DEFAULT_ALERT_AFTER_S` (86400). Nothing downstream re-decides what an absent key means.
+  `informational` is no longer a broken promise: it feeds this resolution instead of being a second,
+  overlapping concept nothing consulted. `alert_after_s` is capped at `MAX_ALERT_AFTER_S` (30 d) — magnitude
+  is the one hostile input this validator would otherwise accept, since one extra digit silently means
+  "never page".
+- `db.py` — schema (`jobs` incl. `created_at`, `bad_since`, `alerted_at`; `runs`, `probes`,
+  `state_changes`), WAL connection, all queries, ISO helpers (`from_iso` clamps to 1970..9999 and never
+  raises). Additive `jobs` columns go in `JOBS_COLUMNS` **and** `SCHEMA`; `init_schema` migrates under
+  `BEGIN IMMEDIATE` with a duplicate-column-tolerant `_add_column`, because `create_app` runs it for BOTH
+  roles and `entrypoint.sh` starts every gunicorn together — the loser of that race used to kill a worker
+  and restart-loop the container. Don't "simplify" either guard away.
 - `state.py` — pure state machine: `compute_state(job, Facts, now)`, `lag_info`, `dest_info`, `disk_info`
   (capacity block for `kind: disk`; `used_pct` is None on a 0/missing total — never a ZeroDivisionError),
   `db_snapshot_stale` (dedup-aware), `copy_tree_stale` (missing vs differ), never-pinged → LATE via
@@ -87,10 +98,33 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   `used_pct` is `(total-available)/total`, so it does NOT match `df`'s `Use%` — the free bytes do. Say so
   rather than "fixing" it; DESIGN.md → `disk` and `probes/common.disk_free` carry the measurement.
 - `services.py` — `Core`: record ping → shallow-merge metrics → recompute ALL jobs → persist transitions →
-  notify (with the **machine-offline rule**: sibling `→ LATE` alerts muted while the machine's `probe` job is
+  run the **episode pass** → notify.
+  **Alerting is by EPISODE, not by transition** (DESIGN.md "Alerting rules" is the spec; read the module
+  docstring before touching any of it). A job pages once, after it has been continuously not-OK for its own
+  `alert_after_s`, and recovers only if that page went out. Two `jobs` columns hold it: `bad_since` (episode
+  start; `jobs.since` cannot serve, it resets on every state change) and `alerted_at` (one page per episode).
+  **Dispatch is LEVEL-triggered** — `_resolve_alerts` walks EVERY job on EVERY recompute, because "still
+  FAIL, now past six hours" is the event and it is not a transition. `recompute_all` and `record_ping` are
+  two entry points into the same `_recompute_pass`; keep them that way.
+  **The governing rule: every ambiguity resolves toward paging, never toward silence.** Transition-paging was
+  accidentally self-healing (the next transition re-paged); one page per episode removes that net. So: a
+  failed POST hands the page back keyed on **episode identity**, never on "is the job not-OK now" (the dwell
+  and the hold both keep an episode open while the job reads OK — a state-based guard skips exactly the case
+  it was written for); an episode closes only after a **verified** OK holds for `ok_dwell_s`; an *unverified*
+  OK does not close it at all (`state.ok_is_unverified` for a destination that could not be checked, and
+  `db.failing_probe_job_ids` for `dashboard-probes` reporting `ok` while the damping below suppresses a real
+  probe failure); a future/unparseable `bad_since` is healed; UNKNOWN clears the episode without recovering.
+  **Every one of those holds is bounded twice** — the episode clock stays authoritative (past its threshold
+  it pages anyway, naming what the episode is really about), and after `ok_hold_s` it closes silently — or a
+  destination that can never be probed again pins `alerted_at` and mutes every later failure of that job.
+  When adding anything here, the question is never "is the job OK?" but "is the EPISODE still open?"
+  Also the **machine-offline rule** ( sibling `→ LATE` alerts muted while the machine's `probe` job is
   LATE, and sibling plain `LATE → OK` recoveries muted while the probe is still LATE or recovers in the same
   batch — the Mac probe posts its sub-jobs before its own heartbeat, so siblings recover one batch early;
-  FAIL/STALE_DEST/BEHIND after LATE always alert); `run_probe_cycle` (probes the jobs `due_probes()` says are
+  FAIL/STALE_DEST/BEHIND after LATE always alert). It is **void when the machine's probe job can never page**
+  (`alert_never`): the rule mutes siblings on the premise that the probe sends one alert for the machine, so
+  without that guard a Mac gone for days pages nobody at all. A suppressed alert must also never stamp
+  `alerted_at` — it would burn the episode's one page and lose its recovery with it. `run_probe_cycle` (probes the jobs `due_probes()` says are
   due + the `dashboard-probes` self-heartbeat + `prune` — one `DELETE … NOT IN (… ORDER BY id DESC LIMIT n)`
   per table, not O(n²)). **Flap damping** (`probe_trouble` / `_classify_trouble`): the self-job records `fail`
   when any probed job is tripped — `hard` (error is not a quota/timeout: first failure, never damped),
@@ -121,8 +155,10 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   Unavailable`), never as bare digits. A dated snapshot name like `km_tracker-20260503-0312.db` contains
   `503`; as bare substrings those markers made a permission-denied on an ordinary nightly path look
   transient. Don't classify on raw stderr, and don't re-add a bare status-code substring marker.
-- `notify.py` — ntfy `Notifier`; body is `job_id: FROM → TO` only (no reason text leaves the box);
-  `should_notify` suppresses `UNKNOWN→OK`; never raises.
+- `notify.py` — ntfy `Notifier`, deliberately dumb: it decides nothing about *whether* to page, `Core` does.
+  `notify_alert(name, id, state, after_s)` for a sustained problem (`job_id: STATE for over 6h`),
+  `notify_recovery(name, id, from_state)` for the end of an episode that was paged. No reason text ever
+  leaves the box; never raises; returns False on a failed POST, which `Core` acts on (see below).
 - `ingest.py` — blueprint + pure payload parsers (`parse_json_payload`, `parse_form_payload`, `parse_metrics`).
 - `web.py` — read blueprint: gate, host pin, security headers (per-request CSP nonce), HTML + JSON routes.
 - `views.py` — builds the `/api/v1/status` contract and job detail from the store.
@@ -156,6 +192,23 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   `run_probe_cycle` passes `timeout=` to `probe_job`, so a stub must accept it (`lambda job, **kw: …`).
 - Test fixtures pin `jobs.created_at` to 2030 (`conftest.pin_created_at`) so the never-pinged → LATE rule
   only fires in the tests that set `created_at` explicitly. Remember this when a new test uses a fixed clock.
+- `conftest.JOBS_DOC` is **index-addressed** by several suites (`doc["jobs"][4]`) — APPEND only, never
+  insert. Every job in it carries `alert_after_s: 0` so those suites still assert dispatch at transition
+  time; `info` is the deliberate exception (it declares nothing, so it exercises the informational → never
+  resolution in place). The threshold layer itself is tested with realistic values in
+  `tests/test_alert_thresholds.py`, whose `core_with()` opts every unnamed job out with `alert: never` so one
+  job's episode is under test and the rest cannot add noise.
+- `RecordingNotifier` overrides `_post`, not `send` — `send`'s try/except is part of what is under test, and
+  a double that overrides `send` would make every retry path look like it worked. It has two failure modes
+  (`fail` raises, `refuse` returns non-2xx) because `send` flattens both to False.
+- **Adding a job to `jobs.example.yml` means giving it an alert policy.** `registry` will fall back to the
+  24 h default, but a shipped job inheriting the default is a job somebody forgot — `test_example_file_alert_
+  policy_matches_the_documented_thresholds` asserts no job has `alert_source == "default"`. Say `alert: never`
+  if that is what you mean, and put the reasoning next to it in the file.
+- **`jobs.yml` on the box is gitignored, so a `git pull` delivers schema but never values.** Any new
+  `jobs.yml` key needs a scripted, idempotent recipe in DEPLOY.md §1d, and every check in it must be scoped
+  to one job's own block — a file-wide search finds a LATER job's key, concludes "already done", and skips
+  this one silently, with a clean parse and no error.
 - Machine IPs, account ids and Drive folder ids never go in code, tests or docs — use
   `<box-tailscale-ip>`-style placeholders; real values live in the gitignored `.env`/`jobs.yml`/env files.
 - Hopper's bearer reads go through the public hostname (`https://dashboard.graham-williams.com/api/v1/status`

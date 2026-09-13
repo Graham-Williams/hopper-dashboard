@@ -173,6 +173,122 @@ curl -sS -o /dev/null -w '%{http_code}\n' -X POST http://<box-tailscale-ip>:8081
 Also confirm the ingest port is **not** on the LAN interface: `ss -ltnp | grep 8081` on the box must show
 `<box-tailscale-ip>:8081` only, never `0.0.0.0:8081`.
 
+### 1d. ⚠️ Upgrading an EXISTING box: three `jobs.yml` edits `git pull` cannot make
+
+**`jobs.yml` is gitignored** (it carries real Drive paths and machine topology), so a pull brings the new
+*schema* but never new *values*. Everything below keeps working if you skip it, silently and wrongly — the
+container starts fine either way, so nothing will tell you. A **fresh** install that copied
+`jobs.example.yml` already has all three and needs none of this.
+
+1. **Alert thresholds** (this release). Every key is optional, so a live file with none of them falls back to
+   the 24 h default for *every* job — including the four that should never page, `box-containers` (which
+   would page 20 h late) and `mac-probe` (which would then page after every long weekend the Mac sleeps).
+2. **`dashboard-probes: grace_s` 600 → 900** (PR #8). A probe cycle can now spend budget + one
+   `DASHBOARD_RCLONE_TIMEOUT_S` ≈ 540 s before writing its heartbeat; with 600 s of grace a slow cycle trades
+   FAIL flapping for LATE flapping.
+3. **`box-disk` and `mac-disk` must EXIST** (PR #9) **before their probes first post.** Ingest rejects an
+   undeclared job id with 404, and the Mac probe treats that as a failed sub-probe — so a missing `mac-disk`
+   turns `mac-probe` itself into an hourly failing ping. Copy both blocks verbatim from `jobs.example.yml`
+   (they contain no secrets) into the right machine sections. The script below **warns loudly** if either is
+   absent rather than inventing it.
+
+```bash
+cd ~/hopper-dashboard
+cp jobs.yml "jobs.yml.bak.$(date +%F)"           # the live file is the only copy of the real paths/ids
+python3 - <<'PY'
+import re, sys
+p = "jobs.yml"; s = open(p).read()
+# One page only when a job has been CONTINUOUSLY not-OK this long (DESIGN.md "Alerting
+# rules"). mac-probe is 72 h and NOT `alert: never`: it is the job whose alert mutes its
+# Mac siblings, so `never` there means a Mac gone for a week pages nothing at all. The
+# two disk gauges are 1 h, not the 24 h default: a dead gauge is already LATE only after
+# 48 h, and a capacity threshold is a level, not a flap.
+AFTER = {"km-backup": 86400, "todoist-points-backup": 86400, "box-containers": 1200,
+         "box-disk": 3600, "dashboard-probes": 21600, "mac-probe": 259200,
+         "mac-disk": 3600, "pa-backup": 108000, "drive-mirror": 86400}
+NEVER = ("minecraft-offload", "taste-twin-publish", "jjho-refresh", "baby-pool-sync")
+# PR #8 raised this job's worst-case cycle; 600 s of grace would trade FAIL flapping for
+# LATE flapping. Scoped to its own block, and only ever raised.
+GRACE = {"dashboard-probes": 900}
+
+def block(jid, text):            # one job's own lines, and nothing after them
+    return re.search(r"^  - id: %s$(?:\n(?!  - id:).*)*" % re.escape(jid), text, re.M)
+
+def replace(text, m, new):       # splice a rewritten block back in by POSITION
+    return text[:m.start()] + new + text[m.end():]
+
+missing = [j for j in list(AFTER) + list(NEVER) if block(j, s) is None]
+for jid, secs in list(AFTER.items()) + [(j, None) for j in NEVER]:
+    m = block(jid, s)
+    if m is None:
+        continue
+    body = m.group(0)
+    if re.search(r"^    alert(_after_s)?:", body, re.M):
+        continue                 # already carries a policy of its own — leave it alone
+    line = "    alert: never\n" if secs is None else "    alert_after_s: %d\n" % secs
+    # Insert after the job's own `name:` line (required on every job, so it always exists).
+    nm = re.search(r"^    name: .*\n", body, re.M)
+    s = replace(s, m, body[:nm.end()] + line + body[nm.end():])
+for jid, want in GRACE.items():
+    m = block(jid, s)
+    if m is None:
+        continue
+    body = m.group(0)
+    g = re.search(r"^    grace_s: (\d+)", body, re.M)
+    if g is None or int(g.group(1)) >= want:
+        continue
+    s = replace(s, m, body[:g.start()] + "    grace_s: %d" % want + body[g.end():])
+open(p, "w").write(s)
+if missing:
+    sys.stderr.write("!! NOT IN jobs.yml, so they got no policy: %s\n"
+                     "   Add the job (see DEPLOY.md 1d) and re-run.\n" % ", ".join(missing))
+PY
+grep -nE '^  - id:|^    (alert|grace_s|late_means)' jobs.yml   # 9 thresholds, 4 nevers, grace_s 900
+docker compose up -d --build                      # validation is strict: a bad edit = a loud restart loop
+docker logs --tail 20 hopper-dashboard            # `jobs.yml: job '<id>': …` names the offending field
+```
+
+**Every check in that script is scoped to one job's own block.** A file-wide search finds a *later* job's key,
+concludes "already done", and skips this one silently — a clean parse, no error, and the edit you thought you
+made never happened.
+
+**Idempotency, verified by running it 3× over five input shapes** — the file as shipped, a pre-feature file, a
+file where one job already carries a hand-written `alert:`, a pre-#8/#9 file (600 s grace, no disk jobs), and
+one whose **jobs are in reverse order**: byte-identical after every run, `load_registry` green on all fifteen
+outputs, no job left inheriting the 24 h default, `grace_s` 900, and the missing-disk-job case warned instead
+of guessing. On the shipped file it is a true no-op (same bytes in and out).
+
+**Then one hand edit the script deliberately does not make.** `mac-probe`'s `late_means:` is operator prose
+shown on the card, and on a pre-feature box it describes the behaviour this release changed. Make it say what
+now happens (this is the wording in `jobs.example.yml`):
+
+```
+    late_means: Not heard from the Mac in 15 hours — probably offline or asleep, not broken. Only a Mac that stays gone for ~3.5 days pages.
+```
+
+Nothing depends on the string — it is the sentence Graham reads on the card at 2 a.m., which is exactly why a
+stale one matters.
+
+Finally, confirm the **app** agrees with the file. This is the check that proves the edit landed:
+
+```bash
+docker exec hopper-dashboard python - <<'PY'
+import json, urllib.request as u
+req = u.Request("http://127.0.0.1:8080/api/v1/status",
+                headers={"Authorization": "Bearer <READ_TOKEN>", "Host": "<APP_HOST>"})
+for j in json.load(u.urlopen(req, timeout=10))["jobs"]:
+    print(f'{j["id"]:24} {j["alert"]}')
+PY
+```
+
+Expect nine `"source": "alert_after_s"`, four `"source": "alert"` with `"never": true`, and **no**
+`"source": "default"` at all — a `default` means that job was missed. `mac-probe` must read
+`{"after_s": 259200, "never": false}`; `never: true` there silences the whole Mac.
+
+The `bad_since` / `alerted_at` columns are added to the existing SQLite by `init_schema` at start-up —
+additive `ALTER TABLE`, no data loss, NULL for every row. A job that is already broken at upgrade time
+therefore starts a **fresh** episode and pages one threshold later: late, never silent.
+
 ## 2. Box — heartbeats (systemd drop-ins + container timer)
 
 ```bash
@@ -355,16 +471,30 @@ until then. Right after the first successful `/offload-recordings` run, seed one
 **Phone alerts (Graham's manual step):** install the **ntfy** app (iOS/Android), tap *Subscribe to topic*,
 enter the `NTFY_TOPIC` value from the box `.env` (server `https://ntfy.sh`). The topic name is the only
 secret — anyone who knows it can read alerts, so don't paste it anywhere else. Alerts carry only
-`job_id: FROM → TO` (no free text). Test from the box:
+`job_id: STATE for over <duration>` (no free text). Test from the box:
 `curl -d "dashboard test" https://ntfy.sh/$(grep '^NTFY_TOPIC=' ~/hopper-dashboard/.env | cut -d= -f2-)`.
 
-**Overnight sleep is not an incident.** The hourly Mac jobs carry a 14 h grace, and while `mac-probe` is
-LATE the dashboard sends one "Mac probe → LATE" alert and suppresses the LATE alerts of the other Mac jobs
-(states still recorded and shown). When the Mac wakes, `mac_probe.py` posts `pa-backup`, then
-`drive-mirror`, then its own heartbeat — three requests, three recomputes — and the siblings' plain
-`LATE → OK` recoveries are muted while `mac-probe` is still LATE, so the wake-up is one alert too
-("Mac probe → OK"). **Expect exactly two alerts per long absence: one when the Mac goes quiet, one when it
-comes back** (tested end-to-end against `jobs.example.yml`). A sibling that wakes into `FAIL` / `STALE_DEST`
+**A push means a SUSTAINED problem, not a blip.** A job pages once, after it has been continuously not-OK
+for its own `alert_after_s` (§1d; per-job rationale in `jobs.example.yml`, model in DESIGN.md "Alerting
+rules"), and sends a `→ OK` only if that page actually went out. So the board and `/api/v1/status` will
+regularly show a `LATE` or `FAIL` the phone never heard about — that is the design, not a bug. Two
+consequences when reading the board:
+- a state change alone is **not** an alert; check the job page's *Alerts* line or `alert.bad_since` in the
+  API to see whether an episode is running and whether it has been paged;
+- a job can read `OK` with its episode still open (it has not held OK long enough to be believed, or the
+  evidence for the OK is missing). The card says so.
+
+**Overnight sleep is not an incident — but a Mac that stays gone is.** The hourly Mac jobs carry a 14 h
+grace, and while `mac-probe` is LATE the dashboard suppresses the LATE alerts of the other Mac jobs (states
+still recorded and shown). `mac-probe` itself pages only after **72 h of being LATE**, i.e. ~87 h ≈ 3.6 days
+of total silence. **So: a night, and a whole weekend with the lid shut, page NOBODY; a Mac that is dead,
+migrated, or whose launchd probe was unloaded pages exactly ONCE, and once more when it comes back** (both
+tested end-to-end against `jobs.example.yml`). `mac-probe` must **never** be `alert: never` — it is the job
+whose alert the suppression borrows, so silencing it silences the whole machine; the code refuses to suppress
+behind a probe job that cannot page, but the threshold is what makes the rule worth having. When the Mac
+wakes, `mac_probe.py` posts `pa-backup`, then `drive-mirror`, then its own heartbeat — three requests, three
+recomputes — and the siblings' plain `LATE → OK` recoveries are muted while `mac-probe` is still LATE. A
+sibling that wakes into `FAIL` / `STALE_DEST`
 / `BEHIND` still alerts on its own — that is news, not the Mac coming back. Keep every Mac sibling's
 `grace_s` ≥ `mac-probe`'s + 120 (as `jobs.example.yml` does): the probe posts the siblings *before* itself,
 so with equal graces a sibling's deadline falls a few seconds earlier and a ticker tick landing in that gap
@@ -409,10 +539,22 @@ script, but that is per-repo work).
 - [ ] `/api/v1/status` (READ_TOKEN) lists all 13 jobs; after ≤5 min box jobs are `OK`, after ≤1 h Mac jobs are
       `OK`/`BEHIND` (not `UNKNOWN`), manual jobs show **Never run** until their first `ping.sh`.
 - [ ] `minecraft-offload` seeded with one `ok` ping after the first offload (§4).
+- [ ] `/api/v1/status` shows the right `alert` block per job (§1d): 9 `"source": "alert_after_s"`, 4
+      `"source": "alert"` / `"never": true`, **zero** `"source": "default"`, and `mac-probe` reading
+      `{"after_s": 259200, "never": false}` (never `true` — see the table below).
 - [ ] Kill test: `sudo systemctl stop dashboard-containers.timer` → `box-containers` goes `LATE` after
-      cadence+grace and an ntfy alert arrives; `start` → recovery alert. Re-enable afterwards.
-- [ ] Fail test (safe): `~/code/hopper-dashboard/probes/ping.sh jjho-refresh fail "drill"` → `FAIL` + alert;
-      then `… ok "drill over"` → recovery.
+      cadence+grace (visible on the board immediately) and the ntfy alert arrives **`alert_after_s` later** —
+      20 min for this job, so don't conclude it's broken at minute 5; `/api/v1/jobs/box-containers` shows
+      `alert.bad_since` counting. `start` → recovery alert, but only if the page had already gone out.
+- [ ] Flap test (this is the feature): stop the timer and `start` it again inside 20 min → a `LATE` and an
+      `OK` in `state_changes`, and **zero** ntfy pushes. Leave it started for ≥5 min before repeating: the
+      episode only closes once the job has held OK for `min(5 min, alert_after_s/10)`, so stop → start → stop
+      inside that window is deliberately ONE outage (that is what makes a container flapping 19-min-down /
+      1-min-up page at all).
+- [ ] Fail test (safe): `~/code/hopper-dashboard/probes/ping.sh jjho-refresh fail "drill"` → `FAIL` on the
+      board. `jjho-refresh` is `alert: never`, so **no push** — that is correct. To drill the *alert* path end
+      to end, temporarily set `alert_after_s: 0` on one job, `docker compose up -d`, ping `fail`, then put the
+      real value back.
 - [ ] `INVENTORY.md` in `~/personal-assistant` updated: new container, new public hostname, new box timer,
       new Mac launchd job, new credential locations (`/etc/hopper-dashboard/ingest.env`,
       `~/.config/hopper-dashboard/env`, box `.env`, `~/.config/rclone/dashboard-ro.conf`).
@@ -449,7 +591,20 @@ restore data; the dashboard's own SQLite is derived state that repopulates withi
 | `dashboard-containers.timer` stopped / user dropped from `docker` group | `box-containers` `LATE`; or `fail` ping with "permission denied" in the note | `systemctl list-timers`; `journalctl -u dashboard-containers.service` |
 | Disk gauge stops being fed (probe moved/renamed, `statvfs` on a path that vanished) | Was: the gauge kept showing its LAST reading for ever, because a `disk` job has no cadence — a frozen number looked like a healthy one | Four layers now, so a frozen gauge cannot read as healthy: (a) a reading older than **48 h** (`state.DISK_METRIC_MAX_AGE_S`) is `LATE`, alerted like any other dead-man's switch — suppressed only while that machine's probe job is itself LATE; (b) an unreadable path is a `fail` ping on BOTH machines → **FAIL, "capacity unreadable (statvfs …)"**, which outranks the stored figures (the Mac probe returns that ping rather than raising — a raise would only mark `mac-probe` FAIL and leave this card on its last reading); (c) a box probe that never ran at all is reported by its wrapper as a `fail` on `box-disk` (`result=probe-failed`, note pointing at `journalctl -u dashboard-containers.service`) rather than only as the unit's exit status; (d) a gauge that has NEVER reported goes `LATE` **6 h** after registration (`DISK_FIRST_READING_GRACE_S`) — the feeder that was never deployed, which `UNKNOWN` would otherwise hide for ever without alerting at all. The card still prints **measured &lt;when&gt;** under the bar. |
 | Board's used-percent does not match `df` | Looks like an arithmetic bug, invites a "fix" that would break the threshold | Expected: the free **bytes** match `df`'s Avail exactly, the **percent** does not (macOS/APFS hands `statvfs` a smaller free figure than `df` uses — measured 79.5% vs 78%, so the 90% ceiling trips near 88.5% on `df`). `f_bavail` is the right number: it is what can actually be written. DESIGN.md → `disk` and `probes/common.disk_free` both say so. |
-| Mac asleep / logged out | `mac-probe` LATE after 15 h; the other Mac jobs go LATE too but their alerts are suppressed — you get ONE alert, and ONE more (`mac-probe → OK`) when it wakes; the siblings' `LATE → OK` are muted while the probe is still LATE | That IS the signal (Mac offline). If only some Mac jobs are late, read the `mac-probe` note — it names the sub-probe that errored. |
+| Mac asleep / logged out | `mac-probe` LATE after 15 h; the other Mac jobs go LATE too but their alerts are suppressed — a night or a weekend with the lid shut pages NOBODY, and a Mac that stays gone pages exactly ONCE (`mac-probe`, at ~87 h = 15 h LATE + its 72 h threshold) | That IS the signal (Mac offline). If only some Mac jobs are late, read the `mac-probe` note — it names the sub-probe that errored. |
+| `mac-probe` set to `alert: never` in `jobs.yml` | **The whole Mac goes dark.** The machine-offline rule mutes every sibling's LATE alert on the premise that the probe sends one alert for the machine — `never` deletes that one alert, so ten days of a dead Mac is `pa-backup` LATE with an 8-day-old `bad_since`, `alerted_at` NULL, and zero ntfy | `/api/v1/status` → `mac-probe`'s `alert` block must read `{"after_s": 259200, "never": false}`. The code refuses to suppress behind a probe that cannot page, so the siblings page instead — but then you get several alerts for one fact, which is the tell |
+| `jobs.yml` on the box never got the alert thresholds (§1d) — it is gitignored, so `git pull` can't add them | Everything silently falls back to 24 h: `box-containers` pages 20 h late, and `mac-probe` pages after 39 h, i.e. every long weekend the Mac sleeps. Nothing errors | `/api/v1/status` → each job's `alert.source`; **any `"default"` means that job was missed.** The job page says "Pages after 1d continuously not OK" where it should say 20m / Never |
+| A threshold set far too long (or `alert: never` on something that matters) | A real outage never reaches the phone — the board is right and nobody looks at it | Deliberately the only silent failure this feature can cause, which is why the default is 24 h and not "off". `alert_after_s` is capped at 30 d, so the extra-digit version is rejected at startup instead of accepted. Re-read the table in `jobs.example.yml` when adding a job; `alert.bad_since` shows an episode is running even when it will never page |
+| ntfy unreachable exactly when a threshold is crossed (429 from the shared host, 5xx, DNS, timeout) | The episode's one page is spent on a POST that never landed, and even the recovery is suppressed because it only fires for an episode that paged | Fixed: a failed push rolls `alerted_at` back to NULL and a later tick retries, spaced ≥5 min per episode so a dead ntfy is not POSTed 72×/h from inside the scheduler tick and the ingest request. `docker logs hopper-dashboard \| grep 'did not land'` shows each retry; a burst of them means ntfy, not the jobs |
+| A heartbeat lands DURING the failed ntfy POST and the job is briefly OK (the 5-minutely `docker ps` cron vs a 5 s ntfy timeout) | A rollback that skipped "the job is no longer not-OK" would skip exactly this: the episode is still open (the dwell), so `alerted_at` stays stamped-but-undelivered and the outage runs on silently | The rollback keys on episode identity only (`bad_since`/`alerted_at` still match), which a genuinely closed episode cannot satisfy — it has `bad_since` NULL. Same `grep 'did not land'` |
+| A recovery push fails (ntfy 429/5xx at exactly that moment) | The "→ OK" is dropped: its episode is already closed, so there is nothing to hand the page back to | Accepted, and it is loss of good news rather than silence — the next real problem opens a fresh episode with an unspent page. `docker logs hopper-dashboard \| grep 'recovery push for'` names any that were dropped. Re-sending later could announce "→ OK" for a job that has since broken again |
+| A destination probe that fails once a day (rate-limited Drive) on a job whose destination IS stale | A failed probe leaves nothing to compare, so the state falls to `OK` — which would clear the episode clock. A backup genuinely 10 days stale flaps STALE_DEST↔OK and never pages | Fixed: an OK with no usable destination probe does not end a `STALE_DEST`/`BEHIND` episode, and the episode still pages at its own threshold even while the probe is blind. The job page says "episode still open"; `dashboard-probes` FAIL + `dest.probe_error` on the card name the probe itself |
+| A `db_snapshot`'s destination probe breaks PERMANENTLY (remote revoked, rclone's shared Drive OAuth client retired) after that job has already paged | An unbounded hold would keep the episode — and its spent page — open for ever, so the backup itself dying and sitting LATE for 10 days would push nothing | The hold is bounded by the job's own `alert_after_s`; past that the episode closes silently (no recovery — nothing was verified fixed) and the next failure pages on a fresh clock. `docker logs hopper-dashboard \| grep 'closed unverified'`. **Residual — the bound limits the WINDOW, not the silence:** a new failure that lands while the hold is still running joins the still-open episode and gets no push of its own for as long as that episode lasts. Correct by the one-page-per-episode rule (never verifiably OK in between, and it did page once) but worth knowing |
+| `dashboard-probes` reads `ok` while a probed destination is failing (PR #8's damping) | Treating that `ok` as a recovery closes the episode and resets the clock; under an alternating fail/damped-ok pattern the 6 h threshold is never reached and the phone never hears about probes that are broken most of the time | Fixed: the self-job's `ok` is judged against the `probes` table, not taken at face value, so the episode is held and the clock keeps running. `dest.probe_error` on each card, and the self-job's run `reason` says `probe-error damped (…)` |
+| A job that flaps just under its threshold (a container on `restart: unless-stopped` backoff: 19 min down, 1 min up) | Broken 95% of the day, never pages — one OK tick would reset the whole clock | Fixed: the episode only ends after the job holds a VERIFIED OK for `min(5 min, threshold/10)`. The card shows "not OK since" with a state pill of OK while that is pending |
+| Clock stepped backwards (NTP correction, box RTC ahead at boot) | A `bad_since` in the future makes `now - bad_since` permanently negative — the job can never reach its threshold | Fixed: an unparseable OR future `bad_since` is healed (clock restarts, `alerted_at` dropped with it). `docker logs hopper-dashboard \| grep 'healing unusable bad_since'` |
+| Both roles migrate the schema at once on the deploy that adds a `jobs` column | The loser of the `PRAGMA table_info` → `ALTER TABLE` race raises `duplicate column name` out of `create_app`; the entrypoint then stops the other gunicorn and the container restart-loops until the second boot finds the column there. It self-heals, but "the dashboard is down" is the loudest silence there is | Fixed: the migration runs under `BEGIN IMMEDIATE` and tolerates a duplicate column. If it ever recurs, `docker logs hopper-dashboard \| grep 'duplicate column'` names it |
+| `box-disk` / `mac-disk` missing from the box `jobs.yml` while their probes post (§1d) | Ingest 404s the undeclared id; the Mac probe counts that as a failed sub-probe, so `mac-probe` becomes an hourly **failing** ping and the gauge is simply absent from the board | `grep -E '^  - id:' jobs.yml \| wc -l` must be 13; the §1d script warns by name if either is absent |
 | Sibling Mac job pages "→ LATE" a tick before `mac-probe` does | Two alerts for one night's sleep | A sibling's `grace_s` dropped below `mac-probe`'s + 120 in `jobs.yml` (the probe posts siblings before itself). Restore the margin. |
 | rclone's shared Google `client_id` retired (2026) | Every Drive remote using the built-in client fails to refresh at once — probes AND the backup writers on box + Mac | `rclone lsd` interactively shows the OAuth error; rclone 1.75+ warns ahead of time. Fix = own GCP OAuth Desktop client in each conf (§1b follow-up). |
 | launchd job unloaded (plist edited by hand, Mac migrated) | Same as asleep, but permanent | `launchctl list \| grep com.hopper.dashboard-probe`; re-run `deploy/mac/install.sh` |
