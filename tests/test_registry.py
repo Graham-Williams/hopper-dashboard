@@ -204,7 +204,11 @@ def test_example_file_alert_policy_matches_the_documented_thresholds():
     assert reg.get("mac-probe").alert_after_s == 259200
     assert reg.get("km-backup").alert_after_s == 86400
     assert reg.get("todoist-points-backup").alert_after_s == 86400
-    assert reg.get("pa-backup").alert_after_s == 108000
+    # 6 h, NOT 30 h. The threshold clock starts when the job goes not-OK, which for
+    # this one is already 38 h after the last backup (cadence 86400 + grace 50520), so
+    # 108000 shipped a page at 68 h ~ 2.8 days against a stated bar of "missed more
+    # than 24 hours". See the TIME-TO-PAGE test below.
+    assert reg.get("pa-backup").alert_after_s == 21600
     assert reg.get("box-containers").alert_after_s == 1200
     assert reg.get("dashboard-probes").alert_after_s == 21600
     assert reg.get("drive-mirror").alert_after_s == 86400
@@ -215,6 +219,73 @@ def test_example_file_alert_policy_matches_the_documented_thresholds():
     # default — a `default` in the shipped file means a job was forgotten.
     assert all(j.alert_never or j.alert_after_s > 0 for j in reg)
     assert [j.id for j in reg if j.alert_source == "default"] == []
+
+
+def _fmt_ttp(seconds: float) -> str:
+    """The canonical TIME-TO-PAGE string for a number of seconds."""
+    if seconds < 3600:
+        return "%dm" % round(seconds / 60)
+    return ("%.1fh" % (seconds / 3600.0)).replace(".0h", "h")
+
+
+def test_every_alerting_job_states_its_real_time_to_page():
+    """`alert_after_s` is NOT the time to a page, and four of the comments in
+    jobs.example.yml used to say it was — wrong by between 15 minutes (the two
+    disk gauges aside, `box-containers` reads 20 m and pages at 35 m) and 38
+    hours (`pa-backup` read "30 h means a whole night was genuinely missed" and
+    paged at 68 h).
+
+    A comment cannot be asserted, so this asserts a NUMBER inside one: every
+    job with a threshold carries a `# TIME-TO-PAGE: <n>` line, and the figure is
+    recomputed here from that job's own cadence/grace/threshold. Drift one and
+    the suite goes red — which is the only reason to believe the other prose
+    around it.
+
+    A `disk` gauge has no cadence, so its figure is the CAPACITY-breach one (the
+    threshold alone); a gauge nothing feeds is LATE at 48 h and pages a
+    threshold after that, which is stated in prose beside it."""
+    import re
+    reg = load_registry(EXAMPLE_JOBS)
+    with open(EXAMPLE_JOBS, encoding="utf-8") as fh:
+        text = fh.read()
+    blocks = {}
+    for m in re.finditer(r"^  - id: ([a-z0-9-]+)$((?:\n(?!  - id:).*)*)", text, re.M):
+        blocks[m.group(1)] = m.group(2)
+    assert set(blocks) == {j.id for j in reg}
+    checked = 0
+    for job in reg:
+        found = re.search(r"^    # TIME-TO-PAGE: (\S+)", blocks[job.id], re.M)
+        if job.alert_never:
+            assert found is None, f"{job.id} never pages; it must not claim a time"
+            continue
+        assert found is not None, f"{job.id} states no TIME-TO-PAGE"
+        want = _fmt_ttp((job.deadline_s or 0) + job.alert_after_s)
+        assert found.group(1) == want, (
+            f"{job.id}: comment says {found.group(1)}, arithmetic says {want} "
+            f"(deadline {job.deadline_s} + threshold {job.alert_after_s})")
+        checked += 1
+    assert checked == 9                                  # every job that can page
+
+
+def test_the_time_to_page_figures_are_the_ones_graham_was_quoted():
+    """The end-to-end numbers themselves, pinned. These are what "how long can
+    this be broken before my phone knows?" actually resolves to, and they are
+    the figures the deploy notes and DESIGN.md quote — so a threshold edit that
+    changes one has to change them everywhere, deliberately."""
+    reg = load_registry(EXAMPLE_JOBS)
+    assert {j.id: _fmt_ttp((j.deadline_s or 0) + j.alert_after_s)
+            for j in reg if not j.alert_never} == {
+        "km-backup": "24.3h", "todoist-points-backup": "24.3h",
+        "box-containers": "35m", "box-disk": "1h", "dashboard-probes": "6.3h",
+        "mac-probe": "87h", "mac-disk": "1h", "pa-backup": "44h",
+        "drive-mirror": "39h"}
+    # The bar Graham set was "backups missed more than 24 hours". Both DB
+    # snapshots clear it; pa-backup cannot (its 38 h deadline is a hard floor —
+    # below it a missed backup is indistinguishable from a sleeping Mac) but it
+    # is now the smallest miss the floor allows instead of nearly three days.
+    assert reg.get("pa-backup").deadline_s == 136920          # 38 h, the floor
+    assert (reg.get("pa-backup").deadline_s
+            + reg.get("pa-backup").alert_after_s) < 2 * 86400
 
 
 def test_the_magnitude_cap_still_admits_every_real_value():
