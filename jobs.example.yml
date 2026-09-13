@@ -11,7 +11,8 @@
 #   count come from the box; without it the card shows only what the Mac probe
 #   reports), probe.interval_s (optional — probe THIS destination only every N
 #   seconds instead of every PROBE_INTERVAL_S cycle; for big trees, see pa-backup
-#   below. Capped at half the freshness window on db_snapshot),
+#   below. Capped at half the freshness window on db_snapshot, and at 24 h on
+#   every kind — a probe that never runs again is invisible),
 #   manual.max_age_s / manual.max_lag_bytes (manual
 #   only; omit both for an informational job that never alerts),
 #   disk.min_free_bytes / disk.max_used_pct (disk only — same rule: omit both for
