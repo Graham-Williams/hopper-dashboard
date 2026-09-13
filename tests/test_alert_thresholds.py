@@ -1016,21 +1016,69 @@ def test_an_alerted_at_with_no_episode_is_healed_not_trusted(settings, notifier)
     """The other unusable shape: `alerted_at` set with `bad_since` NULL. Nothing
     in `Core` ever writes that pair (closing an episode clears both), so it is a
     corrupt or hand-edited row — but left alone it is a spent page attached to
-    nothing, and that is exactly the shape that makes a job un-pageable."""
+    nothing, and that is exactly the shape that makes a job un-pageable.
+
+    The job here is deliberately in a healthy, VERIFIED OK. An earlier version
+    of this test left it in UNKNOWN, where the non-alertable branch clears the
+    same pair — so it passed with the heal deleted and proved nothing. In OK the
+    heal is the only thing standing between a corrupt row and a "Tree copy → OK"
+    push for an outage that never happened and an alert that was never sent."""
     core = core_with(settings, notifier, {"tree": {"alert_after_s": DAY}})
     job = core.registry.get("tree")
+    core.record_ping(job, {"status": "ok"}, now=NOW)
+    assert row(core, "tree")["state"] == "OK"            # healthy, not UNKNOWN
     conn = core.connect()
     with conn:
         conn.execute("UPDATE jobs SET bad_since=NULL, alerted_at=? WHERE id='tree'",
                      (db.to_iso(NOW),))
     conn.close()
-    core.recompute_all(now=NOW + 10)
+    core.recompute_all(now=NOW + 600)                    # OK held well past the dwell
     assert row(core, "tree")["alerted_at"] is None       # healed, with no recovery sent
-    assert notifier.sent == []
+    assert notifier.sent == []                           # ...not "tree: OK → OK"
     # ...and the job pages normally on the next real episode.
-    core.record_ping(job, {"status": "fail"}, now=NOW + 20)
-    core.recompute_all(now=NOW + 20 + DAY)
+    core.record_ping(job, {"status": "fail"}, now=NOW + 700)
+    core.recompute_all(now=NOW + 700 + DAY)
     assert titles(notifier) == ["[dashboard] Tree copy → FAIL"]
+
+
+def test_ok_held_s_reads_a_future_since_as_zero_seconds_held(settings, notifier):
+    """`_ok_held_s` is the dwell's clock, and `jobs.since` is written from the
+    same wall clock that can step. A future `since` makes `now - since`
+    negative, which is not a length of time at all.
+
+    Honest about what this buys: for every job with a non-zero threshold a
+    negative reading compares the same as zero against both bounds, so the
+    guard changes nothing. It bites only for `alert_after_s: 0`, where
+    `ok_dwell_s` is 0 too: there a negative reading fails `held < 0` differently
+    from a zero one, and the episode would sit open — holding its recovery —
+    until the clock caught up. Covered directly rather than through a contrived
+    episode, and it is the contract the callers are written against."""
+    core = core_with(settings, notifier, {})
+    assert core._ok_held_s("FAIL", {"since": db.to_iso(NOW - 100)}, NOW) == 0.0
+    assert core._ok_held_s("OK", {"since": None}, NOW) == 0.0
+    assert core._ok_held_s("OK", {"since": "not-a-timestamp"}, NOW) == 0.0
+    assert core._ok_held_s("OK", {"since": db.to_iso(NOW - 100)}, NOW) == 100.0
+    assert core._ok_held_s("OK", {"since": db.to_iso(NOW + 100)}, NOW) == 0.0
+
+
+def test_a_clock_step_backwards_does_not_strand_an_unsent_page(settings, notifier):
+    """The retry backoff is `now - last_attempt >= ALERT_RETRY_MIN_S`, measured
+    on a clock that can walk backwards (NTP, a VM resuming, the box RTC). After
+    a step back, `waited` is negative — and "negative is not yet 5 minutes"
+    would park an undelivered page until the clock caught up, which for a
+    week-long step is a week of a job that is broken, knows it, and says
+    nothing. `waited < 0` therefore reads as DUE: late-but-noisy over silent."""
+    notifier.fail = True                                 # ntfy unreachable
+    core = core_with(settings, notifier, {"tree": {"alert_after_s": DAY}})
+    job = core.registry.get("tree")
+    core.record_ping(job, {"status": "fail"}, now=NOW)
+    core.recompute_all(now=NOW + DAY + 100)              # threshold crossed: POST fails
+    assert len(notifier.attempts) == 1 and notifier.sent == []
+    assert row(core, "tree")["alerted_at"] is None       # the page was handed back
+    notifier.fail = False
+    core.recompute_all(now=NOW + DAY + 50)               # the clock steps back 50 s
+    assert titles(notifier) == ["[dashboard] Tree copy → FAIL"]
+    assert row(core, "tree")["alerted_at"] == db.to_iso(NOW + DAY + 50)
 
 
 def test_a_trip_through_unknown_clears_the_episode_without_a_recovery(settings, notifier):
