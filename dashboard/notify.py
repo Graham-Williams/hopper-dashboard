@@ -96,7 +96,7 @@ class Notifier:
     def notify_recovery(self, job_name: str, job_id: str,
                         from_state: str) -> bool:
         """The end of an episode that was paged for. Never sent for an episode
-        Graham was not told about — that check lives in ``Core``, which names the
+        the operator was not told about — that check lives in ``Core``, which names the
         state that was PAGED rather than the last one the episode passed
         through."""
         if not self.enabled:
