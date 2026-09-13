@@ -30,8 +30,10 @@ def test_fail_transition_alerts_high_priority(core, notifier, registry):
     assert len(notifier.sent) == 1
     title, body, priority = notifier.sent[0]
     assert title == "[dashboard] Snap DB → FAIL" and priority == "high"
-    # Body is the bare transition: the free-text reason never goes to ntfy.sh.
-    assert body == "snap: OK → FAIL" and "timeout" not in body
+    # Body is the job id + the state the episode is about: the free-text reason
+    # never goes to ntfy.sh. (These fixtures use alert_after_s: 0, so there is no
+    # "for over …" suffix — see tests/test_alert_thresholds.py for that.)
+    assert body == "snap: FAIL" and "timeout" not in body
 
 
 def test_recovery_alerts_default_priority(core, notifier, registry):
@@ -109,7 +111,7 @@ def test_metric_ping_flips_disk_job_to_behind_and_alerts(core, notifier, registr
         "disk_free_bytes": 10 * gib}}, now=NOW + 10)       # shallow merge keeps the total
     assert state == "BEHIND"
     title, body, priority = notifier.sent[-1]
-    assert body == "disk: OK → BEHIND" and priority == "default"   # not urgent, but actionable
+    assert body == "disk: BEHIND" and priority == "default"   # not urgent, but actionable
     assert db.job_row(core.connect(), "disk")["state_reason"].startswith("only 10.0 GiB free")
 
 
@@ -122,7 +124,7 @@ def test_disk_job_has_no_cadence_deadline_but_does_go_stale(core, registry, noti
     assert core.recompute_all(now=NOW + 6 * 3600)["disk"] == "OK"
     # Two days of it is a different thing: nothing is feeding the gauge any more.
     assert core.recompute_all(now=NOW + 49 * 3600)["disk"] == "LATE"
-    assert notifier.sent[-1][1] == "disk: OK → LATE"
+    assert notifier.sent[-1][1] == "disk: LATE"
 
 
 def test_disk_fail_ping_changes_the_board_and_alerts(core, registry, notifier):
@@ -137,7 +139,7 @@ def test_disk_fail_ping_changes_the_board_and_alerts(core, registry, notifier):
                                    "note": "statvfs /data: [Errno 2] No such file"},
                              now=NOW + 300)
     assert state == "FAIL"
-    assert notifier.sent[-1][1] == "disk: OK → FAIL"
+    assert notifier.sent[-1][1] == "disk: FAIL"
     assert "statvfs" in db.job_row(core.connect(), "disk")["state_reason"]
     # …and a later good reading clears it (the failed run stays the newest run row).
     assert core.record_ping(job, {"status": "metric", "metrics": {
@@ -164,7 +166,8 @@ def test_notifier_disabled_when_env_empty():
     from dashboard.notify import Notifier
     n = Notifier("", "")
     assert not n.enabled
-    assert n.notify_transition("x", "x", "OK", "FAIL", None) is False
+    assert n.notify_alert("x", "x", "FAIL", 86400) is False
+    assert n.notify_recovery("x", "x", "FAIL") is False
     n2 = Notifier("https://ntfy.sh", "")
     assert not n2.enabled
 

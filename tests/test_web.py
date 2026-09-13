@@ -215,6 +215,51 @@ def test_status_shape_matches_contract(read, core, registry):
     assert s["total"] == 9 and s["computed_at"]
 
 
+def test_alert_policy_is_exposed_additively(read, core, registry):
+    """The /api/v1 contract is frozen, so the alert block is additive: every
+    contract key still present, plus `alert` on both endpoints. `source` is what
+    makes the resolution inspectable — DEPLOY.md §1d's verification step reads it
+    to prove the box's jobs.yml edit landed."""
+    core.record_ping(registry.get("tree"), {"status": "fail"}, now=NOW)
+    for endpoint, pick in (("/api/v1/status", lambda d: {j["id"]: j for j in d["jobs"]}["tree"]),
+                           ("/api/v1/jobs/tree", lambda d: d["job"])):
+        j = pick(read.get(endpoint, headers=bearer()).get_json())
+        assert CONTRACT_KEYS <= set(j)
+        assert set(j["alert"]) == {"after_s", "never", "source", "bad_since", "alerted_at"}
+        assert j["alert"]["never"] is False and j["alert"]["after_s"] == 0
+        assert j["alert"]["source"] == "alert_after_s"
+        assert j["alert"]["bad_since"] == db.to_iso(NOW)     # episode is running
+        assert j["alert"]["alerted_at"] == db.to_iso(NOW)    # ...and was paged (threshold 0)
+    # `info` declares nothing and is informational: it never pages, and says why.
+    j = {x["id"]: x for x in read.get("/api/v1/status", headers=bearer()).get_json()["jobs"]}["info"]
+    assert j["alert"] == {"after_s": None, "never": True, "source": "informational",
+                          "bad_since": None, "alerted_at": None}
+    core.record_ping(registry.get("tree"), {"status": "ok"}, now=NOW + 5)
+    j = {x["id"]: x for x in read.get("/api/v1/status", headers=bearer()).get_json()["jobs"]}["tree"]
+    assert j["alert"]["bad_since"] is None and j["alert"]["alerted_at"] is None
+
+
+def test_alert_policy_shown_on_the_job_page(settings, notifier):
+    import copy
+    from dashboard import create_app
+    from dashboard.registry import parse_registry
+    from tests.conftest import JOBS_DOC
+    doc = copy.deepcopy(JOBS_DOC)
+    doc["jobs"][1]["alert_after_s"] = 108000                 # tree: 1d 6h
+    doc["jobs"][2].pop("alert_after_s")                      # mirror: never
+    doc["jobs"][2]["alert"] = "never"
+    reg = parse_registry(doc)
+    app = create_app("read", settings, reg, notifier)
+    app.extensions["core"].record_ping(reg.get("tree"), {"status": "fail"}, now=NOW)
+    c = app.test_client()
+    c.post("/login", data={"password": PASSWORD})
+    html = c.get("/jobs/tree").data.decode()
+    assert "Pages after 1d 6h continuously not OK." in html
+    assert "not OK since" in html and "not paged yet" in html
+    assert "Never pages" in c.get("/jobs/mirror").data.decode()
+    assert html.count("<script") == 1                        # CSP: still exactly one inline script
+
+
 def test_job_detail_json(read, core, registry):
     _seed_all_states(core, registry)
     r = read.get("/api/v1/jobs/snap?limit=5", headers=bearer())

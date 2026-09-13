@@ -54,48 +54,73 @@ def pin_created_at(settings, iso: str = PINNED_CREATED_AT) -> None:
 # One job per kind + the dashboard's own probe job. Cadences are short so
 # LATE arithmetic is easy to reason about in tests. Appended, not inserted:
 # several suites address these by index (doc["jobs"][4] etc.).
+#
+# Every job here carries `alert_after_s: 0` — "page as soon as it leaves OK",
+# still capped at ONE page per episode. That keeps these suites focused on WHICH
+# alert is worth sending (above all the machine-offline rule) without every test
+# having to wind a 24 h clock forward. The threshold layer itself — the episode
+# clock, the flap suppression, the unverified-OK hold, `alert: never`, the
+# `informational` resolution — is exercised with realistic values in
+# tests/test_alert_thresholds.py. `info` is the one exception: it declares
+# nothing, so it exercises the informational → never resolution in place.
+ALERT_NOW = {"alert_after_s": 0}
 JOBS_DOC = {
     "jobs": [
         {"id": "snap", "name": "Snap DB", "machine": "box", "kind": "db_snapshot",
          "protects": "a DB", "method": "sqlite backup", "destination": "gdrive:snap",
-         "cadence_s": 300, "grace_s": 300,
+         "cadence_s": 300, "grace_s": 300, **ALERT_NOW,
          "probe": {"rclone_path": "gdrive:snap", "state_dir": "/state/snap"}},
         {"id": "tree", "name": "Tree copy", "machine": "mac", "kind": "rclone_copy_tree",
          "protects": "docs", "method": "rclone copy", "destination": "gdrive:Backups",
-         "cadence_s": 86400, "grace_s": 3600},
+         "cadence_s": 86400, "grace_s": 3600, **ALERT_NOW},
         {"id": "mirror", "name": "Drive mirror", "machine": "mac", "kind": "drive_mirror",
-         "protects": "Documents", "method": "DriveFS", "cadence_s": 3600, "grace_s": 600},
+         "protects": "Documents", "method": "DriveFS", "cadence_s": 3600, "grace_s": 600,
+         **ALERT_NOW},
         {"id": "containers", "name": "Containers", "machine": "box", "kind": "container",
          "protects": "apps", "method": "docker ps", "cadence_s": 300, "grace_s": 300,
-         "expect": ["app-1", "tunnel-1"]},
+         "expect": ["app-1", "tunnel-1"], **ALERT_NOW},
         {"id": "offload", "name": "Offload", "machine": "mac", "kind": "manual",
          "protects": "recordings", "method": "rclone copy", "destination": "gdrive:Gremlins",
-         "manual": {"max_age_s": 1209600, "max_lag_bytes": 1000}},
+         "manual": {"max_age_s": 1209600, "max_lag_bytes": 1000}, **ALERT_NOW},
         {"id": "info", "name": "Info-only", "machine": "mac", "kind": "manual",
          "protects": "nothing much", "method": "by hand"},
         {"id": "macprobe", "name": "Mac probe", "machine": "mac", "kind": "probe",
          "protects": "visibility", "method": "launchd", "cadence_s": 3600, "grace_s": 7200,
-         "late_means": "Mac offline or asleep"},
+         "late_means": "Mac offline or asleep", **ALERT_NOW},
         {"id": "dashboard-probes", "name": "Probe cycle", "machine": "box", "kind": "probe",
-         "protects": "the watcher", "method": "scheduler", "cadence_s": 300, "grace_s": 600},
+         "protects": "the watcher", "method": "scheduler", "cadence_s": 300, "grace_s": 600,
+         **ALERT_NOW},
         {"id": "disk", "name": "Mac disk", "machine": "mac", "kind": "disk",
-         "protects": "headroom", "method": "statvfs",
+         "protects": "headroom", "method": "statvfs", **ALERT_NOW,
          "disk": {"min_free_bytes": 25 * 1024 ** 3, "max_used_pct": 90}},
     ]
 }
 
 
 class RecordingNotifier(Notifier):
-    """Real Notifier logic (enabled, should_notify) with the HTTP call captured."""
+    """Real Notifier logic (enabled, body/priority) with the HTTP call captured.
 
-    def __init__(self, fail: bool = False):
+    Two independent failure modes, because ``Notifier.send`` flattens both to
+    False and the retry path has to cope with either: ``fail`` raises (DNS,
+    timeout, connection reset) and ``refuse`` returns a non-2xx (429, 503).
+    ``attempts`` records every POST tried, ``sent`` only the ones that landed.
+    Both override ``_post``, not ``send`` — ``send``'s try/except is part of what
+    is under test.
+    """
+
+    def __init__(self, fail: bool = False, refuse: bool = False):
         super().__init__("https://ntfy.example", "topic-secret")
         self.sent: list[tuple[str, str, str]] = []
+        self.attempts: list[tuple[str, str, str]] = []
         self.fail = fail
+        self.refuse = refuse
 
     def _post(self, title, body, priority):
+        self.attempts.append((title, body, priority))
         if self.fail:
             raise RuntimeError("ntfy down")
+        if self.refuse:
+            return False
         self.sent.append((title, body, priority))
         return True
 

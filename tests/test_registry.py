@@ -8,6 +8,11 @@ from tests.conftest import EXAMPLE_JOBS, JOBS_DOC
 
 def _doc(**overrides):
     doc = copy.deepcopy(JOBS_DOC)
+    # The shared fixture carries `alert_after_s: 0`, and the two alert keys are
+    # mutually exclusive by KEY now — so an override that sets `alert` replaces it
+    # rather than colliding with it (unless the case is testing exactly that).
+    if "alert" in overrides and "alert_after_s" not in overrides:
+        doc["jobs"][0].pop("alert_after_s", None)
     doc["jobs"][0].update(overrides)
     return doc
 
@@ -80,10 +85,87 @@ def test_top_level_errors(doc, msg):
     ({"manual": {"max_age_s": 5}}, "only valid for kind: manual"),
     ({"disk": {"min_free_bytes": 5}}, "only valid for kind: disk"),
     ({"typo_field": 1}, "unknown job key"),
+    ({"alert_after_s": -1}, "non-negative integer"),
+    ({"alert_after_s": "86400"}, "non-negative integer"),
+    ({"alert_after_s": True}, "non-negative integer"),
+    ({"alert": "sometimes"}, "'alert' must be 'never'"),
+    ({"alert": False}, "'alert' must be a non-empty string"),
+    ({"alert": "never", "alert_after_s": 60}, "mutually exclusive"),
+    # Checked on KEY PRESENCE: with an `is not None` test, `alert: never` +
+    # `alert_after_s: null` parsed to "never" — silence that reads, in the file,
+    # like somebody set a threshold.
+    ({"alert": "never", "alert_after_s": None}, "mutually exclusive"),
+    ({"alert": None, "alert_after_s": 60}, "mutually exclusive"),
+    # Magnitude was the one hostile value the validator accepted: a threshold of
+    # 10**20 seconds is silence, and NOTHING would say so.
+    ({"alert_after_s": 10 ** 20}, "over the 2592000 second"),
+    ({"alert_after_s": 2_592_001}, "over the 2592000 second"),
 ])
 def test_per_job_errors(overrides, msg):
     with pytest.raises(RegistryError, match=msg):
         parse_registry(_doc(**overrides))
+
+
+def test_alert_policy_resolution_and_its_conservative_default():
+    from dashboard.registry import DEFAULT_ALERT_AFTER_S
+    doc = copy.deepcopy(JOBS_DOC)
+    for raw in doc["jobs"]:
+        raw.pop("alert_after_s", None)
+    doc["jobs"][1]["alert_after_s"] = 108000
+    doc["jobs"][2]["alert"] = "never"
+    doc["jobs"][5]["alert_after_s"] = 60        # `info`: explicit beats informational
+    reg = parse_registry(doc)
+    # Declares nothing, not informational → 24 h. Never silence.
+    assert reg.get("snap").alert_after_s == DEFAULT_ALERT_AFTER_S == 86400
+    assert reg.get("snap").alert_never is False and reg.get("snap").alert_source == "default"
+    assert reg.get("tree").alert_after_s == 108000
+    assert reg.get("tree").alert_source == "alert_after_s"
+    assert reg.get("mirror").alert_never is True and reg.get("mirror").alert_source == "alert"
+    # `info` is a manual job with no thresholds — informational — but it asked.
+    assert reg.get("info").informational and reg.get("info").alert_never is False
+    assert reg.get("info").alert_after_s == 60
+    # ...and with nothing declared, `informational` finally means what it says.
+    doc["jobs"][5].pop("alert_after_s")
+    quiet = parse_registry(doc).get("info")
+    assert quiet.informational and quiet.alert_never is True
+    assert quiet.alert_source == "informational"
+    # 0 is legal: "page on the first not-OK recompute" (what the shared fixtures use).
+    assert parse_registry(_doc(alert_after_s=0)).get("snap").alert_after_s == 0
+
+
+def test_example_file_alert_policy_matches_the_documented_thresholds():
+    reg = load_registry(EXAMPLE_JOBS)
+    # Only the on-demand manual jobs opt out. A machine's `kind: probe` job must NOT —
+    # it is what mutes its siblings, so `never` there is silence for the whole machine.
+    assert {j.id for j in reg if j.alert_never} == {
+        "minecraft-offload", "taste-twin-publish", "jjho-refresh", "baby-pool-sync"}
+    assert all(not j.alert_never for j in reg if j.kind == "probe")
+    # 72 h on top of a 15 h LATE deadline: a weekend with the lid shut is silent, a Mac
+    # that is gone for ~3.6 days is not.
+    assert reg.get("mac-probe").alert_after_s == 259200
+    assert reg.get("km-backup").alert_after_s == 86400
+    assert reg.get("todoist-points-backup").alert_after_s == 86400
+    assert reg.get("pa-backup").alert_after_s == 108000
+    assert reg.get("box-containers").alert_after_s == 1200
+    assert reg.get("dashboard-probes").alert_after_s == 21600
+    assert reg.get("drive-mirror").alert_after_s == 86400
+    # The disk gauges are 1 h, NOT the 24 h default: DISK_METRIC_MAX_AGE_S (48 h) has
+    # already served the "sustained" purpose, and a capacity threshold is a level.
+    assert reg.get("box-disk").alert_after_s == reg.get("mac-disk").alert_after_s == 3600
+    # Nothing ships with the "page on every blip" setting, and NOTHING is left to the
+    # default — a `default` in the shipped file means a job was forgotten.
+    assert all(j.alert_never or j.alert_after_s > 0 for j in reg)
+    assert [j.id for j in reg if j.alert_source == "default"] == []
+
+
+def test_the_magnitude_cap_still_admits_every_real_value():
+    """The cap must not be so tight it rejects a sane policy: 30 days is well past
+    the longest shipped threshold (72 h)."""
+    from dashboard.registry import MAX_ALERT_AFTER_S
+    reg = load_registry(EXAMPLE_JOBS)
+    assert max(j.alert_after_s for j in reg) <= MAX_ALERT_AFTER_S
+    assert parse_registry(_doc(alert_after_s=MAX_ALERT_AFTER_S)).get("snap").alert_after_s \
+        == MAX_ALERT_AFTER_S
 
 
 def test_error_names_the_job():
