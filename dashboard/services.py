@@ -534,10 +534,13 @@ class Core:
             # moment the cooldown expires — delayed, never cancelled. Stamping
             # here would turn a rate limit into exactly the permanent silence
             # this whole file is organised against.
-            log.info("page for %s held back: it paged %ss ago and its cooldown "
-                     "(%ss) runs for another %ss", job.id,
-                     int(now - db.from_iso(ep.row["last_paged_at"])),
-                     int(cooldown_s(job)), int(until - now))
+            # Derived from `until` alone — no second parse of the row. Re-reading
+            # `last_paged_at` here would couple this line to _cooling_until's
+            # internals, and a None slipping through would raise INSIDE the
+            # recompute transaction, i.e. lose the whole pass.
+            log.info("page for %s held back by its cooldown (%ss); %ss still to "
+                     "run, then it pages if it is still past its threshold",
+                     job.id, int(cooldown_s(job)), int(until - now))
             return alerted_at
         if self._suppressed_offline(job, about, ep.state, states, transitions,
                                     returning, cooled):
