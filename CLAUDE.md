@@ -114,13 +114,22 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   OK does not close it at all (`state.ok_is_unverified` for a destination that could not be checked, and
   `db.failing_probe_job_ids` for `dashboard-probes` reporting `ok` while the damping below suppresses a real
   probe failure); a future/unparseable `bad_since` is healed; UNKNOWN clears the episode without recovering.
-  **Every one of those holds is bounded twice** — the episode clock stays authoritative (past its threshold
-  it pages anyway, naming what the episode is really about), and after `ok_hold_s` it closes silently — or a
-  destination that can never be probed again pins `alerted_at` and mutes every later failure of that job.
-  When adding anything here, the question is never "is the job OK?" but "is the EPISODE still open?"
+  **THE HARD CEILING, which every hold is bounded by: while an episode is open (`bad_since` set), past its
+  threshold and not yet paged, it pages — regardless of what the job's current state reads.** `_page` is
+  called on EVERY pass over an open episode (not-OK; held open by an unverifiable OK, including the pass that
+  gives that hold up; and the dwell), never inside one branch — a ceiling scoped to one branch was two
+  separate blockers, because the episode could then end from a different branch without ever speaking. The
+  second bound is `ok_hold_s`, after which the episode closes silently; without it a destination that can
+  never be probed again pins `alerted_at` and mutes every later failure of that job. Accepted consequence,
+  documented in DESIGN.md rather than re-suppressed: an outage that outlives the threshold and *then* recovers
+  sends a page and a recovery seconds apart. When adding anything here, the question is never "is the job
+  OK?" but "is the EPISODE still open?"
   Also the **machine-offline rule** ( sibling `→ LATE` alerts muted while the machine's `probe` job is
-  LATE, and sibling plain `LATE → OK` recoveries muted while the probe is still LATE or recovers in the same
-  batch — the Mac probe posts its sub-jobs before its own heartbeat, so siblings recover one batch early;
+  LATE, and sibling plain `LATE → OK` recoveries muted while the probe is still LATE, recovers in the same
+  batch, **or is still inside its own LATE episode** (`_returning_probes`) — the Mac probe posts its sub-jobs
+  before its own heartbeat, so siblings recover first, and the hard ceiling made that gap last for the
+  sibling's whole dwell rather than one batch: without the third clause every lid-shut weekend ends in a
+  `drive-mirror: LATE for over 1d` push the moment the Mac wakes;
   FAIL/STALE_DEST/BEHIND after LATE always alert). It is **void when the machine's probe job can never page**
   (`alert_never`): the rule mutes siblings on the premise that the probe sends one alert for the machine, so
   without that guard a Mac gone for days pages nobody at all. A suppressed alert must also never stamp

@@ -645,6 +645,47 @@ def test_an_episode_held_open_by_a_blind_probe_still_pages_at_its_threshold(sett
     assert len(notifier.sent) == 1
 
 
+def test_a_blind_probe_that_arrives_seconds_in_still_pages_at_the_threshold(settings, notifier):
+    """THE HARD CEILING, at the one instant the old scoping could not reach.
+
+    The ceiling used to live INSIDE `held < ok_hold_s(job)`, and for every
+    threshold over five minutes `ok_hold_s == alert_after_s` — so it was live
+    only while `began + A <= now < since + A`, a window exactly as long as the
+    job was OBSERVED not-OK before the probe went blind. Here that window is ONE
+    SECOND: the destination is genuinely a month stale, the probe times out a
+    second after the episode opens and never sees the destination again, and the
+    heartbeat keeps arriving on cadence, so the card reads OK for ever. No
+    recompute could land in the window, the hold then expired, and the episode
+    closed SILENTLY: a month-stale backup, zero pushes, `bad_since` NULL,
+    `alerted_at` NULL, card green.
+
+    The rule has no window: an open episode past its threshold pages on ANY
+    pass, including the pass that gives the hold up."""
+    core = core_with(settings, notifier, {"snap": {"alert_after_s": 3600}})
+    job = core.registry.get("snap")
+    ping = {"status": "ok", "metrics": {"db_sha256": "aaa"}}
+    stale = db.to_iso(NOW - 30 * DAY)                    # nothing on Drive for a month
+    _probe(core, "snap", NOW, ok=True, newest_iso=stale, state_sha="bbb")
+    core.record_ping(job, ping, now=NOW)
+    assert row(core, "snap")["state"] == "STALE_DEST"    # the episode opens...
+    blind = NOW + 1                                      # ...and is observed for 1 s
+    _probe(core, "snap", blind, ok=False, error="rclone timed out after 240s")
+    core.record_ping(job, ping, now=blind)
+    assert row(core, "snap")["state"] == "OK"            # blind, not fine
+    t = blind + 60
+    while t <= NOW + 3 * 3600:                           # three hours of ticks + heartbeats
+        _probe(core, "snap", t, ok=False, error="rclone timed out after 240s")
+        if (t - blind) % 300 == 0:
+            core.record_ping(job, ping, now=t)           # still alive, so never LATE
+        else:
+            core.recompute_all(now=t)
+        t += 60
+    assert titles(notifier) == ["[dashboard] Snap DB → STALE_DEST"]
+    assert notifier.sent[0][1] == "snap: STALE_DEST for over 1h"
+    assert row(core, "snap")["bad_since"] is None        # the hold expired afterwards
+    assert row(core, "snap")["state"] == "OK"            # ...and the card still reads OK
+
+
 def test_an_unverifiable_ok_holds_the_recovery_too(settings, notifier):
     """"STALE_DEST → OK" when the OK only means "the probe failed" is false
     comfort, so the recovery waits for a probe that can actually see the
@@ -842,6 +883,36 @@ def test_oscillating_just_under_the_threshold_still_pages(settings, notifier):
     # The episode never closed, so the board can still say how long it has been
     # going — and nothing ever announced a recovery that was about to be undone.
     assert row(core, "containers")["bad_since"] == db.to_iso(NOW)
+
+
+def test_an_outage_past_the_threshold_pages_even_though_it_then_recovers(settings, notifier):
+    """The dwell branch is a way for an episode to END, so the ceiling applies
+    there too. Without it the dwell swallowed the page outright: `ok_dwell_s` is
+    `min(5 min, A/10)`, so ANY recovery longer than the dwell closed the episode
+    — and a container 19 min down / 3 min up against a 20 min threshold was
+    broken 86% of the time, for ever, and paged NOTHING (measured: 0 pushes over
+    20 cycles).
+
+    The job crossed the bar Graham set, so the outage is news even though it is
+    over by the time we say so. The page and its recovery therefore arrive close
+    together: accepted deliberately, and rare — a job has to outlive its whole
+    threshold and then recover inside one dwell to produce it."""
+    core = core_with(settings, notifier, {"containers": {"alert_after_s": 1200}})
+    job = core.registry.get("containers")                # expects app-1 + tunnel-1
+    down = {"status": "ok", "metrics": {"running": "app-1"}}
+    up = {"status": "ok", "metrics": {"running": "app-1,tunnel-1"}}
+    t = NOW
+    while t < NOW + 1140:                                # 19 min down: a minute short
+        core.record_ping(job, down, now=t)
+        t += 60
+    assert notifier.sent == []                           # under the threshold, still quiet
+    while t < NOW + 1140 + 180:                          # 3 min up: longer than the dwell
+        core.record_ping(job, up, now=t)
+        t += 60
+    assert titles(notifier) == ["[dashboard] Containers → FAIL",
+                                "[dashboard] Containers → OK"]
+    assert notifier.sent[0][1] == "containers: FAIL for over 20m"
+    assert row(core, "containers")["bad_since"] is None   # and the episode really closed
 
 
 def test_a_short_blip_is_still_muted_and_a_real_recovery_still_ends_the_episode(settings, notifier):

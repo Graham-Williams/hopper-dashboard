@@ -18,9 +18,17 @@ Collapsing to ONE page per episode removed that safety net, so every path that
 can consume or reset the single page has to be exactly right. That rule is
 where the failed-push rollback (:meth:`Core._return_unsent_pages`), the
 unverified-OK hold (``state.ok_is_unverified``), the minimum OK dwell, the
-hard ceiling that pages through a hold, the healing of an unusable
+hard ceiling that pages through every hold, the healing of an unusable
 ``bad_since``, and the refusal to suppress behind a probe job that cannot page
 for itself all come from.
+
+**The hard ceiling, stated once:** while an episode is open, past its
+threshold and not yet paged, it pages — regardless of what the job's current
+state reads. Not "while it is still failing", not "while a hold is running",
+not "if a recompute happens to land in some window": *any* pass over *any*
+open episode past its bar. Both of this branch's structural bugs were the same
+mistake — a ceiling scoped to one branch, so the episode could end from
+another one without ever speaking.
 
 **The rule applies to the safeguards themselves.** Each of those safeguards
 keeps an episode alive, and an episode that never ends holds its unspent page
@@ -224,9 +232,40 @@ class Core:
                 return j
         return None
 
+    def _returning_probes(self, conn, episodes: list[Episode]) -> set[str]:
+        """Machine probe jobs still inside the LATE episode they are coming back
+        from — "the machine has only just woken up".
+
+        The machine-offline rule mutes a sibling's plain ``LATE → OK`` because
+        that news belongs to the probe job. The siblings are pinged *before* the
+        probe, so they recover first: originally by one batch, which the
+        ``transitions`` check below covers. The hard ceiling widened what that
+        gap costs — a sibling's episode stays open for its dwell after it
+        recovers, and on any pass inside that window the ceiling would page for
+        a LATE that was only the Mac asleep. So the mute lasts as long as the
+        PROBE's own episode, which is bounded by the probe's dwell (≤5 min) and
+        cannot outlive the sibling's, since the sibling recovered first and no
+        dwell exceeds :data:`MAX_OK_DWELL_S`.
+
+        Read from the PRE-recompute rows, so the answer cannot depend on where
+        the probe job sits in registry order relative to its siblings.
+        """
+        returning: set[str] = set()
+        for ep in episodes:
+            if ep.job.kind != "probe" or ep.job.id == SELF_JOB_ID:
+                continue
+            if not ep.row.get("bad_since"):
+                continue
+            about = (ep.prev if ep.prev != "OK"
+                     else db.last_non_ok_state(conn, ep.job.id))
+            if about == "LATE":
+                returning.add(ep.job.id)
+        return returning
+
     def _suppressed_offline(self, job: Job, prev: str, state: str,
                             states: dict[str, str],
-                            transitions: dict[str, tuple]) -> bool:
+                            transitions: dict[str, tuple],
+                            returning: set[str] = frozenset()) -> bool:  # type: ignore[assignment]
         """Machine-offline rule: while a machine's probe job is LATE, the other
         jobs on that machine going LATE is the same single fact ("the Mac is
         asleep"), so only the probe's own alert is sent. The sibling
@@ -243,13 +282,16 @@ class Core:
         its own and alerts normally.
 
         Adapted to the level-triggered model: ``prev``/``state`` are still
-        edge-shaped, but they are now read off the *episode* rather than off
-        "the last recompute changed something". For an alert, ``prev`` is the
-        state before this recompute and ``state`` is the state now — so a job
-        sitting LATE past its threshold, with no transition anywhere, is still
-        matched by the first rule. For a recovery, ``prev`` is the state the
-        EPISODE ended in (the dwell means the episode can close minutes after
-        the job came back), which is what the second rule needs.
+        edge-shaped, but they are read off the *episode* rather than off "the
+        last recompute changed something". Every caller passes the state the
+        EPISODE is about as ``prev`` — for a job that is not-OK that is simply
+        its current state, so a job sitting LATE past its threshold with no
+        transition anywhere is still matched by the first rule; for a page or a
+        recovery decided while the job already reads OK it is the state the
+        episode started in, which is what the second rule needs (the dwell and
+        the holds mean an episode can outlive the job's return to OK by
+        minutes). ``returning`` covers the same span on the probe's side — see
+        :meth:`_returning_probes`.
 
         **The rule is void when the probe job cannot page for itself.** The
         whole premise is "one alert for the machine instead of five" — a probe
@@ -269,6 +311,8 @@ class Core:
                 return True
             probe_tr = transitions.get(probe.id)
             if probe_tr is not None and probe_tr[0] == "LATE":
+                return True
+            if probe.id in returning:
                 return True
         return False
 
@@ -313,35 +357,47 @@ class Core:
 
     def _page(self, conn, ep: Episode, about: str, bad_since: str, began: float,
               alerted_at: str | None, states: dict[str, str],
-              transitions: dict[str, tuple], now: float, at: str,
-              intents: list[AlertIntent]) -> None:
+              transitions: dict[str, tuple], returning: set[str], now: float,
+              at: str, intents: list[AlertIntent]) -> str | None:
         """Spend this episode's one page, if everything says we should.
 
         ``about`` is the state the page is *about* — the current state for a
         job that is not-OK, or the state the episode was in for one held open
-        across an OK we cannot verify. Called from both the not-OK branch and
-        the held branch of :meth:`_resolve_alerts`, which is the hard ceiling
-        (decision 2): the episode clock is authoritative, so an episode that
-        outlives its threshold pages even while the job reads an unverified OK.
+        across an OK we cannot (yet) believe.
+
+        Returns the episode's ``alerted_at`` as it now stands: the new stamp if
+        this call paged, otherwise the value passed in. Callers keep their local
+        copy in step with the row, because what follows a ceiling page in the
+        same pass — the recovery, above all — reads it.
+
+        **THE HARD CEILING is the single rule this method exists to serve:**
+        while an episode is open, past its threshold and unpaged, it pages —
+        whatever the job currently reads. :meth:`_resolve_alerts` therefore
+        calls this on *every* pass over an open episode (not-OK, held open by an
+        unverifiable OK, or serving out the dwell), never only inside one branch
+        or one window. An episode that has to wait for the job to be in some
+        particular state to be allowed to speak is an episode that can be
+        silenced by the job recovering, which is exactly backwards.
         """
         job = ep.job
         if job.alert_never or alerted_at:
-            return                            # opted out, or already paged
+            return alerted_at                 # opted out, or already paged
         if now - began < job.alert_after_s:
-            return                            # not sustained long enough yet
-        if self._suppressed_offline(job, ep.prev, ep.state, states, transitions):
+            return alerted_at                 # not sustained long enough yet
+        if self._suppressed_offline(job, about, ep.state, states, transitions,
+                                    returning):
             # Deliberately do NOT stamp alerted_at: a suppressed alert must not
             # burn the episode's single page, or its recovery would be lost too.
             log.info("alert for %s suppressed: its machine's probe job is "
                      "offline (one alert for the machine instead)", job.id)
-            return
+            return alerted_at
         if not self._retry_due(job.id, bad_since, now):
             # A POST for THIS episode failed recently and the page was handed
             # back. Retrying on every tick and every ping means a blocking 5 s
             # urllib call ~72×/hour while ntfy is down — in the scheduler thread
             # and in the ingest request. Space them out; nothing is lost, the
             # next attempt is a few minutes later. Only retries wait.
-            return
+            return alerted_at
         # Optimistic stamp, inside the transaction: it is what stops the 60 s
         # ticker paging again mid-batch. If the POST then fails, _dispatch hands
         # the page straight back (see _return_unsent_pages).
@@ -349,6 +405,7 @@ class Core:
         db.set_alert_episode(conn, job.id, bad_since, at)
         intents.append(AlertIntent(job, "alert", about, bad_since=bad_since,
                                    alerted_at=at))
+        return at
 
     def _resolve_alerts(self, conn, episodes: list[Episode],
                         states: dict[str, str], transitions: dict[str, tuple],
@@ -371,11 +428,20 @@ class Core:
         does an OK too short to believe. Keeping an episode alive is itself
         bounded, though, because an episode that never ends holds its page too.
         The dwell is at most 5 minutes; the unverifiable-OK hold is at most one
-        threshold (:func:`ok_hold_s`) and then closes silently — and while it
-        holds, the episode can still cross its threshold and page.
+        threshold (:func:`ok_hold_s`) and then closes silently.
+
+        **THE INVARIANT that makes all of that safe:** *while an episode is open
+        (``bad_since`` set), past its threshold and not yet paged, it pages —
+        regardless of what the job's current state reads.* :meth:`_page` is
+        therefore called on every pass over an open episode, from both the
+        not-OK branch and the OK branch, before any branch that could end the
+        episode. The rule has no exceptions and no windows: every "the page can
+        wait until X" this code has ever had turned out to be "the page is lost
+        if X never comes".
         """
         at = db.to_iso(now)
         intents: list[AlertIntent] = []
+        returning = self._returning_probes(conn, episodes)
         for ep in episodes:
             job, prev, state, row = ep.job, ep.prev, ep.state, ep.row
             bad_since = row.get("bad_since")
@@ -412,21 +478,31 @@ class Core:
                 about = prev if prev != "OK" else (
                     db.last_non_ok_state(conn, job.id) or prev)
                 held = self._ok_held_s(prev, row, now)
+                # THE HARD CEILING, applied to the EPISODE and to nothing else:
+                # an open episode that is past its threshold and unpaged pages
+                # here, whatever the job currently reads, naming the state the
+                # episode is really about. It is deliberately ABOVE every branch
+                # below — the hold, the hold's expiry, and the dwell — because
+                # each of those is a way for the episode to end, and an episode
+                # must never end unpaged after it crossed the bar Graham set.
+                # Scoped inside one branch it fired only while `began + A <= now
+                # < since + ok_hold_s`; with `ok_hold_s == alert_after_s` for
+                # every threshold over 5 min that window is exactly as long as
+                # the job was OBSERVED not-OK, so a job that flipped to an
+                # unverifiable OK a few seconds in had no recompute land in it
+                # and went silent for good (a destination 30 days stale, the
+                # heartbeat still arriving, zero pushes). The dwell had the same
+                # hole from the other side: any recovery longer than
+                # `min(5 min, A/10)` ended the episode, so 19 min down / 3 min
+                # up — broken 86% of the time, for ever — never paged once.
+                if bad_since is not None:
+                    alerted_at = self._page(conn, ep, about, bad_since, began,
+                                            alerted_at, states, transitions,
+                                            returning, now, at, intents)
                 if self._holding(ep, about):
                     if held < ok_hold_s(job):
                         log.info("episode for %s held open: %s ended in an OK "
                                  "we cannot verify", job.id, about)
-                        # THE HARD CEILING. Being blind is not being fine: if
-                        # the episode itself outlives the job's threshold while
-                        # we cannot confirm a recovery, page for it rather than
-                        # sit on it. Without this, an alternating
-                        # failure/damped-ok probe pattern defers the page for
-                        # ever — the state never settles long enough to be
-                        # believed and the episode never gets to speak.
-                        if bad_since is not None:
-                            self._page(conn, ep, about, bad_since, began,
-                                       alerted_at, states, transitions, now, at,
-                                       intents)
                         continue
                     # ...but only for one threshold. Held for ever, a probe that
                     # never comes back (revoked remote, retired OAuth client)
@@ -453,10 +529,17 @@ class Core:
                 # told about it in the first place. The recovery is therefore up
                 # to `ok_dwell_s` late (5 min at most, 0 for a 0 threshold) — a
                 # deliberate trade against announcing a recovery that is about
-                # to be taken back.
+                # to be taken back. `alerted_at` may have been stamped by the
+                # ceiling a few lines up, in which case this recovery follows
+                # its page by seconds: accepted on purpose. The job was broken
+                # for longer than the threshold Graham set, so the outage is
+                # real news even though it is over — and it is rare, because a
+                # job has to cross its whole threshold and then recover inside
+                # one dwell to do it.
                 if (alerted_at and not job.alert_never
                         and not self._suppressed_offline(
-                            job, about, state, states, transitions)):
+                            job, about, state, states, transitions,
+                            returning)):
                     intents.append(AlertIntent(job, "recovery", about))
                 db.set_alert_episode(conn, job.id, None, None)
                 continue
@@ -481,7 +564,7 @@ class Core:
                 bad_since, began, alerted_at = at, now, None
                 db.set_alert_episode(conn, job.id, bad_since, None)
             self._page(conn, ep, state, bad_since, began, alerted_at, states,
-                       transitions, now, at, intents)
+                       transitions, returning, now, at, intents)
         return intents
 
     @staticmethod

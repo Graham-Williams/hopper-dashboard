@@ -237,6 +237,10 @@ read from inside the container must send `Host: <APP_HOST>` or the Host pin answ
   `state_reason` (why the job is in its current state), `last_run_status`, `last_run_reason`, `last_run_note`,
   `late_means`, `informational`, `expect`, `never_run` (true until the first real run — manual cards say
   "Never run" explicitly), `created_at`,
+  `alert` (`{after_s, never, source, bad_since, alerted_at}` — the RESOLVED policy plus the open episode:
+  `after_s` is null when the job never pages, `source` is one of `alert_after_s` / `alert` / `informational` /
+  `default` (see "Resolving a job's policy"), `bad_since` non-null means an episode is running — which it can
+  be while the state reads OK — and `alerted_at` non-null means it was paged),
   `summary.total`, `summary.computed_at` (newest state recompute — a stale value means the scheduler is down).
   Unauthenticated API calls get a JSON 401, not a redirect.
 - `GET /api/v1/jobs/<id>?limit=100` → `{generated_at, job, runs, state_changes, probes|null}`.
@@ -433,6 +437,7 @@ route can write.
 | retries are spaced `ALERT_RETRY_MIN_S` (5 min) per episode; a **first** page is never delayed | "the next tick" is the ticker *plus* every ping — 72 blocking 5 s POSTs an hour into a dead ntfy, inside the scheduler thread and the ingest request |
 | a failed **recovery** is logged (`recovery push for …`) and dropped | its episode is already closed, so there is nothing to hand it back to; re-sending later could announce "→ OK" for a job that has broken again. Losing it costs good news, never a page |
 | an episode ends only after the job holds a **verified** OK for `min(5 min, alert_after_s/10)` (the *dwell*) | one OK tick used to end it, so a container on `restart: unless-stopped` backoff (19 min down, 1 min up — broken 95% of the day) reset its clock 72×/day and never paged. Cost: a recovery arrives up to 5 min late, which beats announcing a recovery that is about to be taken back |
+| **the hard ceiling**: an open episode past its threshold and unpaged pages on **every** pass, whatever the job currently reads — the not-OK branch, the unverifiable-OK hold, the pass that gives that hold up, and the dwell | every branch that can end an episode is a way to lose its page. See "Both holds are bounded" below for the two reproductions that came from scoping it to one branch |
 | an **unverified** OK does not end the episode at all (the *hold*) | see below |
 | an unparseable or **future** `bad_since` is healed — clock restarted, `alerted_at` dropped | an NTP step backwards makes `now − bad_since` permanently negative: a job that can never page |
 | `alert_after_s` is capped at **30 days** at parse time, loudly | magnitude was the one hostile input the validator accepted; one extra digit silently means "never". Say `alert: never` if that is what you mean |
@@ -456,23 +461,49 @@ produces. Two shapes of unverified OK are held, on different grounds:
 
 Both holds are bounded, and the bound has two halves:
 
-- **The hard ceiling.** While an episode is held, the *episode clock is still authoritative*: once it passes
-  `alert_after_s` it pages anyway, naming the state it is really about (`snap: STALE_DEST for over 1h`, not
-  the OK on the card). Without this, an episode that spends its whole threshold inside a blind window never
-  gets to speak.
+- **THE HARD CEILING — the invariant the whole episode model rests on:**
+
+  > **While an episode is open (`bad_since` set), past its threshold, and not yet paged — page. Regardless of
+  > what the job's current state reads.**
+
+  `Core._page` is therefore called on **every** pass over an open episode: from the not-OK branch, from the
+  held-open-by-an-unverifiable-OK branch *including the pass that gives that hold up*, and from the dwell.
+  It names the state the episode is really about (`snap: STALE_DEST for over 1h`, not the OK on the card).
+  The rule has no exceptions and no windows, and that is the point: the two structural bugs found in review
+  were both a ceiling scoped to one branch, so the episode could end from another branch without ever
+  speaking. Scoped inside the hold it was live only while `began + A ≤ now < since + A` — a window exactly as
+  long as the job was *observed* not-OK — so a destination 30 days stale whose probe went blind five seconds
+  in, heartbeat still arriving, produced **zero pushes** and then closed itself. The dwell had the same hole
+  from the other side: any recovery longer than `min(5 min, A/10)` ended the episode, so a container 19 min
+  down / 3 min up against a 20 min threshold was broken 86% of the time, indefinitely, and paged nothing.
 - **`ok_hold_s` = `max(5 min, alert_after_s)`.** After that much continuous OK the episode closes **silently**
   (no recovery — nothing was verified fixed). Held for ever, a destination that can never be probed again (a
   revoked remote, rclone's shared Drive OAuth client being retired) would pin `alerted_at` and mute every
   later failure of that job, including the backup dying outright. At most one threshold is spent on a
   destination we cannot see.
 
+**The ceiling's deliberate consequence:** a job that is broken for at least its threshold and *then* recovers
+now produces a page **and** a recovery, sometimes seconds apart. That is correct — it crossed the bar Graham
+set, so the gap is real news, and saying so late beats not saying it — and it is rare by construction: the job
+has to outlive its whole threshold and then recover inside one dwell. The honest cost is that a job whose
+outages *each* exceed its threshold pages once per outage: 19 min down / 3 min up against a 20 min threshold
+is ~2 pushes per 22 min. That is a genuinely broken container reported once per genuine outage, not the
+flapping this feature removed (which is sub-threshold and still silent).
+
 **Residual, stated rather than hidden:** the ceiling bounds the *window*, not the silence. A new failure that
 lands while a hold is still running joins the still-open episode and gets no push of its own for as long as
 that episode lasts. That is correct under one-page-per-episode — the job was never verifiably OK in between,
 and it did page once — but it is the sharp edge. `dest.probe_error` on the card and `dashboard-probes` going
-FAIL are what name a dead probe. Likewise, a job that recovers *verifiably* within one tick of crossing its
-threshold closes its episode during the dwell without paging: the page is suppressed only while the job is in
-a **verified** OK, which is a statement we can stand behind.
+FAIL are what name a dead probe.
+
+**The ceiling vs. the machine-offline rule.** The ceiling asks `_suppressed_offline` like every other page, so
+a sibling's LATE episode that is muted behind a sleeping Mac stays muted — including for the minutes its
+episode stays open after the sibling recovers (the dwell). That span is covered by `Core._returning_probes`:
+the mute lasts while the *probe job's own* LATE episode is still open, which is bounded by the probe's dwell
+(≤5 min) and cannot outlive the sibling's, since the siblings are pinged first and no dwell exceeds 5 min.
+Without it, every weekend with the lid shut would end in a `drive-mirror: LATE for over 1d` push the moment
+the Mac woke — the exact noise the machine-offline rule exists to prevent. A sibling that comes back and is
+*still* broken (or breaks again) is not a plain `LATE → OK` and pages normally.
 
 **Resolving a job's policy** (`registry.parse_job`, surfaced at `/api/v1/status` → `jobs[].alert` with a
 `source` field so it never has to be inferred from `jobs.yml`):
