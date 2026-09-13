@@ -18,8 +18,12 @@ import yaml
 ID_RE = re.compile(r"^[a-z0-9-]+$")
 MACHINES = ("box", "mac")
 KINDS = ("db_snapshot", "rclone_copy_tree", "drive_mirror", "container",
-         "manual", "probe")
+         "manual", "probe", "disk")
 # Kinds that run on a schedule and therefore have a dead-man's switch.
+# ``disk`` is deliberately NOT here: it is a gauge, not a job, and the machine's
+# own ``probe`` job (mac-probe / box-containers) is already the liveness signal
+# that the disk metrics ride in on — a second dead-man's switch for the same
+# silence would only double the alerts.
 SCHEDULED_KINDS = ("db_snapshot", "rclone_copy_tree", "drive_mirror",
                    "container", "probe")
 STATES = ("OK", "LATE", "FAIL", "STALE_DEST", "BEHIND", "UNKNOWN")
@@ -32,9 +36,14 @@ PROBEABLE_KINDS = ("db_snapshot", "rclone_copy_tree", "manual")
 
 _TOP_KEYS = {"id", "name", "machine", "kind", "protects", "method",
              "destination", "cadence_s", "grace_s", "probe", "manual",
-             "expect", "late_means"}
+             "disk", "expect", "late_means"}
 _PROBE_KEYS = {"rclone_path", "state_dir"}
 _MANUAL_KEYS = {"max_age_s", "max_lag_bytes"}
+_DISK_KEYS = {"min_free_bytes", "max_used_pct"}
+
+# A used-percentage threshold is a percentage: anything above this is a typo
+# (bytes pasted into the wrong field), not a looser threshold.
+MAX_USED_PCT = 100
 
 # Multiplier on cadence past which a destination's newest object counts as
 # old (DESIGN.md: "newest object age < cadence*N").
@@ -60,6 +69,8 @@ class Job:
     probe_state_dir: str | None = None
     max_age_s: int | None = None
     max_lag_bytes: int | None = None
+    min_free_bytes: int | None = None
+    max_used_pct: int | None = None
     expect: tuple[str, ...] = field(default_factory=tuple)
     late_means: str | None = None
 
@@ -86,9 +97,12 @@ class Job:
 
     @property
     def informational(self) -> bool:
-        """A manual job with no thresholds: shown, never alerted on."""
-        return (self.kind == "manual" and self.max_age_s is None
-                and self.max_lag_bytes is None)
+        """A manual or disk job with no thresholds: shown, never alerted on."""
+        if self.kind == "manual":
+            return self.max_age_s is None and self.max_lag_bytes is None
+        if self.kind == "disk":
+            return self.min_free_bytes is None and self.max_used_pct is None
+        return False
 
 
 class Registry:
@@ -194,7 +208,7 @@ def parse_job(raw: Any, index: int) -> Job:
     cadence = _pos_int(raw, "cadence_s", ref, required=scheduled)
     grace = _pos_int(raw, "grace_s", ref, required=scheduled)
     if not scheduled and (cadence is not None or grace is not None):
-        raise _err(ref, "manual jobs have no schedule; drop cadence_s/grace_s")
+        raise _err(ref, f"{kind} jobs have no schedule; drop cadence_s/grace_s")
 
     probe_raw = raw.get("probe")
     rclone_path = state_dir = None
@@ -224,6 +238,19 @@ def parse_job(raw: Any, index: int) -> Job:
         max_age = _pos_int(manual_raw, "max_age_s", ref, required=False)
         max_lag = _pos_int(manual_raw, "max_lag_bytes", ref, required=False)
 
+    disk_raw = raw.get("disk")
+    min_free = max_used = None
+    if disk_raw is not None:
+        if kind != "disk":
+            raise _err(ref, "'disk' block is only valid for kind: disk")
+        if not isinstance(disk_raw, dict):
+            raise _err(ref, "'disk' must be a mapping")
+        _check_keys(disk_raw, _DISK_KEYS, ref, "disk")
+        min_free = _pos_int(disk_raw, "min_free_bytes", ref, required=False)
+        max_used = _pos_int(disk_raw, "max_used_pct", ref, required=False)
+        if max_used is not None and max_used > MAX_USED_PCT:
+            raise _err(ref, f"'max_used_pct' is a percentage; must be 1-{MAX_USED_PCT}")
+
     expect_raw = raw.get("expect")
     expect: tuple[str, ...] = ()
     if kind == "container":
@@ -241,8 +268,8 @@ def parse_job(raw: Any, index: int) -> Job:
         id=job_id, name=name, machine=machine, kind=kind, protects=protects,
         method=method, destination=destination, cadence_s=cadence,
         grace_s=grace, probe_rclone_path=rclone_path, probe_state_dir=state_dir,
-        max_age_s=max_age, max_lag_bytes=max_lag, expect=expect,
-        late_means=late_means,
+        max_age_s=max_age, max_lag_bytes=max_lag, min_free_bytes=min_free,
+        max_used_pct=max_used, expect=expect, late_means=late_means,
     )
 
 

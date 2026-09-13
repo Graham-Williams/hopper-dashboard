@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 
 from .db import from_iso
@@ -24,6 +25,26 @@ def human_bytes(n: int | float | None) -> str:
     if i == 0:
         return f"{int(n)} B"
     return f"{n:.1f} {units[i]}"
+
+
+GIB = 1024 ** 3
+
+
+def human_gib(n: int | float | None) -> str:
+    """Binary gibibytes — the unit disk capacity is actually discussed in
+    ("105 GiB free"), as opposed to :func:`human_bytes`' decimal GB.
+
+    ``nan``/``inf`` render as "—" rather than as "nan GiB" / a 300-character
+    number: a value that shape is a broken reading, not a capacity."""
+    if n is None:
+        return "—"
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return "—"
+    if n < 0 or not math.isfinite(n):
+        return "—"
+    return f"{n / GIB:.1f} GiB"
 
 
 def human_duration(seconds: float | None) -> str:

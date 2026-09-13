@@ -3,7 +3,8 @@ import pytest
 from dashboard import create_app
 from dashboard.config import Settings
 from dashboard.db import from_iso, to_iso
-from dashboard.humanize import absolute, human_bytes, human_duration, relative
+from dashboard.humanize import (absolute, human_bytes, human_duration, human_gib,
+                                relative)
 from dashboard.ratelimit import SlidingWindowLimiter
 
 
@@ -21,6 +22,15 @@ def test_human_bytes():
     assert human_bytes(21474836480) == "21.5 GB"
     assert human_bytes(1_500_000) == "1.5 MB"
     assert human_bytes("x") == "—"
+
+
+def test_human_gib():
+    # Binary, unlike human_bytes: the thresholds in jobs.yml are GiB figures.
+    assert human_gib(26843545600) == "25.0 GiB"
+    assert human_gib(None) == "—" and human_gib(-1) == "—" and human_gib("x") == "—"
+    assert human_gib(0) == "0.0 GiB"
+    # A broken reading renders as "—", never "nan GiB" or a ~300-character number.
+    assert human_gib(float("nan")) == "—" and human_gib(float("inf")) == "—"
 
 
 def test_human_duration_and_relative():
@@ -76,7 +86,7 @@ def test_create_app_from_env_loads_example_jobs(monkeypatch, tmp_path):
     monkeypatch.setenv("JOBS_FILE", "jobs.example.yml")
     monkeypatch.setenv("DASHBOARD_NO_SCHEDULER", "1")
     app = create_app("ingest")
-    assert len(app.extensions["registry"]) == 11
+    assert len(app.extensions["registry"]) == 13
     assert app.extensions["scheduler"]._thread is None
 
 

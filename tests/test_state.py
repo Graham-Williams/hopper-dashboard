@@ -2,8 +2,10 @@
 
 from dashboard.db import to_iso
 from dashboard.registry import parse_registry
-from dashboard.state import (Facts, compute_state, db_snapshot_stale, dest_info,
-                             lag_info, running_names)
+from dashboard.state import (DISK_FIRST_READING_GRACE_S, DISK_METRIC_MAX_AGE_S,
+                             Facts, _disk_never_reported_late, compute_state,
+                             db_snapshot_stale, dest_info, disk_info, lag_info,
+                             running_names)
 from tests.conftest import JOBS_DOC
 
 NOW = 1_800_000_000.0
@@ -272,3 +274,226 @@ def test_manual_probe_drives_freshness_pill():
     assert d["count"] == 9 and d["fresh"] is False      # older than max_age_s (14 d)
     f = Facts(last_metrics={"lag_bytes": 0}, probe=probe(newest_ago=86400, count=9))
     assert dest_info(job, f, NOW)["fresh"] is True
+
+
+# -- disk --------------------------------------------------------------------
+
+GIB = 1024 ** 3
+DISK = REG.get("disk")          # min_free 25 GiB, max_used_pct 90
+
+
+def disk_facts(free=None, total=None, **extra):
+    m = dict(extra)
+    if free is not None:
+        m["disk_free_bytes"] = free
+    if total is not None:
+        m["disk_total_bytes"] = total
+    return Facts(last_metrics=m, last_metrics_at=to_iso(NOW))
+
+
+def test_disk_unknown_until_metrics_arrive():
+    assert compute_state(DISK, Facts(), NOW) == ("UNKNOWN", "never heard from")
+    state, reason = compute_state(DISK, disk_facts(total=400 * GIB), NOW)
+    assert state == "UNKNOWN" and reason == "no disk metrics reported yet"
+
+
+def test_disk_ok_reports_percent_and_free():
+    state, reason = compute_state(DISK, disk_facts(free=200 * GIB, total=400 * GIB), NOW)
+    assert state == "OK" and reason == "50.0% used, 200.0 GiB free"
+
+
+def test_disk_behind_below_free_floor():
+    # 20 GiB free of 100 GiB: under the 25 GiB floor, but only 80% used — one threshold, not both.
+    state, reason = compute_state(DISK, disk_facts(free=20 * GIB, total=100 * GIB), NOW)
+    assert state == "BEHIND"
+    assert "20.0 GiB free" in reason and "25.0 GiB floor" in reason
+    assert "ceiling" not in reason              # only the threshold that tripped is named
+
+
+def test_disk_behind_over_used_ceiling():
+    # 8% free of 500 GiB = 40 GiB, over the 25 GiB floor, but 92% used.
+    state, reason = compute_state(DISK, disk_facts(free=40 * GIB, total=500 * GIB), NOW)
+    assert state == "BEHIND" and "92.0% used" in reason and "90% ceiling" in reason
+    assert "floor" not in reason
+
+
+def test_disk_behind_names_both_thresholds():
+    state, reason = compute_state(DISK, disk_facts(free=2 * GIB, total=400 * GIB), NOW)
+    assert state == "BEHIND" and "floor" in reason and "ceiling" in reason
+
+
+def test_disk_threshold_is_strict_at_the_boundary():
+    # Exactly ON the floor and exactly ON the ceiling is still OK: both comparisons are strict,
+    # so a threshold reads as "alert when worse than this", never "alert at this".
+    f = disk_facts(free=25 * GIB, total=250 * GIB)
+    assert disk_info(DISK, f)["used_pct"] == 90.0
+    assert compute_state(DISK, f, NOW)[0] == "OK"
+    assert compute_state(DISK, disk_facts(free=25 * GIB - 1, total=250 * GIB), NOW)[0] == "BEHIND"
+    assert compute_state(DISK, disk_facts(free=30 * GIB, total=400 * GIB), NOW)[0] == "BEHIND"
+
+
+def test_disk_zero_or_missing_total_never_divides_by_zero():
+    for total in (0, None, "nan"):
+        f = disk_facts(free=100 * GIB, total=total)
+        d = disk_info(DISK, f)
+        assert d["used_pct"] is None and d["used_bytes"] is None and d["low"] is False
+        assert compute_state(DISK, f, NOW) == ("OK", "100.0 GiB free")
+    # The free-space floor still works with no total to compare against.
+    assert compute_state(DISK, disk_facts(free=1 * GIB, total=0), NOW)[0] == "BEHIND"
+
+
+def test_disk_has_no_cadence_deadline():
+    # Liveness belongs to the machine's probe job, so a reading far older than any
+    # cadence is still OK — only the coarse staleness ceiling below applies.
+    f = disk_facts(free=200 * GIB, total=400 * GIB)
+    f.created_at = to_iso(NOW - 10 * 86400)
+    f.last_metrics_at = to_iso(NOW - 6 * 3600)
+    assert compute_state(DISK, f, NOW)[0] == "OK"
+
+
+def disk_fail_run(note="statvfs /data: [Errno 2] No such file or directory", ago=0):
+    return {"status": "fail", "reason": "error", "note": note,
+            "received_at": to_iso(NOW - ago)}
+
+
+def test_disk_fail_ping_is_not_masked_by_the_last_good_reading():
+    # The probe posted `fail` after its last good reading: the gauge is unreadable,
+    # and the stale figure must not keep the card OK (a fail ping that changes
+    # nothing is worse than no ping at all — it looks handled).
+    f = disk_facts(free=200 * GIB, total=400 * GIB)
+    f.last_metrics_at = to_iso(NOW - 7200)
+    f.last_run = disk_fail_run(ago=3600)
+    state, reason = compute_state(DISK, f, NOW)
+    assert state == "FAIL" and "statvfs" in reason
+
+
+def test_disk_fail_before_any_metrics_arrive_is_fail_not_unknown():
+    state, reason = compute_state(DISK, Facts(last_run=disk_fail_run()), NOW)
+    assert state == "FAIL" and "statvfs" in reason
+
+
+def test_disk_fail_is_cleared_by_a_newer_metric_ping():
+    # A `metric` ping is not a run, so a failed run stays the newest *runs* row for
+    # good; only comparing it against last_metrics_at lets the gauge recover.
+    f = disk_facts(free=200 * GIB, total=400 * GIB)     # measured at NOW
+    f.last_run = disk_fail_run(ago=3600)
+    assert compute_state(DISK, f, NOW)[0] == "OK"
+
+
+def test_disk_goes_late_when_the_feeder_stops_posting():
+    # Partial silence: the disk probe stops running (renamed/moved/interpreter gone)
+    # while its machine's probe job keeps reporting OK. Nothing is posted, so the
+    # fail branch cannot help — the reading's own age has to be the signal.
+    f = disk_facts(free=200 * GIB, total=400 * GIB)
+    f.last_metrics_at = to_iso(NOW - 49 * 3600)
+    state, reason = compute_state(DISK, f, NOW)
+    assert state == "LATE" and "48h" in reason
+
+
+def test_disk_never_reporting_is_late_once_the_grace_has_passed():
+    # The misinstalled-feeder case: the gauge is in jobs.yml but its probe was never
+    # deployed (or its --job id is mistyped). UNKNOWN is also the initial stored state,
+    # so no transition is recorded and no alert ever fires — the card would read
+    # "never heard from" for ever beside a happy box-containers.
+    fresh = Facts(created_at=to_iso(NOW - DISK_FIRST_READING_GRACE_S + 60))
+    assert compute_state(DISK, fresh, NOW) == ("UNKNOWN", "never heard from")
+    old = Facts(created_at=to_iso(NOW - DISK_FIRST_READING_GRACE_S - 60))
+    state, reason = compute_state(DISK, old, NOW)
+    assert state == "LATE" and "probe deployed" in reason
+
+
+def test_disk_metrics_without_a_capacity_figure_also_go_late_after_the_grace():
+    # Metrics arrived but carry no free-bytes key: same silence, same finding.
+    f = disk_facts(total=400 * GIB)
+    f.created_at = to_iso(NOW - DISK_FIRST_READING_GRACE_S - 60)
+    assert compute_state(DISK, f, NOW)[0] == "LATE"
+
+
+def test_disk_grace_does_not_apply_to_other_kinds():
+    # The snapshot job has its own cadence-based dead-man's switch; nothing here
+    # may change what an unregistered-yet scheduled job reports.
+    f = Facts(created_at=to_iso(NOW - 10 * 86400))
+    assert _disk_never_reported_late(REG.get("offload"), f, NOW) is False
+    assert _disk_never_reported_late(DISK, f, NOW) is True
+
+
+def test_disk_fail_with_an_undatable_timestamp_still_wins():
+    # Fail safe: a corrupt received_at must not resurrect the original bug (a stale
+    # good reading reading OK while the probe says the volume is gone).
+    f = disk_facts(free=200 * GIB, total=400 * GIB)
+    f.last_run = disk_fail_run()
+    f.last_run["received_at"] = "garbage"
+    assert compute_state(DISK, f, NOW)[0] == "FAIL"
+
+
+def test_disk_fail_and_reading_in_the_same_second_is_a_fail():
+    # to_iso is second-granular, so a tie is reachable in production. It breaks toward
+    # over-reporting on purpose: do not flip this comparison to a strict `>`.
+    f = disk_facts(free=200 * GIB, total=400 * GIB)     # last_metrics_at == NOW
+    f.last_run = disk_fail_run(ago=0)                   # received_at  == NOW
+    assert compute_state(DISK, f, NOW)[0] == "FAIL"
+
+
+def test_disk_reading_with_an_undatable_timestamp_is_late_not_ok():
+    # Fail safe the other way: an unparseable last_metrics_at used to disable the
+    # staleness ceiling entirely, so a ten-year-old figure read OK.
+    f = disk_facts(free=200 * GIB, total=400 * GIB)
+    f.last_metrics_at = "garbage"
+    assert compute_state(DISK, f, NOW)[0] == "LATE"
+
+
+def test_disk_negative_capacity_is_unknown_not_a_made_up_percentage():
+    # Nothing clamps a negative metric, and arithmetic on one invented
+    # "only — free, below the 25.0 GiB floor; 101.2% used" (human_gib renders a
+    # negative as an em dash). Corrupt, not small: report it as absent.
+    f = disk_facts(free=-5 * GIB, total=400 * GIB)
+    d = disk_info(DISK, f)
+    assert d["free_bytes"] is None and d["used_pct"] is None and d["low"] is False
+    assert compute_state(DISK, f, NOW) == ("UNKNOWN", "no disk metrics reported yet")
+    # A negative TOTAL likewise yields no percentage rather than a negative one.
+    d2 = disk_info(DISK, disk_facts(free=200 * GIB, total=-400 * GIB))
+    assert d2["total_bytes"] is None and d2["used_pct"] is None
+
+
+def test_disk_staleness_ceiling_clears_a_machine_that_was_off_for_a_day():
+    # 24 h would page for a Mac merely switched off overnight and a bit — mac-probe
+    # already pages for that at ~15 h. Under the ceiling the gauge stays OK.
+    assert DISK_METRIC_MAX_AGE_S == 48 * 3600
+    f = disk_facts(free=200 * GIB, total=400 * GIB)
+    f.last_metrics_at = to_iso(NOW - 47 * 3600)
+    assert compute_state(DISK, f, NOW)[0] == "OK"
+
+
+def test_disk_staleness_outranks_a_tripped_threshold():
+    # A figure nobody has refreshed in two days is not evidence of a full disk.
+    f = disk_facts(free=1 * GIB, total=400 * GIB)
+    f.last_metrics_at = to_iso(NOW - 72 * 3600)
+    assert compute_state(DISK, f, NOW)[0] == "LATE"
+
+
+def test_disk_info_payload_shape():
+    d = disk_info(DISK, disk_facts(free=100 * GIB, total=400 * GIB))
+    assert d == {"measured_at": to_iso(NOW), "free_bytes": 100 * GIB,
+                 "total_bytes": 400 * GIB, "used_bytes": 300 * GIB, "used_pct": 75.0,
+                 "min_free_bytes": 25 * GIB, "max_used_pct": 90, "low": False, "low_on": []}
+
+
+def test_disk_info_is_none_for_every_other_kind():
+    f = disk_facts(free=1, total=2)
+    for job_id in ("snap", "tree", "mirror", "containers", "offload", "info", "macprobe"):
+        assert disk_info(REG.get(job_id), f) is None, job_id
+
+
+def test_disk_accepts_the_alternate_metric_spelling():
+    f = Facts(last_metrics={"free_bytes": 200 * GIB, "total_bytes": 400 * GIB})
+    assert disk_info(DISK, f)["used_pct"] == 50.0
+
+
+def test_informational_disk_job_never_goes_behind():
+    from dashboard.registry import parse_job
+    raw = {"id": "d2", "name": "Disk", "machine": "box", "kind": "disk",
+           "protects": "space", "method": "statvfs"}
+    job = parse_job(raw, 0)
+    assert job.informational
+    state, reason = compute_state(job, disk_facts(free=1, total=400 * GIB), NOW)
+    assert state == "OK" and "free" in reason

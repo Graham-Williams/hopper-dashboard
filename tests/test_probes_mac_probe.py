@@ -20,10 +20,12 @@ def _env(tmp_path, **extra):
     return str(env)
 
 
-def _stub_probes(monkeypatch, pa=None, mc=None, dm=None):
+def _stub_probes(monkeypatch, pa=None, mc=None, dm=None, disk=None):
     entry = backup_log.parse_line("2026-09-04 03:00:47 backup complete")
     monkeypatch.setattr(mac_probe, "probe_pa_backup", pa or (lambda cfg, state, log: ([("pa-backup", {"status": "ok"})], entry)))
     monkeypatch.setattr(mac_probe, "probe_minecraft_offload", mc or (lambda cfg, log: [("minecraft-offload", {"status": "metric", "metrics": {"lag_bytes": 0}})]))
+    # mac-disk is stubbed too: the real one statvfs's PROBE_DISK_PATH, which only exists on a Mac.
+    monkeypatch.setattr(mac_probe, "probe_mac_disk", disk or (lambda cfg, log: [("mac-disk", {"status": "metric", "metrics": {"disk_free_bytes": 1}})]))
     monkeypatch.setattr(mac_probe, "probe_drive_mirror", dm or (lambda cfg, log: [("drive-mirror", {"status": "metric", "metrics": {"pending": 0}})]))
     return entry
 
@@ -35,7 +37,7 @@ def test_dry_run_prints_all_pings_and_writes_no_state(tmp_path, monkeypatch, cap
     rc = mac_probe.main(["--dry-run", "--env", _env(tmp_path), "--quiet"])
     out = capsys.readouterr().out
     assert rc == 0 and not sent
-    for job in ("pa-backup", "minecraft-offload", "drive-mirror", "mac-probe"):
+    for job in ("pa-backup", "minecraft-offload", "mac-disk", "drive-mirror", "mac-probe"):
         assert "/api/v1/ping/%s" % job in out
     assert not (tmp_path / "state.json").exists()
     assert "run ok" in (tmp_path / "probe.log").read_text()
@@ -52,10 +54,10 @@ def test_real_run_sends_and_persists_state(tmp_path, monkeypatch):
     monkeypatch.setattr(mac_probe, "send_ping", fake_send)
     rc = mac_probe.main(["--env", _env(tmp_path), "--quiet"])
     assert rc == 0
-    assert [s[2] for s in sent] == ["pa-backup", "minecraft-offload", "drive-mirror", "mac-probe"]
+    assert [s[2] for s in sent] == ["pa-backup", "minecraft-offload", "mac-disk", "drive-mirror", "mac-probe"]
     assert all(s[0] == "http://h:8081" and s[1] == "tok" for s in sent)
     hb = sent[-1][3]
-    assert hb["status"] == "ok" and hb["metrics"]["subprobes_failed"] == 0 and hb["metrics"]["pings_sent"] == 3
+    assert hb["status"] == "ok" and hb["metrics"]["subprobes_failed"] == 0 and hb["metrics"]["pings_sent"] == 4
     state = json.loads((tmp_path / "state.json").read_text())
     assert state[backup_log.STATE_KEY]["last_reported_line"] == entry.raw
 
@@ -70,7 +72,7 @@ def test_one_subprobe_failure_does_not_block_others(tmp_path, monkeypatch):
     rc = mac_probe.main(["--env", _env(tmp_path), "--quiet"])
     assert rc == 1
     jobs = [j for j, _ in sent]
-    assert jobs == ["pa-backup", "drive-mirror", "mac-probe"]
+    assert jobs == ["pa-backup", "mac-disk", "drive-mirror", "mac-probe"]
     hb = sent[-1][1]
     assert hb["status"] == "fail" and "minecraft-offload: rclone not found" in hb["note"]
     assert hb["metrics"]["subprobes_failed"] == 1
@@ -250,3 +252,47 @@ def test_probe_drive_mirror_read_is_an_ok_run_not_a_metric(tmp_path):
     assert body["started_at"] and body["finished_at"]
     assert body["metrics"]["pending"] == 1 and body["metrics"]["mismatch"] == 2
     assert "not caught up" in body["note"]
+
+
+def test_probe_mac_disk_reports_capacity_metrics(tmp_path):
+    cfg = mac_probe.load_settings(_env(tmp_path, PROBE_DISK_PATH=str(tmp_path)))
+    (job, body), = mac_probe.probe_mac_disk(cfg, mac_probe.Logger(None))
+    m = body["metrics"]
+    assert job == "mac-disk" and body["status"] == "metric"   # a gauge, never a run
+    assert m["disk_total_bytes"] >= m["disk_free_bytes"] > 0
+    assert m["disk_path"] == str(tmp_path)
+
+
+def test_probe_mac_disk_unreadable_path_is_a_fail_ping_not_a_raise(tmp_path):
+    """A raise would be caught by main() and posted to mac-probe instead, leaving the
+    mac-disk card on its last good reading — OK for up to 48 h while the volume is gone.
+    Same contract as probe_drive_mirror and the box's disk_probe."""
+    cfg = mac_probe.load_settings(_env(tmp_path, PROBE_DISK_PATH=str(tmp_path / "gone")))
+    (job, body), = mac_probe.probe_mac_disk(cfg, mac_probe.Logger(None))
+    assert job == "mac-disk" and body["status"] == "fail" and body["reason"] == "error"
+    assert "statvfs" in body["note"] and "metrics" not in body
+    assert body["started_at"] and body["finished_at"]
+
+
+def test_unreadable_mac_disk_is_delivered_rather_than_counted_as_a_failure(tmp_path, monkeypatch):
+    """End to end: the fail ping reaches the dashboard, and mac-probe's own heartbeat
+    stays ok — the gauge reports its own trouble."""
+    sent = []
+    monkeypatch.setattr(mac_probe, "send_ping",
+                        lambda url, token, job, body, timeout=None: sent.append((job, body)) or (200, "{}"))
+    rc = mac_probe.main(["--env", _env(tmp_path, PROBE_DISK_PATH=str(tmp_path / "gone")),
+                         "--only", "mac-disk", "--quiet"])
+    assert rc == 0
+    assert [(j, b["status"]) for j, b in sent] == [("mac-disk", "fail"), ("mac-probe", "ok")]
+
+
+def test_minecraft_offload_still_carries_its_own_disk_metrics(tmp_path, monkeypatch):
+    """mac-disk is additive: the offload card's long-standing disk_free_bytes stays put."""
+    base = tmp_path / "mc"
+    (base / "recordings").mkdir(parents=True)
+    cfg = mac_probe.load_settings(_env(tmp_path, PROBE_MC_BASE=str(base), PROBE_MC_SCRIPT="/nonexistent",
+                                      PROBE_RCLONE=sys.executable, PROBE_DISK_PATH=str(tmp_path)))
+    monkeypatch.setattr(mac_probe.rclone_check, "rclone_check",
+                        lambda *a, **k: mac_probe.rclone_check.parse_combined(""))
+    (_, body), = mac_probe.probe_minecraft_offload(cfg, mac_probe.Logger(None))
+    assert body["metrics"]["disk_free_bytes"] > 0 and body["metrics"]["disk_total_bytes"] > 0

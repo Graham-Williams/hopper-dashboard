@@ -95,7 +95,7 @@ grep -q '@@' "$SYSD/dashboard-containers.service.tmp" && { echo "ERROR: unrender
 mv "$SYSD/dashboard-containers.service.tmp" "$SYSD/dashboard-containers.service"
 chmod 0644 "$SYSD/dashboard-containers.service"
 install -m 0644 "$HERE/dashboard-containers.timer" "$SYSD/dashboard-containers.timer"
-chmod +x "$HERE/containers_probe.sh" "$REPO/probes/containers_probe.py" 2>/dev/null || true
+chmod +x "$HERE/containers_probe.sh" "$REPO/probes/containers_probe.py" "$REPO/probes/disk_probe.py" 2>/dev/null || true
 echo "installed dashboard-containers.{service,timer}"
 
 # --- 4. reload + enable ---------------------------------------------------------
@@ -110,10 +110,10 @@ echo; echo "=== drop-ins as systemd sees them ==="
 for u in "${UNITS[@]}"; do systemctl cat "$u.service" | grep -E 'heartbeat.conf|ExecStopPost' || echo "!! $u.service has no heartbeat drop-in"; done
 echo; echo "=== timers ==="
 systemctl list-timers --no-pager | grep -E 'NEXT|km-backup|todoist-points-backup|dashboard-containers' || true
-echo; echo "=== container probe dry run (as $RUN_USER) ==="
+echo; echo "=== box probe dry run (as $RUN_USER): box-containers + box-disk ==="
 sudo -u "$RUN_USER" env "$(grep '^DASHBOARD_URL=' "$ENV_FILE")" "$REPO/deploy/box/containers_probe.sh" --dry-run || echo "dry run failed (rc=$?)"
 echo
-echo "First heartbeats: box-containers within 5 min (or now: systemctl start dashboard-containers.service);"
+echo "First heartbeats: box-containers + box-disk within 5 min (or now: systemctl start dashboard-containers.service);"
 echo "km-backup / todoist-points-backup on their next timer tick (≤5 min). Check with:"
 echo "  journalctl -u dashboard-containers.service -n 5 --no-pager"
 echo "  # read side (curl is not in the image; use python inside the container). Host MUST equal APP_HOST —"

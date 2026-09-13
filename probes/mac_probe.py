@@ -8,6 +8,7 @@ ingest port:
                      hopper-memory, claude-config) vs gdrive:Backups/<tree> (rclone check), split into
                      MISSING (never uploaded → stale) and DIFFER (edited since → informational)
   minecraft-offload  bytes/files under ~/minecraft-channel not yet on Drive, per pair + disk free
+  mac-disk           free/total bytes of the data volume (the dashboard's disk gauge + thresholds)
   drive-mirror       DriveFS mirror queue/mismatch counts (copied sqlite)
   mac-probe          the probe's own heartbeat: ok, or fail + which sub-probes errored
 
@@ -231,6 +232,32 @@ def probe_minecraft_offload(cfg: Dict[str, str], log: Logger) -> List[Ping]:
     return [("minecraft-offload", build_ping("metric", note=note, metrics=metrics))]
 
 
+def probe_mac_disk(cfg: Dict[str, str], log: Logger) -> List[Ping]:
+    """Capacity of the volume the recordings land on, as its own ``disk`` job so it can carry
+    thresholds and alert. ``minecraft-offload`` also reports these two metrics (it has since the
+    first release) — that stays as it is: those are a footnote on an offload card, this is the
+    gauge. A ``metric`` ping, not a run: a disk job is never LATE, and mac-probe already says
+    whether the Mac is awake.
+
+    An unreadable path is reported as a ``fail`` run rather than raised, exactly like
+    ``probe_drive_mirror`` below and ``disk_probe.build_disk_ping`` on the box: a raise
+    only lands in ``failures`` (mac-probe goes FAIL) and posts NOTHING here, so the
+    gauge would sit on its last good reading — OK for up to DISK_METRIC_MAX_AGE_S —
+    while the volume was gone. The failed run outranks the stored figures in
+    ``state.compute_state``'s disk branch."""
+    try:
+        metrics = rclone_check.disk_free(cfg["PROBE_DISK_PATH"])
+    except OSError as e:
+        note = "statvfs %s: %s" % (cfg["PROBE_DISK_PATH"], e)
+        log.error("mac-disk: " + note)
+        return [("mac-disk", build_ping("fail", reason="error", note=note,
+                                        started_at=now_iso(), finished_at=now_iso()))]
+    metrics["disk_path"] = cfg["PROBE_DISK_PATH"]
+    log.log("mac-disk: %s → %d free of %d bytes" % (
+        cfg["PROBE_DISK_PATH"], metrics["disk_free_bytes"], metrics["disk_total_bytes"]))
+    return [("mac-disk", build_ping("metric", metrics=metrics))]
+
+
 def probe_drive_mirror(cfg: Dict[str, str], log: Logger) -> List[Ping]:
     """Reading the mirror DB IS the check for this job (there is no separate scheduled task on
     the Mac), so a successful read is an ``ok`` RUN with finished_at — not a metrics-only update.
@@ -250,7 +277,7 @@ def probe_drive_mirror(cfg: Dict[str, str], log: Logger) -> List[Ping]:
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
-SUBPROBES = ("pa-backup", "minecraft-offload", "drive-mirror")
+SUBPROBES = ("pa-backup", "minecraft-offload", "mac-disk", "drive-mirror")
 
 
 def deliver(pings: List[Ping], cfg: Dict[str, str], dry_run: bool, log: Logger) -> List[str]:
@@ -305,6 +332,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 pings, new_pa_entry = probe_pa_backup(cfg, state, log)
             elif name == "minecraft-offload":
                 pings = probe_minecraft_offload(cfg, log)
+            elif name == "mac-disk":
+                pings = probe_mac_disk(cfg, log)
             elif name == "drive-mirror":
                 pings = probe_drive_mirror(cfg, log)
         except ProbeError as e:

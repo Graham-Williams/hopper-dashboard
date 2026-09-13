@@ -1,13 +1,15 @@
-# hopper-dashboard: host-side container heartbeat (box-containers job).
+# hopper-dashboard: host-side container heartbeat (box-containers) + disk gauge (box-disk).
 # TEMPLATE — deploy/box/install.sh replaces @@REPO@@ with the checkout path (~/hopper-dashboard)
 # and @@USER@@ with the login that runs it (default: whoever invoked sudo; must be in `docker`).
 #
 # The dashboard container deliberately has NO docker socket; this oneshot, driven by
-# dashboard-containers.timer every 5 min, is the only thing that reads `docker ps`. Runs as an
-# unprivileged user in the docker group. Token + URL come from /etc/hopper-dashboard/ingest.env,
-# read by systemd as root and handed to the process as environment.
+# dashboard-containers.timer every 5 min, is the only thing that reads `docker ps`. It also posts
+# the box's root-filesystem capacity (box-disk) — a disk gauge has no schedule of its own, so it
+# rides this timer rather than adding a second one. Runs as an unprivileged user in the docker
+# group. Token + URL come from /etc/hopper-dashboard/ingest.env, read by systemd as root and
+# handed to the process as environment.
 [Unit]
-Description=hopper-dashboard container heartbeat (docker ps → box-containers)
+Description=hopper-dashboard box probes (statvfs → box-disk, docker ps → box-containers)
 Wants=network-online.target
 After=network-online.target docker.service
 
@@ -16,6 +18,17 @@ Type=oneshot
 User=@@USER@@
 EnvironmentFile=-/etc/hopper-dashboard/ingest.env
 ExecStart=@@REPO@@/deploy/box/containers_probe.sh
-TimeoutStartSec=60
+# Two probes run in sequence here, plus the wrapper's fallback ping, so the ceiling has to cover
+# all three worst cases — and they are ADDITIVE: the fallback curl only runs after the disk probe
+# has already burned its own budget failing.
+#   disk probe:       statvfs (instant) + send_ping 3 attempts × 10 s + ~4.5 s backoff  ≈  35 s
+#   fallback curl:    -m 10 --retry 2 + its ~1 s/2 s backoff                           ≈  33 s
+#   containers probe: docker ps 30 s timeout + send_ping 3 × 10 s + ~4.5 s backoff      ≈  65 s
+# ≈ 133 s worst case, so 150 s left only ~11% headroom — not enough for a slow interpreter start
+# on a loaded box. 210 s restores ~58%, and still finishes inside the timer's 5-minute interval.
+# The original 60 s could not even cover the containers probe alone: systemd SIGTERMed the unit
+# exactly when docker or the network was in trouble — i.e. when the disk reading matters most —
+# and (before the disk probe was moved first) that reading was the one silently lost.
+TimeoutStartSec=210
 NoNewPrivileges=true
 PrivateTmp=true

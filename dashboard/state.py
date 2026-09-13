@@ -7,7 +7,8 @@ testable with a fixed ``now``:
 - ``LATE``       no heartbeat within cadence+grace (dead-man's switch)
 - ``FAIL``       last heartbeat status=fail, or a container job missing an expected container
 - ``STALE_DEST`` heartbeat says ok but the destination disagrees
-- ``BEHIND``     manual job over its lag/age target, or a Drive mirror with pending work
+- ``BEHIND``     manual job over its lag/age target, a Drive mirror with pending work, or a
+                 ``disk`` job under its free-space floor / over its used-percent ceiling
 - ``UNKNOWN``    never heard from — but only for ``cadence+grace`` after the job was
                  first registered (``jobs.created_at``); a scheduled job that has NEVER
                  pinged then goes LATE, so a mis-installed heartbeat can't stay silent forever
@@ -29,7 +30,11 @@ import math
 from dataclasses import dataclass, field
 
 from .db import from_iso
+from .humanize import human_gib
 from .registry import Job
+
+# Largest magnitude any metric may have (mirrors ingest.INT_ABS_MAX; see _num).
+METRIC_ABS_MAX = float(2 ** 63)
 
 # Metric keys the Mac probe / scripts may use for "how far behind".
 LAG_BYTES_KEYS = ("lag_bytes", "missing_bytes")
@@ -39,6 +44,43 @@ MISSING_BYTES_KEYS = ("missing_bytes",)
 MISSING_FILES_KEYS = ("missing_files",)
 DIFFER_BYTES_KEYS = ("differ_bytes",)
 DIFFER_FILES_KEYS = ("differ_files",)
+# disk capacity. The probes post the ``disk_*`` pair; the bare spelling is accepted
+# so an ad-hoc script's metrics are understood too (same rule as LAG_BYTES_KEYS).
+DISK_FREE_KEYS = ("disk_free_bytes", "free_bytes")
+DISK_TOTAL_KEYS = ("disk_total_bytes", "total_bytes")
+# How old a capacity reading may get before the gauge itself is the finding.
+#
+# A `disk` job has no cadence (see SCHEDULED_KINDS) because its machine's probe
+# job carries the same silence — but that only covers TOTAL silence. The box's
+# disk probe can stop running on its own (renamed, moved, interpreter gone: the
+# wrapper records a non-zero rc in the journal and that is all) while
+# box-containers, posted by a different script on the same timer, keeps saying
+# OK. Nothing is posted then, so the fail branch below cannot fire; the reading's
+# own age is the only signal left.
+#
+# 48 h is deliberately generous. The feeders run every 5 min (box) and hourly
+# (Mac), so this is ~576 / ~48 consecutive misses — unambiguous. It also sits
+# above mac-probe's ~15 h LATE deadline, so a Mac merely switched off for a day
+# does not page twice for one fact (the machine-offline rule in services.py
+# mutes the sibling alert only while the probe job is itself LATE; a 24 h
+# ceiling would reintroduce exactly the double-alerting that rule avoids).
+DISK_METRIC_MAX_AGE_S = 48 * 3600
+
+# How long a `disk` job may sit with NO usable reading at all before that silence is
+# itself the finding. The ceiling above protects a feeder that stopped; this protects
+# one that never started — e.g. the job is in jobs.yml but its probe was never
+# deployed, or its `--job` id is mistyped. Without it the card reads "never heard
+# from" for ever AND nothing is alerted, because UNKNOWN is also the initial stored
+# state, so db.set_state records no transition and services._dispatch never runs.
+# Scheduled kinds get this from _never_pinged_late (cadence + grace); a disk gauge has
+# no cadence (see SCHEDULED_KINDS) so deadline_s is None and it needs its own grace.
+# 6 h is generous against feeders that run every 5 min (box) and hourly (Mac), and
+# LATE — not FAIL — so services.py's machine-offline rule mutes it while the machine's
+# own probe job is LATE (a Mac asleep at registration time must not page).
+DISK_FIRST_READING_GRACE_S = 6 * 3600
+_DISK_NO_READING_LATE = (
+    "no capacity reading at all, and registered more than %dh ago"
+    " — is this gauge's probe deployed?" % (DISK_FIRST_READING_GRACE_S // 3600))
 
 
 @dataclass
@@ -52,12 +94,18 @@ class Facts:
 
 
 def _num(value) -> float | None:
-    """Coerce a metric to a finite float, or None.
+    """Coerce a metric to a finite, plausibly-sized float, or None.
 
     Strings are accepted (probes may send numbers as text) but ``"nan"``,
     ``"inf"`` and ``"1e999"`` parse to non-finite floats that later blow up
     ``int()`` in the state computation and 500 every reader until the metric
     is overwritten — so anything non-finite is treated as absent.
+
+    Magnitude is capped for the same reason: ``ingest`` rejects a numeric
+    ``1e308``, but a metric sent as the *string* ``"1e308"`` is a legal short
+    string, and ``int()`` on it yields a 309-digit integer that lands in
+    ``/api/v1/status`` and ~310 characters in the gauge's heading. Nothing real
+    — bytes, files, seconds — comes near 9.2e18, so treat it as absent too.
     """
     if isinstance(value, bool):
         return None
@@ -70,7 +118,7 @@ def _num(value) -> float | None:
             return None
     else:
         return None
-    return f if math.isfinite(f) else None
+    return f if math.isfinite(f) and abs(f) <= METRIC_ABS_MAX else None
 
 
 def _first_num(metrics: dict, keys) -> float | None:
@@ -212,6 +260,57 @@ def lag_info(job: Job, f: Facts, now: float) -> dict | None:
     }
 
 
+def disk_info(job: Job, f: Facts) -> dict | None:
+    """Capacity block for the JSON + card, or None for any kind but ``disk``.
+
+    ``used_pct`` is simply ``(total - available) / total`` from what ``statvfs``
+    reported. The free BYTES match ``df``'s Avail exactly; the PERCENTAGE will
+    not match ``df``'s (on macOS/APFS, measured: 79.5% here vs 78% there — ``df``
+    divides by a larger free figure that ``statvfs`` never hands Python). That is
+    expected, not a rounding bug: a 90% ceiling here trips around 88.5% as ``df``
+    prints it. See ``probes/common.disk_free``.
+
+    It is None when the total is absent or zero: a container bind-mount and a
+    statvfs on a path that went away both report 0 blocks, and dividing by that
+    would 500 the whole board.
+    """
+    if job.kind != "disk":
+        return None
+    free = _first_num(f.last_metrics, DISK_FREE_KEYS)
+    total = _first_num(f.last_metrics, DISK_TOTAL_KEYS)
+    # Capacity cannot be negative: a negative figure is corrupt, not small. Neither
+    # ingest nor _num rejects one, and arithmetic on it invents nonsense — a negative
+    # free against a real total yields used_pct > 100 and a reason reading "only —
+    # free" (human_gib renders a negative as an em dash). Treat it as absent so the
+    # card says the capacity is unknown instead.
+    if free is not None and free < 0:
+        free = None
+    if total is not None and total < 0:
+        total = None
+    used = used_pct = None
+    if free is not None and total is not None and total > 0:
+        used = max(0.0, total - free)
+        used_pct = round(used / total * 100, 1)
+    low_on = []
+    if (job.min_free_bytes is not None and free is not None
+            and free < job.min_free_bytes):
+        low_on.append("free")
+    if (job.max_used_pct is not None and used_pct is not None
+            and used_pct > job.max_used_pct):
+        low_on.append("used_pct")
+    return {
+        "measured_at": f.last_metrics_at,
+        "free_bytes": int(free) if free is not None else None,
+        "total_bytes": int(total) if total is not None else None,
+        "used_bytes": int(used) if used is not None else None,
+        "used_pct": used_pct,
+        "min_free_bytes": job.min_free_bytes,
+        "max_used_pct": job.max_used_pct,
+        "low": bool(low_on),
+        "low_on": low_on,
+    }
+
+
 def dest_info(job: Job, f: Facts, now: float) -> dict:
     newest_iso = _newest_iso(job, f)
     newest = _newest_epoch(job, f)
@@ -251,6 +350,17 @@ def _never_pinged_late(job: Job, f: Facts, now: float) -> bool:
     return created is not None and now - created > job.deadline_s
 
 
+def _disk_never_reported_late(job: Job, f: Facts, now: float) -> bool:
+    """The disk-gauge analogue of _never_pinged_late: a `disk` job registered longer
+    ago than DISK_FIRST_READING_GRACE_S has had long enough to report something, so
+    its continued silence is LATE rather than "new". Callers check it only where no
+    usable reading exists."""
+    if job.kind != "disk":
+        return False
+    created = from_iso(f.created_at)
+    return created is not None and now - created > DISK_FIRST_READING_GRACE_S
+
+
 def compute_state(job: Job, f: Facts, now: float) -> tuple[str, str]:
     """Return (STATE, human reason)."""
     lr = f.last_run
@@ -259,7 +369,55 @@ def compute_state(job: Job, f: Facts, now: float) -> tuple[str, str]:
                         or f"never pinged, and registered more than {job.deadline_s}s ago"
                         " — is the heartbeat installed?")
     if lr is None and not f.last_metrics:
+        if _disk_never_reported_late(job, f, now):
+            return "LATE", _DISK_NO_READING_LATE
         return "UNKNOWN", "never heard from"
+
+    if job.kind == "disk":
+        # A gauge, not a job: judged on the newest metrics, with no cadence-based
+        # dead-man's switch (see SCHEDULED_KINDS). Two things still outrank the
+        # figures, in this order:
+        #   1. the probe saying it could not read the filesystem at all, and
+        #   2. the figures being too old to mean anything (DISK_METRIC_MAX_AGE_S).
+        d = disk_info(job, f) or {}
+        metrics_at = from_iso(f.last_metrics_at)
+        # Newest word wins. Mirrors the `manual` branch's fail check, but a disk
+        # probe posts success as a `metric` ping — which is NOT a run — so the
+        # failed run stays the newest `runs` row for ever; without comparing it
+        # against last_metrics_at one transient statvfs error would pin the card
+        # to FAIL while healthy readings flowed in behind it.
+        #
+        # Both comparisons fail SAFE on a timestamp that will not parse (only
+        # reachable via a corrupt row): an undatable failure is still a failure, and
+        # an undatable reading is not evidence of health. The scheduled branch below
+        # treats an unparseable received_at as LATE for the same reason.
+        is_fail = bool(lr and lr.get("status") == "fail")
+        failed_at = from_iso(lr.get("received_at")) if is_fail else None
+        if is_fail and (failed_at is None or metrics_at is None or failed_at >= metrics_at):
+            why = lr.get("note") or lr.get("reason") or "no reason"
+            return "FAIL", f"capacity unreadable ({str(why)[:120]})"
+        if d.get("free_bytes") is None:
+            if _disk_never_reported_late(job, f, now):
+                return "LATE", _DISK_NO_READING_LATE
+            return "UNKNOWN", "no disk metrics reported yet"
+        if metrics_at is None or now - metrics_at > DISK_METRIC_MAX_AGE_S:
+            # LATE, not FAIL: this IS a dead-man's switch, and reusing LATE gets
+            # the machine-offline alert suppression in services.py for free.
+            return "LATE", (f"no capacity reading in over "
+                            f"{DISK_METRIC_MAX_AGE_S // 3600}h — whatever feeds "
+                            f"this gauge has stopped (probe moved or renamed?) or "
+                            f"the machine has been off that long")
+        if d["low"]:
+            parts = []
+            if "free" in d["low_on"]:
+                parts.append(f"only {human_gib(d['free_bytes'])} free, below the "
+                             f"{human_gib(d['min_free_bytes'])} floor")
+            if "used_pct" in d["low_on"]:
+                parts.append(f"{d['used_pct']}% used, over the "
+                             f"{d['max_used_pct']}% ceiling")
+            return "BEHIND", "; ".join(parts)
+        used = f"{d['used_pct']}% used, " if d["used_pct"] is not None else ""
+        return "OK", f"{used}{human_gib(d['free_bytes'])} free"
 
     if job.kind == "manual":
         if lr and lr.get("status") == "fail":
