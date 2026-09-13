@@ -541,13 +541,35 @@ def not_ok_seconds(conn: sqlite3.Connection, job_id: str, start: float,
     the same reason: it cannot be used as a boundary, and one poisoned row must
     not be able to invent hours of badness.
 
-    **Time we cannot account for counts as OK**, so the sum can only ever be an
-    UNDER-estimate: a scan that runs out of rows (or of ``limit``) leaves the
-    older part of the window unattributed rather than assuming the worst. The
+    **How accurate this actually is** — measured, because the wording here used
+    to overclaim:
+
+    - For a MONOTONE timeline it is **exact**, not merely an under-estimate
+      (4000 randomised histories, worst deviation 0.000 s). What under-counts is
+      missing history: a scan that runs out of rows (or of ``limit``) leaves the
+      older part of the window unattributed rather than assuming the worst.
+    - **A single** clock step cannot inflate it: the out-of-order row is skipped
+      as unusable and the span it would have opened is closed by the next older
+      usable row instead. That is true of *one* step and false of a **sawtooth**
+      — every backwards row is dropped, so the surviving older row's state claims
+      the whole gap, and when the dropped rows are the recoveries, nearly the
+      entire window reads as bad: measured at **42 900 s of a 43 200 s window**
+      where 21 600 s was real. Both are pinned by
+      ``test_not_ok_seconds_cannot_be_inflated_by_a_clock_that_stepped_back``.
+    - Sub-second truncation **over**-counts slightly: ``changed_at`` is ISO to
+      whole seconds while ``end`` is a float, worth up to 1 s per span (measured
+      worst case 3.1 s).
+
+    **The hard ceiling in every case is ``end - start``** — the caller's window,
+    i.e. ``BAD_WINDOW_MULTIPLE × alert_after_s``, which is exactly twice the bar
+    it is compared against. So the worst a poisoned clock can buy is a page one
+    window early, and never a page for a job that is fine right now: the
     accumulator is an OR beside the episode clock, never a replacement for it
-    (see ``services.Core._past_bar``), so an under-estimate degrades to the
-    behaviour the clock already had — while an over-estimate would be a page for
-    an outage that never happened.
+    (see ``services.Core._past_bar``), it is only consulted for an episode that
+    is open, and it is only ever asked about the state that episode is in. An
+    under-estimate degrades to the behaviour the clock already had; an
+    over-estimate pages early. Both are the direction the governing rule asks
+    for, which is why this is documented rather than defended against.
     """
     if end <= start:
         return 0.0

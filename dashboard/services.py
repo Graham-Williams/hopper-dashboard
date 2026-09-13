@@ -154,12 +154,14 @@ BAD_SCAN_LIMIT = 2000
 # heartbeat itself, and holding those broke recovery for every unprobed job.
 DEST_DRIVEN_STATES = ("STALE_DEST", "BEHIND")
 
-# Shortest gap between two ntfy attempts for the SAME episode. The rollback in
-# :meth:`Core._return_unsent_pages` makes the next pass retry, and "the next
-# pass" is the 60 s ticker plus every ping that lands — ~72 blocking 5 s POSTs
-# an hour while ntfy is down, inside the scheduler thread AND inside whichever
-# ingest request delivered the heartbeat. The delay is only ever on a RETRY:
-# the FIRST page of an episode is never held back (see Core._retry_due).
+# Shortest gap between two ntfy attempts for the SAME page — one episode, at one
+# severity rank. The rollback in :meth:`Core._return_unsent_pages` makes the next
+# pass retry, and "the next pass" is the 60 s ticker plus every ping that lands —
+# ~72 blocking 5 s POSTs an hour while ntfy is down, inside the scheduler thread
+# AND inside whichever ingest request delivered the heartbeat. The delay is only
+# ever on a RETRY: the FIRST page of an episode is never held back (see
+# Core._retry_due). There are two alertable ranks, so the worst case per job is
+# two attempts per window (24/hour), not one.
 ALERT_RETRY_MIN_S = 300
 # How far back a per-job failure streak is counted. Far above any sane
 # PROBE_FAIL_THRESHOLD; bounds the scan on a job that has been failing for
@@ -384,10 +386,14 @@ class Core:
         # wall time). The scheduler schedules the next cycle from this, never
         # from the pre-cycle clock.
         self.last_cycle_end: float | None = None
-        # job id -> (episode bad_since, epoch of the last ntfy attempt for it).
+        # job id -> (episode bad_since, {severity rank -> epoch of the last ntfy
+        # attempt at that rank}). The rank has to be INSIDE the entry, not part
+        # of a flat per-job key: a page and its escalation are two different
+        # pages, each with its own backoff, and one per-job slot let them evict
+        # each other on every flip (see _retry_due).
         # In memory on purpose (see _retry_due): a restart simply retries
         # sooner, which is the safe direction, and it needs no migration.
-        self._alert_attempted: dict[str, tuple[str, float]] = {}
+        self._alert_attempted: dict[str, tuple[str, dict[int, float]]] = {}
 
     # -- plumbing ---------------------------------------------------------- #
 
@@ -578,23 +584,41 @@ class Core:
             return 0.0
         return now - since
 
-    def _retry_due(self, job_id: str, attempt_key: str, now: float) -> bool:
-        """May we POST for this episode yet?
+    def _retry_due(self, job_id: str, bad_since: str, rank: int,
+                   now: float) -> bool:
+        """May we POST this page yet?
 
-        Always yes for an episode we have not tried to page for — the FIRST
-        alert of an episode is never delayed, which is the whole point of the
-        threshold. Only a retry of the same episode (the previous POST failed
-        and :meth:`_return_unsent_pages` gave the page back) waits out
-        ``ALERT_RETRY_MIN_S``. A clock that steps backwards reads as due rather
-        than as "wait": late-but-noisy over silent, as everywhere else.
+        Always yes for a page we have not tried to send — the FIRST alert of an
+        episode is never delayed, which is the whole point of the threshold, and
+        neither is the first escalation. Only a retry of the SAME page (the
+        previous POST failed and :meth:`_return_unsent_pages` gave the page
+        back) waits out ``ALERT_RETRY_MIN_S``. A clock that steps backwards
+        reads as due rather than as "wait": late-but-noisy over silent, as
+        everywhere else.
 
-        ``attempt_key`` is the episode PLUS the severity rank being paged
-        (:meth:`_attempt_key`), not ``bad_since`` alone. An escalation is a new
-        page inside an episode that has already POSTed, so keyed on the episode
-        alone it would read as a retry and be held back for five minutes — a
-        "the disk is now unreadable" push delayed by a backoff that exists only
-        to stop hammering a dead ntfy. Two ranks means at most two live keys per
-        episode, so the backoff still bounds retries per page.
+        **A page is identified by the episode AND the severity rank being
+        paged**, never by ``bad_since`` alone: an escalation is a new page inside
+        an episode that has already POSTed, so keyed on the episode alone it
+        would read as a retry and be held back for five minutes — a "the disk is
+        now unreadable" push delayed by a backoff that exists only to stop
+        hammering a dead ntfy.
+
+        **The two ranks are held SIDE BY SIDE, in one entry per job, and that is
+        load-bearing.** A flat ``dict[job_id, (key, when)]`` with the rank folded
+        into the key looks equivalent and is not: the two keys evict each other,
+        so a job whose state oscillates across the rank boundary (a disk gauge
+        flipping BEHIND ↔ FAIL) reads every single pass as a page it has never
+        tried, and the backoff stops applying at all. Measured against a 60 s
+        oscillation and a dead ntfy: **60** attempts an hour, against 12 for a
+        non-oscillating episode — 83 % of the way back to the ~72 the backoff
+        exists to prevent. Per-rank, the bound is what it claims to be: at most
+        one attempt per rank per ``ALERT_RETRY_MIN_S``, two ranks, so ≤ 24 an
+        hour whatever the state does
+        (``test_an_oscillating_episode_cannot_defeat_the_retry_backoff``).
+
+        A new episode replaces the whole entry, so the map holds at most one
+        entry per job and at most two timestamps inside it — nothing accumulates
+        over a job that flaps for a month.
 
         The map is per-``Core``, and only the ingest role dispatches — it runs
         ``gunicorn --workers 1 --threads 4`` (see ``entrypoint.sh``), so one
@@ -602,16 +626,28 @@ class Core:
         If ingest is ever given more than one worker the backoff multiplies by
         the worker count; that is more pushes, not fewer, but check here first.
         """
-        last = self._alert_attempted.get(job_id)
-        if last is None or last[0] != attempt_key:
+        entry = self._alert_attempted.get(job_id)
+        if entry is None or entry[0] != bad_since:
             return True
-        waited = now - last[1]
+        when = entry[1].get(rank)
+        if when is None:
+            return True
+        waited = now - when
         return waited >= ALERT_RETRY_MIN_S or waited < 0
 
-    @staticmethod
-    def _attempt_key(bad_since: str, about: str) -> str:
-        """The retry-backoff key: this episode, at this severity rank."""
-        return f"{bad_since}@{alert_severity(about)}"
+    def _note_attempt(self, job_id: str, bad_since: str, rank: int,
+                      now: float) -> None:
+        """Record that we are POSTing this page now, for :meth:`_retry_due`.
+
+        A rank of the CURRENT episode joins the existing entry; any other
+        episode replaces it outright, which is what keeps the map at one entry
+        per job.
+        """
+        entry = self._alert_attempted.get(job_id)
+        if entry is None or entry[0] != bad_since:
+            entry = (bad_since, {})
+            self._alert_attempted[job_id] = entry
+        entry[1][rank] = now
 
     @staticmethod
     def _past_bar(conn, job: Job, about: str, began: float,
@@ -635,8 +671,17 @@ class Core:
         *replaced* the clock with "count only the not-OK seconds", which can
         only ever page LATER than the clock does. Added beside the clock, the
         accumulator has no path to silence: every episode that paged before this
-        change still pages at exactly the same moment, and the only new
-        behaviour is extra pages. The second half of that argument is upstream:
+        change still reaches its bar at exactly the same moment, and the only new
+        behaviour is extra pages. **"The same moment" is about the BAR, not about
+        the push** — one push can still move. An escalation stamps
+        `last_paged_at` (see :meth:`_page`), which is a page that did not exist
+        before this change, so the FOLLOWING episode's first page can be held by
+        a cooldown it would not have met on the old code — up to one
+        `cooldown_s` later. It is a delay, never a cancellation (a held page
+        stamps nothing and the ceiling re-offers it), and the cumulative push
+        count is never below the old code's at any instant. Asserted, not
+        argued, in `test_the_escalation_is_not_held_by_the_cooldown_but_does_stamp_it`.
+        The second half of that argument is upstream:
         PR #8's damping means transient probe noise never reaches an alertable
         state at all, so the accumulator sits behind the filter and never sees
         the 27-flap storm that made this dangerous (asserted, not assumed —
@@ -650,19 +695,45 @@ class Core:
         machine-offline rule ("one alert for the machine"); with a flat
         accumulator, the next morning's first *unrelated* `drive-mirror: BEHIND`
         episode paged the instant it opened, on the strength of a sleep that was
-        explicitly declared not-news. Per-state, that cannot happen: muted LATE
-        time can only ever count toward a LATE page, which the same mute still
-        gags. It is also the better semantics — "this exact problem keeps coming
-        back", which is the question the episode asks, only cumulatively.
-        Residual, stated: a job that alternates between DIFFERENT bad states
-        across separate episodes accumulates neither. Within one episode the
-        clock already covers it (a mid-episode LATE → FAIL does not reset it).
+        explicitly declared not-news. Per-state closes exactly that: muted LATE
+        time can no longer speak for a page about a DIFFERENT state. It is also
+        the better semantics — "this exact problem keeps coming back", which is
+        the question the episode asks, only cumulatively. Residual, stated: a job
+        that alternates between DIFFERENT bad states across separate episodes
+        accumulates neither. Within one episode the clock already covers it (a
+        mid-episode LATE → FAIL does not reset it).
+
+        **What per-state does NOT close, stated plainly because an earlier
+        version of this docstring claimed it did: muted LATE time still counts
+        toward a page about a LATER LATE episode.** The mute
+        (:meth:`_suppressed_offline`) is a function of the probe's state RIGHT
+        NOW, not of accumulated time, and :func:`db.not_ok_seconds` reads across
+        episode boundaries — so "the same mute still gags it" is false as soon as
+        the machine is back. Reachable on the shipped file, measured on
+        `drive-mirror`'s real numbers
+        (`test_muted_late_time_can_still_bring_a_later_late_page_forward`): a
+        40 h Mac sleep accrues ~25 h of muted LATE, the episode closes silently,
+        and a fresh LATE that starts 15 h later pages the instant it opens
+        instead of a day in. It needs `alert_after_s` to exceed the job's own
+        LATE onset — otherwise the earlier badness has aged out of the window
+        before a new episode can even begin — which on the shipped file is true
+        of `drive-mirror` and nothing else
+        (`test_which_shipped_jobs_can_have_muted_time_brought_forward`).
+        **Direction: it pages EARLY, never silently** — the job really is in that
+        state now, and the seconds counted really were unreported — so it is a
+        residual under the governing rule, not a defect. Two things must stay
+        true for that to hold: the page is still at most one per episode, and it
+        still takes a full `alert_after_s` of real, same-state, unreported time.
 
         **The early-fire is bounded by UNPAGED badness.** Not-OK time that
         already paged is absorbed by the cooldown instead — a second page inside
         `cooldown_s` is held whatever the accumulator says — so what the
         accumulator can bring forward is exactly the badness nobody was told
-        about, which is the thing it exists to stop losing.
+        about, which is the thing it exists to stop losing. That bound is also
+        the precise reason the muted case above is the one that gets through: a
+        suppressed page deliberately stamps NOTHING (not `alerted_at`, not
+        `last_paged_at`, so the episode keeps its page), so muted time is unpaged
+        time with no cooldown behind it. A mute is not a cooldown.
 
         Missing history reads as zero accrued time, not as badness: the scan
         stops at the oldest row it can see, and time before that is unaccounted
@@ -756,6 +827,14 @@ class Core:
                 # than nothing" and send a duplicate of the page that already
                 # went out, and ranking it at the top would swallow a genuine
                 # later escalation. Healed once, then it behaves normally.
+                # What this costs, stated: if the state has ALREADY worsened by
+                # the first recompute after the upgrade, the heal records the
+                # WORSE state as "what was sent" and that worsening never
+                # escalates — one lost escalation per episode open across the
+                # deploy. Not a regression (the old code had no escalation at
+                # all) and not silence (the episode's own page had already gone
+                # out); the alternative is a duplicate of a page that has
+                # already been read, for every such episode.
                 log.info("recording %s as the paged state for %s's open episode "
                          "(it was paged before alerted_state existed)",
                          about, job.id)
@@ -801,18 +880,19 @@ class Core:
             log.info("alert for %s suppressed: its machine's probe job is "
                      "offline (one alert for the machine instead)", job.id)
             return alerted_at, alerted_state
-        attempt = self._attempt_key(bad_since, about)
-        if not self._retry_due(job.id, attempt, now):
-            # A POST for THIS page failed recently and it was handed back.
-            # Retrying on every tick and every ping means a blocking 5 s urllib
-            # call ~72×/hour while ntfy is down — in the scheduler thread and in
-            # the ingest request. Space them out; nothing is lost, the next
-            # attempt is a few minutes later. Only retries wait.
+        rank = alert_severity(about)
+        if not self._retry_due(job.id, bad_since, rank, now):
+            # A POST for THIS page — this episode, at this rank — failed recently
+            # and it was handed back. Retrying on every tick and every ping means
+            # a blocking 5 s urllib call ~72×/hour while ntfy is down — in the
+            # scheduler thread and in the ingest request. Space them out; nothing
+            # is lost, the next attempt is a few minutes later. Only retries
+            # wait.
             return alerted_at, alerted_state
         # Optimistic stamp, inside the transaction: it is what stops the 60 s
         # ticker paging again mid-batch. If the POST then fails, _dispatch hands
         # the page straight back (see _return_unsent_pages).
-        self._alert_attempted[job.id] = (attempt, now)
+        self._note_attempt(job.id, bad_since, rank, now)
         db.set_alert_episode(conn, job.id, bad_since, at, about)
         prev_paged_at = ep.row.get("last_paged_at")
         db.set_last_paged_at(conn, job.id, at)

@@ -96,8 +96,11 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   `runs`, `probes`, `state_changes`), WAL connection, all queries, ISO helpers (`from_iso` clamps to
   1970..9999 and never raises). `not_ok_seconds` reconstructs a job's state timeline from `state_changes` for
   the alert accumulator — derived, not stored, for the same reasons `probe_fail_streak` is (nothing to
-  migrate, unforgeable by INGEST_TOKEN), walked by rowid (`sc_job_seq`) so a clock step cannot reorder it, and
-  under-estimating by construction: time it cannot account for counts as OK.
+  migrate, unforgeable by INGEST_TOKEN), and walked by rowid (`sc_job_seq`) so a clock step cannot reorder it.
+  Accuracy is **measured, not assumed** (the docstring used to overclaim): exact for a monotone timeline,
+  under-counting only where history is missing, over-counting by <1 s per span because ISO stamps are whole
+  seconds, and inflatable by an *oscillating* clock up to the window itself — bounded in every case by
+  `end - start`, i.e. twice the bar it is compared against, so the worst case is a page one window early.
   **"Which probe row is newest" is decided by `id` (insert order), never by `probed_at`** —
   `last_probe`, `last_ok_probe`, `oldest_probe`, `probe_fail_streak` and `failing_probe_job_ids` all order by
   id, and `probes_job_seq` is the index for it. `probed_at` is the writer's wall clock, so one row written
@@ -141,6 +144,10 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   only page LATER — that is how #13 item 4's two attempts each produced a silence bug); it counts **one state,
   not any badness** (counting everything laundered a sleeping Mac's deliberately-muted sibling LATE into an
   instant page for an unrelated BEHIND); and the cooldown below still caps the rate.
+  **Known residual, don't re-close it in the silence direction:** per-state does NOT stop muted LATE time
+  counting toward a *later LATE* page — a mute reads the probe's state now and stamps nothing, so muted time is
+  unpaged badness with no cooldown behind it. Reachable on `drive-mirror` alone (its 24 h threshold is above its
+  15 h LATE onset); two tests pin both the behaviour and the shipped set.
   *"this got worse"* (`alert_severity` + `alerted_state`, issue #16). An episode that has paged pages ONCE
   more if its state gets strictly worse, at that state's own priority. Severity is read off
   `notify.HIGH_PRIORITY_STATES` rather than invented, so the rank and the `Priority` header cannot disagree —
@@ -186,6 +193,14 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   containers flap. The failed-push rollback returns `last_paged_at` with `alerted_at` — half a rollback lets
   one 429 buy a whole cooldown of silence — and an unparseable or future `last_paged_at` is refused and
   healed, for the same reason `bad_since` is.
+  **THE RETRY BACKOFF** (`ALERT_RETRY_MIN_S`, 5 min, `_retry_due`/`_note_attempt`) spaces *retries* of a page
+  whose POST failed; a first page, and a first escalation, are never delayed. It is keyed on the episode **and
+  the severity rank**, held as ONE entry per job with a timestamp per rank — not one slot per job with the rank
+  folded into the key, which is what it was: folded, `bs@1` and `bs@2` evict each other, so a state oscillating
+  across the rank boundary reads every pass as an untried page and the backoff stops applying (measured 60
+  attempts/hour against 12). Per rank the ceiling is 2 attempts per window, ≤ 24/hour. In memory on purpose — a
+  restart retries sooner, which is the safe direction — and single-process only because ingest runs
+  `--workers 1`.
   Also the **machine-offline rule** ( sibling `→ LATE` alerts muted while the machine's `probe` job is
   LATE, and sibling plain `LATE → OK` recoveries muted while the probe is still LATE, recovers in the same
   batch, **or is still inside its own LATE episode** (`_returning_probes`) — the Mac probe posts its sub-jobs

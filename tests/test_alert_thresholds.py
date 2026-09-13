@@ -1949,8 +1949,13 @@ def test_a_muted_late_cannot_accumulate_into_a_page_for_something_else(settings,
     alert suppressed by the machine-offline rule ("one alert for the machine, not
     five"), and the next morning the first genuinely new `drive-mirror: BEHIND`
     episode paged the INSTANT it opened on the strength of that sleep. Per-state,
-    muted LATE time can only ever count toward a LATE page — which the same mute
-    still gags."""
+    muted LATE time can no longer speak for a page about a DIFFERENT state.
+
+    Scoped precisely, because this docstring used to overclaim: it does **not**
+    follow that "the same mute still gags it". Muted LATE time still counts
+    toward a page about a later *LATE* episode — see
+    `test_muted_late_time_can_still_bring_a_later_late_page_forward`, which
+    reproduces that on the shipped `drive-mirror` numbers."""
     core = core_with(settings, notifier, {"mirror": {"alert_after_s": 3600},
                                           "macprobe": {"alert_after_s": 3 * DAY}})
     mac, mirror = core.registry.get("macprobe"), core.registry.get("mirror")
@@ -1981,6 +1986,140 @@ def test_a_muted_late_cannot_accumulate_into_a_page_for_something_else(settings,
                      now=NOW + 30_400 + 3600)
     assert titles(notifier) == ["[dashboard] Drive mirror → BEHIND"]
     assert notifier.sent[0][1] == "mirror: BEHIND for over 1h"   # continuous, not cumulative
+
+
+def _shipped_core(settings, notifier):
+    """A Core over the REAL `jobs.example.yml`, so the two tests below are about
+    the thresholds actually deployed rather than a fixture's. Every job that is
+    not pinged stays UNKNOWN (`pin_created_at`), so it contributes no pushes."""
+    from dashboard.registry import load_registry
+    from tests.conftest import EXAMPLE_JOBS
+    core = Core(settings, load_registry(EXAMPLE_JOBS), notifier)
+    core.init_store()
+    pin_created_at(settings)
+    return core
+
+
+def late_onset_s(job) -> int | None:
+    """How long this job must be unheard-from before it reads LATE, or None if it
+    can never read LATE at all.
+
+    `deadline_s` for a scheduled kind; a `disk` gauge has no cadence and is
+    judged on the age of its newest reading instead (`DISK_METRIC_MAX_AGE_S`);
+    `manual` is neither, so it has no dead-man's switch and None is the honest
+    answer — which also means the machine-offline rule can never mute it, since
+    that rule is about LATE. Derived rather than typed out, because it is the
+    number the muted-time residual below turns on.
+    """
+    from dashboard.state import DISK_METRIC_MAX_AGE_S
+    if job.scheduled:
+        return job.deadline_s
+    return DISK_METRIC_MAX_AGE_S if job.kind == "disk" else None
+
+
+def test_muted_late_time_can_still_bring_a_later_late_page_forward(settings, notifier):
+    """The residual the test above does NOT cover, reproduced rather than
+    described — because the claim "the same mute still gags it" was in three
+    places and is false.
+
+    The mute (`_suppressed_offline`) reads the probe's state RIGHT NOW;
+    `db.not_ok_seconds` reads across episode boundaries. So muted LATE seconds
+    are unpaged badness with nothing behind them — a suppressed page stamps
+    neither `alerted_at` nor `last_paged_at`, deliberately, which is exactly why
+    no cooldown absorbs the next one. A mute is not a cooldown.
+
+    Run on `drive-mirror`'s real numbers (24 h threshold, 15 h LATE onset, 48 h
+    window): a 40 h sleep, awake just long enough to serve out the dwell, then
+    15 h of silence — and the fresh episode pages at age ZERO, carrying "for over
+    1d in the last 2d".
+
+    **This is a residual, not a defect.** It pages EARLY, never silently; the job
+    really is LATE at that moment; the seconds counted really were never
+    reported; and it is still one page per episode. Fixing it by discarding
+    accrued badness would push in the one direction this feature may not go."""
+    core = _shipped_core(settings, notifier)
+    mirror, probe = core.registry.get("drive-mirror"), core.registry.get("mac-probe")
+    assert mirror.alert_after_s > late_onset_s(mirror)    # why it is reachable here
+    ok = {"status": "ok", "metrics": {"pending": 0, "mismatch": 0}}
+    t = NOW
+    core.record_ping(mirror, ok, now=t)
+    core.record_ping(probe, {"status": "ok"}, now=t)
+    while t < NOW + 40 * 3600:                           # the lid is shut
+        t += 900
+        core.recompute_all(now=t)
+    # Both LATE, and NOT ONE PUSH: the sibling is muted behind the probe, and the
+    # probe's own 72 h threshold is nowhere near. ~25 h of LATE, unreported.
+    assert row(core, "drive-mirror")["state"] == "LATE"
+    assert row(core, "mac-probe")["state"] == "LATE"
+    assert notifier.sent == []
+    assert row(core, "drive-mirror")["alerted_at"] is None
+    assert row(core, "drive-mirror")["last_paged_at"] is None   # a mute stamps nothing
+    # It wakes. The episode closes silently once the dwell is served out.
+    wake = t
+    while t < wake + dwell(core, "drive-mirror") + 900:
+        core.record_ping(mirror, ok, now=t)
+        core.record_ping(probe, {"status": "ok"}, now=t)
+        core.recompute_all(now=t)
+        t += 300
+    assert row(core, "drive-mirror")["bad_since"] is None and notifier.sent == []
+    # Now the Mac is up and reporting, but this one sub-probe stops posting: a
+    # genuinely NEW episode, with no mute available to it.
+    late_at = None
+    stop = t + late_onset_s(mirror) + 2 * 3600
+    while t < stop and not notifier.sent:
+        t += 300
+        core.record_ping(probe, {"status": "ok"}, now=t)
+        core.recompute_all(now=t)
+        if late_at is None and row(core, "drive-mirror")["state"] == "LATE":
+            late_at = t
+    assert titles(notifier) == ["[dashboard] Google Drive mirror → LATE"]
+    # The page is the ACCUMULATOR's ("in the last 2d"), not the clock's, and it
+    # lands on the first pass of an episode that is one tick old against a
+    # 24 h bar.
+    assert notifier.sent[0][1] == "drive-mirror: LATE for over 1d in the last 2d"
+    assert late_at is not None and t - late_at == 0
+
+
+def test_which_shipped_jobs_can_have_muted_time_brought_forward(settings, notifier):
+    """The guard that makes the residual above a KNOWN one instead of a surprise.
+
+    Laundering muted time into a *later* episode needs the earlier badness to
+    still be inside the window when the new episode opens — and the gap between
+    two episodes is at least the job's own LATE onset, since that is how long the
+    silence must last for the new episode to begin. So the window (`2 ×
+    alert_after_s`) has to hold one whole threshold of old badness PLUS that gap,
+    which is only possible when `alert_after_s > late_onset_s`. Measured at the
+    boundary: at `alert_after_s == late_onset_s` the page still comes from the
+    clock at the full threshold; one tick above it, the accumulator fires at age
+    zero.
+
+    A job also has to be MUTABLE at all, which rules out three groups before the
+    arithmetic: a machine with no non-self probe job has no machine-offline rule
+    (`_machine_probe("box")` is None), a job that never pages cannot page early,
+    and a job that can never read LATE (`late_onset_s` is None — `manual` has no
+    dead-man's switch) has no muted LATE time to launder in the first place.
+
+    Pinned as an exact set so that adding a Mac job with a threshold above its
+    own LATE onset — or shortening `drive-mirror`'s to close this — fails here and
+    is read, rather than silently widening a residual DESIGN.md calls narrow."""
+    from dashboard.services import SELF_JOB_ID
+    core = _shipped_core(settings, notifier)
+    machines = {j.machine for j in core.registry
+                if j.kind == "probe" and j.id != SELF_JOB_ID}
+    assert machines == {"mac"}                    # box jobs cannot be muted
+    mutable = [j for j in core.registry
+               if j.machine in machines and not j.alert_never
+               and j.kind != "probe" and late_onset_s(j) is not None]
+    assert {j.id for j in mutable} == {"pa-backup", "drive-mirror", "mac-disk"}
+    exposed = {j.id for j in mutable if j.alert_after_s > late_onset_s(j)}
+    assert exposed == {"drive-mirror"}
+    # Not vacuous: the other two mutable Mac jobs are inside the bound, with the
+    # margins that keep them there.
+    assert late_onset_s(core.registry.get("pa-backup")) == 86400 + 50520
+    assert late_onset_s(core.registry.get("mac-disk")) == 48 * 3600
+    for job_id in ("pa-backup", "mac-disk"):
+        job = core.registry.get(job_id)
+        assert job.alert_after_s < late_onset_s(job), job_id
 
 
 def test_badness_older_than_the_window_does_not_count(settings, notifier):
@@ -2077,7 +2216,17 @@ def test_not_ok_seconds_cannot_be_inflated_by_a_clock_that_stepped_back(settings
     `bad_since`) leaves rows out of order and one dated in the FUTURE. The walk
     is by rowid, and a row whose stamp is not strictly older than the span being
     closed is skipped: one poisoned row must not be able to invent hours of
-    badness and page for an outage that never happened."""
+    badness and page for an outage that never happened.
+
+    **True of ONE step — and the second half of this test is why the docstring in
+    `db.not_ok_seconds` no longer claims more than that.** A clock that keeps
+    stepping (a sawtooth) has every backwards row dropped, so the surviving older
+    row's state claims the whole gap; when the dropped rows are the RECOVERIES,
+    nearly the entire window reads as bad. Deliberately not defended against: the
+    hard ceiling is `end - start`, which is exactly twice the bar, so the worst it
+    buys is a page one window early for a job that IS in that state right now —
+    the direction the governing rule asks for. Pinned so the SIZE of it is on
+    record rather than discovered."""
     core = core_with(settings, notifier, {})
     _change(core, "tree", NOW, "FAIL")
     _change(core, "tree", NOW + 300, "OK", "FAIL")
@@ -2092,6 +2241,27 @@ def test_not_ok_seconds_cannot_be_inflated_by_a_clock_that_stepped_back(settings
                      "to_state) VALUES ('tree','not-a-timestamp','OK','FAIL')")
     conn.close()
     assert _bad_s(core, "tree", NOW, NOW + 1200) == 300
+    # The sawtooth. 12 h of a job alternating FAIL/OK every 5 min, so 6 h of it
+    # is really bad — written by a clock that is 5 min behind on every other row.
+    # WHICH rows are the late ones decides the direction, and both are here: the
+    # skewed row is the one that gets dropped as unusable, so skewing the FAILs
+    # drops the OK boundaries and the surviving FAIL spans swallow the gaps.
+    window = 12 * 3600
+    for job_id, skewed in (("snap", "FAIL"), ("containers", "OK")):
+        state, k = "OK", 0
+        while k * 300 < window:
+            state = "FAIL" if state == "OK" else "OK"
+            at = NOW + k * 300 - (300 if state == skewed else 0)
+            _change(core, job_id, at, state, "OK" if state == "FAIL" else "FAIL")
+            k += 1
+        got = _bad_s(core, job_id, NOW, NOW + window)
+        assert got <= window                   # the only hard bound there is
+        if skewed == "FAIL":
+            # The recoveries are dropped: 6 h of real badness reads as 11 h 55 m,
+            # i.e. the window itself is the only thing holding it down.
+            assert got == 42900.0
+        else:
+            assert got == 0.0                  # the other phase under-counts
 
 
 # --------------------------------------------------------------------------- #
@@ -2266,6 +2436,48 @@ def test_the_escalation_backoff_does_not_delay_it_behind_the_first_page(settings
                                  "disk: BEHIND → FAIL", "high")
 
 
+def test_an_oscillating_episode_cannot_defeat_the_retry_backoff(settings, notifier):
+    """The other half of the rank-keyed backoff — and the only test in this file
+    whose failure mode is the MACHINE rather than the phone.
+
+    The two ranks have to be held side by side (one entry per job, a timestamp
+    per rank). Folded into a single flat `dict[job_id, (key, when)]` they evict
+    each other, so a state that oscillates across the rank boundary makes every
+    pass read as a page that has never been tried, and the backoff stops
+    applying at all. Measured on exactly the input below — a gauge flipping
+    BEHIND ↔ FAIL every 60 s with ntfy 503-ing for an hour: **60** attempts with
+    one slot per job, against **12** for the same hour with a non-oscillating
+    episode. At 5 s per blocking `urllib` call that is five minutes an hour spent
+    inside the scheduler thread and the ingest request, 83% of the way back to
+    the ~72/hour `ALERT_RETRY_MIN_S` exists to prevent.
+
+    Not reachable at the shipped cadences — every feeder is ≥ 300 s, so nothing
+    flips this fast — which is why this guards the mechanism rather than
+    reproducing an incident. A looping `probes/ping.sh` or one faster
+    `probe.interval_s` is the whole distance to it."""
+    notifier.fail = True                                 # ntfy 503, every time
+    core = core_with(settings, notifier, {"disk": {"alert_after_s": DISK_A}})
+    job = core.registry.get("disk")
+    core.record_ping(job, _capacity(10), now=NOW)
+    core.recompute_all(now=NOW + DISK_A)                 # threshold crossed
+    assert len(notifier.attempts) == 1 and notifier.sent == []
+    t, low = NOW + DISK_A, False
+    while t < NOW + DISK_A + 3600:
+        t += 60
+        core.record_ping(job, _capacity(10) if low else UNREADABLE, now=t)
+        low = not low
+    # Two ranks, each allowed one attempt per RETRY_MIN. Derived, not a literal:
+    # the number that matters is that it is nowhere near 60. (Measured: 20 — the
+    # two ranks' 300 s cycles interleave rather than lining up.)
+    assert len(notifier.attempts) - 1 <= 2 * (3600 // RETRY_MIN)
+    # ...and the page is only DELAYED. It is still unspent, and it goes out as
+    # soon as ntfy answers — a backoff that dropped it would be a silence.
+    assert row(core, "disk")["alerted_at"] is None
+    notifier.fail = False
+    core.recompute_all(now=t + RETRY_MIN)
+    assert len(notifier.sent) == 1
+
+
 def test_the_worst_case_push_rate_per_cooldown_window(settings, notifier):
     """The arithmetic `cooldown_s`'s docstring quotes, asserted instead of
     argued. The pathological job for the escalation is one that crosses its
@@ -2299,6 +2511,32 @@ def test_the_worst_case_push_rate_per_cooldown_window(settings, notifier):
     # priority that was missing entirely before this change.
     assert any(s[1] == "disk: BEHIND → FAIL" and s[2] == "high"
                for s in notifier.sent)
+
+
+def test_the_fleet_wide_push_ceiling_is_the_sum_over_the_alerting_jobs():
+    """The number above is PER JOB, and the incident this feature removed was
+    ~11 pushes/day from a single job — so the figure that matters on the phone
+    is the fleet's, not one job's. It is not a simulation: the per-job ceiling is
+    3 pushes per cooldown window (page + escalation + recovery), so the fleet's
+    is that summed over every job that can page.
+
+    Asserted over the shipped file, with the shape of the sum pinned too, so that
+    adding a job with a fast threshold changes this number here rather than only
+    in production."""
+    from dashboard.registry import load_registry
+    from tests.conftest import EXAMPLE_JOBS
+    reg = load_registry(EXAMPLE_JOBS)
+    alerting = [j for j in reg if not j.alert_never]
+    per_job = {j.id: 3 * DAY / cooldown_s(j) for j in alerting}
+    assert len(alerting) == 9
+    assert sum(per_job.values()) == 70.0
+    # The floor is what dominates it: the five jobs whose threshold is under 6 h
+    # each contribute the full 12/day (60), and the four day-or-longer ones
+    # contribute 10 between them (3 + 3 + 3 + 1).
+    at_floor = {i for i, n in per_job.items() if n == 12}
+    assert at_floor == {"box-containers", "box-disk", "dashboard-probes",
+                        "mac-disk", "pa-backup"}
+    assert sum(n for i, n in per_job.items() if i not in at_floor) == 10.0
 
 
 def test_the_recovery_names_the_state_that_was_paged_not_the_latest_one(settings, notifier):

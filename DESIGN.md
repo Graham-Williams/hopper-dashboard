@@ -468,11 +468,11 @@ cannot write either.
 | `alerted_at` caps the episode at ONE page | the noise this feature exists to remove |
 | `UNKNOWN` is not alertable and starts no episode; entering it **clears** the bookkeeping with no recovery | "no data yet" ≠ "broken" (real silence is already the never-pinged → LATE rule). Clearing matters: a paged job that passed through UNKNOWN used to keep `alerted_at` for ever and be un-pageable |
 | a failed ntfy POST rolls `alerted_at` back to NULL so a later tick retries, keyed on **episode identity** (`bad_since`+`alerted_at`), never on "is the job not-OK now" | one unlucky POST otherwise bought permanent silence. The identity test is load-bearing: the dwell and the hold both keep an episode open while the job reads OK, so a state-based guard skips exactly the case it was written for |
-| retries are spaced `ALERT_RETRY_MIN_S` (5 min) per episode; a **first** page is never delayed | "the next tick" is the ticker *plus* every ping — 72 blocking 5 s POSTs an hour into a dead ntfy, inside the scheduler thread and the ingest request |
+| retries are spaced `ALERT_RETRY_MIN_S` (5 min) per **page** — the episode *and* the severity rank, held side by side in one entry per job; a **first** page (or first escalation) is never delayed | "the next tick" is the ticker *plus* every ping — 72 blocking 5 s POSTs an hour into a dead ntfy, inside the scheduler thread and the ingest request. The two ranks must be separate slots, not one slot per job with the rank folded into a key: folded, they evict each other, and a state oscillating across the rank boundary (a disk gauge flipping BEHIND ↔ FAIL) reads every pass as a page it has never tried — **measured at 60 attempts/hour against 12 for a non-oscillating episode**, i.e. the backoff not applying at all. Per rank the worst case is 2 attempts per window, ≤ 24/hour |
 | a failed **recovery** is logged (`recovery push for …`) and dropped | its episode is already closed, so there is nothing to hand it back to; re-sending later could announce "→ OK" for a job that has broken again. Losing it costs good news, never a page |
 | an episode ends only after the job holds a **verified** OK for the *dwell*: `max(min(5 min, alert_after_s/10), min(2 × cadence_s, 15 min))` | one OK tick used to end it, so a container on `restart: unless-stopped` backoff (19 min down, 1 min up — broken 95% of the day) reset its clock 72×/day and never paged. The **cadence term** is the second half of that fix: a dwell shorter than the job's own sampling interval is decided by ONE observation, and `box-containers` is sampled every 300 s while its threshold-derived dwell was 120 s — so a container crash-looping at 50/67/75 % down for six hours closed its episode over and over and paged NOTHING. Cost: a recovery arrives up to one dwell late (600 s for the box jobs, 900 s for the Mac's), which beats announcing a recovery that is about to be taken back. Cadence-less jobs (`manual`, `disk`) keep the threshold-derived value — there is nothing to sample. The 15 min cap is not cosmetic: `pa-backup`'s 24 h cadence would otherwise give it a two-DAY dwell, i.e. a page held hostage for two days |
 | **the per-job cooldown**: after a page for a job, the next PAGE for that job waits `max(alert_after_s, 6 h)`, persisted in `jobs.last_paged_at` | one page per EPISODE says nothing about how often an episode may RESTART. Measured over a simulated day at `box-containers`' real threshold: **132 pushes** at 19-min-down / 20-min-up, and an independently measured 30-min crash-loop cycle at 48/day. It **delays** a page and can never **cancel** one: a held page stamps nothing, so the episode keeps it and the ceiling re-offers it every pass. It binds on exactly three shipped jobs (threshold under 6 h); above the floor a new episode already takes longer than the cooldown to reach its own threshold. Persisted, not in memory, because an in-memory cooldown resets on every deploy and a deploy is what makes containers flap |
-| **the accumulator**: an episode is ALSO past its bar when the job has spent `alert_after_s` in *the state being paged about* within the last `BAD_WINDOW_MULTIPLE × alert_after_s` (= 2×, i.e. "bad more than half the time, over two thresholds") | one verified OK longer than the dwell destroyed an episode outright, so an intermittent destination reset its clock for ever: 60 min down / 15 min up FAILED 73% of its probes and paged **zero times a day**; 300/30 failed 90% and paged **zero**. The damping has exactly this backstop one layer down (`PROBE_NO_SUCCESS_S`, from the last *successful* probe) and the episode had none. It is an **OR** beside the clock, never a replacement — a rule that counts only not-OK seconds can only page LATER, which is how the two attempts in #13 item 4 each produced a silence bug. Per-STATE, not "any badness": counting everything laundered deliberately muted time (a sleeping Mac's sibling LATE) into an instant page for an unrelated BEHIND. Derived from `state_changes` (`db.not_ok_seconds`), which ingest cannot write, walked by rowid so a clock step cannot inflate it, and under-estimating by construction — unaccounted time reads as OK |
+| **the accumulator**: an episode is ALSO past its bar when the job has spent `alert_after_s` in *the state being paged about* within the last `BAD_WINDOW_MULTIPLE × alert_after_s` (= 2×, i.e. "bad more than half the time, over two thresholds") | one verified OK longer than the dwell destroyed an episode outright, so an intermittent destination reset its clock for ever: 60 min down / 15 min up FAILED 73% of its probes and paged **zero times a day**; 300/30 failed 90% and paged **zero**. The damping has exactly this backstop one layer down (`PROBE_NO_SUCCESS_S`, from the last *successful* probe) and the episode had none. It is an **OR** beside the clock, never a replacement — a rule that counts only not-OK seconds can only page LATER, which is how the two attempts in #13 item 4 each produced a silence bug. Per-STATE, not "any badness": counting everything laundered deliberately muted time (a sleeping Mac's sibling LATE) into an instant page for an unrelated BEHIND. **What per-state does NOT close** (measured, and previously mis-stated here as impossible): muted LATE time still counts toward a later *LATE* page, because the mute reads the probe's state now and the sum reads across episodes — on the shipped file that is reachable on `drive-mirror` and nothing else (see "Muted time is not a cooldown" below). Derived from `state_changes` (`db.not_ok_seconds`), which ingest cannot write, and walked by rowid so **a** single clock step cannot inflate it. Accuracy, measured rather than asserted: exact for a monotone timeline, under-counting only when history is missing, over-counting by <1 s/span from whole-second stamps, and inflatable by a *sawtooth* clock up to the window itself (42 900 s of a 43 200 s window). The hard ceiling is always `end - start` = twice the bar, so the worst case is a page one window early |
 | **escalation**: an episode that has already paged pages ONCE more if its state gets strictly worse, carrying that state's own priority. `jobs.alerted_state` records what was sent; severity is read off `HIGH_PRIORITY_STATES`, so there are two ranks and no third | one page per episode is inverted for a *gauge*: `box-disk` paged "BEHIND for over 1h" at priority `default`, then free space fell to 1 GiB, then `statvfs` failed (FAIL) — **no further push, and no high-priority push ever**. BEHIND is the early warning; FAIL is the event. Reading the rank off the same table as the `Priority` header is what stops the two disagreeing, which was the defect. Two ranks IS the bound: nowhere above rank 2 to go, so worsening cannot storm. Deliberately **not** held by the cooldown (a strictly worse state is a different fact, and it is already bounded at one per paged episode) but it **stamps** `last_paged_at`, so the next episode's first page moves out a full cooldown |
 | a **recovery** names `alerted_state`, not the latest non-OK state | `about` reads the newest non-OK transition, so an episode paged as "BEHIND for over 1h" that later touched FAIL recovered as "FAIL → OK" — a resolution for an alert that was never sent, which on a phone reads as a page you missed |
 | **the hard ceiling**: an open episode past its threshold and unpaged pages on **every** pass, whatever the job currently reads — the not-OK branch, the unverifiable-OK hold, the pass that gives that hold up, and the dwell | every branch that can end an episode is a way to lose its page. See "Both holds are bounded" below for the two reproductions that came from scoping it to one branch |
@@ -557,6 +557,15 @@ follows a page that was sent, so their rate is already the cooldown's, and dropp
 on the phone with no resolution — which reads as "still broken" and is a silence of its own.
 `test_the_worst_case_push_rate_per_cooldown_window` asserts the bound.
 
+**That 12/day is PER JOB**, which is worth spelling out because the incident being fixed was ~11 pushes/day
+from *one* job. Fleet-wide the ceiling is `3 × 86400 / cooldown_s` summed over the jobs that alert: on the
+shipped file, **70 pushes/day** across 9 alerting jobs — five sit at the 6 h floor and contribute 12 each, and
+the four with day-or-longer thresholds contribute 3 + 3 + 3 + 1. That is the arithmetic worst case, with every
+job simultaneously past its bar, worsening and recovering round the clock for a whole day; it is a bound, not a
+forecast (the measured single-job figure above is 8/day). Asserted over the shipped file by
+`test_the_fleet_wide_push_ceiling_is_the_sum_over_the_alerting_jobs`, so adding a fast-threshold job moves the
+number in the doc rather than surprising anyone.
+
 **Residuals, stated rather than hidden:**
 
 - **The ceiling bounds the *window*, not the silence.** A new failure that lands while a hold is still
@@ -582,6 +591,15 @@ on the phone with no resolution — which reads as "still broken" and is a silen
   rate-limited by the cooldown, and the second is bounded by *unpaged* badness specifically — anything that
   already paged runs into the cooldown instead of bringing the next page forward. The alternative, narrowing
   the ceiling to count only not-OK time, is what #13 item 4 rejected: it can only ever page later.
+- **"Bad more than half the time" is the shorthand, not the arithmetic** — the window is exactly `2 ×
+  alert_after_s`, so the bar is *half* the window and the comparison is `>=`. A job whose failures register on
+  the spot and which is bad exactly half the time therefore sits ON the bar and pages: measured at a 6 h
+  threshold, a 50% duty cycle pages **7.5 pushes/day** at a 1 h flap period. The same duty cycle on the DAMPED
+  self-job pages **nothing** at short periods — the damping eats the first cycles of every down-span, putting it
+  just under — until the period approaches the window, where two partial down-spans fit inside one window and it
+  pages again (**3.75 pushes/day** at a 42 000 s period against the 43 200 s window). That period sensitivity is
+  inherent to any fixed-window accumulator, it is bounded by the per-job cooldown either way, and it is the
+  reason the shorthand should not be read as an exact duty-cycle threshold.
 
 **The ceiling vs. the machine-offline rule.** The ceiling asks `_suppressed_offline` like every other page, so
 a sibling's LATE episode that is muted behind a sleeping Mac stays muted — including for the minutes its
@@ -602,6 +620,31 @@ moment anyone shortens that threshold, which is not an edit anybody would expect
 Without it, every weekend with the lid shut would end in a `drive-mirror: LATE for over 1d` push the moment
 the Mac woke — the exact noise the machine-offline rule exists to prevent. A sibling that comes back and is
 *still* broken (or breaks again) is not a plain `LATE → OK` and pages normally.
+
+**Muted time is not a cooldown — the accumulator's one real residual, corrected here after a review found the
+previous claim false.** The accumulator's early fire is bounded by *unpaged* badness, because anything that
+paged runs into the cooldown instead. A **suppressed** page deliberately stamps nothing (not `alerted_at`, so
+the episode keeps its page; not `last_paged_at`, so no cooldown starts), which is exactly right for the mute
+and makes muted time the one kind of unpaged badness with nothing behind it. The per-STATE rule above stops
+muted LATE counting toward a page about a *different* state; it does **not** stop it counting toward a later
+**LATE** page, because the mute is a function of the probe's state *now* while `not_ok_seconds` reads across
+episode boundaries. "The same mute still gags it" was the claim, and it is false as soon as the machine is
+back.
+
+Reachable on the shipped file, and measured on `drive-mirror`'s real numbers: a 40 h Mac sleep accrues ~25 h of
+muted LATE, the episode closes silently, and a fresh LATE 15 h later pages **the instant it opens** with
+`LATE for over 1d in the last 2d` instead of a day in
+(`test_muted_late_time_can_still_bring_a_later_late_page_forward`). The condition is
+`alert_after_s > the job's own LATE onset` — `cadence_s + grace_s`, or `DISK_METRIC_MAX_AGE_S` for a gauge —
+because otherwise the earlier badness has aged out of the 2× window before a new episode can even begin. On
+the shipped file exactly one job is over that line (`drive-mirror`: 24 h against a 15 h onset); `pa-backup`
+(6 h against 38 h) and `mac-disk` (1 h against 48 h) are not, box jobs cannot be muted at all because
+`_machine_probe("box")` is `None`, and the four `manual` Mac jobs never page.
+`test_which_shipped_jobs_can_have_muted_time_brought_forward` pins that set, so a `jobs.yml` edit that adds
+another one fails loudly instead of quietly widening this. **It is not silence** — the job really is in that
+state, the seconds counted really were never reported, and it is still one page per episode — so it is left as
+a documented residual rather than "fixed" by discarding accrued badness, which would push in the one direction
+this feature may not go.
 
 **Resolving a job's policy** (`registry.parse_job`, surfaced at `/api/v1/status` → `jobs[].alert` with a
 `source` field so it never has to be inferred from `jobs.yml`):
