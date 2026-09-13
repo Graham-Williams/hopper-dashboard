@@ -20,10 +20,24 @@ from dashboard.state import Facts, compute_state, dest_info, lag_info
 from tests.conftest import (INGEST_TOKEN, JOBS_DOC, PASSWORD, READ_TOKEN, auth,
                             pin_created_at)
 from dashboard.registry import parse_registry
-from dashboard.services import Core
+from dashboard.services import Core, ok_dwell_s
 
 NOW = 1_800_000_000.0
 REG = parse_registry(JOBS_DOC)
+
+
+def _example_dwell(reg, job_id) -> float:
+    """Same idea for a core built over the shipped jobs.example.yml."""
+    return ok_dwell_s(reg.get(job_id))
+
+
+def _dwell(job_id) -> float:
+    """The job's own OK dwell — derived, never a flat constant, because it is
+    cadence-aware (services.ok_dwell_s) and a wait that is too short fails as
+    SILENCE, which is what these tests are here to tell apart."""
+    return ok_dwell_s(REG.get(job_id))
+
+
 POISON_ISO = "0001-01-01T00:00:00+14:00"   # datetime.timestamp() raises OverflowError on this
 
 
@@ -338,6 +352,12 @@ def test_mac_comes_back_one_recovery_alert(core, notifier):
     core.record_ping(mirror, {"status": "ok"}, now=NOW + 100_101)   # recovers while probe still LATE
     assert notifier.sent == []
     core.record_ping(mac, {"status": "ok"}, now=NOW + 100_102)
+    assert notifier.sent == []                     # OK, but not yet HELD: no episode has closed
+    # One pass past the probe's own dwell closes all three episodes at once. The
+    # siblings recovered a couple of seconds EARLIER, so their episodes close in
+    # this same pass — still muted, because the probe's episode is only now
+    # ending and `_returning_probes` reads the pre-recompute rows.
+    core.recompute_all(now=NOW + 100_102 + _dwell("macprobe"))
     assert [t for t, _, _ in notifier.sent] == ["[dashboard] Mac probe → OK"]
     conn = core.connect()   # the muted recoveries are still persisted and visible
     assert db.job_row(conn, "tree")["state"] == "OK" and db.job_row(conn, "mirror")["state"] == "OK"
@@ -354,6 +374,7 @@ def test_mac_sibling_waking_into_fail_still_alerts(core, notifier):
     core.record_ping(tree, {"status": "fail", "reason": "rclone exit 1"}, now=NOW + 100_100)
     assert [t for t, _, _ in notifier.sent] == ["[dashboard] Tree copy → FAIL"]
     core.record_ping(mac, {"status": "ok"}, now=NOW + 100_101)
+    core.recompute_all(now=NOW + 100_101 + _dwell("macprobe"))
     assert [t for t, _, _ in notifier.sent][-1] == "[dashboard] Mac probe → OK"
 
 
@@ -366,6 +387,7 @@ def test_mac_offline_rule_is_a_pure_function_of_probe_state(core, notifier):
     core.recompute_all(now=NOW + 5000)             # mirror LATE (4200), probe still OK (10800)
     assert [t for t, _, _ in notifier.sent] == ["[dashboard] Drive mirror → LATE"]
     core.record_ping(mirror, {"status": "ok"}, now=NOW + 5001)
+    core.recompute_all(now=NOW + 5001 + _dwell("mirror"))
     assert [t for t, _, _ in notifier.sent][-1] == "[dashboard] Drive mirror → OK"
 
 
@@ -426,7 +448,10 @@ def test_example_jobs_a_night_or_a_weekend_asleep_pages_nobody(settings, notifie
     assert notifier.sent == []                     # nothing was paged, so nothing "recovers"
     assert {jid: db.job_row(conn, jid)["state"] for jid in ("mac-probe", "pa-backup", "drive-mirror")} \
         == {"mac-probe": "OK", "pa-backup": "OK", "drive-mirror": "OK"}
-    core.recompute_all(now=wake + 600)             # OK held past the dwell → the episodes end
+    # Each job turned OK when ITS ping landed (wake, wake+3, wake+5), so the
+    # last of them closes one dwell after that — 900 s here, two of mac-probe's
+    # hourly cadences, not the old flat 300.
+    core.recompute_all(now=wake + 5 + _example_dwell(_reg, "drive-mirror"))
     assert db.job_row(conn, "drive-mirror")["bad_since"] is None
 
 
@@ -463,6 +488,8 @@ def test_mac_sibling_recovery_in_same_batch_as_probe_is_muted(core, notifier, mo
         db.insert_run(conn, "macprobe", received_at=to_iso(NOW + 20_100), status="ok")
         db.insert_run(conn, "mirror", received_at=to_iso(NOW + 20_100), status="ok")
     core.recompute_all(now=NOW + 20_101)
+    assert notifier.sent == []                     # both OK; neither episode has closed yet
+    core.recompute_all(now=NOW + 20_101 + _dwell("macprobe"))
     assert [t for t, _, _ in notifier.sent] == ["[dashboard] Mac probe → OK"]
 
 
@@ -549,7 +576,7 @@ def test_no_free_text_from_a_ping_or_the_registry_can_reach_ntfy(settings, notif
                             "exit_code": 1, "metrics": hostile_metrics},
                      now=NOW + 1)                        # LATE → FAIL
     core.record_ping(tree, {"status": "ok", "reason": reason, "note": note},
-                     now=NOW + 2)                        # → OK, dwell is 0 → recovery
+                     now=NOW + 2)                        # → OK; the recovery waits out the dwell
     core.record_ping(core.registry.get("containers"),
                      {"status": "ok", "reason": reason, "note": note,
                       "metrics": {"running": f"{LEAK}-container-1"}}, now=NOW + 3)
@@ -559,6 +586,9 @@ def test_no_free_text_from_a_ping_or_the_registry_can_reach_ntfy(settings, notif
                                   "path": f"/Users/someone/{LEAK}-PATH"}},
                      now=NOW + 4)
     core.recompute_all(now=NOW + 5)
+    # Past `tree`'s dwell, so the recovery push is in the sample too — it is its
+    # own free-text opportunity (it names the state the episode was about).
+    core.recompute_all(now=NOW + 2 + _dwell("tree"))
 
     assert len(notifier.attempts) >= 6                   # not vacuous: it really paged
     assert notifier.attempts == notifier.sent            # nothing swallowed en route

@@ -15,19 +15,30 @@ these fails, the failure is "Graham's phone stayed quiet", not "an extra push".
 
 import copy
 
+import pytest
+
 from dashboard import db, probes
 from dashboard.probes import ProbeResult
 from dashboard.registry import parse_registry
-from dashboard.services import Core
+from dashboard.services import COOLDOWN_FLOOR_S, Core, cooldown_s, ok_dwell_s
 from tests.conftest import JOBS_DOC, pin_created_at
 
 NOW = 1_800_000_000.0
 DAY = 86400
-# Seconds of unbroken OK an episode needs before it counts as over, for every
-# threshold long enough to hit the cap (see services.ok_dwell_s).
-MIN_DWELL = 300
 # Shortest gap between two ntfy attempts for the same episode (services).
 RETRY_MIN = 300
+
+
+def dwell(core, job_id) -> float:
+    """The seconds of unbroken OK THIS job needs before its episode is over.
+
+    Derived from the job, never hard-coded. The dwell is cadence-aware
+    (``services.ok_dwell_s``), so a flat constant here would quietly stop being
+    long enough the moment a job's cadence or threshold moved — and "the test
+    advanced the clock, but not past the dwell" fails as *silence*, which is
+    indistinguishable from the bug these tests exist to catch.
+    """
+    return ok_dwell_s(core.registry.get(job_id))
 
 
 def core_with(settings, notifier, policy, mutate=None):
@@ -202,7 +213,7 @@ def test_recovery_only_for_an_episode_that_was_paged(settings, notifier):
     core.record_ping(job, {"status": "fail"}, now=NOW)
     core.record_ping(job, {"status": "ok"}, now=NOW + 300)
     assert notifier.sent == []
-    core.recompute_all(now=NOW + 300 + MIN_DWELL)        # OK held → episode over
+    core.recompute_all(now=NOW + 300 + dwell(core, "tree"))        # OK held → episode over
     assert row(core, "tree")["bad_since"] is None and row(core, "tree")["alerted_at"] is None
     # Episode 2: past the threshold → one page, then one recovery.
     core.record_ping(job, {"status": "fail"}, now=NOW + 900)
@@ -210,12 +221,12 @@ def test_recovery_only_for_an_episode_that_was_paged(settings, notifier):
     assert titles(notifier) == ["[dashboard] Tree copy → FAIL"]
     core.record_ping(job, {"status": "ok"}, now=NOW + 1000 + DAY)
     assert len(notifier.sent) == 1                       # the OK has to be held first
-    core.recompute_all(now=NOW + 1000 + DAY + MIN_DWELL)  # episode closes → one recovery
+    core.recompute_all(now=NOW + 1000 + DAY + dwell(core, "tree"))  # episode closes → one recovery
     assert titles(notifier)[-1] == "[dashboard] Tree copy → OK"
     assert notifier.sent[-1][1] == "tree: FAIL → OK" and notifier.sent[-1][2] == "default"
     assert row(core, "tree")["bad_since"] is None and row(core, "tree")["alerted_at"] is None
     for i in range(1, 10):                               # ...and only one
-        core.recompute_all(now=NOW + 1000 + DAY + MIN_DWELL + 60 * i)
+        core.recompute_all(now=NOW + 1000 + DAY + dwell(core, "tree") + 60 * i)
     assert len(notifier.sent) == 2
 
 
@@ -364,7 +375,7 @@ def test_offline_suppression_does_not_consume_the_episodes_one_alert(settings, n
                      now=NOW + 30_000)
     core.record_ping(mac, {"status": "ok"}, now=NOW + 30_002)
     assert notifier.sent == []                           # nothing was paged, so nothing "recovers"
-    core.recompute_all(now=NOW + 30_000 + MIN_DWELL)     # OK held: the episode ends
+    core.recompute_all(now=NOW + 30_000 + dwell(core, "mirror"))     # OK held: the episode ends
     assert row(core, "mirror")["bad_since"] is None
     # A real problem now opens a clean episode — and the page the outage never
     # spent is still there to be spent.
@@ -434,26 +445,33 @@ def test_a_failed_push_gives_the_page_back_and_is_retried_on_a_backoff(settings,
     assert len(notifier.sent) == 1
     # The recovery is for an alert that really did arrive.
     core.record_ping(job, {"status": "ok"}, now=NOW + DAY + 3600)
-    core.recompute_all(now=NOW + DAY + 3600 + MIN_DWELL)
+    core.recompute_all(now=NOW + DAY + 3600 + dwell(core, "tree"))
     assert titles(notifier)[-1] == "[dashboard] Tree copy → OK"
 
 
 def test_the_retry_backoff_never_delays_a_new_episodes_first_page(settings, notifier):
     """The backoff is keyed on the EPISODE, not the job. A failed push must not
     hold up the first page of whatever breaks next — that would be the
-    threshold quietly getting longer after every ntfy hiccup."""
-    core = core_with(settings, notifier, {"tree": {"alert_after_s": 0}})
-    job = core.registry.get("tree")
+    threshold quietly getting longer after every ntfy hiccup.
+
+    `offload` on purpose: a cadence-less job, so its dwell is 0 and the second
+    episode can open INSIDE the 5-minute retry window, which is the only place
+    this property is observable. The per-job cooldown is not in the way either,
+    because a POST that never landed leaves no cooldown behind — asserted below,
+    because that is the half of the rollback that is easiest to forget."""
+    core = core_with(settings, notifier, {"offload": {"alert_after_s": 0}})
+    job = core.registry.get("offload")
     notifier.fail = True
     core.record_ping(job, {"status": "fail"}, now=NOW)   # episode 1: POST fails
     notifier.fail = False
     assert notifier.attempts and notifier.sent == []
-    assert row(core, "tree")["alerted_at"] is None
+    assert row(core, "offload")["alerted_at"] is None
+    assert row(core, "offload")["last_paged_at"] is None
     core.record_ping(job, {"status": "ok"}, now=NOW + 30)     # ...and it recovers
-    assert row(core, "tree")["bad_since"] is None        # dwell is 0 at a 0 threshold
+    assert row(core, "offload")["bad_since"] is None     # dwell is 0 with no cadence
     # A brand-new failure well inside the 5-minute retry window pages at once.
     core.record_ping(job, {"status": "fail"}, now=NOW + 60)
-    assert titles(notifier) == ["[dashboard] Tree copy → FAIL"]
+    assert titles(notifier) == ["[dashboard] Offload → FAIL"]
 
 
 def test_a_refused_push_is_retried_too(settings, notifier):
@@ -488,7 +506,7 @@ def test_a_recovered_job_does_not_get_its_page_back(settings, notifier):
         # The job comes back between COMMIT and the POST (a heartbeat landing
         # on the ingest worker while the ticker thread is mid-dispatch).
         core.record_ping(job, {"status": "ok"}, now=NOW + DAY + 1)
-        core.recompute_all(now=NOW + DAY + 1 + MIN_DWELL)   # OK held: episode closed
+        core.recompute_all(now=NOW + DAY + 1 + dwell(core, "tree"))   # OK held: episode closed
         notifier.fail = True
         try:
             real_dispatch(intents)
@@ -706,6 +724,11 @@ def test_an_unverifiable_ok_holds_the_recovery_too(settings, notifier):
     _probe(core, "snap", NOW + 600, ok=True, newest_iso=db.to_iso(NOW + 590),
            state_sha="aaa")
     core.record_ping(job, {"status": "ok", "metrics": {"db_sha256": "aaa"}}, now=NOW + 600)
+    # Evidence restored — but the OK still has to be HELD. The job turned OK at
+    # NOW+300, so the episode closes one dwell after that, not on the first
+    # believable probe.
+    assert len(notifier.sent) == 1
+    core.recompute_all(now=NOW + 300 + dwell(core, "snap"))
     assert titles(notifier)[-1] == "[dashboard] Snap DB → OK"
     assert notifier.sent[-1][1] == "snap: STALE_DEST → OK"   # not "OK → OK"
     assert row(core, "snap")["alerted_at"] is None
@@ -769,6 +792,7 @@ def test_a_late_episode_still_recovers_when_the_destination_is_unprobed(settings
     core.recompute_all(now=NOW + 601)
     assert titles(notifier) == ["[dashboard] Snap DB → LATE"]
     core.record_ping(job, {"status": "ok"}, now=NOW + 700)
+    core.recompute_all(now=NOW + 700 + dwell(core, "snap"))   # OK held -> episode over
     assert titles(notifier)[-1] == "[dashboard] Snap DB → OK"
 
 
@@ -826,8 +850,12 @@ def test_a_genuinely_clean_probe_cycle_does_close_the_episode(settings, notifier
     _cycle(core, monkeypatch, NOW, ok=False)
     _cycle(core, monkeypatch, NOW + 300, ok=False)       # streak 2 → FAIL → page
     assert titles(notifier) == ["[dashboard] Probe cycle → FAIL"]
-    _cycle(core, monkeypatch, NOW + 600, ok=True)        # one good listing is enough
+    _cycle(core, monkeypatch, NOW + 600, ok=True)        # one good listing clears the FAIL
     assert row(core, "dashboard-probes")["state"] == "OK"
+    # ...but one is not yet a recovery: the cadence-aware dwell wants two probe
+    # cycles of unbroken OK before it believes the episode is over.
+    assert titles(notifier) == ["[dashboard] Probe cycle → FAIL"]
+    _cycle(core, monkeypatch, NOW + 600 + dwell(core, "dashboard-probes"), ok=True)
     assert titles(notifier)[-1] == "[dashboard] Probe cycle → OK"
     assert row(core, "dashboard-probes")["bad_since"] is None
 
@@ -941,12 +969,24 @@ def test_an_outage_past_the_threshold_pages_even_though_it_then_recovers(setting
         core.record_ping(job, down, now=t)
         t += 60
     assert notifier.sent == []                           # under the threshold, still quiet
-    while t < NOW + 1140 + 180:                          # 3 min up: longer than the dwell
+    while t < NOW + 1140 + 180:                          # 3 min up
+        core.record_ping(job, up, now=t)
+        t += 60
+    # The ceiling has spoken: the episode outlived the 20 min bar Graham set, so
+    # it is news whatever the job reads now.
+    assert titles(notifier) == ["[dashboard] Containers → FAIL"]
+    assert notifier.sent[0][1] == "containers: FAIL for over 20m"
+    # But 3 minutes is no longer a RECOVERY. `box-containers` is sampled every
+    # 300 s by the host cron, so its dwell is two samples (600 s) and 180 s of OK
+    # is ONE sample — indistinguishable from the up-phase of a crash loop. The
+    # episode stays open, which is what stops the next 19 minutes down from
+    # opening a fresh one and paging all over again.
+    assert row(core, "containers")["bad_since"] is not None
+    while t < NOW + 1140 + dwell(core, "containers") + 60:
         core.record_ping(job, up, now=t)
         t += 60
     assert titles(notifier) == ["[dashboard] Containers → FAIL",
                                 "[dashboard] Containers → OK"]
-    assert notifier.sent[0][1] == "containers: FAIL for over 20m"
     assert row(core, "containers")["bad_since"] is None   # and the episode really closed
 
 
@@ -959,7 +999,7 @@ def test_a_short_blip_is_still_muted_and_a_real_recovery_still_ends_the_episode(
     core.record_ping(job, {"status": "fail"}, now=NOW)
     core.record_ping(job, {"status": "ok"}, now=NOW + 300)
     assert row(core, "dashboard-probes")["bad_since"] == db.to_iso(NOW)   # dwell not served
-    core.recompute_all(now=NOW + 300 + MIN_DWELL)
+    core.recompute_all(now=NOW + 300 + dwell(core, "dashboard-probes"))
     assert row(core, "dashboard-probes")["bad_since"] is None
     assert notifier.sent == []
     # Hours later it breaks for good: the clock starts NOW, not back at the blip.
@@ -1124,7 +1164,7 @@ def test_no_recovery_for_a_job_switched_to_never_mid_episode(settings, notifier)
     # Same DB, new registry: `alert: never` (a jobs.yml edit + restart).
     quiet = core_with(settings, notifier, {"tree": {"alert": "never"}})
     quiet.record_ping(quiet.registry.get("tree"), {"status": "ok"}, now=NOW + DAY + 60)
-    quiet.recompute_all(now=NOW + DAY + 60 + MIN_DWELL)
+    quiet.recompute_all(now=NOW + DAY + 60 + dwell(quiet, "tree"))
     assert len(notifier.sent) == 1                       # no recovery
     assert row(quiet, "tree")["alerted_at"] is None      # ...and the episode is closed out
 
@@ -1190,3 +1230,523 @@ def test_a_stale_disk_gauge_is_muted_while_its_machine_is_offline(settings, noti
     assert titles(notifier) == ["[dashboard] Mac probe → LATE"]    # one fact, one page
     assert row(core, "disk")["bad_since"] is not None    # the gauge's episode IS running
     assert row(core, "disk")["alerted_at"] is None       # ...with its page unspent
+
+
+# --------------------------------------------------------------------------- #
+# The per-job page cooldown
+#
+# One page per EPISODE caps an outage at one push. It says nothing about how
+# often an episode may RESTART, and a container on `restart: unless-stopped`
+# backoff restarts one every twenty minutes for ever: measured at 132 pushes a
+# day on 19-min-down / 20-min-up, and an independently measured >=30-min
+# crash-loop cycle at 48/day. That is the alert storm this branch exists to
+# remove, relocated from "every transition" to "every episode".
+#
+# A rate limit on a pager is a silence mechanism, so it is built the only way a
+# silence mechanism may be built here: it can DELAY a page and it can never
+# CANCEL one. Everything below tests that boundary.
+# --------------------------------------------------------------------------- #
+
+DOWN = {"status": "ok", "metrics": {"running": "app-1"}}          # tunnel-1 missing
+UP = {"status": "ok", "metrics": {"running": "app-1,tunnel-1"}}
+BOX_A = 1200          # box-containers' real threshold: 20 minutes
+
+
+def _duty(core, job, down_s, up_s, until, start=NOW, step=60):
+    """Ping DOWN for ``down_s`` then UP for ``up_s``, repeating until ``until``."""
+    t = start
+    while t < until:
+        end = min(t + down_s, until)
+        while t < end:
+            core.record_ping(job, DOWN, now=t)
+            t += step
+        end = min(t + up_s, until)
+        while t < end:
+            core.record_ping(job, UP, now=t)
+            t += step
+    return t
+
+
+def _alerts(notifier):
+    return [t for t in titles(notifier) if not t.endswith("→ OK")]
+
+
+def _recoveries(notifier):
+    return [t for t in titles(notifier) if t.endswith("→ OK")]
+
+
+def test_a_flapping_container_pages_per_cooldown_not_per_episode(settings, notifier):
+    """The storm, at the shipped threshold. 19 min down / 20 min up: the up
+    phase outlasts the 600 s dwell, so every cycle is a genuinely NEW episode
+    with its own unspent page — dozens a day, each of which used to page AND
+    recover.
+
+    Note what is NOT used to achieve the fix: the job's threshold is untouched.
+    Making `box-containers` wait longer before paging would have re-opened the
+    silence window the hard ceiling just closed — a container down for an hour
+    would go quiet again."""
+    core = core_with(settings, notifier, {"containers": {"alert_after_s": BOX_A}})
+    job = core.registry.get("containers")
+    _duty(core, job, 1140, 1200, until=NOW + DAY)
+    # 36 episodes in the day; 4 six-hour cooldown windows.
+    assert len(_alerts(notifier)) == 4
+    # The board still saw every one of them — this filters the phone, not history.
+    assert len(changes(core, "containers")) > 40
+
+
+def test_the_cooldown_expires_into_a_page_and_never_into_silence(settings, notifier):
+    """**THE INVARIANT that makes the cooldown safe**, and the only reason a rate
+    limit is allowed anywhere near this file: a job that is still — or again —
+    not-OK past its threshold when the cooldown expires PAGES.
+
+    The mechanism is that a held-back page does not STAMP anything. `alerted_at`
+    stays NULL, so the episode keeps its unspent page and the hard ceiling
+    re-offers it on every single pass; the moment the cooldown is over, one of
+    those passes goes through. Stamping in the cooldown branch would look
+    identical for six hours and then be permanent silence."""
+    core = core_with(settings, notifier, {"containers": {"alert_after_s": BOX_A}})
+    job = core.registry.get("containers")
+    t = NOW
+    while t < NOW + 1300:                                # episode 1 crosses 20 min
+        core.record_ping(job, DOWN, now=t)
+        t += 60
+    assert _alerts(notifier) == ["[dashboard] Containers → FAIL"]
+    paged = db.from_iso(row(core, "containers")["last_paged_at"])
+    assert paged is not None
+    # It recovers properly — past the dwell, so the episode really closes.
+    while t < NOW + 1300 + dwell(core, "containers") + 120:
+        core.record_ping(job, UP, now=t)
+        t += 60
+    assert row(core, "containers")["bad_since"] is None
+    # ...and then breaks again and STAYS broken, for hours, inside the cooldown.
+    while t < paged + COOLDOWN_FLOOR_S - 120:
+        core.record_ping(job, DOWN, now=t)
+        t += 60
+    assert len(_alerts(notifier)) == 1                   # silent, for hours
+    assert row(core, "containers")["bad_since"] is not None
+    assert row(core, "containers")["alerted_at"] is None  # the page is UNSPENT
+    # The cooldown runs out. The very next pass pages — no new trigger, no new
+    # transition, nothing changed except the clock.
+    core.recompute_all(now=paged + COOLDOWN_FLOOR_S + 1)
+    assert _alerts(notifier) == ["[dashboard] Containers → FAIL"] * 2
+
+
+def test_a_cooldown_held_page_yields_no_recovery_either(settings, notifier):
+    """Recoveries need no rule of their own: "recovery only for an episode that
+    was actually paged" already means a held-back page produces no "-> OK". That
+    is what halves the traffic rather than merely shifting it, and it is the
+    reason the cooldown branch must not stamp `alerted_at` — stamping would make
+    a *silent* episode announce its own recovery."""
+    core = core_with(settings, notifier, {"containers": {"alert_after_s": BOX_A}})
+    job = core.registry.get("containers")
+    t = NOW
+    while t < NOW + 1300:                                # episode 1: pages
+        core.record_ping(job, DOWN, now=t)
+        t += 60
+    while t < NOW + 1300 + dwell(core, "containers") + 120:
+        core.record_ping(job, UP, now=t)                 # ...and recovers
+        t += 60
+    assert _alerts(notifier) == ["[dashboard] Containers → FAIL"]
+    assert _recoveries(notifier) == ["[dashboard] Containers → OK"]
+    # Episode 2, entirely inside the cooldown: crosses its threshold, held back,
+    # then recovers. Neither end of it reaches the phone.
+    while t < NOW + 1300 + dwell(core, "containers") + 120 + 1400:
+        core.record_ping(job, DOWN, now=t)
+        t += 60
+    assert row(core, "containers")["alerted_at"] is None
+    while t < NOW + 1300 + dwell(core, "containers") + 120 + 1400 \
+            + dwell(core, "containers") + 120:
+        core.record_ping(job, UP, now=t)
+        t += 60
+    assert row(core, "containers")["bad_since"] is None   # episode 2 is over
+    assert len(notifier.sent) == 2                        # ...and it said nothing
+
+
+def test_the_cooldown_survives_a_restart(settings, notifier):
+    """In memory this would reset on every deploy — and `docker compose up -d
+    --build` is precisely the event that makes containers flap, so an in-memory
+    cooldown would forget itself exactly when it is needed. Same DB, new `Core`
+    (a container restart): the cooldown is still running."""
+    core = core_with(settings, notifier, {"containers": {"alert_after_s": BOX_A}})
+    job = core.registry.get("containers")
+    t = NOW
+    while t < NOW + 1300:
+        core.record_ping(job, DOWN, now=t)
+        t += 60
+    assert len(notifier.sent) == 1
+    while t < NOW + 1300 + dwell(core, "containers") + 120:
+        core.record_ping(job, UP, now=t)
+        t += 60
+    # The container is redeployed: a brand-new Core over the same SQLite file.
+    fresh = core_with(settings, notifier, {"containers": {"alert_after_s": BOX_A}})
+    job = fresh.registry.get("containers")
+    while t < NOW + 1300 + dwell(fresh, "containers") + 120 + 1400:
+        fresh.record_ping(job, DOWN, now=t)
+        t += 60
+    assert row(fresh, "containers")["bad_since"] is not None   # past its threshold
+    assert _alerts(notifier) == ["[dashboard] Containers → FAIL"]   # still held back
+
+
+def test_a_failed_push_leaves_no_cooldown_behind(settings, notifier):
+    """The rollback has TWO halves. Returning `alerted_at` without returning
+    `last_paged_at` is a half-rollback: the episode gets its page back and then
+    cannot spend it for six hours, because a POST that never reached ntfy still
+    looks like a page to the rate limiter. One unlucky 429 would buy a whole
+    cooldown of silence — the exact failure the rollback exists to prevent,
+    moved one column to the left."""
+    core = core_with(settings, notifier, {"tree": {"alert_after_s": DAY}})
+    job = core.registry.get("tree")
+    core.record_ping(job, {"status": "fail"}, now=NOW)
+    notifier.fail = True
+    core.recompute_all(now=NOW + DAY)
+    assert notifier.attempts and notifier.sent == []
+    assert row(core, "tree")["alerted_at"] is None       # page handed back...
+    assert row(core, "tree")["last_paged_at"] is None    # ...and so is the cooldown
+    notifier.fail = False
+    core.recompute_all(now=NOW + DAY + RETRY_MIN)        # backoff served: retry lands
+    assert titles(notifier) == ["[dashboard] Tree copy → FAIL"]
+    assert row(core, "tree")["last_paged_at"] == db.to_iso(NOW + DAY + RETRY_MIN)
+
+
+def test_a_last_paged_at_in_the_future_cannot_mute_a_job_for_ever(settings, notifier):
+    """The same clock-step trap as `bad_since`, on the column added by this
+    change. A stamp in the future makes `now - last_paged_at` permanently
+    negative, i.e. a cooldown that never expires — a job that can never page
+    again. Refuse to honour it, heal the row, and say so in the log."""
+    core = core_with(settings, notifier, {"containers": {"alert_after_s": BOX_A}})
+    job = core.registry.get("containers")
+    conn = core.connect()
+    with conn:
+        db.set_last_paged_at(conn, "containers", db.to_iso(NOW + 50 * DAY))
+    conn.close()
+    t = NOW
+    while t < NOW + 1300:
+        core.record_ping(job, DOWN, now=t)
+        t += 60
+    assert _alerts(notifier) == ["[dashboard] Containers → FAIL"]
+    # ...and the poisoned value is gone, replaced by this page's own stamp.
+    stamped = db.from_iso(row(core, "containers")["last_paged_at"])
+    assert stamped is not None and stamped < NOW + DAY
+
+
+def test_an_unparseable_last_paged_at_is_healed_rather_than_trusted(settings, notifier):
+    """Same rule for a value that is not a timestamp at all (a hand-edited row,
+    a botched migration). Unusable means NO cooldown, never an eternal one."""
+    core = core_with(settings, notifier, {"containers": {"alert_after_s": BOX_A}})
+    job = core.registry.get("containers")
+    conn = core.connect()
+    with conn:
+        db.set_last_paged_at(conn, "containers", "not-a-timestamp")
+    conn.close()
+    t = NOW
+    while t < NOW + 1300:
+        core.record_ping(job, DOWN, now=t)
+        t += 60
+    assert _alerts(notifier) == ["[dashboard] Containers → FAIL"]
+
+
+def test_a_machine_probe_inside_its_own_cooldown_cannot_mute_its_siblings(settings, notifier):
+    """**Suppression may only borrow an alert that EXISTS.** That was already
+    enforced statically (`alert: never` on the probe voids the rule); the
+    cooldown makes the same thing true temporarily, so it has to be enforced
+    the same way.
+
+    Without this, a Mac that dies a couple of hours after its probe last paged
+    is: the probe's page held by its cooldown, and every sibling's page muted
+    behind a probe that is not speaking. A real multi-day outage, zero pushes,
+    for the length of the cooldown — the precise failure the static guard was
+    written to prevent, reintroduced by a new mechanism.
+
+    (Unreachable on the shipped file, where `mac-probe` is 72 h and a cooldown
+    can never bind above the floor — see the arithmetic test below. It is
+    reachable the moment anyone shortens that threshold, which is exactly the
+    kind of edit nobody would expect to silence a machine.)"""
+    core = core_with(settings, notifier, {"macprobe": {"alert_after_s": 3600},
+                                          "mirror": {"alert_after_s": 3600}})
+    mac, mirror = core.registry.get("macprobe"), core.registry.get("mirror")
+    core.record_ping(mac, {"status": "ok"}, now=NOW)
+    core.record_ping(mirror, {"status": "ok"}, now=NOW)
+    # The probe paged for something of its own a few hours ago, so its cooldown
+    # is still running when the Mac goes away. (Set after the pings: a stamp
+    # ahead of `now` is a poisoned clock and would be healed away, as it should
+    # be.)
+    conn = core.connect()
+    with conn:
+        db.set_last_paged_at(conn, "macprobe", db.to_iso(NOW + 10_000))
+    conn.close()
+    core.recompute_all(now=NOW + 20_000)                 # Mac asleep: both LATE
+    core.recompute_all(now=NOW + 23_700)                 # both past their threshold
+    # Not vacuous: the probe really is gagged — its own page is held back and
+    # its episode still carries an unspent one.
+    assert "[dashboard] Mac probe → LATE" not in titles(notifier)
+    assert row(core, "macprobe")["alerted_at"] is None
+    # ...so the sibling must NOT hide behind it. Several alerts for one fact is
+    # a nuisance; none at all is an outage nobody hears about.
+    assert "[dashboard] Drive mirror → LATE" in titles(notifier)
+    # And when the probe's cooldown finally expires, the machine speaks for
+    # itself — delayed, not cancelled.
+    core.recompute_all(now=NOW + 10_000 + COOLDOWN_FLOOR_S + 60)
+    assert "[dashboard] Mac probe → LATE" in titles(notifier)
+
+
+def test_a_cooldown_can_never_bind_on_a_job_whose_threshold_clears_the_floor():
+    """The arithmetic that decides the blast radius, asserted rather than
+    reasoned about in a comment.
+
+    A new episode cannot page before `bad_since + alert_after_s`; a new episode
+    cannot open before the previous one closed; and the previous one closed at
+    or after the page that belonged to it. So consecutive pages are already at
+    least one threshold apart, and for every job with `alert_after_s >=
+    COOLDOWN_FLOOR_S` the cooldown equals that threshold and changes nothing at
+    all. On the shipped file it binds on exactly three jobs — the three that can
+    flap fast."""
+    from dashboard.registry import load_registry
+    from tests.conftest import EXAMPLE_JOBS
+    reg = load_registry(EXAMPLE_JOBS)
+    binds = {j.id for j in reg
+             if not j.alert_never and cooldown_s(j) > j.alert_after_s}
+    assert binds == {"box-containers", "box-disk", "mac-disk"}
+    for j in reg:
+        if not j.alert_never:
+            assert cooldown_s(j) == max(j.alert_after_s, COOLDOWN_FLOOR_S)
+
+
+# --------------------------------------------------------------------------- #
+# The OK dwell has to span at least two OBSERVATIONS
+#
+# A dwell derived from the threshold alone is blind to how often the job is
+# actually looked at, and a dwell shorter than the sampling interval is not a
+# dwell at all: ONE sample satisfies it and closes the episode.
+# --------------------------------------------------------------------------- #
+
+def _crash_loop(core, job, down_of, period, hours, start=NOW):
+    """Sample the job at its REAL cadence — the host cron posts `docker ps`
+    every 300 s — with `down_of` samples in every `period` failing. That is what
+    a crash-looping container looks like from the box: not a smooth outage, an
+    alternating sequence.
+
+    **The 60 s ticker runs between the samples**, and it is load-bearing. The
+    dwell is measured against `jobs.since`, so it is the TICKS that notice a job
+    has now been OK for 120 s — the pings alone would each land while `held` is
+    still 0 and the bug would not reproduce at all. This is the difference
+    between simulating the deployment and simulating a convenient fiction."""
+    t = start
+    nxt = start
+    i = 0
+    while t < start + hours * 3600:
+        if t >= nxt:
+            core.record_ping(job, DOWN if (i % period) < down_of else UP, now=t)
+            nxt += 300
+            i += 1
+        else:
+            core.recompute_all(now=t)
+        t += 60
+    return t
+
+
+@pytest.mark.parametrize("down_of,period", [(1, 2), (2, 3), (3, 4), (4, 5)])
+def test_a_container_down_most_of_the_time_pages_at_every_duty_cycle(
+        settings, notifier, down_of, period):
+    """`box-containers` is sampled every 300 s by the host cron and its old dwell
+    was `min(300, 1200/10)` = 120 s, so ANY single OK sample satisfied it and
+    closed the episode. Measured over a 6 h crash-loop at 50/67/75/80% down:
+    ZERO pushes. It took four consecutive failing samples to page at all — i.e.
+    the job had to be broken 20 minutes with no blip, which is exactly what a
+    crash loop never is.
+
+    Two samples of dwell is the whole fix: one OK sample can no longer end an
+    episode, so the failing samples accumulate into an episode that crosses the
+    threshold."""
+    core = core_with(settings, notifier, {"containers": {"alert_after_s": BOX_A}})
+    _crash_loop(core, core.registry.get("containers"), down_of, period, hours=6)
+    pct = 100 * down_of // period
+    assert _alerts(notifier), f"{pct}% down for 6 h paged NOTHING"
+
+
+def test_every_scheduled_job_dwells_for_two_of_its_own_samples():
+    """The property, over the shipped file rather than a fixture: a job that
+    reports every `cadence_s` is only OBSERVED that often, so its episode may
+    not be closed by fewer than two observations. Capped, because the other end
+    is just as wrong — `pa-backup` has a 24 h cadence and an uncapped rule would
+    give it a two-DAY dwell, i.e. an episode that cannot close for two days and
+    therefore a page held hostage for two days."""
+    from dashboard.registry import load_registry
+    from dashboard.services import CADENCE_DWELL_SAMPLES, MAX_CADENCE_DWELL_S
+    from tests.conftest import EXAMPLE_JOBS
+    for j in load_registry(EXAMPLE_JOBS):
+        if not j.cadence_s:
+            continue                                     # a gauge has nothing to sample
+        assert ok_dwell_s(j) >= min(CADENCE_DWELL_SAMPLES * j.cadence_s,
+                                    MAX_CADENCE_DWELL_S)
+        assert ok_dwell_s(j) <= MAX_CADENCE_DWELL_S
+        # ...and a dwell must never eat the threshold it is protecting.
+        assert j.alert_never or ok_dwell_s(j) < j.alert_after_s
+
+
+def test_the_machine_probes_dwell_is_never_shorter_than_its_siblings():
+    """`_returning_probes` mutes a sibling's `LATE -> OK` page for as long as the
+    PROBE's episode is open. The siblings recover FIRST (mac_probe.py posts them
+    before its own heartbeat), so their episodes close first — but only while the
+    probe's dwell is at least as long as theirs. The old code could assert this
+    in a comment ("no dwell exceeds MAX_OK_DWELL_S"); with a cadence-aware dwell
+    that sentence is no longer true, so assert the thing itself.
+
+    It holds because the cap makes 900 s the longest dwell there is and
+    `mac-probe`'s 3600 s cadence reaches it. Remove the cap and `pa-backup`'s
+    24 h cadence gives it a dwell 24x the probe's."""
+    from dashboard.registry import load_registry
+    from tests.conftest import EXAMPLE_JOBS
+    reg = load_registry(EXAMPLE_JOBS)
+    probe = reg.get("mac-probe")
+    siblings = [j for j in reg if j.machine == "mac" and j.id != probe.id]
+    assert siblings
+    for j in siblings:
+        assert ok_dwell_s(j) <= ok_dwell_s(probe), j.id
+
+
+def test_an_unverifiable_ok_never_closes_an_episode_sooner_than_a_verified_one():
+    """`ok_hold_s` and `ok_dwell_s` are checked in that order, so a hold SHORTER
+    than the dwell would close an episode sooner for an OK we cannot verify than
+    for one we can — and the hold path closes SILENTLY, with no recovery. The
+    cadence-aware dwell is what made that reachable (it can now exceed the 300 s
+    the hold used to floor at)."""
+    from dashboard.services import ok_hold_s
+    from dashboard.registry import load_registry
+    from tests.conftest import EXAMPLE_JOBS
+    for j in load_registry(EXAMPLE_JOBS):
+        assert ok_hold_s(j) >= ok_dwell_s(j), j.id
+    # And on a shape the shipped file does not have: a fast-paging job with a
+    # cadence, where the threshold-derived hold would be only 300 s.
+    doc = copy.deepcopy(JOBS_DOC)
+    for raw in doc["jobs"]:
+        raw.pop("alert", None)
+        raw["alert_after_s"] = 0
+    snap = parse_registry(doc).get("snap")               # cadence 300 -> dwell 600
+    assert ok_dwell_s(snap) == 600 and ok_hold_s(snap) >= 600
+
+
+# --------------------------------------------------------------------------- #
+# Attacking `_returning_probes` — the mute added by THIS branch
+#
+# It is a brand-new way to be silent, in the area that has already produced two
+# structural silence bugs. Four questions, asked adversarially: can it mute a
+# page that is not the machine's fault? can it outlast its own justification?
+# does it depend on registry order? can it be made permanent?
+# --------------------------------------------------------------------------- #
+
+def test_a_returning_probe_cannot_mute_a_siblings_non_late_page(settings, notifier):
+    """The mute exists for ONE fact — "the Mac was asleep" — so it may only ever
+    swallow a plain `LATE -> OK`. A sibling whose episode is about a FAILED RUN
+    or a STALE DESTINATION is news of its own; the Mac having been asleep says
+    nothing about it, and the wake-up is exactly when such a verdict lands."""
+    core = core_with(settings, notifier, {"macprobe": {"alert_after_s": 3600},
+                                          "tree": {"alert_after_s": 3600}})
+    mac, tree = core.registry.get("macprobe"), core.registry.get("tree")
+    core.record_ping(mac, {"status": "ok"}, now=NOW)
+    core.record_ping(tree, {"status": "ok"}, now=NOW)
+    core.recompute_all(now=NOW + 200_000)                # Mac gone: both LATE
+    notifier.sent.clear()
+    # The Mac wakes and the tree copy reports a REAL failure, then the probe's
+    # own heartbeat lands — the probe is inside the LATE episode it is returning
+    # from, which is precisely when `returning` is populated.
+    core.record_ping(tree, {"status": "fail", "reason": "rclone exit 1"},
+                     now=NOW + 200_100)
+    core.record_ping(mac, {"status": "ok"}, now=NOW + 200_102)
+    core.recompute_all(now=NOW + 200_100 + 3600)         # tree crosses its threshold
+    assert "[dashboard] Tree copy → FAIL" in titles(notifier)
+
+
+def test_a_returning_probes_mute_cannot_outlast_its_own_episode(settings, notifier):
+    """The mute is bounded by the PROBE's OPEN EPISODE, and by nothing longer.
+
+    Keyed on anything that survives the episode — "the last non-OK state this
+    probe was in", say — it would never end: `mac-probe` goes LATE once, in its
+    first week, and from then on EVERY sibling page decided while the sibling
+    reads OK is swallowed, for ever, on the strength of a sleep that finished
+    months ago. A silence with no expiry, set off by an ordinary night.
+
+    So: the Mac sleeps once and everything closes cleanly. Long after, with the
+    probe healthy and pinging throughout, `drive-mirror` alone has an outage
+    that outlives its threshold and then recovers inside its own dwell — which
+    is exactly the ceiling page that runs through the branch `returning` guards.
+    It must go out."""
+    core = core_with(settings, notifier, {"macprobe": {"alert_after_s": 3 * DAY},
+                                          "mirror": {"alert_after_s": 3600}})
+    mac, mirror = core.registry.get("macprobe"), core.registry.get("mirror")
+    core.record_ping(mac, {"status": "ok"}, now=NOW)
+    core.record_ping(mirror, {"status": "ok"}, now=NOW)
+    core.recompute_all(now=NOW + 20_000)                 # one night's sleep: both LATE
+    core.record_ping(mirror, {"status": "ok"}, now=NOW + 30_000)
+    core.record_ping(mac, {"status": "ok"}, now=NOW + 30_002)
+    core.recompute_all(now=NOW + 30_002 + dwell(core, "macprobe") + 60)
+    assert row(core, "macprobe")["bad_since"] is None    # the sleep is fully over
+    assert notifier.sent == []                           # ...and woke nobody
+    # Weeks of normal operation, as far as the probe is concerned: it keeps
+    # reporting hourly and never leaves OK again. Only the mirror goes quiet.
+    t = NOW + 31_000
+    stop = NOW + 34_200 + 3400                           # just under its 1 h threshold
+    while t < stop:
+        if (t - NOW) % 3600 < 60:
+            core.record_ping(mac, {"status": "ok"}, now=t)
+        core.recompute_all(now=t)
+        t += 60
+    assert row(core, "mirror")["state"] == "LATE"
+    assert row(core, "macprobe")["state"] == "OK"
+    assert notifier.sent == []                           # still under the threshold
+    # It comes back — and its episode, held open by the dwell, crosses the
+    # threshold while the job itself reads OK. That is the ceiling's page.
+    core.record_ping(mirror, {"status": "ok"}, now=stop)
+    core.recompute_all(now=NOW + 34_200 + 3700)
+    assert "[dashboard] Drive mirror → LATE" in titles(notifier)
+
+
+def test_a_sibling_that_stays_late_pages_once_the_probe_is_back(settings, notifier):
+    """The version that would hurt most: the machine comes back, the probe
+    recovers and closes, but one sibling never does — its launchd job was
+    unloaded, so it is LATE for a reason that has nothing to do with sleep. The
+    mute must not survive the probe's return."""
+    core = core_with(settings, notifier, {"macprobe": {"alert_after_s": 3600},
+                                          "mirror": {"alert_after_s": 3600}})
+    mac, mirror = core.registry.get("macprobe"), core.registry.get("mirror")
+    core.record_ping(mac, {"status": "ok"}, now=NOW)
+    core.record_ping(mirror, {"status": "ok"}, now=NOW)
+    core.recompute_all(now=NOW + 20_000)
+    notifier.sent.clear()
+    t = NOW + 20_100
+    core.record_ping(mac, {"status": "ok"}, now=t)       # only the probe returns
+    while t < NOW + 20_100 + 4 * 3600:                   # the mirror stays silent
+        core.recompute_all(now=t)
+        t += 300
+    assert row(core, "mirror")["state"] == "LATE"
+    assert "[dashboard] Drive mirror → LATE" in titles(notifier)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_the_returning_probe_mute_does_not_depend_on_registry_order(
+        settings, notifier, reverse):
+    """`_returning_probes` is computed ONCE per batch, from the PRE-recompute
+    rows, so it cannot matter whether the probe job sits before or after its
+    siblings in jobs.yml. Read from post-recompute state instead and a sibling
+    listed first would see a different answer from one listed last — a silence
+    bug you could introduce by reordering a YAML file."""
+    def mutate(doc):
+        if reverse:
+            doc["jobs"].reverse()
+
+    core = core_with(settings, notifier,
+                     {"macprobe": {"alert_after_s": 3600},
+                      "mirror": {"alert_after_s": 3600}}, mutate=mutate)
+    mac, mirror = core.registry.get("macprobe"), core.registry.get("mirror")
+    core.record_ping(mac, {"status": "ok"}, now=NOW)
+    core.record_ping(mirror, {"status": "ok"}, now=NOW)
+    core.recompute_all(now=NOW + 20_000)
+    core.recompute_all(now=NOW + 20_000 + 3600)          # both past their thresholds
+    # The Mac wakes in the real order: siblings first, the probe's own heartbeat
+    # last, each its own request and its own recompute.
+    core.record_ping(mirror, {"status": "ok"}, now=NOW + 30_000)
+    core.record_ping(mac, {"status": "ok"}, now=NOW + 30_002)
+    core.recompute_all(now=NOW + 30_002 + dwell(core, "macprobe") + 60)
+    # One page and one recovery, for the MACHINE — whichever end of jobs.yml the
+    # probe was declared at.
+    assert titles(notifier) == ["[dashboard] Mac probe → LATE",
+                                "[dashboard] Mac probe → OK"]

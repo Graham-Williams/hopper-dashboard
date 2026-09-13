@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     updated_at      TEXT,
     created_at      TEXT,               -- first seen in jobs.yml; drives UNKNOWN -> LATE for never-pinged jobs
     bad_since       TEXT,               -- start of the current continuously-not-OK episode (NULL = no episode)
-    alerted_at      TEXT                -- when THIS episode was paged for (NULL = not paged; one page per episode)
+    alerted_at      TEXT,               -- when THIS episode was paged for (NULL = not paged; one page per episode)
+    last_paged_at   TEXT                -- when this JOB last paged, across episodes (drives the per-job cooldown)
 );
 CREATE TABLE IF NOT EXISTS runs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -142,6 +143,12 @@ JOBS_COLUMNS = (
     ("created_at", "TEXT"),
     ("bad_since", "TEXT"),
     ("alerted_at", "TEXT"),
+    # No backfill here either, and the direction is deliberate: NULL reads as
+    # "this job has never paged", so the first upgrade cannot start life inside
+    # a cooldown it never earned. The worst case is one extra page just after a
+    # deploy — and deploys are exactly when containers flap, which is why this
+    # lives in the DB at all rather than in memory.
+    ("last_paged_at", "TEXT"),
 )
 
 
@@ -279,6 +286,24 @@ def set_alert_episode(conn: sqlite3.Connection, job_id: str,
     """
     conn.execute("UPDATE jobs SET bad_since=?, alerted_at=? WHERE id=?",
                  (bad_since, alerted_at, job_id))
+
+
+def set_last_paged_at(conn: sqlite3.Connection, job_id: str,
+                      at: str | None) -> None:
+    """Record when this JOB last paged — across episodes, unlike
+    ``alerted_at``, which belongs to one episode and is cleared when it closes.
+
+    This is the per-job alert cooldown's only state, and it is persisted rather
+    than held in memory on purpose: an in-memory cooldown resets on every
+    restart, and a deploy (`docker compose up -d --build`) is precisely the
+    event that makes containers flap. A cooldown that forgets itself exactly
+    when it is needed is not a cooldown.
+
+    Written NULL again by the failed-push rollback: a page that never left the
+    box must not start a cooldown, or one unlucky POST buys a whole cooldown of
+    silence (see ``services.Core._return_unsent_pages``).
+    """
+    conn.execute("UPDATE jobs SET last_paged_at=? WHERE id=?", (at, job_id))
 
 
 def prune(conn: sqlite3.Connection, keep_runs: int = 2000,

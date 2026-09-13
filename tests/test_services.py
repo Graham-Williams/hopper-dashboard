@@ -4,6 +4,7 @@ probe cycle recording, scheduler resilience."""
 from dashboard import db, probes
 from dashboard.probes import ProbeResult
 from dashboard.scheduler import Scheduler
+from dashboard.services import ok_dwell_s
 from tests.conftest import RecordingNotifier
 
 NOW = 1_800_000_000.0
@@ -40,6 +41,8 @@ def test_recovery_alerts_default_priority(core, notifier, registry):
     job = registry.get("snap")
     core.record_ping(job, {"status": "fail"}, now=NOW)
     core.record_ping(job, ok(), now=NOW + 10)
+    assert [p for _, _, p in notifier.sent] == ["high"]   # the OK is not yet held
+    core.recompute_all(now=NOW + 10 + ok_dwell_s(job))    # episode closes -> recovery
     priorities = [p for _, _, p in notifier.sent]
     assert priorities == ["high", "default"]
     assert notifier.sent[-1][0].endswith("→ OK")
@@ -62,8 +65,10 @@ def test_ticker_fires_late_without_traffic(core, notifier, registry):
     assert states["snap"] == "LATE"
     assert notifier.sent[-1][0] == "[dashboard] Snap DB → LATE"
     assert notifier.sent[-1][2] == "default"
-    # Heartbeat resumes → recovery alert.
+    # Heartbeat resumes -> recovery alert, once the OK has been HELD for the
+    # job's own dwell (two of its 300 s cadences).
     assert core.record_ping(job, ok(), now=NOW + 700) == "OK"
+    core.recompute_all(now=NOW + 700 + ok_dwell_s(job))
     assert notifier.sent[-1][0].endswith("→ OK")
 
 
@@ -348,15 +353,22 @@ def test_intervening_success_resets_the_streak(core, notifier, monkeypatch):
     assert [t for t, _, _ in notifier.sent] == []
 
 
-def test_recovery_from_fail_is_immediate(core, notifier, monkeypatch):
+def test_one_good_cycle_clears_fail_immediately(core, notifier, monkeypatch):
+    """Damping delays a FAIL; it must never delay the clearing of one. The
+    STATE goes back to OK on the first clean cycle - what waits is the recovery
+    PUSH, which needs the job's dwell (two probe cycles) of unbroken OK before
+    the episode is believed to be over."""
     _probe_results(monkeypatch, ok=False, error="rclone exit 7: rateLimitExceeded",
                    transient=True)
     core.run_probe_cycle(now=NOW)
     core.run_probe_cycle(now=NOW + 300)
     assert db.job_row(core.connect(), "dashboard-probes")["state"] == "FAIL"
     _probe_results(monkeypatch, ok=True)
-    core.run_probe_cycle(now=NOW + 600)          # ONE good cycle is enough
+    core.run_probe_cycle(now=NOW + 600)          # ONE good cycle clears the state
     assert db.job_row(core.connect(), "dashboard-probes")["state"] == "OK"
+    assert notifier.sent[-1][0] == "[dashboard] Probe cycle → FAIL"
+    job = core.registry.get("dashboard-probes")
+    core.run_probe_cycle(now=NOW + 600 + ok_dwell_s(job))
     assert notifier.sent[-1][0] == "[dashboard] Probe cycle → OK"
 
 

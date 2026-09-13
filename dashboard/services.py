@@ -64,6 +64,39 @@ NOTE_MAX = 500
 # clock back to zero.
 MAX_OK_DWELL_S = 300
 
+# ...but a dwell derived from the THRESHOLD alone is blind to how often the job
+# is actually looked at, and a dwell shorter than the sampling interval is not a
+# dwell at all. `box-containers` is the worked example: threshold 1200 s gives
+# 120 s, while the host cron posts `docker ps` every 300 s — so ONE OK sample
+# always satisfied it and closed the episode. Measured over a 6 h crash-loop at
+# 50/67/75/80% down: ZERO pushes. It took four consecutive failing samples to
+# page at all.
+#
+# So the dwell must also span at least :data:`CADENCE_DWELL_SAMPLES`
+# observations. Capped, because the other end is just as wrong: `pa-backup` has
+# a 24 h cadence, and 2 × 86400 would be a two-day dwell — an episode that
+# cannot close for two days is an episode holding its page hostage for two days,
+# which the hard ceiling makes dangerous rather than merely slow.
+CADENCE_DWELL_SAMPLES = 2
+MAX_CADENCE_DWELL_S = 900
+
+# The per-job page cooldown: after a page for job J, no further PAGE for J for
+# this long. Floor, not the whole rule — see :func:`cooldown_s`.
+#
+# WHY THIS EXISTS. The one-page-per-episode rule caps an OUTAGE at one push; it
+# says nothing about how often an episode may restart. A container on
+# `restart: unless-stopped` backoff — 19 min down, 3 min up — crosses its
+# threshold, recovers past the dwell, and opens a fresh episode with a fresh
+# unspent page, for ever: measured at 40 pushes/day, and an independently
+# measured ≥30-min crash-loop cycle at 48/day. That is the alert storm this
+# branch exists to remove, relocated from "every transition" to "every episode".
+#
+# Six hours is the floor because it is the longest fuse already in the file
+# (`dashboard-probes`), i.e. the most silence Graham has already accepted for a
+# box job. Lengthening the offending job's THRESHOLD instead would have been
+# wrong: that re-opens the silence window the hard ceiling just closed.
+COOLDOWN_FLOOR_S = 21600
+
 # States whose verdict comes from the DESTINATION rather than from the
 # heartbeat. An episode that was in one of these must not be closed by an OK we
 # could not verify (see the hold in :meth:`Core._resolve_alerts`); an episode
@@ -97,8 +130,53 @@ def _monotonic() -> float:
 
 
 def ok_dwell_s(job: Job) -> float:
-    """Seconds of continuous, VERIFIED OK needed to end ``job``'s episode."""
-    return min(MAX_OK_DWELL_S, job.alert_after_s / 10)
+    """Seconds of continuous, VERIFIED OK needed to end ``job``'s episode.
+
+    Two independent floors, whichever is longer:
+
+    - a tenth of the job's own threshold, capped at :data:`MAX_OK_DWELL_S`;
+    - :data:`CADENCE_DWELL_SAMPLES` of the job's own reporting cadence, capped
+      at :data:`MAX_CADENCE_DWELL_S`.
+
+    The second is what stops a single OK sample closing an episode. A job whose
+    truth arrives every ``cadence_s`` seconds is only *observed* that often, so
+    a dwell below one cadence is decided by one observation and a dwell below
+    two cannot tell "recovered" from "up for one sample of a crash loop".
+
+    A job with no cadence (``manual``, ``disk``) keeps the threshold-derived
+    value alone: there is nothing to sample. A disk gauge is a level that does
+    not un-fill itself, and a manual job has no timer to be late against.
+    """
+    dwell = min(MAX_OK_DWELL_S, job.alert_after_s / 10)
+    if job.cadence_s:
+        dwell = max(dwell, min(CADENCE_DWELL_SAMPLES * job.cadence_s,
+                               MAX_CADENCE_DWELL_S))
+    return dwell
+
+
+def cooldown_s(job: Job) -> float:
+    """How long after a page for ``job`` the next PAGE for it is held back.
+
+    ``max(alert_after_s, COOLDOWN_FLOOR_S)`` — never shorter than the threshold
+    the operator chose, and never shorter than six hours.
+
+    **It binds far less often than it looks.** A new episode cannot page before
+    ``bad_since + alert_after_s``, and a new episode cannot open before the
+    previous one closed, which is at or after the page that closed it. So for
+    every job whose threshold is already ``>= COOLDOWN_FLOOR_S`` the next page
+    is at least one threshold — i.e. one cooldown — after the last one anyway,
+    and this rule changes nothing at all. On the shipped file it binds ONLY on
+    ``box-containers`` (20 m), ``box-disk`` and ``mac-disk`` (1 h each). That is
+    the intended blast radius: the three jobs that can flap fast.
+
+    **The cooldown never spends the episode's page** (:meth:`Core._page` does
+    not stamp ``alerted_at`` when it holds one back), so the episode stays open
+    and unpaged and the hard ceiling re-tries it on every single pass. The
+    moment the cooldown expires, a job that is still — or again — past its
+    threshold pages. The cooldown can therefore delay a page; it can never
+    cancel one. That is the whole reason it is safe, and it has its own test.
+    """
+    return max(float(job.alert_after_s), float(COOLDOWN_FLOOR_S))
 
 
 def ok_hold_s(job: Job) -> float:
@@ -114,8 +192,15 @@ def ok_hold_s(job: Job) -> float:
     episode may cost, so the hold expires after the job's own
     ``alert_after_s`` — never less than the dwell cap, so a job that pages
     immediately still gets a few minutes for a transient probe error.
+
+    **Never shorter than the job's own dwell**, either. The hold and the dwell
+    are checked in that order, so a hold below the dwell would close the episode
+    SOONER for an OK we cannot verify than for one we can — and closing on the
+    hold path sends no recovery. Unreachable on the shipped file (every
+    threshold there is well above the 900 s dwell cap) but free to guarantee,
+    and the cadence-aware dwell is what made it reachable at all.
     """
-    return max(MAX_OK_DWELL_S, job.alert_after_s)
+    return max(MAX_OK_DWELL_S, ok_dwell_s(job), job.alert_after_s)
 
 
 @dataclass(frozen=True)
@@ -125,13 +210,16 @@ class AlertIntent:
 
     ``bad_since``/``alerted_at`` carry the episode this intent belongs to, so a
     failed POST can hand the page back to exactly that episode and nothing else
-    (:meth:`Core._return_unsent_pages`).
+    (:meth:`Core._return_unsent_pages`). ``prev_paged_at`` carries the job's
+    cooldown stamp as it was BEFORE this page, so the same rollback can put that
+    back too — a page that never left the box must not leave a cooldown behind.
     """
     job: Job
     kind: str          # "alert" | "recovery"
     state: str         # the state the episode is about
     bad_since: str | None = None
     alerted_at: str | None = None
+    prev_paged_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -262,10 +350,41 @@ class Core:
                 returning.add(ep.job.id)
         return returning
 
+    def _cooled_probes(self, episodes: list[Episode], now: float) -> set[str]:
+        """Machine probe jobs whose OWN page is currently held back by their own
+        cooldown, and which have not already paged for the episode they are in.
+
+        The machine-offline rule may only borrow an alert that EXISTS. That was
+        already checked statically (``probe.alert_never``); the cooldown makes
+        the same thing true dynamically and temporarily, so it has to be checked
+        the same way. Without this, a Mac that dies three hours after its probe
+        last paged is: probe page held by the cooldown, every sibling's page
+        muted behind a probe that is not speaking — a real outage, zero pushes,
+        for the length of the cooldown. Exactly the failure mode the static
+        guard exists to prevent, reintroduced by a new mechanism.
+
+        A probe that has ALREADY paged for its current episode
+        (``alerted_at`` set) is fine to hide behind: the alert exists, it was
+        sent, and the siblings genuinely are the same fact.
+
+        Read from the PRE-recompute rows for the same reason ``returning`` is:
+        so the answer cannot depend on registry order.
+        """
+        cooled: set[str] = set()
+        for ep in episodes:
+            if ep.job.kind != "probe" or ep.job.id == SELF_JOB_ID:
+                continue
+            if ep.row.get("alerted_at"):
+                continue
+            if self._cooling_until(ep.row, ep.job, now) is not None:
+                cooled.add(ep.job.id)
+        return cooled
+
     def _suppressed_offline(self, job: Job, prev: str, state: str,
                             states: dict[str, str],
                             transitions: dict[str, tuple],
-                            returning: set[str]) -> bool:
+                            returning: set[str],
+                            cooled: set[str]) -> bool:
         """Machine-offline rule: while a machine's probe job is LATE, the other
         jobs on that machine going LATE is the same single fact ("the Mac is
         asleep"), so only the probe's own alert is sent. The sibling
@@ -297,11 +416,14 @@ class Core:
         whole premise is "one alert for the machine instead of five" — a probe
         job that never pages deletes that one alert, and a Mac that is gone for
         days then pages NOTHING while ``pa-backup`` sits LATE with a week-old
-        ``bad_since``. Suppression may only borrow an alert that exists."""
+        ``bad_since``. Suppression may only borrow an alert that exists — which
+        is now two checks, one static (``alert_never``) and one for the moment
+        (:meth:`_cooled_probes`), because the per-job cooldown can take the
+        probe's alert away temporarily."""
         probe = self._machine_probe(job.machine)
         if probe is None or probe.id == job.id:
             return False
-        if probe.alert_never:
+        if probe.alert_never or probe.id in cooled:
             return False
         probe_state = states.get(probe.id)
         if state == "LATE" and probe_state == "LATE":
@@ -355,9 +477,29 @@ class Core:
         waited = now - last[1]
         return waited >= ALERT_RETRY_MIN_S or waited < 0
 
+    @staticmethod
+    def _cooling_until(row: dict, job: Job, now: float) -> float | None:
+        """When ``job``'s page cooldown expires, or None if it is not cooling.
+
+        Reads the persisted ``last_paged_at``. A stamp that is unparseable or in
+        the FUTURE (a clock step, a hand-edited row) is treated as **no
+        cooldown at all** rather than as one that can never expire — the same
+        reasoning as the ``bad_since`` healing, and the same direction: a
+        cooldown that outlives every clock is a job that can never page again,
+        which is the one outcome this feature may not produce.
+        """
+        if job.alert_never:
+            return None
+        last = db.from_iso(row.get("last_paged_at"))
+        if last is None or last > now:
+            return None
+        until = last + cooldown_s(job)
+        return until if until > now else None
+
     def _page(self, conn, ep: Episode, about: str, bad_since: str, began: float,
               alerted_at: str | None, states: dict[str, str],
-              transitions: dict[str, tuple], returning: set[str], now: float,
+              transitions: dict[str, tuple], returning: set[str],
+              cooled: set[str], now: float,
               at: str, intents: list[AlertIntent]) -> str | None:
         """Spend this episode's one page, if everything says we should.
 
@@ -384,8 +526,21 @@ class Core:
             return alerted_at                 # opted out, or already paged
         if now - began < job.alert_after_s:
             return alerted_at                 # not sustained long enough yet
+        until = self._cooling_until(ep.row, job, now)
+        if until is not None:
+            # THE PER-JOB COOLDOWN. Deliberately does NOT stamp `alerted_at`:
+            # the episode keeps its unspent page, so the ceiling above re-tries
+            # this same call on every later pass and the page goes out the
+            # moment the cooldown expires — delayed, never cancelled. Stamping
+            # here would turn a rate limit into exactly the permanent silence
+            # this whole file is organised against.
+            log.info("page for %s held back: it paged %ss ago and its cooldown "
+                     "(%ss) runs for another %ss", job.id,
+                     int(now - db.from_iso(ep.row["last_paged_at"])),
+                     int(cooldown_s(job)), int(until - now))
+            return alerted_at
         if self._suppressed_offline(job, about, ep.state, states, transitions,
-                                    returning):
+                                    returning, cooled):
             # Deliberately do NOT stamp alerted_at: a suppressed alert must not
             # burn the episode's single page, or its recovery would be lost too.
             log.info("alert for %s suppressed: its machine's probe job is "
@@ -403,8 +558,11 @@ class Core:
         # the page straight back (see _return_unsent_pages).
         self._alert_attempted[job.id] = (bad_since, now)
         db.set_alert_episode(conn, job.id, bad_since, at)
+        prev_paged_at = ep.row.get("last_paged_at")
+        db.set_last_paged_at(conn, job.id, at)
         intents.append(AlertIntent(job, "alert", about, bad_since=bad_since,
-                                   alerted_at=at))
+                                   alerted_at=at,
+                                   prev_paged_at=prev_paged_at))
         return at
 
     def _resolve_alerts(self, conn, episodes: list[Episode],
@@ -442,10 +600,26 @@ class Core:
         at = db.to_iso(now)
         intents: list[AlertIntent] = []
         returning = self._returning_probes(conn, episodes)
+        cooled = self._cooled_probes(episodes, now)
         for ep in episodes:
             job, prev, state, row = ep.job, ep.prev, ep.state, ep.row
             bad_since = row.get("bad_since")
             alerted_at = row.get("alerted_at")
+
+            # A `last_paged_at` we cannot use — unparseable, or in the FUTURE
+            # after a clock step — would otherwise be a cooldown that never
+            # expires, i.e. a permanently un-pageable job. `_cooling_until`
+            # already refuses to honour one (so nothing below can be misled by
+            # it), but clear it here as well so the row stops carrying a value
+            # that reads like a policy, and so the log says what happened. Same
+            # rule, same direction, as the `bad_since` healing below.
+            paged_raw = row.get("last_paged_at")
+            if paged_raw is not None:
+                paged = db.from_iso(paged_raw)
+                if paged is None or paged > now:
+                    log.warning("healing unusable last_paged_at %r for %s",
+                                paged_raw, job.id)
+                    db.set_last_paged_at(conn, job.id, None)
 
             # A `bad_since` we cannot use: unparseable, or in the FUTURE after a
             # clock step (NTP walking the clock back, a box RTC ahead at boot).
@@ -498,7 +672,7 @@ class Core:
                 if bad_since is not None:
                     alerted_at = self._page(conn, ep, about, bad_since, began,
                                             alerted_at, states, transitions,
-                                            returning, now, at, intents)
+                                            returning, cooled, now, at, intents)
                 if self._holding(ep, about):
                     if held < ok_hold_s(job):
                         log.info("episode for %s held open: %s ended in an OK "
@@ -539,7 +713,7 @@ class Core:
                 if (alerted_at and not job.alert_never
                         and not self._suppressed_offline(
                             job, about, state, states, transitions,
-                            returning)):
+                            returning, cooled)):
                     intents.append(AlertIntent(job, "recovery", about))
                 db.set_alert_episode(conn, job.id, None, None)
                 continue
@@ -564,7 +738,7 @@ class Core:
                 bad_since, began, alerted_at = at, now, None
                 db.set_alert_episode(conn, job.id, bad_since, None)
             self._page(conn, ep, state, bad_since, began, alerted_at, states,
-                       transitions, returning, now, at, intents)
+                       transitions, returning, cooled, now, at, intents)
         return intents
 
     @staticmethod
@@ -659,8 +833,17 @@ class Core:
 
     def _return_unsent_pages(self, unsent: list[AlertIntent]) -> None:
         """Clear ``alerted_at`` for alerts whose POST failed, so the next tick
-        retries. A short follow-up transaction, after dispatch, never holding
-        the write lock across an HTTP call.
+        retries — **and put ``last_paged_at`` back where it was**, so the
+        undelivered page does not start a cooldown. A short follow-up
+        transaction, after dispatch, never holding the write lock across an HTTP
+        call.
+
+        Restoring the cooldown stamp is not a nicety. Without it the rollback is
+        a half-rollback: the episode gets its page back and then cannot spend it
+        for six hours, because a POST that never reached ntfy still looks like a
+        page to the rate limiter. One unlucky 429 would buy a whole cooldown of
+        silence — the failure this method exists to prevent, moved one field to
+        the left. Both halves are undone or neither.
 
         Only for the SAME episode: if the job has recovered, moved on, or been
         re-stamped since, the page belongs to whatever is there now. The failure
@@ -687,10 +870,12 @@ class Core:
                             or row.get("alerted_at") != intent.alerted_at):
                         continue              # a different episode owns the row
                     log.warning("ntfy push for %s did not land; returning the "
-                                "episode's page so the next tick retries",
-                                intent.job.id)
+                                "episode's page and its cooldown so the next "
+                                "tick retries", intent.job.id)
                     db.set_alert_episode(conn, intent.job.id,
                                          intent.bad_since, None)
+                    db.set_last_paged_at(conn, intent.job.id,
+                                         intent.prev_paged_at)
         except Exception:  # noqa: BLE001 — alerting must never raise into ingest
             log.exception("could not return the page for a failed ntfy push")
         finally:
