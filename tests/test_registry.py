@@ -2,7 +2,8 @@ import copy
 
 import pytest
 
-from dashboard.registry import (RegistryError, load_registry, parse_registry)
+from dashboard.registry import (MAX_PROBE_INTERVAL_S, RegistryError, load_registry,
+                                parse_registry)
 from tests.conftest import EXAMPLE_JOBS, JOBS_DOC
 
 
@@ -266,6 +267,31 @@ def test_probe_interval_s_capped_for_db_snapshot():
     doc["jobs"][1]["probe"] = {"rclone_path": "gdrive-ro:Backups",
                                "interval_s": 86400}
     assert parse_registry(doc).get("tree").probe_interval_s == 86400
+
+
+def test_probe_interval_s_has_a_magnitude_cap_on_every_kind():
+    """The semantic cap above is db_snapshot-only, so `rclone_copy_tree` and
+    `manual` — the two kinds DEPLOY.md §1d has the operator hand-edit
+    (`pa-backup`, `minecraft-offload`) — had no magnitude bound at all:
+    `interval_s: 18000000` parsed fine and meant 208 days between probes,
+    invisibly (a cycle with nothing due still records `dashboard-probes` as ok).
+    A day is the ceiling, and 86400 itself stays legal."""
+    doc = copy.deepcopy(JOBS_DOC)
+    doc["jobs"][1]["probe"] = {"rclone_path": "gdrive-ro:Backups",
+                               "interval_s": MAX_PROBE_INTERVAL_S}
+    assert parse_registry(doc).get("tree").probe_interval_s == MAX_PROBE_INTERVAL_S
+    doc["jobs"][1]["probe"]["interval_s"] = MAX_PROBE_INTERVAL_S + 1
+    with pytest.raises(RegistryError, match=r"over the 86400 second maximum"):
+        parse_registry(doc)
+    doc["jobs"][1]["probe"]["interval_s"] = 18_000_000        # the 208-day typo
+    with pytest.raises(RegistryError, match=r"over the 86400 second maximum"):
+        parse_registry(doc)
+    # ...and on a manual job, the other kind that may carry a probe block.
+    doc = copy.deepcopy(JOBS_DOC)
+    doc["jobs"][4]["probe"] = {"rclone_path": "gdrive-ro:Gremlins",
+                               "interval_s": 10 ** 20}
+    with pytest.raises(RegistryError, match=r"over the 86400 second maximum"):
+        parse_registry(doc)
 
 
 def test_example_file_probe_intervals_are_documented_for_the_big_trees():

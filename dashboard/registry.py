@@ -63,6 +63,15 @@ DEFAULT_ALERT_AFTER_S = 86400
 # "never page". One extra digit is the whole failure, so a value past the point
 # of usefulness is a typo, not a policy — say `alert: never` if you mean never.
 MAX_ALERT_AFTER_S = 2_592_000   # 30 days
+# The same rule for the other magnitude the file accepts. `probe.interval_s:
+# 18000000` means "list the destination once at boot and then never again" —
+# 208 days — and it is INVISIBLE, because a cycle with nothing due still records
+# `dashboard-probes` as ok and the card keeps whatever the last probe said. The
+# semantic cap below (half the freshness window) only covers `db_snapshot`; this
+# one covers the two kinds DEPLOY.md §1d tells the operator to hand-edit,
+# `rclone_copy_tree` and `manual`, which had no magnitude bound at all. A day is
+# already far past useful for a destination check.
+MAX_PROBE_INTERVAL_S = 86_400   # 24 hours
 # The only value `alert:` accepts today — an explicit opt-out for jobs whose
 # not-OK states are lag metrics nobody should be woken for.
 ALERT_NEVER = "never"
@@ -206,7 +215,8 @@ def _opt_str(raw: dict, key: str, ref: str, max_len: int = 200) -> str | None:
     return val.strip()
 
 
-def _pos_int(container: dict, key: str, ref: str, required: bool) -> int | None:
+def _pos_int(container: dict, key: str, ref: str, required: bool,
+             max_value: int | None = None) -> int | None:
     if key not in container or container[key] is None:
         if required:
             raise _err(ref, f"'{key}' is required for this kind")
@@ -214,6 +224,11 @@ def _pos_int(container: dict, key: str, ref: str, required: bool) -> int | None:
     val = container[key]
     if isinstance(val, bool) or not isinstance(val, int) or val <= 0:
         raise _err(ref, f"'{key}' must be a positive integer")
+    if max_value is not None and val > max_value:
+        raise _err(ref, f"'{key}' is {val}, which is over the {max_value} "
+                        f"second maximum — that is almost certainly a typo, "
+                        f"and a probe that never runs again is invisible: the "
+                        f"card keeps reporting whatever the last one saw")
     return val
 
 
@@ -299,7 +314,8 @@ def parse_job(raw: Any, index: int) -> Job:
         _check_keys(probe_raw, _PROBE_KEYS, ref, "probe")
         rclone_path = _opt_str(probe_raw, "rclone_path", ref)
         state_dir = _opt_str(probe_raw, "state_dir", ref)
-        probe_interval = _pos_int(probe_raw, "interval_s", ref, required=False)
+        probe_interval = _pos_int(probe_raw, "interval_s", ref, required=False,
+                                  max_value=MAX_PROBE_INTERVAL_S)
         if rclone_path is None:
             raise _err(ref, "'probe.rclone_path' is required when 'probe' is given")
         if kind not in PROBEABLE_KINDS:

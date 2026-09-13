@@ -278,8 +278,10 @@ Validation is strict and fails startup with the job id + field: ids `^[a-z0-9-]+
 `destination`, a `probe` block is accepted only on `db_snapshot` / `rclone_copy_tree` / `manual`, a `disk`
 block only on `disk` (with `max_used_pct` bounded to 1-100, so bytes pasted into the wrong field are
 rejected rather than silently disabling the threshold), `container` requires a non-empty `expect`,
-`probe.interval_s` is a positive int and on a `db_snapshot` may not exceed half the freshness window
-(`cadence_s * DEST_FRESH_MULTIPLIER / 2`), unknown keys anywhere are errors.
+`probe.interval_s` is a positive int, may not exceed `MAX_PROBE_INTERVAL_S` (86400 — a magnitude cap on
+EVERY kind, because `interval_s: 18000000` is 208 days of not looking and nothing on the board says so), and
+on a `db_snapshot` may not exceed half the freshness window (`cadence_s * DEST_FRESH_MULTIPLIER / 2`),
+unknown keys anywhere are errors.
 State computation runs on every ping (for ALL jobs, so LATE keeps firing even if the ticker thread dies) and
 on a 60 s ticker (so LATE fires without traffic). Every state transition is written to `state_changes` and
 dispatched to ntfy (`NTFY_URL` + `NTFY_TOPIC` env; disabled when empty) with title `[dashboard] <job> → <STATE>`
@@ -381,7 +383,10 @@ top of its cadence, or a slow cycle trades FAIL flapping for LATE flapping; see 
 against the destination's **own newest-object timestamp**, an absolute time that does not drift as the probe
 row ages — a longer interval only delays noticing a *new* object. The only kind whose state reads that age is
 `db_snapshot`, and those keep the default interval (300 s against a 3600 s window); `registry.py` refuses an
-`interval_s` above half the window for that kind so the invariant is enforced, not just reasoned about. The
+`interval_s` above half the window for that kind so the invariant is enforced, not just reasoned about. On
+top of that, **every** kind is capped at `MAX_PROBE_INTERVAL_S` = 86400: the semantic cap does not apply to
+`rclone_copy_tree`/`manual`, which are exactly the two the operator hand-edits (DEPLOY.md §1d), so an extra
+digit there used to buy months of silent not-looking. The
 two jobs set to 1800 s are `rclone_copy_tree` and `manual`, whose `STALE_DEST`/`BEHIND` verdicts come from
 heartbeat `missing_*`/lag metrics, and whose freshness windows (12 d / `max_age_s` 14 d) dwarf 1800 s.
 **Transient vs real:** a failure whose text matches `probes.TRANSIENT_MARKERS` (`rateLimitExceeded`, 429,
@@ -440,7 +445,7 @@ route can write.
 | **the hard ceiling**: an open episode past its threshold and unpaged pages on **every** pass, whatever the job currently reads — the not-OK branch, the unverifiable-OK hold, the pass that gives that hold up, and the dwell | every branch that can end an episode is a way to lose its page. See "Both holds are bounded" below for the two reproductions that came from scoping it to one branch |
 | an **unverified** OK does not end the episode at all (the *hold*) | see below |
 | an unparseable or **future** `bad_since` is healed — clock restarted, `alerted_at` dropped | an NTP step backwards makes `now − bad_since` permanently negative: a job that can never page |
-| `alert_after_s` is capped at **30 days** at parse time, loudly | magnitude was the one hostile input the validator accepted; one extra digit silently means "never". Say `alert: never` if that is what you mean |
+| `alert_after_s` is capped at **30 days** at parse time, loudly, and `probe.interval_s` at **24 h** on every kind | magnitude was the one hostile input the validator accepted; one extra digit silently means "never page" / "never look again". Say `alert: never` if that is what you mean |
 
 **"OK" is not always evidence of health.** `compute_state` must return one of six states, so a check that
 *could not be made* falls through to OK on the heartbeat alone (`db_snapshot_stale` returning `None` matches

@@ -64,8 +64,12 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
 - `registry.py` — `jobs.yml` schema + strict validation → `Registry` of frozen `Job`s. Kinds, states,
   `PROBEABLE_KINDS` (`probe` block: required on db_snapshot, optional on rclone_copy_tree / manual — the
   box's `gdrive-ro` remote can list `Backups/` and `Gremlins/`), and `DEST_FRESH_MULTIPLIER` (12) live here.
-  `probe.interval_s` (optional per-job probe cadence) is capped at half the freshness window on db_snapshot,
-  the one kind whose STALE_DEST verdict reads the probe's newest-object time.
+  `probe.interval_s` (optional per-job probe cadence) is capped twice: semantically at half the freshness
+  window on db_snapshot, the one kind whose STALE_DEST verdict reads the probe's newest-object time, and by
+  magnitude at `MAX_PROBE_INTERVAL_S` (86400) on **every** kind. The second cap is not redundant — the
+  semantic one does not apply to `rclone_copy_tree`/`manual`, which are precisely the two DEPLOY.md §1d has
+  the operator hand-edit, and `interval_s: 18000000` there means 208 days of never looking with nothing on
+  the board to show for it.
   `disk` is a kind but NOT in `SCHEDULED_KINDS`/`PROBEABLE_KINDS`: it is a capacity gauge (`disk:` block,
   `min_free_bytes` / `max_used_pct`), never probed, no cadence, and `informational` when both thresholds
   are omitted — same rule as a thresholdless `manual` job. It has no *per-cadence* dead-man's switch, but
