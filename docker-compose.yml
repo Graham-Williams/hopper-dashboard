@@ -42,6 +42,10 @@ services:
       APP_ENV: ${APP_ENV:-prod}
       TRUSTED_PROXY_CIDR: ${TRUSTED_PROXY_CIDR:-}
       PROBE_INTERVAL_S: ${PROBE_INTERVAL_S:-300}
+      # NOT RCLONE_TIMEOUT_S — `RCLONE_TIMEOUT*` is rclone's own env namespace (`--timeout`).
+      DASHBOARD_RCLONE_TIMEOUT_S: ${DASHBOARD_RCLONE_TIMEOUT_S:-240}
+      PROBE_FAIL_THRESHOLD: ${PROBE_FAIL_THRESHOLD:-2}
+      PROBE_NO_SUCCESS_S: ${PROBE_NO_SUCCESS_S:-3600}
       JOBS_FILE: /app/jobs.yml
       DASHBOARD_DATA: /app/data
     ports:

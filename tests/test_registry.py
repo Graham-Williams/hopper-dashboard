@@ -148,6 +148,58 @@ def test_probe_block_rejected_on_other_kinds(idx):
         parse_registry(doc)
 
 
+def test_probe_interval_s_is_optional_and_defaults_to_none():
+    """None means "every cycle", i.e. the global PROBE_INTERVAL_S."""
+    assert parse_registry(JOBS_DOC).get("snap").probe_interval_s is None
+    doc = copy.deepcopy(JOBS_DOC)
+    doc["jobs"][1]["probe"] = {"rclone_path": "gdrive-ro:Backups",
+                               "interval_s": 1800}
+    assert parse_registry(doc).get("tree").probe_interval_s == 1800
+
+
+@pytest.mark.parametrize("bad", [0, -1, "1800", 1800.0, True, None])
+def test_probe_interval_s_must_be_a_positive_int(bad):
+    doc = copy.deepcopy(JOBS_DOC)
+    doc["jobs"][1]["probe"] = {"rclone_path": "gdrive-ro:Backups", "interval_s": bad}
+    if bad is None:                       # None is "absent", not an error
+        assert parse_registry(doc).get("tree").probe_interval_s is None
+        return
+    with pytest.raises(RegistryError, match="'interval_s' must be a positive integer"):
+        parse_registry(doc)
+
+
+def test_probe_interval_s_capped_for_db_snapshot():
+    """db_snapshot is the only kind whose STALE_DEST verdict reads the probe's
+    newest-object time, so its interval must stay well inside the freshness
+    window (cadence_s * 12) — otherwise a stale probe row reads as a stale
+    destination. cadence_s 300 → window 3600 → cap 1800."""
+    doc = copy.deepcopy(JOBS_DOC)
+    doc["jobs"][0]["probe"]["interval_s"] = 1800
+    assert parse_registry(doc).get("snap").probe_interval_s == 1800
+    doc["jobs"][0]["probe"]["interval_s"] = 1801
+    with pytest.raises(RegistryError, match=r"'probe.interval_s' must be <= 1800"):
+        parse_registry(doc)
+    # The cap applies only to db_snapshot: a copy tree may be probed rarely.
+    doc = copy.deepcopy(JOBS_DOC)
+    doc["jobs"][1]["probe"] = {"rclone_path": "gdrive-ro:Backups",
+                               "interval_s": 86400}
+    assert parse_registry(doc).get("tree").probe_interval_s == 86400
+
+
+def test_example_file_probe_intervals_are_documented_for_the_big_trees():
+    """pa-backup / minecraft-offload keep their probe blocks COMMENTED OUT (as
+    on the box), so the example file must still parse with no probe on them —
+    the 1800 s interval lives in the commented template next to them."""
+    reg = load_registry(EXAMPLE_JOBS)
+    assert not reg.get("pa-backup").has_probe
+    assert not reg.get("minecraft-offload").has_probe
+    assert [j.id for j in reg.probed()] == ["km-backup", "todoist-points-backup"]
+    assert all(j.probe_interval_s is None for j in reg.probed())
+    with open(EXAMPLE_JOBS, encoding="utf-8") as fh:
+        text = fh.read()
+    assert text.count("#   interval_s: 1800") == 2
+
+
 # -- disk --------------------------------------------------------------------
 
 DISK_IDX = 8  # the disk job in JOBS_DOC

@@ -11,6 +11,9 @@ import os
 from dataclasses import dataclass, field
 
 
+MAX_FAIL_THRESHOLD = 10
+
+
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name, "")
     if not raw.strip():
@@ -52,6 +55,22 @@ class Settings:
     app_env: str = "prod"
     probe_interval_s: int = 300
     tick_interval_s: int = 60
+    # Hard timeout for one `rclone lsjson` (per job). Big trees page slowly and
+    # rclone backs off on Drive rate limits. Env var is deliberately prefixed:
+    # bare `RCLONE_TIMEOUT*` names belong to rclone itself (`--timeout`), and a
+    # name collision here would silently reconfigure rclone's networking.
+    # Read through `effective_rclone_timeout_s`, which clamps it.
+    rclone_timeout_s: int = 240
+    # Consecutive failed probes OF ONE JOB before the dashboard's own
+    # `dashboard-probes` job is reported FAIL. 1 = the old behaviour (alert on
+    # the first transient rate limit). Recovery is always immediate. Only
+    # transient (quota/timeout) failures are damped at all; a hard error trips
+    # on the first failure. Read through `effective_fail_threshold`.
+    probe_fail_threshold: int = 2
+    # Backstop on the damping: however transient the errors look, a probed job
+    # with no SUCCESSFUL probe for this long trips FAIL. 0 disables it.
+    # Read through `effective_no_success_s`.
+    probe_no_success_s: int = 3600
     # Set False in tests / when another process owns the scheduler.
     start_scheduler: bool = True
     # Per-IP sliding-window limits (count per window seconds).
@@ -72,6 +91,38 @@ class Settings:
     def db_path(self) -> str:
         return os.path.join(self.data_dir, "dashboard.db")
 
+    @property
+    def effective_rclone_timeout_s(self) -> int:
+        """One probe can never be allowed to outlast a whole cycle: probes are
+        serial, so a timeout above the cycle interval guarantees overrun even
+        for a single job."""
+        return max(5, min(int(self.rclone_timeout_s), int(self.probe_interval_s)))
+
+    @property
+    def effective_fail_threshold(self) -> int:
+        """At least 1 (alert eventually) and at most MAX_FAIL_THRESHOLD — a
+        typo'd 200 would otherwise switch alerting off for a week."""
+        return max(1, min(int(self.probe_fail_threshold), MAX_FAIL_THRESHOLD))
+
+    @property
+    def effective_no_success_s(self) -> int:
+        """0 = backstop disabled. Otherwise at least one cycle, so it can never
+        fire before the job has had a chance to be probed again."""
+        window = int(self.probe_no_success_s)
+        if window <= 0:
+            return 0
+        return max(window, int(self.probe_interval_s))
+
+    @property
+    def probe_cycle_budget_s(self) -> int:
+        """Wall-clock budget for one probe cycle. Probes are serial, so without
+        a budget `n_probed × timeout` can run far past the cycle interval (and,
+        before the post-cycle clock fix, made the next cycle instantly due —
+        back-to-back hammering of a remote that just rate-limited us). One cycle
+        interval's worth of probing; whatever is left over stays due and is
+        picked up next cycle, oldest-probe-first."""
+        return max(int(self.effective_rclone_timeout_s), int(self.probe_interval_s))
+
     @classmethod
     def from_env(cls) -> "Settings":
         return cls(
@@ -88,6 +139,9 @@ class Settings:
             app_env=(os.environ.get("APP_ENV", "prod").strip().lower() or "prod"),
             probe_interval_s=_env_int("PROBE_INTERVAL_S", 300),
             tick_interval_s=_env_int("TICK_INTERVAL_S", 60),
+            rclone_timeout_s=_env_int("DASHBOARD_RCLONE_TIMEOUT_S", 240),
+            probe_fail_threshold=_env_int("PROBE_FAIL_THRESHOLD", 2),
+            probe_no_success_s=_env_int("PROBE_NO_SUCCESS_S", 3600),
             start_scheduler=os.environ.get("DASHBOARD_NO_SCHEDULER", "") == "",
             trusted_proxy_cidrs=_env_cidrs("TRUSTED_PROXY_CIDR"),
         )

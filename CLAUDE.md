@@ -31,7 +31,7 @@ roles in one process for local dev.
 ```
 uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -r requirements-dev.txt
 # (or: python3.12 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt)
-.venv/bin/python -m pytest -q                         # ~365 tests, no network, < 5 s
+.venv/bin/python -m pytest -q                         # ~425 tests, no network, ~5 s
 /usr/bin/python3 -m pytest -o addopts="" tests/test_probes_*.py -q   # ~100 probe tests, MUST pass stdlib-only
 /usr/bin/python3 -m compileall -qf probes/             # 3.9 syntax gate (CI also RUNS the probe tests on 3.9)
 
@@ -40,7 +40,9 @@ export APP_PASSWORD=devpass SESSION_SECRET=devsecret INGEST_TOKEN=devtoken READ_
 # (APP_ENV=dev to run with the gate off; prod refuses to start without APP_PASSWORD)
 .venv/bin/python -m dashboard                         # read http://127.0.0.1:8080  ingest :8081
 # env knobs: DASHBOARD_DATA (default ./data locally, /app/data in the image), JOBS_FILE, READ_PORT,
-#            INGEST_PORT, DASHBOARD_BIND, PROBE_INTERVAL_S, TICK_INTERVAL_S, DASHBOARD_NO_SCHEDULER=1
+#            INGEST_PORT, DASHBOARD_BIND, PROBE_INTERVAL_S, TICK_INTERVAL_S, DASHBOARD_NO_SCHEDULER=1,
+#            DASHBOARD_RCLONE_TIMEOUT_S (240 — NOT RCLONE_TIMEOUT*, that namespace is rclone's own),
+#            PROBE_FAIL_THRESHOLD (2), PROBE_NO_SUCCESS_S (3600)
 
 curl -X POST -H 'Authorization: Bearer devtoken' -d result=success -d exit=0 localhost:8081/api/v1/ping/km-backup
 curl -X POST -H 'Authorization: Bearer devtoken' -H 'Content-Type: application/json' \
@@ -62,6 +64,8 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
 - `registry.py` — `jobs.yml` schema + strict validation → `Registry` of frozen `Job`s. Kinds, states,
   `PROBEABLE_KINDS` (`probe` block: required on db_snapshot, optional on rclone_copy_tree / manual — the
   box's `gdrive-ro` remote can list `Backups/` and `Gremlins/`), and `DEST_FRESH_MULTIPLIER` (12) live here.
+  `probe.interval_s` (optional per-job probe cadence) is capped at half the freshness window on db_snapshot,
+  the one kind whose STALE_DEST verdict reads the probe's newest-object time.
   `disk` is a kind but NOT in `SCHEDULED_KINDS`/`PROBEABLE_KINDS`: it is a capacity gauge (`disk:` block,
   `min_free_bytes` / `max_used_pct`), never probed, no cadence, and `informational` when both thresholds
   are omitted — same rule as a thresholdless `manual` job. It has no *per-cadence* dead-man's switch, but
@@ -86,10 +90,37 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   notify (with the **machine-offline rule**: sibling `→ LATE` alerts muted while the machine's `probe` job is
   LATE, and sibling plain `LATE → OK` recoveries muted while the probe is still LATE or recovers in the same
   batch — the Mac probe posts its sub-jobs before its own heartbeat, so siblings recover one batch early;
-  FAIL/STALE_DEST/BEHIND after LATE always alert); `run_probe_cycle` (probes + the `dashboard-probes`
-  self-heartbeat + `prune` — one `DELETE … NOT IN (… ORDER BY id DESC LIMIT n)` per table, not O(n²)).
-- `scheduler.py` — daemon thread; `step()` is exposed for tests; never lets an exception kill the loop.
-- `probes.py` — `rclone lsjson --recursive --files-only` (argv, 90 s timeout) + state-file reader.
+  FAIL/STALE_DEST/BEHIND after LATE always alert); `run_probe_cycle` (probes the jobs `due_probes()` says are
+  due + the `dashboard-probes` self-heartbeat + `prune` — one `DELETE … NOT IN (… ORDER BY id DESC LIMIT n)`
+  per table, not O(n²)). **Flap damping** (`probe_trouble` / `_classify_trouble`): the self-job records `fail`
+  when any probed job is tripped — `hard` (error is not a quota/timeout: first failure, never damped),
+  `streak` (`settings.probe_fail_threshold`, default 2, *consecutive failed probes of that job*), or
+  `silence` (no successful probe of it for `PROBE_NO_SUCCESS_S`, default 3600 s — the backstop: damping may
+  delay an alert, never cancel one). Recovery is one successful probe of the offending job. The streak is
+  **derived from the `probes` table** (`db.probe_fail_streak`), NOT stored: per-job (so a job with
+  `interval_s` is not reset by the cycles it wasn't due for — that bug meant it could never alert at all),
+  restart-safe, and unforgeable through ingest, which cannot write `probes`. Don't move it back into
+  `last_metrics`. Cycle accounting: each cycle has a wall-clock budget (`Settings.probe_cycle_budget_s`,
+  deferrals in `metrics.deferred`, `due_probes()` ordered oldest-first so nothing starves) and is stamped and
+  recomputed at its **end** (`Core.last_cycle_end`). Full rationale: DESIGN.md "Probe cadence and flap
+  damping" — don't lower the threshold to 1, that is the behaviour that produced 27 FAIL→OK flips and ~55
+  pushes in 4 days with nothing broken.
+- `scheduler.py` — daemon thread; `step()` is exposed for tests; never lets an exception kill the loop. It
+  calls `run_probe_cycle` on the global `PROBE_INTERVAL_S`, re-arming from `Core.last_cycle_end` (the
+  POST-cycle clock — from the pre-cycle clock an overrunning cycle is instantly due again, which hammers the
+  remote that just rate-limited us); per-job `probe.interval_s` is applied *inside* the cycle (dueness from
+  the persisted `probes.probed_at`), not here.
+- `probes.py` — `rclone lsjson --recursive --files-only` (argv, `DASHBOARD_RCLONE_TIMEOUT_S`, default 240 s —
+  90 s was itself a leading cause of probe "failures" on a ~1000-object tree; the effective value is clamped
+  to `PROBE_INTERVAL_S` since probes are serial) + state-file reader; `is_transient_error` /
+  `TRANSIENT_MARKERS` label a Drive rate limit or timeout in the error text and set `ProbeResult.transient`,
+  so quota push-back never reads like a wrong destination. That flag is load-bearing (transient = damped,
+  hard = immediate FAIL), so rclone's echoed paths are stripped before matching — both the annotated/quoted
+  forms and any bare `/`-containing token, since real rclone prints the failing path unquoted as well — and
+  the HTTP statuses (429/503) only match in their real spellings (`Error 429:`, `code 503`, `503 Service
+  Unavailable`), never as bare digits. A dated snapshot name like `km_tracker-20260503-0312.db` contains
+  `503`; as bare substrings those markers made a permission-denied on an ordinary nightly path look
+  transient. Don't classify on raw stderr, and don't re-add a bare status-code substring marker.
 - `notify.py` — ntfy `Notifier`; body is `job_id: FROM → TO` only (no reason text leaves the box);
   `should_notify` suppresses `UNKNOWN→OK`; never raises.
 - `ingest.py` — blueprint + pure payload parsers (`parse_json_payload`, `parse_form_payload`, `parse_metrics`).
@@ -122,6 +153,7 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   work identically without it). Don't add a second `<script>` — the CSP nonce is generated once per request
   via `csp_nonce()`, and anything else that needs interactivity should be reconsidered.
 - Tests must stay network-free: mock `probes.probe_job` / `subprocess.run` and use `RecordingNotifier`.
+  `run_probe_cycle` passes `timeout=` to `probe_job`, so a stub must accept it (`lambda job, **kw: …`).
 - Test fixtures pin `jobs.created_at` to 2030 (`conftest.pin_created_at`) so the never-pinged → LATE rule
   only fires in the tests that set `created_at` explicitly. Remember this when a new test uses a fixed clock.
 - Machine IPs, account ids and Drive folder ids never go in code, tests or docs — use

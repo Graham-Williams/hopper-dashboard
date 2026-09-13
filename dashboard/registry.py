@@ -37,7 +37,7 @@ PROBEABLE_KINDS = ("db_snapshot", "rclone_copy_tree", "manual")
 _TOP_KEYS = {"id", "name", "machine", "kind", "protects", "method",
              "destination", "cadence_s", "grace_s", "probe", "manual",
              "disk", "expect", "late_means"}
-_PROBE_KEYS = {"rclone_path", "state_dir"}
+_PROBE_KEYS = {"rclone_path", "state_dir", "interval_s"}
 _MANUAL_KEYS = {"max_age_s", "max_lag_bytes"}
 _DISK_KEYS = {"min_free_bytes", "max_used_pct"}
 
@@ -67,6 +67,7 @@ class Job:
     grace_s: int | None = None
     probe_rclone_path: str | None = None
     probe_state_dir: str | None = None
+    probe_interval_s: int | None = None
     max_age_s: int | None = None
     max_lag_bytes: int | None = None
     min_free_bytes: int | None = None
@@ -212,16 +213,32 @@ def parse_job(raw: Any, index: int) -> Job:
 
     probe_raw = raw.get("probe")
     rclone_path = state_dir = None
+    probe_interval = None
     if probe_raw is not None:
         if not isinstance(probe_raw, dict):
             raise _err(ref, "'probe' must be a mapping")
         _check_keys(probe_raw, _PROBE_KEYS, ref, "probe")
         rclone_path = _opt_str(probe_raw, "rclone_path", ref)
         state_dir = _opt_str(probe_raw, "state_dir", ref)
+        probe_interval = _pos_int(probe_raw, "interval_s", ref, required=False)
         if rclone_path is None:
             raise _err(ref, "'probe.rclone_path' is required when 'probe' is given")
         if kind not in PROBEABLE_KINDS:
             raise _err(ref, f"kind {kind} cannot have a 'probe' block")
+        # db_snapshot is the one kind whose STALE_DEST verdict is computed from
+        # the probe's newest-object time against cadence_s * DEST_FRESH_MULTIPLIER.
+        # A probe row that is itself older than that window would report a fresh
+        # destination as stale, so refuse an interval that could get close: cap it
+        # at half the staleness window. Other kinds judge staleness from heartbeat
+        # metrics, so a slow probe only delays a cosmetic newest/count refresh.
+        if kind == "db_snapshot" and probe_interval is not None and cadence:
+            cap = cadence * DEST_FRESH_MULTIPLIER // 2
+            if probe_interval > cap:
+                raise _err(ref, f"'probe.interval_s' must be <= {cap} for a "
+                                f"db_snapshot with cadence_s {cadence} (half of "
+                                f"cadence_s * {DEST_FRESH_MULTIPLIER}); a probe "
+                                f"row older than the freshness window would read "
+                                f"a fresh destination as STALE_DEST")
     if kind == "db_snapshot" and rclone_path is None:
         raise _err(ref, "db_snapshot requires probe.rclone_path")
     if kind == "rclone_copy_tree" and destination is None:
@@ -268,6 +285,7 @@ def parse_job(raw: Any, index: int) -> Job:
         id=job_id, name=name, machine=machine, kind=kind, protects=protects,
         method=method, destination=destination, cadence_s=cadence,
         grace_s=grace, probe_rclone_path=rclone_path, probe_state_dir=state_dir,
+        probe_interval_s=probe_interval,
         max_age_s=max_age, max_lag_bytes=max_lag, min_free_bytes=min_free,
         max_used_pct=max_used, expect=expect, late_means=late_means,
     )
