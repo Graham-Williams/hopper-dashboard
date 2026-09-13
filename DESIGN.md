@@ -278,6 +278,9 @@ Validation is strict and fails startup with the job id + field: ids `^[a-z0-9-]+
 `destination`, a `probe` block is accepted only on `db_snapshot` / `rclone_copy_tree` / `manual`, a `disk`
 block only on `disk` (with `max_used_pct` bounded to 1-100, so bytes pasted into the wrong field are
 rejected rather than silently disabling the threshold), `container` requires a non-empty `expect`,
+every schema string is rejected if it contains a control character (C0 or DEL — `job.name` becomes the ntfy
+`Title` header, and a CR/LF there makes `http.client` refuse every POST for that job for ever: not an
+injection, but a job that can never page and can never spend its page, so it is caught where a human sees it),
 `probe.interval_s` is a positive int, may not exceed `MAX_PROBE_INTERVAL_S` (86400 — a magnitude cap on
 EVERY kind, because `interval_s: 18000000` is 208 days of not looking and nothing on the board says so), and
 on a `db_snapshot` may not exceed half the freshness window (`cadence_s * DEST_FRESH_MULTIPLIER / 2`),
@@ -530,6 +533,9 @@ the Mac woke — the exact noise the machine-offline rule exists to prevent. A s
 
 `alert` and `alert_after_s` are mutually exclusive **checked on key presence** — with an `is not None` test,
 `alert: never` + `alert_after_s: null` parsed to "never", i.e. silence that reads like a threshold in the file.
+A **lone** `alert_after_s: null` (or `alert: null`) is an **error** for the same reason: it escapes the
+presence check because there is nothing to be exclusive with, and then resolves as if the key were absent —
+which on an informational job is `never`, a permanent silence filed under a key whose name says otherwise.
 An explicit `alert_after_s` wins even on an informational job, so there is always a way to alert on one.
 **`informational` now means what it always claimed.** `registry.py` documented it as "shown, never alerted
 on" and *nothing consulted it* — such a job pushed on every transition like any other. It is now resolved into

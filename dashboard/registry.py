@@ -195,13 +195,38 @@ def _err(job_ref: str, msg: str) -> RegistryError:
     return RegistryError(f"jobs.yml: job {job_ref}: {msg}")
 
 
+def _no_control_chars(val: str, key: str, ref: str) -> str:
+    """Reject C0/DEL anywhere in a schema string, loudly, at parse time.
+
+    `job.name` is the only free text that leaves the box: it becomes the ntfy
+    `Title` header. `http.client` refuses a header value containing CR or LF, so
+    a CRLF in a name is not an injection — but it turns that job PERMANENTLY
+    un-pageable, which is worse than noise here. Every POST for it raises,
+    `Notifier.send` swallows the exception and returns False, the rollback hands
+    the page straight back, and the next tick tries again: measured, 24 POST
+    attempts over two simulated hours with `alerted_at` NULL throughout. The
+    page is never delivered, never spent, and the recovery can never fire —
+    a job that looks armed on the board and can never speak.
+
+    So the value is rejected where a human can see the error (the container
+    refuses to start with the job named), not sanitised silently somewhere
+    downstream. NUL, ESC and the rest go with it: none of them belong in a job
+    label, they render as garbage in a terminal-coloured log line, and the whole
+    class is cheaper to exclude than to reason about one code point at a time.
+    A trailing newline from YAML is already gone — this runs after `.strip()`.
+    """
+    if any(ord(c) < 0x20 or ord(c) == 0x7f for c in val):
+        raise _err(ref, f"'{key}' must not contain control characters")
+    return val
+
+
 def _req_str(raw: dict, key: str, ref: str, max_len: int = 200) -> str:
     val = raw.get(key)
     if not isinstance(val, str) or not val.strip():
         raise _err(ref, f"'{key}' is required and must be a non-empty string")
     if len(val) > max_len:
         raise _err(ref, f"'{key}' is longer than {max_len} characters")
-    return val.strip()
+    return _no_control_chars(val.strip(), key, ref)
 
 
 def _opt_str(raw: dict, key: str, ref: str, max_len: int = 200) -> str | None:
@@ -212,7 +237,7 @@ def _opt_str(raw: dict, key: str, ref: str, max_len: int = 200) -> str | None:
         raise _err(ref, f"'{key}' must be a non-empty string when given")
     if len(val) > max_len:
         raise _err(ref, f"'{key}' is longer than {max_len} characters")
-    return val.strip()
+    return _no_control_chars(val.strip(), key, ref)
 
 
 def _pos_int(container: dict, key: str, ref: str, required: bool,
@@ -299,6 +324,20 @@ def parse_job(raw: Any, index: int) -> Job:
     if "alert" in raw and "alert_after_s" in raw:
         raise _err(ref, "'alert' and 'alert_after_s' are mutually exclusive; "
                         "keep one (even when the other is null)")
+    # ...and the same reasoning one key at a time. A LONE `alert_after_s: null`
+    # (a value commented out, a `${}` that expanded to nothing, a half-finished
+    # edit) escaped the presence check above because there was nothing to be
+    # exclusive with: `_nonneg_int` early-returns None, and the job then falls
+    # through to whatever an ABSENT key would mean. On an informational job that
+    # is `never` — an accidental, permanent silence sitting in the file under a
+    # key that reads like a configured threshold, which is the exact failure the
+    # presence check exists to prevent. Present-but-null is a mistake in every
+    # case, so say so instead of resolving it.
+    for key in ("alert", "alert_after_s"):
+        if key in raw and raw[key] is None:
+            raise _err(ref, f"'{key}' is present but null; that is not a "
+                            f"policy — give it a value or remove the key "
+                            f"(use 'alert: never' if you mean never)")
     alert_after_s = _nonneg_int(raw, "alert_after_s", ref)
     alert_mode = _opt_str(raw, "alert", ref, max_len=16)
     if alert_mode is not None and alert_mode != ALERT_NEVER:

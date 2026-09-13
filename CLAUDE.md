@@ -80,7 +80,13 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   `informational` is no longer a broken promise: it feeds this resolution instead of being a second,
   overlapping concept nothing consulted. `alert_after_s` is capped at `MAX_ALERT_AFTER_S` (30 d) — magnitude
   is the one hostile input this validator would otherwise accept, since one extra digit silently means
-  "never page".
+  "never page". A **present-but-null** `alert` / `alert_after_s` is an ERROR, not a resolution: alone it
+  escaped the presence check (nothing to be exclusive with) and fell through to what an ABSENT key means,
+  which on an informational job is `never` — silence filed under a key that reads like a threshold.
+  Every schema string is also rejected if it contains a **control character**: `job.name` is the only free
+  text that leaves the box (the ntfy `Title` header), and a CR/LF in it makes `http.client` refuse the POST
+  for ever — not an injection (zero bytes reach the socket) but a job that can never page and never spend
+  its page, which is worse. Loud at parse time; the container refuses to start, naming the job.
 - `db.py` — schema (`jobs` incl. `created_at`, `bad_since`, `alerted_at`; `runs`, `probes`,
   `state_changes`), WAL connection, all queries, ISO helpers (`from_iso` clamps to 1970..9999 and never
   raises). **"Which probe row is newest" is decided by `id` (insert order), never by `probed_at`** —

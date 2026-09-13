@@ -97,6 +97,11 @@ def test_top_level_errors(doc, msg):
     # like somebody set a threshold.
     ({"alert": "never", "alert_after_s": None}, "mutually exclusive"),
     ({"alert": None, "alert_after_s": 60}, "mutually exclusive"),
+    # A LONE null escaped that check — nothing to be exclusive with — and fell
+    # through to whatever an ABSENT key means: `never` on an informational job
+    # (silence that reads like a threshold), the 24 h default elsewhere.
+    ({"alert_after_s": None}, "present but null"),
+    ({"alert": None}, "present but null"),
     # Magnitude was the one hostile value the validator accepted: a threshold of
     # 10**20 seconds is silence, and NOTHING would say so.
     ({"alert_after_s": 10 ** 20}, "over the 2592000 second"),
@@ -132,6 +137,59 @@ def test_alert_policy_resolution_and_its_conservative_default():
     assert quiet.alert_source == "informational"
     # 0 is legal: "page on the first not-OK recompute" (what the shared fixtures use).
     assert parse_registry(_doc(alert_after_s=0)).get("snap").alert_after_s == 0
+
+
+@pytest.mark.parametrize("bad", [
+    "Tree copy\r\nX-Injected: yes",          # the header-injection shape
+    "Tree\ncopy", "Tree\rcopy",              # a bare LF or CR does it too
+    "Tree\x00copy", "Tree\x1b[31mcopy",      # NUL, ESC
+    "Tree\x7fcopy",                          # DEL
+])
+def test_a_control_character_in_a_job_string_is_rejected_at_parse_time(bad):
+    """A control character in `job.name` makes that job PERMANENTLY un-pageable.
+    The name becomes the ntfy `Title` header; `http.client` refuses a header
+    value containing CR/LF, so nothing is ever injected (zero bytes reach the
+    socket) — but every POST raises, `send` swallows it and returns False, the
+    failed-push rollback hands the page straight back, and the next tick tries
+    again: 24 attempts over two simulated hours, `alerted_at` NULL throughout.
+    The page is never delivered and never spent, so the recovery can never fire
+    either, and the board shows a job that looks armed and cannot speak.
+
+    `.strip()` alone did not catch any of these — it only trims the ends."""
+    doc = copy.deepcopy(JOBS_DOC)
+    doc["jobs"][1]["name"] = bad
+    with pytest.raises(RegistryError, match=r"must not contain control characters"):
+        parse_registry(doc)
+    # ...and the same for every other free-text field that reaches a log or the page.
+    doc = copy.deepcopy(JOBS_DOC)
+    doc["jobs"][1]["destination"] = bad            # optional string → _opt_str
+    with pytest.raises(RegistryError, match=r"must not contain control characters"):
+        parse_registry(doc)
+    # A trailing newline from YAML is still fine: it is stripped before the check.
+    doc = copy.deepcopy(JOBS_DOC)
+    doc["jobs"][1]["name"] = "Tree copy\n"
+    assert parse_registry(doc).get("tree").name == "Tree copy"
+
+
+def test_a_lone_null_alert_key_is_an_error_not_a_resolution():
+    """The mutual-exclusion check is on key PRESENCE precisely so an accidental
+    silence cannot read like a configured threshold — but a LONE null slipped
+    past it, because there was nothing to be exclusive with. `_nonneg_int`
+    early-returns None and the job then resolves as if the key were ABSENT: on
+    an INFORMATIONAL job that is `alert: never`, i.e. permanent silence sitting
+    in the file under a key whose name says a threshold was set. (Elsewhere it
+    lands on the 24 h default — the safe direction, and still not what the file
+    says.) Present-but-null is a mistake in every case."""
+    doc = copy.deepcopy(JOBS_DOC)
+    doc["jobs"][5]["alert_after_s"] = None        # `info`: manual, no thresholds
+    with pytest.raises(RegistryError, match=r"'alert_after_s' is present but null"):
+        parse_registry(doc)
+    doc["jobs"][5]["alert_after_s"] = 3600        # the same job, said properly
+    assert parse_registry(doc).get("info").alert_after_s == 3600
+    doc = copy.deepcopy(JOBS_DOC)
+    doc["jobs"][5]["alert"] = None
+    with pytest.raises(RegistryError, match=r"'alert' is present but null"):
+        parse_registry(doc)
 
 
 def test_example_file_alert_policy_matches_the_documented_thresholds():
