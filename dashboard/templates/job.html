@@ -19,8 +19,8 @@
     <dt>Last success</dt><dd>{{ when(job.last_success, now) }}</dd>
     {% if job.cadence_s %}<dt>Cadence</dt><dd>every {{ job.cadence_s|human_duration }} (+{{ job.grace_s|human_duration }} grace)</dd>{% endif %}
     <dt>Alerts</dt>
-    <dd>{% if job.alert.never %}Never pages — state changes are recorded here only.{% else %}Pages after {{ job.alert.after_s|human_duration }} continuously not OK.{% endif %}
-      {%- if job.alert.bad_since %} <span class="muted">· not OK since {{ when(job.alert.bad_since, now) }}{% if job.alert.alerted_at %}, paged {{ when(job.alert.alerted_at, now) }}{% elif not job.alert.never %}, not paged yet{% endif %}{% if job.state == 'OK' %} (episode still open — it has not held OK long enough to count, or the evidence for it is missing){% endif %}</span>{% endif %}</dd>
+    <dd>{% if job.alert.never %}Never pages — state changes are recorded here only.{% else %}Pages after {{ job.alert.after_s|human_duration }} continuously not OK, or that much not-OK time within {{ job.alert.window_s|human_duration }}.{% endif %}
+      {%- if job.alert.bad_since %} <span class="muted">· not OK since {{ when(job.alert.bad_since, now) }}{% if job.alert.alerted_at %}, paged {{ when(job.alert.alerted_at, now) }}{% if job.alert.alerted_state %} about {{ job.alert.alerted_state }}{% endif %}{% elif not job.alert.never %}, not paged yet{% endif %}{% if job.state == 'OK' %} (episode still open — it has not held OK long enough to count, or the evidence for it is missing){% endif %}</span>{% endif %}</dd>
     {% if job.kind == 'manual' and job.never_run %}
     <dt>Status</dt><dd><strong>Never run</strong> — no completion pinged yet{% if job.lag and job.lag.max_age_s %}; the max-age target is inert until the first <code>ping.sh {{ job.id }} ok</code>{% endif %}</dd>
     {% endif %}

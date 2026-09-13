@@ -227,11 +227,15 @@ def test_alert_policy_is_exposed_additively(read, core, registry):
         j = pick(read.get(endpoint, headers=bearer()).get_json())
         assert CONTRACT_KEYS <= set(j)
         assert set(j["alert"]) == {"after_s", "never", "source", "bad_since",
-                                   "alerted_at", "cooldown_s", "last_paged_at"}
+                                   "alerted_at", "alerted_state", "window_s",
+                                   "cooldown_s", "last_paged_at"}
         assert j["alert"]["never"] is False and j["alert"]["after_s"] == 0
         assert j["alert"]["source"] == "alert_after_s"
         assert j["alert"]["bad_since"] == db.to_iso(NOW)     # episode is running
         assert j["alert"]["alerted_at"] == db.to_iso(NOW)    # ...and was paged (threshold 0)
+        # ...about WHAT, which the card needs to explain a "paged" stamp sitting
+        # next to a state the page never mentioned (an escalation not yet sent).
+        assert j["alert"]["alerted_state"] == "FAIL"
         # The per-job cooldown, so "quiet phone, unhappy board" is answerable
         # from the API: this job paged just now and cannot page again for 6 h.
         assert j["alert"]["cooldown_s"] == COOLDOWN_FLOOR_S
@@ -240,6 +244,7 @@ def test_alert_policy_is_exposed_additively(read, core, registry):
     j = {x["id"]: x for x in read.get("/api/v1/status", headers=bearer()).get_json()["jobs"]}["info"]
     assert j["alert"] == {"after_s": None, "never": True, "source": "informational",
                           "bad_since": None, "alerted_at": None,
+                          "alerted_state": None, "window_s": None,
                           "cooldown_s": None, "last_paged_at": None}
     core.record_ping(registry.get("tree"), {"status": "ok"}, now=NOW + 5)
     core.recompute_all(now=NOW + 5 + ok_dwell_s(registry.get("tree")))
@@ -265,7 +270,10 @@ def test_alert_policy_shown_on_the_job_page(settings, notifier):
     c = app.test_client()
     c.post("/login", data={"password": PASSWORD})
     html = c.get("/jobs/tree").data.decode()
-    assert "Pages after 1d 6h continuously not OK." in html
+    # Both halves of the policy, not just the continuous one: a card that says
+    # only "after 1d 6h continuously" describes a rule the code no longer has.
+    assert ("Pages after 1d 6h continuously not OK, or that much not-OK time "
+            "within 2d 12h." in html)
     assert "not OK since" in html and "not paged yet" in html
     assert "Never pages" in c.get("/jobs/mirror").data.decode()
     assert html.count("<script") == 1                        # CSP: still exactly one inline script

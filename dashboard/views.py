@@ -11,7 +11,7 @@ import time
 
 from . import db
 from .registry import Job, Registry
-from .services import cooldown_s
+from .services import bad_window_s, cooldown_s
 from .state import Facts, dest_info, disk_info, lag_info
 
 HISTORY_LEN = 30
@@ -72,12 +72,22 @@ def job_entry(conn, job: Job, row: dict | None, now: float,
         # worth asking when the phone is quiet but the board is not: is this job
         # unpaged because nothing crossed a threshold, or because it paged
         # recently?
+        # `alerted_state` is WHAT that page said, which is not always the state
+        # on the card: an episode paged as BEHIND that has since gone FAIL shows
+        # `state: FAIL` beside `alerted_state: BEHIND` until the escalation goes
+        # out. Without it, "paged 2h ago" next to a red card is unreadable.
         "alert": {
             "after_s": None if job.alert_never else job.alert_after_s,
             "never": job.alert_never,
             "source": job.alert_source,
             "bad_since": row.get("bad_since"),
             "alerted_at": row.get("alerted_at"),
+            "alerted_state": row.get("alerted_state"),
+            # The accumulator's window: this job also pages after `after_s` of
+            # not-OK time (in one state) inside `window_s`, not only after
+            # `after_s` unbroken. Exposed so the job page can say both rules out
+            # loud rather than describing half the policy.
+            "window_s": None if job.alert_never else int(bad_window_s(job)),
             "cooldown_s": None if job.alert_never else int(cooldown_s(job)),
             "last_paged_at": row.get("last_paged_at"),
         },

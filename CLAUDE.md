@@ -92,9 +92,13 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   text that leaves the box (the ntfy `Title` header), and a CR/LF in it makes `http.client` refuse the POST
   for ever — not an injection (zero bytes reach the socket) but a job that can never page and never spend
   its page, which is worse. Loud at parse time; the container refuses to start, naming the job.
-- `db.py` — schema (`jobs` incl. `created_at`, `bad_since`, `alerted_at`; `runs`, `probes`,
-  `state_changes`), WAL connection, all queries, ISO helpers (`from_iso` clamps to 1970..9999 and never
-  raises). **"Which probe row is newest" is decided by `id` (insert order), never by `probed_at`** —
+- `db.py` — schema (`jobs` incl. `created_at`, `bad_since`, `alerted_at`, `alerted_state`, `last_paged_at`;
+  `runs`, `probes`, `state_changes`), WAL connection, all queries, ISO helpers (`from_iso` clamps to
+  1970..9999 and never raises). `not_ok_seconds` reconstructs a job's state timeline from `state_changes` for
+  the alert accumulator — derived, not stored, for the same reasons `probe_fail_streak` is (nothing to
+  migrate, unforgeable by INGEST_TOKEN), walked by rowid (`sc_job_seq`) so a clock step cannot reorder it, and
+  under-estimating by construction: time it cannot account for counts as OK.
+  **"Which probe row is newest" is decided by `id` (insert order), never by `probed_at`** —
   `last_probe`, `last_ok_probe`, `oldest_probe`, `probe_fail_streak` and `failing_probe_job_ids` all order by
   id, and `probes_job_seq` is the index for it. `probed_at` is the writer's wall clock, so one row written
   while the clock was ahead outranks every real probe after it for ever: the newest row reads `ok`, the
@@ -121,10 +125,30 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
 - `services.py` — `Core`: record ping → shallow-merge metrics → recompute ALL jobs → persist transitions →
   run the **episode pass** → notify.
   **Alerting is by EPISODE, not by transition** (DESIGN.md "Alerting rules" is the spec; read the module
-  docstring before touching any of it). A job pages once, after it has been continuously not-OK for its own
-  `alert_after_s`, and recovers only if that page went out. Three `jobs` columns hold it: `bad_since` (episode
-  start; `jobs.since` cannot serve, it resets on every state change), `alerted_at` (one page per episode) and
-  `last_paged_at` (the per-job COOLDOWN, which spans episodes — see below).
+  docstring before touching any of it). A job pages once, after it has been not-OK for its own
+  `alert_after_s`, and recovers only if that page went out. Four `jobs` columns hold it: `bad_since` (episode
+  start; `jobs.since` cannot serve, it resets on every state change), `alerted_at` (one page per episode),
+  `alerted_state` (WHAT that page said) and `last_paged_at` (the per-job COOLDOWN, which spans episodes — see
+  below).
+  **THE EPISODE IS NOT FLAT** — two things it could not express were each a silence, and both fixes live in
+  `_page`:
+  *"this has been bad a lot"* (`_past_bar` + `bad_window_s`, issue #15). An episode is past its bar
+  **either** continuously for `alert_after_s` **or** cumulatively: `alert_after_s` spent in the state being
+  paged about, inside the last `2 × alert_after_s`. Without it a destination that failed for an hour and
+  listed once every quarter-hour restarted its 6 h clock for ever — measured at **zero pushes/day** while
+  failing 73-90% of probes, which is exactly what a rate-limited Drive looks like. Three things make it safe
+  and all three are load-bearing: it is an **OR** beside the clock (a rule that counts only not-OK seconds can
+  only page LATER — that is how #13 item 4's two attempts each produced a silence bug); it counts **one state,
+  not any badness** (counting everything laundered a sleeping Mac's deliberately-muted sibling LATE into an
+  instant page for an unrelated BEHIND); and the cooldown below still caps the rate.
+  *"this got worse"* (`alert_severity` + `alerted_state`, issue #16). An episode that has paged pages ONCE
+  more if its state gets strictly worse, at that state's own priority. Severity is read off
+  `notify.HIGH_PRIORITY_STATES` rather than invented, so the rank and the `Priority` header cannot disagree —
+  that disagreement WAS the bug (a disk paged "BEHIND for over 1h" at `default`, then filled, then went
+  unreadable, and no high-priority push was ever sent). Two ranks is the bound. It deliberately ignores the
+  cooldown (a worse state is a different fact, and it is already one-per-paged-episode) but stamps
+  `last_paged_at`. The **recovery names `alerted_state`**, not the latest non-OK state, or an episode paged as
+  BEHIND recovers as "FAIL → OK" — a resolution for an alert nobody received.
   **Dispatch is LEVEL-triggered** — `_resolve_alerts` walks EVERY job on EVERY recompute, because "still
   FAIL, now past six hours" is the event and it is not a transition. `recompute_all` and `record_ping` are
   two entry points into the same `_recompute_pass`; keep them that way.
@@ -205,9 +229,13 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   `503`; as bare substrings those markers made a permission-denied on an ordinary nightly path look
   transient. Don't classify on raw stderr, and don't re-add a bare status-code substring marker.
 - `notify.py` — ntfy `Notifier`, deliberately dumb: it decides nothing about *whether* to page, `Core` does.
-  `notify_alert(name, id, state, after_s)` for a sustained problem (`job_id: STATE for over 6h`),
-  `notify_recovery(name, id, from_state)` for the end of an episode that was paged. No reason text ever
-  leaves the box; never raises; returns False on a failed POST, which `Core` acts on (see below).
+  `notify_alert(name, id, state, after_s, within_s=None)` for a sustained problem (`job_id: STATE for over
+  6h`, or `… for over 6h in the last 12h` when the accumulator decided it — don't drop that clause, an alert
+  that overstates what it saw is one you learn to discount), `notify_escalation(name, id, from, to)` for an
+  episode that got worse (`job_id: BEHIND → FAIL`, at the worse state's priority), `notify_recovery(name, id,
+  from_state)` for the end of an episode that was paged. `HIGH_PRIORITY_STATES` is the single source for both
+  the `Priority` header and `services.alert_severity` — keep it that way. No reason text ever leaves the box;
+  never raises; returns False on a failed POST, which `Core` acts on (see below).
 - `ingest.py` — blueprint + pure payload parsers (`parse_json_payload`, `parse_form_payload`, `parse_metrics`).
 - `web.py` — read blueprint: gate, host pin, security headers (per-request CSP nonce), HTML + JSON routes.
 - `views.py` — builds the `/api/v1/status` contract and job detail from the store.
@@ -259,6 +287,19 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
 - `RecordingNotifier` overrides `_post`, not `send` — `send`'s try/except is part of what is under test, and
   a double that overrides `send` would make every retry path look like it worked. It has two failure modes
   (`fail` raises, `refuse` returns non-2xx) because `send` flattens both to False.
+- **A silence test needs an UPPER bound too.** `assert notifier.sent` passes just as well for a fix that pages
+  sixty times, which is the failure on the other side and the one this project has actually shipped. The
+  accumulator suites assert `1 <= alerts <= DAY // COOLDOWN_FLOOR_S` and a total push bound; derive the bound
+  from the cooldown rather than typing a number.
+- **The long simulations use the `no_prune` fixture, and it is a speed patch, not a behaviour one.**
+  `db.prune` runs inside every probe cycle and its `id NOT IN (SELECT … LIMIT n)` is correlated, so SQLite
+  re-runs the subquery per candidate row: the 1152-cycle storm replay takes **113 s** with it and **2 s**
+  without. (It is worth knowing for production too — that cost is paid every cycle against tables kept at
+  2000 rows per job.)
+- **A test that expects an ESCALATION has to page a default-priority state first** (BEHIND / LATE): the rank
+  is read off `HIGH_PRIORITY_STATES`, so an episode that already paged FAIL or STALE_DEST is at the top and
+  correctly sends nothing more. `disk` is the natural fixture — low space is BEHIND, an unreadable `statvfs`
+  is FAIL.
 - **Adding a job to `jobs.example.yml` means giving it an alert policy.** `registry` will fall back to the
   24 h default, but a shipped job inheriting the default is a job somebody forgot — `test_example_file_alert_
   policy_matches_the_documented_thresholds` asserts no job has `alert_source == "default"`. Say `alert: never`

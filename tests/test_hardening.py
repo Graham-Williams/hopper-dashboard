@@ -149,12 +149,26 @@ def test_schema_migration_adds_the_alert_episode_columns(tmp_path):
         db.init_schema(conn)                               # idempotent: a redeploy re-runs it
         row = db.job_row(conn, "km-backup")
         assert row["bad_since"] is None and row["alerted_at"] is None
+        # ...and the two columns added since: the cooldown stamp and the state a
+        # page was about. NULL for both, which is why no job starts life inside a
+        # cooldown it never earned, and why an already-paged episode is HEALED
+        # rather than ranked (services.Core._page).
+        assert row["last_paged_at"] is None and row["alerted_state"] is None
         assert row["state"] == "FAIL" and row["last_metrics"] == {"bytes": 7}   # no data lost
         with conn:
             db.set_alert_episode(conn, "km-backup", to_iso(NOW + 60), None)
         row = db.job_row(conn, "km-backup")
         assert row["bad_since"] == to_iso(NOW + 60)
         assert row["updated_at"] == to_iso(NOW)            # the liveness column is untouched
+        with conn:
+            db.set_alert_episode(conn, "km-backup", to_iso(NOW + 60),
+                                 to_iso(NOW + 120), "FAIL")
+        assert db.job_row(conn, "km-backup")["alerted_state"] == "FAIL"
+        # The accumulator's index comes with the same migration, on a table that
+        # already exists in a 0.1 database.
+        idx = {r["name"] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'")}
+        assert "sc_job_seq" in idx
     finally:
         conn.close()
 

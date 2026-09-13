@@ -35,6 +35,25 @@ keeps an episode alive, and an episode that never ends holds its unspent page
 hostage too — so each one is bounded and each bound is stated where it is
 implemented. A guard that asks "is the job OK right now?" is almost always
 asking the wrong question; ask whether the **episode** is still open.
+
+**The episode is not flat.** Two things it could not express were each a
+silence:
+
+- *"this has been bad a lot"* — a destination that fails for an hour and then
+  lists successfully once is a genuinely recovered job by the episode rules, so
+  its clock restarted for ever and it paged NOTHING (issue #15; Drive's
+  ``rateLimitExceeded`` is intermittent by nature). :func:`bad_window_s` plus
+  :meth:`Core._past_bar` add the accumulator that closes it, as an OR beside
+  the continuous rule and never as a replacement for it.
+- *"this got worse"* — one page per episode meant a gauge paged for BEHIND and
+  then said nothing when the disk filled and the reading failed outright, at
+  the wrong ntfy priority (issue #16). :func:`alert_severity` plus
+  ``jobs.alerted_state`` allow exactly one re-page per episode, when the
+  episode's state crosses from a default-priority state to a high-priority one.
+
+Both are bounded by the per-job cooldown, which stays the only rate guarantee
+in the file: see :func:`cooldown_s` for the arithmetic, stated as pushes rather
+than as pages.
 """
 
 from __future__ import annotations
@@ -46,9 +65,9 @@ from dataclasses import dataclass
 
 from . import db, probes
 from .config import Settings
-from .notify import Notifier
+from .notify import HIGH_PRIORITY_STATES, Notifier
 from .registry import Job, Registry
-from .state import Facts, compute_state, is_alertable, ok_is_unverified
+from .state import ALERTABLE_STATES, Facts, compute_state, is_alertable, ok_is_unverified
 
 log = logging.getLogger(__name__)
 
@@ -96,6 +115,37 @@ MAX_CADENCE_DWELL_S = 900
 # box job. Lengthening the offending job's THRESHOLD instead would have been
 # wrong: that re-opens the silence window the hard ceiling just closed.
 COOLDOWN_FLOOR_S = 21600
+
+# THE EPISODE ACCUMULATOR, as a multiple of the job's own threshold: an episode
+# is also past its bar when the job has been not-OK for `alert_after_s` seconds
+# within the last `BAD_WINDOW_MULTIPLE * alert_after_s`.
+#
+# WHY THIS EXISTS. The damping in PR #8 has a cumulative backstop
+# (`PROBE_NO_SUCCESS_S`, measured from the last SUCCESSFUL probe) which
+# guarantees the STATE reaches FAIL however the streak arithmetic falls. The
+# episode had no equivalent, so a destination that failed for an hour and then
+# listed successfully once was, to the episode rules, a job that recovered: the
+# clock restarted from zero, for ever. Measured over 24 h against the real
+# `run_probe_cycle` with production values (threshold 6 h, cycle 300 s):
+# 60 min down / 5 min up paged ONCE a day, and 60/15, 180/15 and 300/30 paged
+# **zero times** while failing 73-90% of every probe. Google Drive's
+# `rateLimitExceeded` — the failure that motivated PR #8, and which really did
+# break the nightly backup on 2026-09-10 — is intermittent by nature, so this
+# was the shape most likely to matter.
+#
+# WHY A MULTIPLE OF 2. The bar is "not-OK for one whole threshold inside the
+# window", so the multiple IS the duty cycle it takes to page: 2 means "broken
+# more than half the time, for two thresholds". One would be the existing
+# continuous rule (it needs 100%) and therefore no help at all; four would page
+# for a job broken a quarter of the time, which is a judgement nobody has asked
+# for. It cannot page EARLIER than the continuous rule — accruing
+# `alert_after_s` of not-OK time takes at least `alert_after_s` — so the
+# accumulator only ever adds cases, never moves the existing one.
+BAD_WINDOW_MULTIPLE = 2
+# Bound on the transition-log scan behind it. `state_changes` is not pruned, and
+# a job that flaps writes rows for ever; 2000 covers ~1000 not-OK spans inside
+# any window, far past the point where the sum has already cleared the bar.
+BAD_SCAN_LIMIT = 2000
 
 # States whose verdict comes from the DESTINATION rather than from the
 # heartbeat. An episode that was in one of these must not be closed by an OK we
@@ -175,8 +225,66 @@ def cooldown_s(job: Job) -> float:
     moment the cooldown expires, a job that is still — or again — past its
     threshold pages. The cooldown can therefore delay a page; it can never
     cancel one. That is the whole reason it is safe, and it has its own test.
+
+    **It caps PAGES, not pushes, and the difference is a factor of three.** Two
+    things ride past it on purpose, and both are bounded by the episode rather
+    than by the clock:
+
+    - a **recovery** is sent for every episode that paged, and is deliberately
+      not capped — see :meth:`Core._resolve_alerts`. Measured on a gauge
+      hovering 3 h low / 1 h healthy for a week: 28 pages (the cap, working)
+      and 28 recoveries, i.e. 8 pushes/day against a 6 h cooldown;
+    - an **escalation** (:func:`alert_severity`) is at most one per *paged*
+      episode, and a paged episode is itself at most one per cooldown.
+
+    So the honest worst case per job is page + escalation + recovery per
+    cooldown window — 12 pushes/day at the 6 h floor — and it takes a job that
+    crosses its threshold, gets strictly worse, then genuinely recovers, every
+    six hours for ever. `test_the_worst_case_push_rate_per_cooldown_window`
+    asserts the bound rather than leaving it to this comment.
     """
     return max(float(job.alert_after_s), float(COOLDOWN_FLOOR_S))
+
+
+def bad_window_s(job: Job) -> float:
+    """How far back :meth:`Core._past_bar` adds up ``job``'s not-OK time.
+
+    See :data:`BAD_WINDOW_MULTIPLE`. Zero for a job with a zero threshold —
+    which pages on its first not-OK recompute anyway, so there is nothing an
+    accumulator could add.
+    """
+    return BAD_WINDOW_MULTIPLE * float(job.alert_after_s)
+
+
+def alert_severity(state: str) -> int:
+    """How urgent a page about ``state`` is, as a rank an escalation compares.
+
+    **Derived from the ntfy priority, not invented here.** The question the
+    escalation exists to answer is "would this page have been louder than the
+    one we already sent?", so the ordering is read off
+    :data:`dashboard.notify.HIGH_PRIORITY_STATES` — the same table that decides
+    the ``Priority`` header. Inventing a second ordering would let the two drift
+    apart, and the whole defect in issue #16 was a push going out at the wrong
+    priority.
+
+    That gives exactly two alertable ranks, which is also the bound: one page at
+    the default-priority rank (BEHIND / LATE) and at most one more when the
+    episode reaches the high-priority rank (FAIL / STALE_DEST). A worsening
+    cannot become a storm because there is nowhere above rank 2 to go.
+
+    ``0`` is "not a state we page about" — UNKNOWN, OK, or a value we cannot
+    read at all. Ranked BELOW every real state on purpose: an unreadable
+    ``alerted_state`` then reads as "we have no idea what was sent", and the
+    ambiguity resolves toward paging like everything else here. The one place
+    that could turn into a duplicate page — a row paged by an older version,
+    which has no ``alerted_state`` at all — is healed instead (see
+    :meth:`Core._page`).
+    """
+    if state in HIGH_PRIORITY_STATES:
+        return 2
+    if state in ALERTABLE_STATES:
+        return 1
+    return 0
 
 
 def ok_hold_s(job: Job) -> float:
@@ -213,13 +321,28 @@ class AlertIntent:
     (:meth:`Core._return_unsent_pages`). ``prev_paged_at`` carries the job's
     cooldown stamp as it was BEFORE this page, so the same rollback can put that
     back too — a page that never left the box must not leave a cooldown behind.
+
+    ``prev_alerted_at``/``prev_alerted_state`` are the same idea for an
+    ESCALATION, which is the one page that lands on an episode that has already
+    paged: rolling it back to NULL would re-arm the episode's *first* page as
+    well, so the pair it replaced is carried instead and restored verbatim. For
+    a first page they are both None, which is exactly what the rollback wrote
+    before escalations existed.
+
+    ``within_s`` is set only when the page was decided by the accumulator rather
+    than by a continuous run (:meth:`Core._past_bar`); it is the window the
+    not-OK time was added up over, and the ntfy body says so instead of claiming
+    an outage that long.
     """
     job: Job
-    kind: str          # "alert" | "recovery"
+    kind: str          # "alert" | "escalation" | "recovery"
     state: str         # the state the episode is about
     bad_since: str | None = None
     alerted_at: str | None = None
     prev_paged_at: str | None = None
+    prev_alerted_at: str | None = None
+    prev_alerted_state: str | None = None
+    within_s: float | None = None
 
 
 @dataclass(frozen=True)
@@ -455,7 +578,7 @@ class Core:
             return 0.0
         return now - since
 
-    def _retry_due(self, job_id: str, bad_since: str, now: float) -> bool:
+    def _retry_due(self, job_id: str, attempt_key: str, now: float) -> bool:
         """May we POST for this episode yet?
 
         Always yes for an episode we have not tried to page for — the FIRST
@@ -465,6 +588,14 @@ class Core:
         ``ALERT_RETRY_MIN_S``. A clock that steps backwards reads as due rather
         than as "wait": late-but-noisy over silent, as everywhere else.
 
+        ``attempt_key`` is the episode PLUS the severity rank being paged
+        (:meth:`_attempt_key`), not ``bad_since`` alone. An escalation is a new
+        page inside an episode that has already POSTed, so keyed on the episode
+        alone it would read as a retry and be held back for five minutes — a
+        "the disk is now unreadable" push delayed by a backoff that exists only
+        to stop hammering a dead ntfy. Two ranks means at most two live keys per
+        episode, so the backoff still bounds retries per page.
+
         The map is per-``Core``, and only the ingest role dispatches — it runs
         ``gunicorn --workers 1 --threads 4`` (see ``entrypoint.sh``), so one
         process, one map, shared by the ticker thread and every ingest thread.
@@ -472,10 +603,88 @@ class Core:
         the worker count; that is more pushes, not fewer, but check here first.
         """
         last = self._alert_attempted.get(job_id)
-        if last is None or last[0] != bad_since:
+        if last is None or last[0] != attempt_key:
             return True
         waited = now - last[1]
         return waited >= ALERT_RETRY_MIN_S or waited < 0
+
+    @staticmethod
+    def _attempt_key(bad_since: str, about: str) -> str:
+        """The retry-backoff key: this episode, at this severity rank."""
+        return f"{bad_since}@{alert_severity(about)}"
+
+    @staticmethod
+    def _past_bar(conn, job: Job, about: str, began: float,
+                  now: float) -> tuple[bool, float | None]:
+        """Has this episode earned a page yet? Returns ``(past, within_s)``,
+        where ``within_s`` is the accumulator's window when that is what decided
+        it and None when the episode simply ran long enough.
+
+        Two independent ways past the bar, and the first is the original one:
+
+        - **continuously** not-OK for ``alert_after_s`` — the episode clock,
+          which includes the dwell it is serving out (that is the documented
+          soft edge, and it errs toward paging);
+        - **cumulatively** in ``about`` for ``alert_after_s`` inside the last
+          :func:`bad_window_s` — the accumulator (:data:`BAD_WINDOW_MULTIPLE`),
+          which is what makes an intermittent destination reachable at all.
+
+        **It is an OR, and that is the whole safety argument.** Issue #13 item 4
+        declined an accumulator here because the two attempts at it during
+        review each produced a silence bug — both of them versions that
+        *replaced* the clock with "count only the not-OK seconds", which can
+        only ever page LATER than the clock does. Added beside the clock, the
+        accumulator has no path to silence: every episode that paged before this
+        change still pages at exactly the same moment, and the only new
+        behaviour is extra pages. The second half of that argument is upstream:
+        PR #8's damping means transient probe noise never reaches an alertable
+        state at all, so the accumulator sits behind the filter and never sees
+        the 27-flap storm that made this dangerous (asserted, not assumed —
+        `test_the_historical_flap_storm_still_pages_nothing`).
+
+        **Only time in ``about`` counts — the SAME state this page is about, not
+        "any badness".** Found by an existing test rather than by reasoning:
+        counting every alertable state let time that was deliberately MUTED be
+        laundered into a page about something else. Every night the Mac sleeps,
+        each of its jobs sits LATE for hours with its alert suppressed by the
+        machine-offline rule ("one alert for the machine"); with a flat
+        accumulator, the next morning's first *unrelated* `drive-mirror: BEHIND`
+        episode paged the instant it opened, on the strength of a sleep that was
+        explicitly declared not-news. Per-state, that cannot happen: muted LATE
+        time can only ever count toward a LATE page, which the same mute still
+        gags. It is also the better semantics — "this exact problem keeps coming
+        back", which is the question the episode asks, only cumulatively.
+        Residual, stated: a job that alternates between DIFFERENT bad states
+        across separate episodes accumulates neither. Within one episode the
+        clock already covers it (a mid-episode LATE → FAIL does not reset it).
+
+        **The early-fire is bounded by UNPAGED badness.** Not-OK time that
+        already paged is absorbed by the cooldown instead — a second page inside
+        `cooldown_s` is held whatever the accumulator says — so what the
+        accumulator can bring forward is exactly the badness nobody was told
+        about, which is the thing it exists to stop losing.
+
+        Missing history reads as zero accrued time, not as badness: the scan
+        stops at the oldest row it can see, and time before that is unaccounted
+        rather than assumed bad. That direction can only ever fall back to the
+        continuous rule, i.e. to the behaviour this file already had.
+        """
+        if now - began >= job.alert_after_s:
+            return True, None
+        window = bad_window_s(job)
+        if window <= 0:                      # a 0-threshold job already paged
+            return False, None
+        if alert_severity(about) == 0:
+            # Not a state we page about at all (an episode with no non-OK
+            # transition on record can name OK here). Accumulating "time spent
+            # OK" would page for health; the clock above is the only rule that
+            # may speak for a state like this.
+            return False, None
+        bad = db.not_ok_seconds(conn, job.id, now - window, now, (about,),
+                                BAD_SCAN_LIMIT)
+        if bad >= job.alert_after_s:
+            return True, window
+        return False, None
 
     @staticmethod
     def _cooling_until(row: dict, job: Job, now: float) -> float | None:
@@ -497,20 +706,22 @@ class Core:
         return until if until > now else None
 
     def _page(self, conn, ep: Episode, about: str, bad_since: str, began: float,
-              alerted_at: str | None, states: dict[str, str],
+              alerted_at: str | None, alerted_state: str | None,
+              states: dict[str, str],
               transitions: dict[str, tuple], returning: set[str],
               cooled: set[str], now: float,
-              at: str, intents: list[AlertIntent]) -> str | None:
-        """Spend this episode's one page, if everything says we should.
+              at: str, intents: list[AlertIntent]
+              ) -> tuple[str | None, str | None]:
+        """Spend this episode's page, if everything says we should.
 
         ``about`` is the state the page is *about* — the current state for a
         job that is not-OK, or the state the episode was in for one held open
         across an OK we cannot (yet) believe.
 
-        Returns the episode's ``alerted_at`` as it now stands: the new stamp if
-        this call paged, otherwise the value passed in. Callers keep their local
-        copy in step with the row, because what follows a ceiling page in the
-        same pass — the recovery, above all — reads it.
+        Returns the episode's ``(alerted_at, alerted_state)`` as they now stand:
+        the new pair if this call paged, otherwise the values passed in. Callers
+        keep their local copies in step with the row, because what follows a
+        ceiling page in the same pass — the recovery, above all — reads them.
 
         **THE HARD CEILING is the single rule this method exists to serve:**
         while an episode is open, past its threshold and unpaged, it pages —
@@ -520,53 +731,98 @@ class Core:
         or one window. An episode that has to wait for the job to be in some
         particular state to be allowed to speak is an episode that can be
         silenced by the job recovering, which is exactly backwards.
+
+        **ONE PAGE PER EPISODE, PLUS ONE PER ESCALATION** (issue #16). A flat
+        one-page rule meant a gauge that paged "BEHIND for over 1h" said nothing
+        when the free space fell to 1 GiB and then the reading failed outright —
+        and never sent a HIGH-priority push at all, because the priority is read
+        off the state and the state that was paged was the mild one. For a
+        capacity gauge that is exactly inverted: BEHIND is the early warning,
+        FAIL is the event. So a page also goes out when the episode's state gets
+        strictly WORSE than the state already paged (:func:`alert_severity`),
+        carrying that state's own priority. ``jobs.alerted_state`` remembers
+        what was sent; there are two ranks, so an episode can escalate at most
+        once and a worsening cannot become a storm.
         """
         job = ep.job
-        if job.alert_never or alerted_at:
-            return alerted_at                 # opted out, or already paged
-        if now - began < job.alert_after_s:
-            return alerted_at                 # not sustained long enough yet
-        until = self._cooling_until(ep.row, job, now)
-        if until is not None:
-            # THE PER-JOB COOLDOWN. Deliberately does NOT stamp `alerted_at`:
-            # the episode keeps its unspent page, so the ceiling above re-tries
-            # this same call on every later pass and the page goes out the
-            # moment the cooldown expires — delayed, never cancelled. Stamping
-            # here would turn a rate limit into exactly the permanent silence
-            # this whole file is organised against.
-            # Derived from `until` alone — no second parse of the row. Re-reading
-            # `last_paged_at` here would couple this line to _cooling_until's
-            # internals, and a None slipping through would raise INSIDE the
-            # recompute transaction, i.e. lose the whole pass.
-            log.info("page for %s held back by its cooldown (%ss); %ss still to "
-                     "run, then it pages if it is still past its threshold",
-                     job.id, int(cooldown_s(job)), int(until - now))
-            return alerted_at
+        if job.alert_never:
+            return alerted_at, alerted_state             # opted out
+        escalation = False
+        if alerted_at:
+            if alerted_state is None:
+                # Paged by a version that had no `alerted_state` (the upgrade
+                # deploy, or a hand-edited row). Record what the episode is
+                # about NOW rather than guessing: rank 0 would read as "worse
+                # than nothing" and send a duplicate of the page that already
+                # went out, and ranking it at the top would swallow a genuine
+                # later escalation. Healed once, then it behaves normally.
+                log.info("recording %s as the paged state for %s's open episode "
+                         "(it was paged before alerted_state existed)",
+                         about, job.id)
+                db.set_alert_episode(conn, job.id, bad_since, alerted_at, about)
+                return alerted_at, about
+            if alert_severity(about) <= alert_severity(alerted_state):
+                return alerted_at, alerted_state         # already paged, no worse
+            escalation = True
+        past, within = self._past_bar(conn, job, about, began, now)
+        if not past:
+            return alerted_at, alerted_state  # not sustained long enough yet
+        # THE COOLDOWN APPLIES TO A FIRST PAGE ONLY. An escalation skips it, on
+        # purpose: the cooldown exists to stop the SAME fact being repeated, a
+        # strictly worse state is a different fact, and the flat cooldown
+        # swallowing it was a stated residual of PR #11 rather than a decision.
+        # It is bounded without a timer — at most one per paged episode, and a
+        # paged episode is itself at most one per cooldown — and it still STAMPS
+        # `last_paged_at` below, so it pushes the NEXT episode's first page out
+        # by a full cooldown. The rate limit is moved, not lifted.
+        if not escalation:
+            until = self._cooling_until(ep.row, job, now)
+            if until is not None:
+                # THE PER-JOB COOLDOWN. Deliberately does NOT stamp
+                # `alerted_at`: the episode keeps its unspent page, so the
+                # ceiling above re-tries this same call on every later pass and
+                # the page goes out the moment the cooldown expires — delayed,
+                # never cancelled. Stamping here would turn a rate limit into
+                # exactly the permanent silence this whole file is organised
+                # against.
+                # Derived from `until` alone — no second parse of the row.
+                # Re-reading `last_paged_at` here would couple this line to
+                # _cooling_until's internals, and a None slipping through would
+                # raise INSIDE the recompute transaction, i.e. lose the pass.
+                log.info("page for %s held back by its cooldown (%ss); %ss still "
+                         "to run, then it pages if it is still past its "
+                         "threshold", job.id, int(cooldown_s(job)),
+                         int(until - now))
+                return alerted_at, alerted_state
         if self._suppressed_offline(job, about, ep.state, states, transitions,
                                     returning, cooled):
             # Deliberately do NOT stamp alerted_at: a suppressed alert must not
             # burn the episode's single page, or its recovery would be lost too.
             log.info("alert for %s suppressed: its machine's probe job is "
                      "offline (one alert for the machine instead)", job.id)
-            return alerted_at
-        if not self._retry_due(job.id, bad_since, now):
-            # A POST for THIS episode failed recently and the page was handed
-            # back. Retrying on every tick and every ping means a blocking 5 s
-            # urllib call ~72×/hour while ntfy is down — in the scheduler thread
-            # and in the ingest request. Space them out; nothing is lost, the
-            # next attempt is a few minutes later. Only retries wait.
-            return alerted_at
+            return alerted_at, alerted_state
+        attempt = self._attempt_key(bad_since, about)
+        if not self._retry_due(job.id, attempt, now):
+            # A POST for THIS page failed recently and it was handed back.
+            # Retrying on every tick and every ping means a blocking 5 s urllib
+            # call ~72×/hour while ntfy is down — in the scheduler thread and in
+            # the ingest request. Space them out; nothing is lost, the next
+            # attempt is a few minutes later. Only retries wait.
+            return alerted_at, alerted_state
         # Optimistic stamp, inside the transaction: it is what stops the 60 s
         # ticker paging again mid-batch. If the POST then fails, _dispatch hands
         # the page straight back (see _return_unsent_pages).
-        self._alert_attempted[job.id] = (bad_since, now)
-        db.set_alert_episode(conn, job.id, bad_since, at)
+        self._alert_attempted[job.id] = (attempt, now)
+        db.set_alert_episode(conn, job.id, bad_since, at, about)
         prev_paged_at = ep.row.get("last_paged_at")
         db.set_last_paged_at(conn, job.id, at)
-        intents.append(AlertIntent(job, "alert", about, bad_since=bad_since,
-                                   alerted_at=at,
-                                   prev_paged_at=prev_paged_at))
-        return at
+        intents.append(AlertIntent(job, "escalation" if escalation else "alert",
+                                   about, bad_since=bad_since, alerted_at=at,
+                                   prev_paged_at=prev_paged_at,
+                                   prev_alerted_at=alerted_at,
+                                   prev_alerted_state=alerted_state,
+                                   within_s=within))
+        return at, about
 
     def _resolve_alerts(self, conn, episodes: list[Episode],
                         states: dict[str, str], transitions: dict[str, tuple],
@@ -583,10 +839,11 @@ class Core:
         ``bad_since``, which is the whole point — the question is "has this
         been broken for a day?", not "did something change?".
 
-        There is exactly one page per episode, so every way an episode can end
-        is a way to lose a page. Each is therefore biased toward keeping the
-        episode alive: an OK we could not verify does not end it, and neither
-        does an OK too short to believe. Keeping an episode alive is itself
+        There is one page per episode (plus at most one escalation, when the
+        episode's state gets strictly worse — :func:`alert_severity`), so every
+        way an episode can end is a way to lose a page. Each is therefore biased
+        toward keeping the episode alive: an OK we could not verify does not end
+        it, and neither does an OK too short to believe. Keeping an episode alive is itself
         bounded, though, because an episode that never ends holds its page too.
         The dwell is at most 5 minutes; the unverifiable-OK hold is at most one
         threshold (:func:`ok_hold_s`) and then closes silently.
@@ -608,6 +865,10 @@ class Core:
             job, prev, state, row = ep.job, ep.prev, ep.state, ep.row
             bad_since = row.get("bad_since")
             alerted_at = row.get("alerted_at")
+            # What was actually SENT about this episode — a different question
+            # from what the episode is about NOW: the escalation compares against
+            # it, and the recovery is named from it.
+            alerted_state = row.get("alerted_state")
 
             # A `last_paged_at` we cannot use — unparseable, or in the FUTURE
             # after a clock step — would otherwise be a cooldown that never
@@ -634,7 +895,7 @@ class Core:
             if bad_since is not None and (began is None or began > now):
                 log.warning("healing unusable bad_since %r for %s", bad_since,
                             job.id)
-                bad_since = began = alerted_at = None
+                bad_since = began = alerted_at = alerted_state = None
                 db.set_alert_episode(conn, job.id, None, None)
             elif bad_since is None and alerted_at is not None:
                 # An `alerted_at` with no episode to belong to: nothing here ever
@@ -644,7 +905,7 @@ class Core:
                 # it — the direction that can only ever page MORE.
                 log.warning("healing an alerted_at with no open episode for %s",
                             job.id)
-                alerted_at = None
+                alerted_at = alerted_state = None
                 db.set_alert_episode(conn, job.id, None, None)
 
             if state == "OK":
@@ -673,9 +934,10 @@ class Core:
                 # `min(5 min, A/10)` ended the episode, so 19 min down / 3 min
                 # up — broken 86% of the time, for ever — never paged once.
                 if bad_since is not None:
-                    alerted_at = self._page(conn, ep, about, bad_since, began,
-                                            alerted_at, states, transitions,
-                                            returning, cooled, now, at, intents)
+                    alerted_at, alerted_state = self._page(
+                        conn, ep, about, bad_since, began, alerted_at,
+                        alerted_state, states, transitions, returning, cooled,
+                        now, at, intents)
                 if self._holding(ep, about):
                     if held < ok_hold_s(job):
                         log.info("episode for %s held open: %s ended in an OK "
@@ -713,11 +975,28 @@ class Core:
                 # real news even though it is over — and it is rare, because a
                 # job has to cross its whole threshold and then recover inside
                 # one dwell to do it.
+                #
+                # It names `alerted_state` — the state actually PAGED — not
+                # `about`. `about` reads the LATEST non-OK state, so an episode
+                # paged as "BEHIND for over 1h" that later touched FAIL
+                # recovered as "FAIL → OK": a resolution for an alert that was
+                # never sent, which reads like a missed page. They differ
+                # only for an episode whose state moved, and `alerted_state` is
+                # the half that matches what is on the phone. The fallback is
+                # for a row paged before the column existed.
+                #
+                # NOT rate-limited, deliberately — see :func:`cooldown_s`. A
+                # recovery only ever follows a page that was sent, so its rate
+                # is already the cooldown's; capping it as well would leave a
+                # page on the phone with no resolution, which reads as "still
+                # broken" and is a silence of its own. The cost is honest and
+                # measured: 2 pushes per cooldown window, not 1.
                 if (alerted_at and not job.alert_never
                         and not self._suppressed_offline(
                             job, about, state, states, transitions,
                             returning, cooled)):
-                    intents.append(AlertIntent(job, "recovery", about))
+                    intents.append(AlertIntent(job, "recovery",
+                                               alerted_state or about))
                 db.set_alert_episode(conn, job.id, None, None)
                 continue
 
@@ -738,10 +1017,11 @@ class Core:
             # job page sooner than its threshold rather than later — the right
             # direction.
             if bad_since is None:
-                bad_since, began, alerted_at = at, now, None
+                bad_since, began, alerted_at, alerted_state = at, now, None, None
                 db.set_alert_episode(conn, job.id, bad_since, None)
-            self._page(conn, ep, state, bad_since, began, alerted_at, states,
-                       transitions, returning, cooled, now, at, intents)
+            self._page(conn, ep, state, bad_since, began, alerted_at,
+                       alerted_state, states, transitions, returning, cooled,
+                       now, at, intents)
         return intents
 
     @staticmethod
@@ -816,17 +1096,22 @@ class Core:
                 if intent.kind == "recovery":
                     sent = self.notifier.notify_recovery(job.name, job.id,
                                                          intent.state)
+                elif intent.kind == "escalation":
+                    sent = self.notifier.notify_escalation(
+                        job.name, job.id, intent.prev_alerted_state or "",
+                        intent.state)
                 else:
                     sent = self.notifier.notify_alert(job.name, job.id,
                                                       intent.state,
-                                                      job.alert_after_s)
+                                                      job.alert_after_s,
+                                                      within_s=intent.within_s)
             except Exception:  # noqa: BLE001 — belt and braces
                 log.exception("notifier raised; ignoring")
             if not sent and intent.kind == "recovery" and self.notifier.enabled:
                 log.warning("recovery push for %s (%s → OK) did not land; its "
                             "episode is already closed, so it is dropped",
                             job.id, intent.state)
-            if intent.kind == "alert" and not sent:
+            if intent.kind in ("alert", "escalation") and not sent:
                 unsent.append(intent)
         # `notify_alert` also returns False when ntfy is simply switched off;
         # rolling back then would rewrite the row every 60 s for ever, so only a
@@ -835,11 +1120,11 @@ class Core:
             self._return_unsent_pages(unsent)
 
     def _return_unsent_pages(self, unsent: list[AlertIntent]) -> None:
-        """Clear ``alerted_at`` for alerts whose POST failed, so the next tick
-        retries — **and put ``last_paged_at`` back where it was**, so the
-        undelivered page does not start a cooldown. A short follow-up
-        transaction, after dispatch, never holding the write lock across an HTTP
-        call.
+        """Put back what a failed POST had already claimed — the episode's
+        ``alerted_at``/``alerted_state`` as they were before it, so the next tick
+        retries, **and ``last_paged_at``**, so the undelivered page does not
+        start a cooldown. A short follow-up transaction, after dispatch, never
+        holding the write lock across an HTTP call.
 
         Restoring the cooldown stamp is not a nicety. Without it the rollback is
         a half-rollback: the episode gets its page back and then cannot spend it
@@ -875,8 +1160,16 @@ class Core:
                     log.warning("ntfy push for %s did not land; returning the "
                                 "episode's page and its cooldown so the next "
                                 "tick retries", intent.job.id)
-                    db.set_alert_episode(conn, intent.job.id,
-                                         intent.bad_since, None)
+                    # For a first page the restored pair is (None, None), which
+                    # is what this always wrote. For an ESCALATION it is the
+                    # pair that page replaced: clearing to NULL instead would
+                    # re-arm the episode's FIRST page as well and send it twice,
+                    # while restoring the pair leaves the escalation still due —
+                    # `alert_severity` sees the worse state again on the next
+                    # pass. Delayed, never cancelled, like every other hold.
+                    db.set_alert_episode(conn, intent.job.id, intent.bad_since,
+                                         intent.prev_alerted_at,
+                                         intent.prev_alerted_state)
                     db.set_last_paged_at(conn, intent.job.id,
                                          intent.prev_paged_at)
         except Exception:  # noqa: BLE001 — alerting must never raise into ingest
@@ -1015,8 +1308,14 @@ class Core:
 
         ``hard``    the error is not a quota/timeout — a missing directory or a
                     revoked token is not noise, it is the answer, so it is not
-                    damped at all and pages on the first failure (this is the
-                    latency the un-damped version had, kept for real errors).
+                    damped at all and trips the self-job to FAIL on the FIRST
+                    failure (this is the latency the un-damped version had, kept
+                    for real errors). **FAIL, not a push**: the state is what
+                    arrives at once, and the page then waits out
+                    ``dashboard-probes``' own ``alert_after_s`` like every other
+                    job's — six hours on the shipped file. Damping decides when
+                    the board goes red; the episode rules decide when the phone
+                    rings, and nothing here can shorten that.
         ``streak``  ``PROBE_FAIL_THRESHOLD`` consecutive failed probes of this
                     job. This is the damping proper: the measured noise was
                     isolated single failures, never adjacent ones.

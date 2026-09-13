@@ -24,7 +24,13 @@
 # ALERT POLICY — `alert_after_s: N` or `alert: never`, never both (that is an error
 #   even when one of them is null). ntfy hears about a SUSTAINED problem, not a
 #   transition: a job pages ONCE, after it has been CONTINUOUSLY not-OK for its own
-#   alert_after_s, and again ("→ OK") only if that episode was actually paged for.
+#   alert_after_s — OR after that much not-OK time inside twice that window, which is
+#   what makes an INTERMITTENT failure reachable (a destination failing 80% of the
+#   time but listing successfully every quarter-hour used to page never) — and again
+#   ("→ OK") only if that episode was actually paged for. An episode that gets
+#   strictly WORSE (BEHIND/LATE → FAIL/STALE_DEST) pages once more, at the worse
+#   state's priority; that is the only way to hear about a disk that pages while
+#   lowish and then fills up.
 #   Every blip still lands on the board and in state_changes — this filters the phone,
 #   not the history. Resolution, in precedence order:
 #     alert: never          → never pages
@@ -46,7 +52,10 @@
 #       # TIME-TO-PAGE: <n>
 #
 #   line stating the END-TO-END figure — deadline + threshold, the number that answers
-#   "how long can this be broken before my phone knows?". Four of these comments used
+#   "how long can this be broken before my phone knows?" for a job that is broken
+#   CONTINUOUSLY. A job that is broken most of the time but not all of it reaches the
+#   same bar cumulatively instead (see above), which can only ever be sooner than this
+#   figure, never later. Four of these comments used
 #   to describe the threshold alone and were wrong by between 15 minutes and 38 hours;
 #   `test_every_alerting_job_states_its_real_time_to_page` recomputes all of them from
 #   the values in this file, so one cannot drift again without the suite going red.
@@ -61,6 +70,8 @@
 #   threshold. A held-back page is DELAYED, never cancelled: the episode keeps its
 #   unspent page and goes out the moment the cooldown expires. A suppressed page also
 #   sends no "→ OK", so a flapping container costs nothing in either direction.
+#   The cap is on PAGES: a paged episode may also send one escalation and one "→ OK",
+#   so the honest worst case is three pushes per cooldown window for one job.
 jobs:
   # ------------------------------------------------------------------ box --
   - id: km-backup
