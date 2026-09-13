@@ -5,6 +5,7 @@ key cap, ISO clamping, ingest parsing bounds, ntfy body, probe argv."""
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 import sqlite3
@@ -19,6 +20,7 @@ from dashboard.state import Facts, compute_state, dest_info, lag_info
 from tests.conftest import (INGEST_TOKEN, JOBS_DOC, PASSWORD, READ_TOKEN, auth,
                             pin_created_at)
 from dashboard.registry import parse_registry
+from dashboard.services import Core
 
 NOW = 1_800_000_000.0
 REG = parse_registry(JOBS_DOC)
@@ -487,6 +489,90 @@ def test_ntfy_body_never_carries_reason_text(core, notifier):
     assert title == "[dashboard] Containers → FAIL"
     assert body == "containers: FAIL"
     assert "tunnel-1" not in body and "not running" not in body
+
+
+LEAK = "ZZLEAK"          # one marker prefix, so the assertion can be total
+
+
+def _hostile_doc():
+    """The shared registry with every free-text field loaded with a marker.
+
+    `name` deliberately keeps its innocuous value: the job NAME is the one piece
+    of free text that is *supposed* to reach ntfy (it is what makes a push
+    readable on a phone, it is byte-identical to pre-0.2 behaviour, and it is
+    documented as such). Everything else here — what the job protects, how, the
+    destination path, what LATE means, the expected container names — is local
+    detail that must never leave the box."""
+    doc = copy.deepcopy(JOBS_DOC)
+    for raw in doc["jobs"]:
+        raw["protects"] = f"{LEAK}-PROTECTS /Users/someone/secret.db"
+        raw["method"] = f"{LEAK}-METHOD rclone --config /etc/rclone.conf"
+        raw["alert_after_s"] = 0                      # page on the first not-OK pass
+        if raw.get("destination") is not None:
+            raw["destination"] = f"gdrive:{LEAK}-DRIVE-FOLDER-ID"
+        if raw.get("late_means") is not None:
+            raw["late_means"] = f"{LEAK}-LATE-MEANS the machine is asleep"
+        if raw.get("expect"):
+            raw["expect"] = [f"{LEAK}-container-1", f"{LEAK}-container-2"]
+        if raw.get("probe"):
+            raw["probe"] = {"rclone_path": f"gdrive:{LEAK}-PROBE-PATH",
+                            "state_dir": f"/state/{LEAK}-STATE-DIR"}
+    return doc
+
+
+def test_no_free_text_from_a_ping_or_the_registry_can_reach_ntfy(settings, notifier):
+    """THE privacy invariant of the alerting layer, asserted rather than
+    promised: ntfy.sh is a third party, and the ONLY things that may reach it
+    are the job's name, its id, its state and its own configured threshold.
+
+    Three docstrings said so and nothing checked it. The existing body test
+    looks at ONE push for TWO specific substrings, and the three tests that pass
+    a `reason` never inspect the payload for it — so a future signature change
+    (`notify_alert(..., reason=reason)`, a "helpful" reason in the body, a
+    metric echoed into the title) would ship green. This drives real episodes
+    through `Core` with markers in every free-text field a human or a probe can
+    write — reason, note, metric keys AND values, and the registry's own
+    protects/method/destination/late_means/expect — and asserts that not one
+    push, attempted or delivered, contains any of them."""
+    core = Core(settings, parse_registry(_hostile_doc()), notifier)
+    core.init_store()
+    pin_created_at(settings, "2020-01-01T00:00:00Z")     # never pinged → LATE
+    reason = (f"{LEAK}-REASON km-tracker-app-1 exited; rclone stderr: directory "
+              f"not found gdrive:{LEAK}/Backups")
+    note = f"{LEAK}-NOTE box is 100.64.0.1, password is hunter2"
+    hostile_metrics = {f"{LEAK}_metric_key": f"{LEAK}_metric_value",
+                       "running": f"{LEAK}-container-1", "note": note}
+
+    core.recompute_all(now=NOW)                          # every job LATE → pages
+    tree = core.registry.get("tree")
+    core.record_ping(tree, {"status": "fail", "reason": reason, "note": note,
+                            "exit_code": 1, "metrics": hostile_metrics},
+                     now=NOW + 1)                        # LATE → FAIL
+    core.record_ping(tree, {"status": "ok", "reason": reason, "note": note},
+                     now=NOW + 2)                        # → OK, dwell is 0 → recovery
+    core.record_ping(core.registry.get("containers"),
+                     {"status": "ok", "reason": reason, "note": note,
+                      "metrics": {"running": f"{LEAK}-container-1"}}, now=NOW + 3)
+    core.record_ping(core.registry.get("disk"),
+                     {"status": "metric",
+                      "metrics": {"disk_free_bytes": 1, "disk_total_bytes": 100,
+                                  "path": f"/Users/someone/{LEAK}-PATH"}},
+                     now=NOW + 4)
+    core.recompute_all(now=NOW + 5)
+
+    assert len(notifier.attempts) >= 6                   # not vacuous: it really paged
+    assert notifier.attempts == notifier.sent            # nothing swallowed en route
+    for title, body, priority in notifier.attempts:
+        assert LEAK not in title, title
+        assert LEAK not in body, body
+        assert LEAK not in priority, priority
+    # Positively: the push says who and what, and nothing else. The name is the
+    # one deliberate disclosure; the id, state and threshold are the rest.
+    titles = {t for t, _, _ in notifier.sent}
+    assert "[dashboard] Tree copy → FAIL" in titles
+    assert "[dashboard] Tree copy → OK" in titles
+    assert {b for _, b, _ in notifier.sent if b.startswith("tree:")} == {
+        "tree: FAIL", "tree: FAIL → OK"}      # its LATE is the Mac's, and muted
 
 
 # --------------------------------------------------------------------------- #
