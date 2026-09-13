@@ -25,7 +25,7 @@
     <dt>Status</dt><dd><strong>Never run</strong> — no completion pinged yet{% if job.lag and job.lag.max_age_s %}; the max-age target is inert until the first <code>ping.sh {{ job.id }} ok</code>{% endif %}</dd>
     {% endif %}
     {% if job.disk %}
-    <dt>Capacity</dt><dd>{{ disk_gauge(job.disk, now) }}</dd>
+    <dt>Capacity</dt><dd>{{ disk_gauge(job.disk, now, job.alert) }}</dd>
     {% endif %}
     {% if job.lag %}
     <dt>{{ 'Missing' if job.kind == 'rclone_copy_tree' else 'Behind' }}</dt><dd>{{ job.lag.bytes|human_bytes if job.lag.bytes is not none else '—' }}

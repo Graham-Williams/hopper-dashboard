@@ -11,7 +11,7 @@
 {% if iso and (iso|absolute) %}<time datetime="{{ iso }}" title="{{ iso|absolute }}">{{ iso|relative(now) }}</time>{% elif iso %}<span class="muted" title="unparseable timestamp">?</span>{% else %}<span class="muted">never</span>{% endif %}
 {%- endmacro %}
 
-{% macro disk_gauge(disk, now) -%}
+{% macro disk_gauge(disk, now, alert) -%}
 {#- Capacity gauge for kind: disk. The bar is decoration: the percent, the free/total figures and
     the threshold line below it carry the same information as text (never colour alone). -#}
 {% if disk.free_bytes is none %}<span class="muted">no disk metrics reported yet</span>{% else %}
@@ -36,8 +36,14 @@
   </svg>
   {% endif %}
   <div class="gauge-foot muted small">
-    {%- if disk.min_free_bytes or disk.max_used_pct %}alerts below {{ disk.min_free_bytes|human_gib if disk.min_free_bytes else '—' }} free{% if disk.max_used_pct %} or over {{ disk.max_used_pct }}% used{% endif %}
-    {%- else %}informational — no thresholds set, never alerts{% endif %}
+    {#- Two INDEPENDENT facts, and the old caption ran them together: the capacity thresholds
+        (what turns the gauge BEHIND) and the alert policy (whether BEHIND ever reaches the phone).
+        "alerts below 50 GiB free" was a flat lie on a gauge carrying thresholds AND `alert: never`,
+        and "never alerts" was a lie on a threshold-less gauge carrying an explicit alert_after_s.
+        State each from its own source. -#}
+    {%- if disk.min_free_bytes or disk.max_used_pct %}BEHIND below {{ disk.min_free_bytes|human_gib if disk.min_free_bytes else '—' }} free{% if disk.max_used_pct %} or over {{ disk.max_used_pct }}% used{% endif %}
+    {%- else %}no capacity thresholds set{% endif %}
+    {%- if alert.never %} · never pages{% else %} · pages after {{ alert.after_s|human_duration }} not OK{% endif %}
     {%- if disk.measured_at %} · measured {{ when(disk.measured_at, now) }}{% endif %}
   </div>
 </div>

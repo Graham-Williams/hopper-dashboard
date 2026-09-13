@@ -2,6 +2,7 @@
 HTML rendering of every state."""
 
 from dashboard import db
+from dashboard.services import COOLDOWN_FLOOR_S, ok_dwell_s
 from tests.conftest import PASSWORD, READ_TOKEN
 
 CONTRACT_KEYS = {"id", "name", "machine", "kind", "state", "since", "last_run",
@@ -225,18 +226,28 @@ def test_alert_policy_is_exposed_additively(read, core, registry):
                            ("/api/v1/jobs/tree", lambda d: d["job"])):
         j = pick(read.get(endpoint, headers=bearer()).get_json())
         assert CONTRACT_KEYS <= set(j)
-        assert set(j["alert"]) == {"after_s", "never", "source", "bad_since", "alerted_at"}
+        assert set(j["alert"]) == {"after_s", "never", "source", "bad_since",
+                                   "alerted_at", "cooldown_s", "last_paged_at"}
         assert j["alert"]["never"] is False and j["alert"]["after_s"] == 0
         assert j["alert"]["source"] == "alert_after_s"
         assert j["alert"]["bad_since"] == db.to_iso(NOW)     # episode is running
         assert j["alert"]["alerted_at"] == db.to_iso(NOW)    # ...and was paged (threshold 0)
+        # The per-job cooldown, so "quiet phone, unhappy board" is answerable
+        # from the API: this job paged just now and cannot page again for 6 h.
+        assert j["alert"]["cooldown_s"] == COOLDOWN_FLOOR_S
+        assert j["alert"]["last_paged_at"] == db.to_iso(NOW)
     # `info` declares nothing and is informational: it never pages, and says why.
     j = {x["id"]: x for x in read.get("/api/v1/status", headers=bearer()).get_json()["jobs"]}["info"]
     assert j["alert"] == {"after_s": None, "never": True, "source": "informational",
-                          "bad_since": None, "alerted_at": None}
+                          "bad_since": None, "alerted_at": None,
+                          "cooldown_s": None, "last_paged_at": None}
     core.record_ping(registry.get("tree"), {"status": "ok"}, now=NOW + 5)
+    core.recompute_all(now=NOW + 5 + ok_dwell_s(registry.get("tree")))
     j = {x["id"]: x for x in read.get("/api/v1/status", headers=bearer()).get_json()["jobs"]}["tree"]
     assert j["alert"]["bad_since"] is None and j["alert"]["alerted_at"] is None
+    # ...but `last_paged_at` SURVIVES the episode it belongs to — that is the
+    # whole point of it: the cooldown spans episodes, `alerted_at` does not.
+    assert j["alert"]["last_paged_at"] == db.to_iso(NOW)
 
 
 def test_alert_policy_shown_on_the_job_page(settings, notifier):
@@ -400,7 +411,12 @@ def test_disk_gauge_renders_on_board_and_job_page(authed, core, registry):
         assert "100.0 GiB free of 400.0 GiB" in card          # GiB, not human_bytes' decimal GB
         assert 'class="gaugebar"' in card and 'class="fill" x="0" y="0" width="75.0"' in card
         assert 'class="mark" x="90"' in card                  # the 90% ceiling marker
-        assert "alerts below 25.0 GiB free or over 90% used" in card
+        # The capacity thresholds and the alert policy are stated SEPARATELY: one
+        # says what turns the gauge BEHIND, the other whether BEHIND ever reaches
+        # the phone. Running them together is how a gauge with thresholds AND
+        # `alert: never` came to claim it alerts.
+        assert "BEHIND below 25.0 GiB free or over 90% used" in card
+        assert "pages after 0s not OK" in card
     # The bar must not rely on an inline style attribute: style-src is 'self' with no
     # 'unsafe-inline', so a style="width:…" bar would silently render empty.
     assert "style=" not in authed.get("/").data.decode()
@@ -435,8 +451,136 @@ def test_gauge_bar_width_is_clamped_at_both_ends(read_app):
     def render(used_pct):
         return disk_gauge({"free_bytes": 1, "total_bytes": 2, "used_pct": used_pct,
                            "min_free_bytes": None, "max_used_pct": None,
-                           "low": False, "measured_at": None}, NOW)
+                           "low": False, "measured_at": None}, NOW,
+                          {"never": True, "after_s": None})
 
     assert 'class="fill" x="0" y="0" width="0"' in render(-40.0)
     assert 'class="fill" x="0" y="0" width="100"' in render(120.0)
     assert 'class="fill" x="0" y="0" width="62.5"' in render(62.5)
+
+
+# --------------------------------------------------------------------------- #
+# Board captions: "will this job ever page", not `informational`
+#
+# They are different questions, and the difference is load-bearing for exactly
+# the job that matters. `minecraft-offload` is `alert: never` AND carries
+# `manual:` thresholds, so it is NOT `informational` — the caption keyed off
+# `informational` skipped it entirely, and it sits on the board reading BEHIND
+# (its normal resting state between offloads) with nothing saying it will never
+# page. That is the same informational-vs-alert_never confusion this branch
+# fixed in the code, left in the one place Graham actually looks.
+# --------------------------------------------------------------------------- #
+
+def _board(settings, notifier, doc):
+    from dashboard import create_app
+    from dashboard.registry import parse_registry
+    reg = parse_registry(doc)
+    app = create_app("read", settings, reg, notifier)
+    c = app.test_client()
+    c.post("/login", data={"password": PASSWORD})
+    return app, reg, c
+
+
+def test_a_never_alerting_job_with_lag_thresholds_says_so_on_the_board(settings, notifier):
+    """The `minecraft-offload` shape: opted out by `alert: never`, but with
+    `manual:` thresholds, so `informational` is False."""
+    import copy
+    from tests.conftest import JOBS_DOC
+    doc = copy.deepcopy(JOBS_DOC)
+    offload = [j for j in doc["jobs"] if j["id"] == "offload"][0]
+    offload.pop("alert_after_s")
+    offload["alert"] = "never"
+    assert offload["manual"]["max_lag_bytes"]            # not informational
+    app, reg, c = _board(settings, notifier, doc)
+    app.extensions["core"].record_ping(
+        reg.get("offload"), {"status": "ok", "metrics": {"lag_bytes": 99999}}, now=NOW)
+    html = c.get("/").data.decode()
+    card = html[html.index('id="job-offload"'):]
+    card = card[:card.index("</article>")]
+    assert "never alerts" in card
+    assert "alert: never" in card                        # ...and WHICH reason
+    assert "informational" not in card
+
+
+def test_an_informational_job_still_says_why_it_never_alerts(settings, notifier):
+    """The other reason, still captioned, and told apart from the first: no
+    thresholds at all, so the policy resolved to `never` on its own."""
+    import copy
+    from tests.conftest import JOBS_DOC
+    doc = copy.deepcopy(JOBS_DOC)
+    offload = [j for j in doc["jobs"] if j["id"] == "offload"][0]
+    offload.pop("alert_after_s")
+    offload.pop("manual")                                # no thresholds -> informational
+    app, reg, c = _board(settings, notifier, doc)
+    assert reg.get("offload").informational and reg.get("offload").alert_never
+    app.extensions["core"].record_ping(
+        reg.get("offload"), {"status": "ok", "metrics": {"lag_bytes": 5}}, now=NOW)
+    html = c.get("/").data.decode()
+    card = html[html.index('id="job-offload"'):]
+    card = card[:card.index("</article>")]
+    assert "never alerts" in card and "informational: no thresholds set" in card
+
+
+def test_a_job_that_can_page_gets_no_never_alerts_caption(settings, notifier):
+    """The caption must not be printed for a job that WILL page — the opposite
+    lie. `offload` with a real threshold is not opted out of anything."""
+    import copy
+    from tests.conftest import JOBS_DOC
+    doc = copy.deepcopy(JOBS_DOC)
+    app, reg, c = _board(settings, notifier, doc)        # offload: alert_after_s 0
+    app.extensions["core"].record_ping(
+        reg.get("offload"), {"status": "ok", "metrics": {"lag_bytes": 99999}}, now=NOW)
+    html = c.get("/").data.decode()
+    card = html[html.index('id="job-offload"'):]
+    card = card[:card.index("</article>")]
+    assert "never alerts" not in card
+
+
+def test_a_disk_gauge_with_thresholds_but_alert_never_does_not_claim_it_alerts(
+        settings, notifier):
+    """The `_macros.html` half of the same bug. The gauge foot read its caption
+    off the CAPACITY thresholds — "alerts below 25.0 GiB free" — which is a flat
+    lie on a gauge that carries thresholds AND `alert: never`. The thresholds
+    say what turns the gauge BEHIND; the alert policy says whether BEHIND ever
+    reaches a phone. Two facts, two sources."""
+    import copy
+    from tests.conftest import JOBS_DOC
+    doc = copy.deepcopy(JOBS_DOC)
+    disk = [j for j in doc["jobs"] if j["id"] == "disk"][0]
+    disk.pop("alert_after_s")
+    disk["alert"] = "never"
+    app, reg, c = _board(settings, notifier, doc)
+    assert reg.get("disk").min_free_bytes and reg.get("disk").alert_never
+    app.extensions["core"].record_ping(
+        reg.get("disk"), {"status": "metric",
+                          "metrics": {"disk_free_bytes": 100 * 1024 ** 3,
+                                      "disk_total_bytes": 400 * 1024 ** 3}}, now=NOW)
+    html = c.get("/").data.decode()
+    card = html[html.index("Capacity"):]
+    assert "BEHIND below 25.0 GiB free" in card          # the thresholds, stated
+    assert "never pages" in card                         # ...and the policy, stated
+    assert "alerts below" not in card                    # never the old conflation
+
+
+def test_a_threshold_less_disk_gauge_that_pages_says_so(settings, notifier):
+    """And the mirror image, which the old caption also got backwards: a gauge
+    with NO capacity thresholds but an explicit `alert_after_s` used to read
+    "informational — no thresholds set, never alerts" while being perfectly able
+    to page for a reading that went stale."""
+    import copy
+    from tests.conftest import JOBS_DOC
+    doc = copy.deepcopy(JOBS_DOC)
+    disk = [j for j in doc["jobs"] if j["id"] == "disk"][0]
+    disk.pop("disk")                                     # no capacity thresholds
+    disk["alert_after_s"] = 3600
+    app, reg, c = _board(settings, notifier, doc)
+    assert reg.get("disk").informational and not reg.get("disk").alert_never
+    app.extensions["core"].record_ping(
+        reg.get("disk"), {"status": "metric",
+                          "metrics": {"disk_free_bytes": 100 * 1024 ** 3,
+                                      "disk_total_bytes": 400 * 1024 ** 3}}, now=NOW)
+    card = c.get("/").data.decode()
+    card = card[card.index("Capacity"):]
+    assert "no capacity thresholds set" in card
+    assert "pages after 1h not OK" in card
+    assert "never alerts" not in card
