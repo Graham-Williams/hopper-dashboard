@@ -17,11 +17,31 @@
 #   disk.min_free_bytes / disk.max_used_pct (disk only — same rule: omit both for
 #   an informational gauge), expect (container
 #   only — names that must appear in metrics.running), late_means (optional text
-#   shown when the job is LATE, e.g. "Mac offline or asleep").
+#   shown when the job is LATE, e.g. "Mac offline or asleep"),
+#   alert_after_s / alert (see below).
+#
+# ALERT POLICY — `alert_after_s: N` or `alert: never`, never both (that is an error
+#   even when one of them is null). ntfy hears about a SUSTAINED problem, not a
+#   transition: a job pages ONCE, after it has been CONTINUOUSLY not-OK for its own
+#   alert_after_s, and again ("→ OK") only if that episode was actually paged for.
+#   Every blip still lands on the board and in state_changes — this filters the phone,
+#   not the history. Resolution, in precedence order:
+#     alert: never          → never pages
+#     alert_after_s: N      → pages after N seconds (0 = on the first non-OK recompute;
+#                             capped at 30 days, because a longer value is a typo, not
+#                             a policy). An explicit N wins even on an informational job.
+#     nothing + informational (a manual/disk job with no thresholds) → never pages
+#     nothing at all        → 86400 (24 h). Conservative on purpose: a job nobody
+#                             thought about must page LATE, never not at all.
+#   /api/v1/status shows the resolved policy per job under `alert` (with `source`
+#   naming what decided it), so you never have to infer it from this file.
 jobs:
   # ------------------------------------------------------------------ box --
   - id: km-backup
     name: km-tracker DB → Drive
+    # Alert policy: page only after a FULL DAY with no working backup. At a 5-min
+    # cadence one missed run is nothing; a day of them is a real gap in the history.
+    alert_after_s: 86400        # 24 h
     machine: box
     kind: db_snapshot
     protects: km-tracker SQLite (prod game-night history)
@@ -35,6 +55,7 @@ jobs:
 
   - id: todoist-points-backup
     name: todoist-points DB → Drive
+    alert_after_s: 86400        # 24 h, same reasoning as km-backup
     machine: box
     kind: db_snapshot
     protects: todoist-points ledger SQLite (points earned/spent)
@@ -48,6 +69,10 @@ jobs:
 
   - id: box-containers
     name: Box containers
+    # The shortest threshold here: a container being down IS the outage (apps are
+    # offline), so 20 min. Long enough to ride out our own `docker compose up -d
+    # --build` deploys and a host reboot's restart storm without paging for them.
+    alert_after_s: 1200         # 20 m
     machine: box
     kind: container
     protects: Every self-hosted app + the Cloudflare tunnel that fronts them
@@ -71,6 +96,13 @@ jobs:
 
   - id: box-disk
     name: Box disk
+    # 1 h, NOT the 24 h default. This gauge already has a long fuse of its own: a
+    # feeder that dies is LATE only after DISK_METRIC_MAX_AGE_S (48 h), so a day on
+    # top would mean hearing about a dead gauge at 72 h — the 48 h has already served
+    # the "sustained" purpose. And a tripped capacity threshold is a LEVEL, not a flap
+    # (a disk does not un-fill itself), so all a threshold buys here is riding out a
+    # reading hovering at the boundary (84.9 / 85.1 %), which an hour does easily.
+    alert_after_s: 3600         # 1 h
     machine: box
     kind: disk
     protects: Every container's data volume + the DB snapshots staged before upload
@@ -87,6 +119,11 @@ jobs:
 
   - id: dashboard-probes
     name: Dashboard probe cycle
+    # 6 h — the longest fuse of the box jobs, because this is the job that flapped 27
+    # times in four days on transient Drive rate limits (DESIGN.md "Probe cadence and
+    # flap damping"). Six hours of a failing probe means the destination checks have
+    # genuinely stopped working, not that Drive pushed back once.
+    alert_after_s: 21600        # 6 h
     machine: box
     kind: probe
     protects: This dashboard's own destination probes (the watcher is watched)
@@ -102,16 +139,25 @@ jobs:
   # ------------------------------------------------------------------ mac --
   - id: mac-probe
     name: Mac probe
+    # 72 h — and NEVER `alert: never`. This is the job whose alert the machine-offline
+    # rule borrows: while it is LATE the other Mac jobs' LATE alerts are suppressed, so
+    # silencing it silences the whole machine. (services.py refuses to suppress behind
+    # a probe that cannot page, but the threshold is what makes the rule worth having.)
+    # 72 h on top of the 15 h LATE deadline is ~87 h of silence: a weekend with the lid
+    # shut pages nobody; a Mac that is dead, stolen or whose launchd job was unloaded
+    # pages exactly once.
+    alert_after_s: 259200       # 72 h
     machine: mac
     kind: probe
     protects: Visibility into everything Mac-side (backup log, offload lag, disk, Drive mirror)
     method: launchd com.hopper.dashboard-probe hourly (+ RunAtLoad) posts metrics over Tailscale
     cadence_s: 3600
     grace_s: 50400              # 14 h: the Mac sleeps overnight; LATE only past a full night + a working day
-    late_means: Not heard from the Mac in 15 hours — it is probably offline or asleep, not broken.
+    late_means: Not heard from the Mac in 15 hours — probably offline or asleep, not broken. Only a Mac that stays gone for ~3.5 days pages.
 
   - id: mac-disk
     name: Mac disk
+    alert_after_s: 3600         # 1 h, same reasoning as box-disk
     machine: mac
     kind: disk
     protects: Headroom for OBS recordings, Whisper runs and the Drive mirror's local copies
@@ -128,6 +174,9 @@ jobs:
 
   - id: pa-backup
     name: personal-assistant → Drive
+    # 30 h, not 24: this runs nightly, so 24 h could page for a run that is merely a
+    # few hours late. 30 h means a whole night was genuinely missed.
+    alert_after_s: 108000       # 30 h
     machine: mac
     kind: rclone_copy_tree
     protects: Hopper's docs, memory, scripts and logs (~/personal-assistant)
@@ -159,6 +208,9 @@ jobs:
 
   - id: drive-mirror
     name: Google Drive mirror
+    # 24 h: pending uploads clear themselves once the Mac is awake and online, so a
+    # backlog only means something once it has survived a day.
+    alert_after_s: 86400        # 24 h
     machine: mac
     kind: drive_mirror
     protects: Documents, Desktop and minecraft-channel mirrored by Drive for Desktop
@@ -183,6 +235,10 @@ jobs:
 
   - id: minecraft-offload
     name: Minecraft recordings offload
+    # On-demand, run when Graham feels like it: BEHIND is information, not an
+    # incident. (It has manual: thresholds, so it is not `informational` and would
+    # otherwise inherit the 24 h default — say it explicitly.)
+    alert: never
     machine: mac
     kind: manual
     protects: OBS recordings, world backups and Flashback replays (~/minecraft-channel)
@@ -205,6 +261,8 @@ jobs:
 
   - id: taste-twin-publish
     name: taste-twin report publish
+    alert: never                # on-demand; also informational (no manual: thresholds),
+                                # which resolves to `never` on its own — stated anyway
     machine: mac
     kind: manual
     protects: Friend-facing Letterboxd taste reports on taste-twin.graham-williams.com
@@ -213,6 +271,7 @@ jobs:
 
   - id: jjho-refresh
     name: JJHo transcript refresh
+    alert: never                # on-demand
     machine: mac
     kind: manual
     protects: JJHo Fan Almanac episode index + transcripts
@@ -221,6 +280,7 @@ jobs:
 
   - id: baby-pool-sync
     name: baby-pool entries sync
+    alert: never                # on-demand; the entries are final
     machine: mac
     kind: manual
     protects: Baby pool entries served at baby-pool.graham-williams.com
