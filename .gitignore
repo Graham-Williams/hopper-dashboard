@@ -2,9 +2,10 @@
 .env
 .env.*
 !.env.example
-jobs.yml
+jobs.yml*
 *.token
-rclone.conf
+rclone*.conf
+*-ro.conf
 *.conf.bak
 ingest.env
 
@@ -34,3 +35,6 @@ dist/
 
 # local scratch
 .scratch/
+
+# agent scratch (feature context, not part of the app)
+.claude/
