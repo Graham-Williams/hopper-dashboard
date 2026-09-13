@@ -832,6 +832,41 @@ def test_a_genuinely_clean_probe_cycle_does_close_the_episode(settings, notifier
     assert row(core, "dashboard-probes")["bad_since"] is None
 
 
+def test_a_future_dated_probe_row_cannot_mask_the_failures_after_it(settings, notifier,
+                                                                    monkeypatch):
+    """`probes.probed_at` is the writer's wall clock. A box whose RTC boots ahead
+    — or an NTP step backwards afterwards, the same step this branch already
+    heals for `bad_since` — leaves one row dated in the FUTURE, and ordered by
+    `probed_at` that row outranks every real probe after it permanently: the
+    "newest" row reads ok, so `failing_probe_job_ids` is empty, the streak is 0,
+    the damped-OK hold is switched off and PR #8's damping can never un-damp.
+    One poisoned row, and the job that watches the watchers goes quiet for good.
+
+    Insert order (`id`) is the only monotonic sequence we control — and clamping
+    `probed_at` at insert cannot help, because at insert time the value IS now;
+    it only becomes the future when the clock later steps back."""
+    core = core_with(settings, notifier, {"dashboard-probes": {"alert_after_s": 3600}})
+    _probe(core, "snap", NOW + 7200, ok=True, newest_iso=db.to_iso(NOW), count=1)
+    _probe(core, "snap", NOW, ok=False, error="rclone timed out after 240s")
+    conn = core.connect()
+    try:
+        assert db.last_probe(conn, "snap")["ok"] == 0            # the LATER row wins
+        assert db.probe_fail_streak(conn, "snap") == 1
+        assert db.failing_probe_job_ids(conn, ["snap"]) == {"snap"}
+    finally:
+        conn.close()
+    # ...and the consequence, end to end: exactly the damped-failure scenario
+    # below, with that one row sitting in the table. The hold must still hold.
+    t = NOW
+    seen = 0
+    while t <= NOW + 4200:                                       # fail, fail, ok, repeating
+        _cycle(core, monkeypatch, t, ok=(seen % 3) == 2)
+        seen += 1
+        t += 300
+    assert titles(notifier) == ["[dashboard] Probe cycle → FAIL"]
+    assert notifier.sent[0][1] == "dashboard-probes: FAIL for over 1h"
+
+
 def test_the_damped_hold_is_bounded_like_every_other_hold(settings, notifier, monkeypatch):
     """A destination that stays broken for ever must not pin `alerted_at` for
     ever. After one threshold of being unable to verify anything, the episode

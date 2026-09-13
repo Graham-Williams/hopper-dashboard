@@ -83,7 +83,13 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   "never page".
 - `db.py` — schema (`jobs` incl. `created_at`, `bad_since`, `alerted_at`; `runs`, `probes`,
   `state_changes`), WAL connection, all queries, ISO helpers (`from_iso` clamps to 1970..9999 and never
-  raises). Additive `jobs` columns go in `JOBS_COLUMNS` **and** `SCHEMA`; `init_schema` migrates under
+  raises). **"Which probe row is newest" is decided by `id` (insert order), never by `probed_at`** —
+  `last_probe`, `last_ok_probe`, `oldest_probe`, `probe_fail_streak` and `failing_probe_job_ids` all order by
+  id, and `probes_job_seq` is the index for it. `probed_at` is the writer's wall clock, so one row written
+  while the clock was ahead outranks every real probe after it for ever: the newest row reads `ok`, the
+  damped-OK hold switches off, and PR #8's damping can never un-damp. Clamping at insert cannot fix that (at
+  insert time the value IS now), and `prune` already keeps rows by `id DESC`. Durations are still measured
+  from `probed_at`; only row selection changed. Additive `jobs` columns go in `JOBS_COLUMNS` **and** `SCHEMA`; `init_schema` migrates under
   `BEGIN IMMEDIATE` with a duplicate-column-tolerant `_add_column`, because `create_app` runs it for BOTH
   roles and `entrypoint.sh` starts every gunicorn together — the loser of that race used to kill a worker
   and restart-loop the container. Don't "simplify" either guard away.

@@ -62,6 +62,11 @@ CREATE TABLE IF NOT EXISTS probes (
     error            TEXT
 );
 CREATE INDEX IF NOT EXISTS probes_job_at ON probes (job_id, probed_at DESC);
+-- Insert order, which is what "the newest probe" is actually decided on (see
+-- `last_probe`). `probes_job_at` cannot serve those queries: its rows are
+-- ordered by probed_at first, so an `ORDER BY id DESC` over one job would fall
+-- back to sorting up to `prune`'s 2000 rows per job on every recompute.
+CREATE INDEX IF NOT EXISTS probes_job_seq ON probes (job_id, id DESC);
 CREATE TABLE IF NOT EXISTS state_changes (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id     TEXT NOT NULL,
@@ -353,24 +358,46 @@ def recent_runs(conn: sqlite3.Connection, job_id: str,
 
 
 def last_probe(conn: sqlite3.Connection, job_id: str) -> dict | None:
+    """The newest probe row for this job — **by insert order, not by clock.**
+
+    Every "which probe row is current" query below orders by ``id``, and that
+    is load-bearing rather than a style choice. ``probed_at`` is the writer's
+    wall clock, so a clock that was ahead when a row was written (a box RTC
+    booting wrong, NTP stepping back afterwards — the same step this branch
+    already heals for ``bad_since``) leaves a row dated in the FUTURE, and a
+    future row outranks every real one after it, permanently. Proved: with one
+    `NOW+2h` ok row followed by a genuine failure, ``failing_probe_job_ids``
+    returned an empty set and ``probe_fail_streak`` returned 0 — so the damped-
+    OK hold was disabled and PR #8's damping could never un-damp.
+
+    Clamping ``probed_at`` at INSERT cannot fix that: at insert time the value
+    IS "now" by definition; it only becomes the future when the clock later
+    steps back. The rowid is the one monotonic sequence we control, and
+    ``probes`` has exactly one writer (the ingest process's scheduler thread),
+    so insert order is the true order of observations. ``probed_at`` is still
+    what every DURATION is measured from — this only decides *which row*.
+    """
     return row_to_dict(conn.execute(
-        "SELECT * FROM probes WHERE job_id=? ORDER BY probed_at DESC, id DESC "
+        "SELECT * FROM probes WHERE job_id=? ORDER BY id DESC "
         "LIMIT 1", (job_id,)).fetchone())
 
 
 def last_ok_probe(conn: sqlite3.Connection, job_id: str) -> dict | None:
     """Newest successful probe row — "when was this destination last actually
-    listed", which is what the no-success backstop in services.py measures."""
+    listed", which is what the no-success backstop in services.py measures.
+    Insert order, for the reason in :func:`last_probe`."""
     return row_to_dict(conn.execute(
-        "SELECT * FROM probes WHERE job_id=? AND ok=1 ORDER BY probed_at DESC, "
+        "SELECT * FROM probes WHERE job_id=? AND ok=1 ORDER BY "
         "id DESC LIMIT 1", (job_id,)).fetchone())
 
 
 def oldest_probe(conn: sqlite3.Connection, job_id: str) -> dict | None:
     """Oldest retained probe row. Used only as the reference point for a job
-    that has never had a successful probe."""
+    that has never had a successful probe. Insert order, like every other
+    ordering over this table (:func:`last_probe`) — and it matches ``prune``,
+    which already keeps rows by ``id DESC``."""
     return row_to_dict(conn.execute(
-        "SELECT * FROM probes WHERE job_id=? ORDER BY probed_at ASC, id ASC "
+        "SELECT * FROM probes WHERE job_id=? ORDER BY id ASC "
         "LIMIT 1", (job_id,)).fetchone())
 
 
@@ -383,9 +410,13 @@ def probe_fail_streak(conn: sqlite3.Connection, job_id: str,
     (no row is written), and — unlike a metric on the jobs table — the ingest
     route cannot write the `probes` table at all, so the streak is not
     forgeable by anything holding INGEST_TOKEN.
+
+    Counted in insert order (:func:`last_probe`): a single future-dated row
+    otherwise sits at the head of this scan for ever and reads as "the last
+    probe was fine".
     """
     rows = conn.execute(
-        "SELECT ok FROM probes WHERE job_id=? ORDER BY probed_at DESC, id DESC "
+        "SELECT ok FROM probes WHERE job_id=? ORDER BY id DESC "
         "LIMIT ?", (job_id, max(1, int(limit)))).fetchall()
     streak = 0
     for row in rows:
@@ -405,6 +436,11 @@ def failing_probe_job_ids(conn: sqlite3.Connection,
     ``ok`` because a transient probe failure is being damped. Read from the
     ``probes`` table rather than from a metric because the ingest route cannot
     write ``probes`` at all (see ``services.LEGACY_METRIC_KEYS``).
+
+    Partitioned by insert order, for the reason in :func:`last_probe`, and
+    deliberately the SAME ordering ``probe_trouble`` uses: if the two disagreed
+    about which row is newest, one would hold an episode open while the other
+    computed the self-job as healthy.
     """
     ids = [str(j) for j in job_ids]
     if not ids:
@@ -412,7 +448,7 @@ def failing_probe_job_ids(conn: sqlite3.Connection,
     marks = ",".join("?" * len(ids))
     rows = conn.execute(
         f"SELECT job_id FROM (SELECT job_id, ok, ROW_NUMBER() OVER ("
-        f"  PARTITION BY job_id ORDER BY probed_at DESC, id DESC) AS rn "
+        f"  PARTITION BY job_id ORDER BY id DESC) AS rn "
         f"  FROM probes WHERE job_id IN ({marks})) WHERE rn = 1 AND ok = 0",
         ids).fetchall()
     return {r["job_id"] for r in rows}

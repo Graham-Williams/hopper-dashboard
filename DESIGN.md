@@ -402,6 +402,14 @@ instead of paging at once. Transients are **not** exempt
 from the consecutive count or the backstop: a *persistent* quota failure is a real problem — it is one way a
 nightly backup stops working — and must still reach FAIL, including for a job with its own `interval_s`.
 
+**"Newest probe row" means newest by `id`, not by `probed_at`.** `probed_at` is the writer's wall clock, so a
+row written while the clock was ahead (an RTC booting wrong, an NTP step backwards afterwards) sits in the
+future and outranks every real probe after it, permanently — the newest row reads `ok`, so
+`db.failing_probe_job_ids` is empty, `db.probe_fail_streak` is 0, the damped-OK hold is switched off and the
+damping above can never un-damp. Clamping at insert does not help (at insert time the value *is* now; it
+becomes the future later), so every "which row is current" query orders by the rowid, which is monotonic
+because `probes` has exactly one writer. Durations are still measured from `probed_at`.
+
 ### Alerting rules
 
 > **The governing rule: every ambiguity resolves toward paging, never toward silence.**
