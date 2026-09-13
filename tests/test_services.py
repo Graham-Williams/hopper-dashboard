@@ -100,6 +100,50 @@ def test_metric_ping_can_flip_manual_job_to_behind(core, notifier, registry):
     assert notifier.sent[-1][0] == "[dashboard] Offload → BEHIND"
 
 
+def test_metric_ping_flips_disk_job_to_behind_and_alerts(core, notifier, registry):
+    job = registry.get("disk")
+    gib = 1024 ** 3
+    assert core.record_ping(job, {"status": "metric", "metrics": {
+        "disk_free_bytes": 200 * gib, "disk_total_bytes": 400 * gib}}, now=NOW) == "OK"
+    state = core.record_ping(job, {"status": "metric", "metrics": {
+        "disk_free_bytes": 10 * gib}}, now=NOW + 10)       # shallow merge keeps the total
+    assert state == "BEHIND"
+    title, body, priority = notifier.sent[-1]
+    assert body == "disk: OK → BEHIND" and priority == "default"   # not urgent, but actionable
+    assert db.job_row(core.connect(), "disk")["state_reason"].startswith("only 10.0 GiB free")
+
+
+def test_disk_job_has_no_cadence_deadline_but_does_go_stale(core, registry, notifier):
+    gib = 1024 ** 3
+    core.record_ping(registry.get("disk"), {"status": "metric", "metrics": {
+        "disk_free_bytes": 200 * gib, "disk_total_bytes": 400 * gib}}, now=NOW)
+    # Hours of silence: a scheduled job would be LATE long ago; a gauge keeps its
+    # reading (mac-probe / box-containers own the machine's liveness signal).
+    assert core.recompute_all(now=NOW + 6 * 3600)["disk"] == "OK"
+    # Two days of it is a different thing: nothing is feeding the gauge any more.
+    assert core.recompute_all(now=NOW + 49 * 3600)["disk"] == "LATE"
+    assert notifier.sent[-1][1] == "disk: OK → LATE"
+
+
+def test_disk_fail_ping_changes_the_board_and_alerts(core, registry, notifier):
+    """A `fail` ping used to leave the card OK for ever: the disk branch computed
+    straight from last_metrics and never looked at the run. End-to-end, because
+    the board and /api/v1/status are the path that is actually read."""
+    job = registry.get("disk")
+    gib = 1024 ** 3
+    assert core.record_ping(job, {"status": "metric", "metrics": {
+        "disk_free_bytes": 200 * gib, "disk_total_bytes": 400 * gib}}, now=NOW) == "OK"
+    state = core.record_ping(job, {"status": "fail", "reason": "error",
+                                   "note": "statvfs /data: [Errno 2] No such file"},
+                             now=NOW + 300)
+    assert state == "FAIL"
+    assert notifier.sent[-1][1] == "disk: OK → FAIL"
+    assert "statvfs" in db.job_row(core.connect(), "disk")["state_reason"]
+    # …and a later good reading clears it (the failed run stays the newest run row).
+    assert core.record_ping(job, {"status": "metric", "metrics": {
+        "disk_free_bytes": 199 * gib}}, now=NOW + 600) == "OK"
+
+
 def test_ping_recomputes_other_jobs_too(core, registry):
     core.record_ping(registry.get("snap"), ok(), now=NOW)
     core.record_ping(registry.get("tree"), ok(), now=NOW + 5000)

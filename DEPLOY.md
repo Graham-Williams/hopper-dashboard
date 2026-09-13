@@ -16,9 +16,15 @@ Two halves:
   and a container timer on the box, an hourly launchd job on the Mac, and `probes/ping.sh` for manual jobs.
 
 Job ids are fixed and must match `jobs.yml` (unknown id → 404, by design):
-`box`: `km-backup`, `todoist-points-backup`, `box-containers`, `dashboard-probes` ·
-`mac`: `mac-probe`, `pa-backup`, `drive-mirror`, `minecraft-offload`, `taste-twin-publish`, `jjho-refresh`,
-`baby-pool-sync`.
+`box`: `km-backup`, `todoist-points-backup`, `box-containers`, `box-disk`, `dashboard-probes` ·
+`mac`: `mac-probe`, `pa-backup`, `drive-mirror`, `minecraft-offload`, `mac-disk`, `taste-twin-publish`,
+`jjho-refresh`, `baby-pool-sync`.
+
+**Adding a job id is app-first, probe-second.** The registry is loaded once at start-up, so a new id must be
+in the live (gitignored) `jobs.yml` **and the container restarted** *before* anything posts to it — `docker
+compose up -d` in `~/hopper-dashboard` after editing the file. In the other order every ping 404s, which is
+not silent: the Mac probe turns `mac-probe` into `fail` (an ntfy alert **every hour**) and the box unit exits
+non-zero every 5 minutes.
 
 ---
 
@@ -186,8 +192,13 @@ What it does (idempotent; never restarts a container or the backup units):
   change the backup unit's own result),
 - renders `dashboard-containers.service` (`User=` ← `--user`, default `$SUDO_USER`; must be in `docker`) and
   installs + enables `dashboard-containers.timer` (`OnCalendar=*:0/5` + `Persistent=true` → every 5 min →
-  `deploy/box/containers_probe.sh` → `docker ps` → `box-containers` ping; the dashboard container itself has
-  no docker socket),
+  `deploy/box/containers_probe.sh` → `statvfs /` → `box-disk` ping **and** `docker ps` → `box-containers`
+  ping, in that order: the cheap probe goes first so `docker ps` trouble can never eat the disk reading
+  inside `TimeoutStartSec=210` (≈133 s worst case: 35 s disk probe + 33 s fallback curl + 65 s containers
+  probe — they are additive). The dashboard container itself has no docker socket. If the disk probe
+  cannot run at all the wrapper posts the `fail` ping for it, so the failure reaches the board and not
+  just the journal; when BOTH probes fail the unit's exit status carries the CONTAINERS code, since the
+  disk failure is already on the board),
 - `daemon-reload`, then prints `systemd-analyze verify`, `systemctl cat`, `list-timers` and a dry run.
 
 Verify within 5 minutes (the backup timers tick every 5 min, so all three box jobs should report):
@@ -210,7 +221,20 @@ The in-container read is only for verifying before §3 is wired. Hopper's normal
 public hostname — `curl -sS -H "Authorization: Bearer $READ_TOKEN" https://dashboard.graham-williams.com/api/v1/status`
 — which carries the right Host by construction.
 
-`km-backup`, `todoist-points-backup`, `box-containers` should be `OK`; the Mac jobs are still `UNKNOWN` (they
+**Re-installing after a change to the box probes:** the service runs
+`deploy/box/containers_probe.sh` straight out of the checkout, so a `git pull` in `~/hopper-dashboard`
+is enough for a *script* change to take effect on the next tick. Re-run `sudo deploy/box/install.sh …`
+(idempotent; it never restarts a container or the backup units) when a **unit file** changed — as it did
+when `box-disk` was added to this timer, which rewrote the unit's Description. Confirm what is live with
+a dry run, which prints **both** pings:
+
+```bash
+cd ~/hopper-dashboard && set -a; . /etc/hopper-dashboard/ingest.env; set +a
+deploy/box/containers_probe.sh --dry-run     # → /api/v1/ping/box-containers AND /api/v1/ping/box-disk
+journalctl -u dashboard-containers.service -n 4 --no-pager   # after the next tick: two "sent … HTTP 200"
+```
+
+`km-backup`, `todoist-points-backup`, `box-containers`, `box-disk` should be `OK`; the Mac jobs are still `UNKNOWN` (they
 turn `LATE` on their own after cadence+grace if the Mac probe is never installed — that is the point).
 
 ## 3. Cloudflare — public read side
@@ -296,6 +320,17 @@ The probe posts:
   `/System/Volumes/Data`. Never uploads. `--size-only` is deliberate: these trees are tens of GB of video,
   and an hourly MD5 pass against the 120 s probe timeout produced spurious `mac-probe FAIL`s; the small
   `pa-backup` trees keep the full checksum check.
+- `mac-disk` — `metric`: `disk_free_bytes` / `disk_total_bytes` / `disk_path` for
+  `/System/Volumes/Data` (`PROBE_DISK_PATH`), rendered as the capacity gauge and thresholded in
+  `jobs.yml` (`disk.min_free_bytes` 25 GiB / `disk.max_used_pct` 90 → `BEHIND`). A `disk` job is a gauge
+  with no cadence, so this is metrics-only and `mac-probe` remains the Mac's liveness signal — but a
+  reading nothing refreshes for 48 h still goes `LATE` (`state.DISK_METRIC_MAX_AGE_S`) — as does a gauge
+  that has never reported at all more than 6 h after registration (`DISK_FIRST_READING_GRACE_S`) — and a
+  `statvfs` error posts a `fail` run (it is NOT raised: a raise would only mark `mac-probe` FAIL and leave
+  this card on its last reading) that the card shows as **FAIL, capacity unreadable**. Note the percentage will not
+  match `df`'s `Use%` (see DESIGN.md → `disk`): the free bytes do, the percent does not.
+  `minecraft-offload` still reports the same two figures as a footnote on its own card — that is
+  deliberate duplication, not drift.
 - `drive-mirror` — an **`ok` run** (reading the mirror DB *is* the check, so it counts as a heartbeat) with
   metrics: DriveFS mirror queue (`pending`), `mismatch`, `roots`, `roots_list`, `db_age_s` from a **copy** of
   `mirror_sqlite.db{,-wal,-shm}`; a `fail` run if no mirror db exists.
@@ -371,7 +406,7 @@ script, but that is per-repo work).
       `/tmp/rclone/rclone.conf` is `10001 600`.
 - [ ] `https://dashboard.graham-williams.com/` → login page; `/healthz` → 200; `POST /api/v1/ping/x` via the
       public host **with the READ_TOKEN** is 404/405 (ingest isn't tunnelled; see §3 for why 401 proves nothing).
-- [ ] `/api/v1/status` (READ_TOKEN) lists all 11 jobs; after ≤5 min box jobs are `OK`, after ≤1 h Mac jobs are
+- [ ] `/api/v1/status` (READ_TOKEN) lists all 13 jobs; after ≤5 min box jobs are `OK`, after ≤1 h Mac jobs are
       `OK`/`BEHIND` (not `UNKNOWN`), manual jobs show **Never run** until their first `ping.sh`.
 - [ ] `minecraft-offload` seeded with one `ok` ping after the first offload (§4).
 - [ ] Kill test: `sudo systemctl stop dashboard-containers.timer` → `box-containers` goes `LATE` after
@@ -412,6 +447,8 @@ restore data; the dashboard's own SQLite is derived state that repopulates withi
 | Drive rate-limits a big-tree probe (`rateLimitExceeded` / rclone timeout) | A probe fails but `dashboard-probes` stays **OK** — by design, damped until `PROBE_FAIL_THRESHOLD` (2) consecutive failed probes **of that job**. Undamped, this flapped FAIL→OK 27× in 4 days with nothing broken, which masked a real backup failure in the same window | The errors are still recorded: `reason` says `probe-error damped (transient quota/timeout, failure 1 of 2 before FAIL)`, `metrics.failed_transient` counts them, and the job page's probe table shows each `transient (Drive quota/timeout): …` row. If it does not clear, the job's **next** failed probe trips FAIL and pages — for a job with `interval_s: 1800` that is one interval later, not one cycle; and either way `PROBE_NO_SUCCESS_S` (3600 s) trips FAIL once nothing has listed that destination for an hour. Reduce traffic with `probe.interval_s` on the big tree before raising the threshold. |
 | `probe.interval_s` set too high on a `db_snapshot` | Would make a fresh destination read `STALE_DEST` from an aged probe row | Can't happen: `registry.py` refuses `interval_s` above half the freshness window (`cadence_s * 12 / 2`) for that kind and the container won't start |
 | `dashboard-containers.timer` stopped / user dropped from `docker` group | `box-containers` `LATE`; or `fail` ping with "permission denied" in the note | `systemctl list-timers`; `journalctl -u dashboard-containers.service` |
+| Disk gauge stops being fed (probe moved/renamed, `statvfs` on a path that vanished) | Was: the gauge kept showing its LAST reading for ever, because a `disk` job has no cadence — a frozen number looked like a healthy one | Four layers now, so a frozen gauge cannot read as healthy: (a) a reading older than **48 h** (`state.DISK_METRIC_MAX_AGE_S`) is `LATE`, alerted like any other dead-man's switch — suppressed only while that machine's probe job is itself LATE; (b) an unreadable path is a `fail` ping on BOTH machines → **FAIL, "capacity unreadable (statvfs …)"**, which outranks the stored figures (the Mac probe returns that ping rather than raising — a raise would only mark `mac-probe` FAIL and leave this card on its last reading); (c) a box probe that never ran at all is reported by its wrapper as a `fail` on `box-disk` (`result=probe-failed`, note pointing at `journalctl -u dashboard-containers.service`) rather than only as the unit's exit status; (d) a gauge that has NEVER reported goes `LATE` **6 h** after registration (`DISK_FIRST_READING_GRACE_S`) — the feeder that was never deployed, which `UNKNOWN` would otherwise hide for ever without alerting at all. The card still prints **measured &lt;when&gt;** under the bar. |
+| Board's used-percent does not match `df` | Looks like an arithmetic bug, invites a "fix" that would break the threshold | Expected: the free **bytes** match `df`'s Avail exactly, the **percent** does not (macOS/APFS hands `statvfs` a smaller free figure than `df` uses — measured 79.5% vs 78%, so the 90% ceiling trips near 88.5% on `df`). `f_bavail` is the right number: it is what can actually be written. DESIGN.md → `disk` and `probes/common.disk_free` both say so. |
 | Mac asleep / logged out | `mac-probe` LATE after 15 h; the other Mac jobs go LATE too but their alerts are suppressed — you get ONE alert, and ONE more (`mac-probe → OK`) when it wakes; the siblings' `LATE → OK` are muted while the probe is still LATE | That IS the signal (Mac offline). If only some Mac jobs are late, read the `mac-probe` note — it names the sub-probe that errored. |
 | Sibling Mac job pages "→ LATE" a tick before `mac-probe` does | Two alerts for one night's sleep | A sibling's `grace_s` dropped below `mac-probe`'s + 120 in `jobs.yml` (the probe posts siblings before itself). Restore the margin. |
 | rclone's shared Google `client_id` retired (2026) | Every Drive remote using the built-in client fails to refresh at once — probes AND the backup writers on box + Mac | `rclone lsd` interactively shows the OAuth error; rclone 1.75+ warns ahead of time. Fix = own GCP OAuth Desktop client in each conf (§1b follow-up). |

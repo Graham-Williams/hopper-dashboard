@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import chip, when, history_strip %}
+{% from "_macros.html" import chip, when, history_strip, disk_gauge %}
 {% block content %}
 {% set s = status.summary %}
 <section class="summary" aria-label="Summary">
@@ -51,6 +51,9 @@
         <dt>Last success</dt><dd>{{ when(j.last_success, now) }}</dd>
         {% if j.cadence_s %}
         <dt>Cadence</dt><dd>every {{ j.cadence_s|human_duration }} <span class="muted">(+{{ j.grace_s|human_duration }} grace)</span></dd>
+        {% endif %}
+        {% if j.disk %}
+        <dt>Capacity</dt><dd>{{ disk_gauge(j.disk, now) }}</dd>
         {% endif %}
         {% if j.lag %}
         <dt>{{ 'Missing' if j.kind == 'rclone_copy_tree' else 'Behind' }}</dt>

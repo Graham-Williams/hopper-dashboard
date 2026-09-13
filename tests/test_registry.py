@@ -17,16 +17,24 @@ def test_example_file_loads_and_has_required_jobs():
     ids = {j.id for j in reg}
     assert {"km-backup", "todoist-points-backup", "box-containers", "mac-probe",
             "pa-backup", "drive-mirror", "minecraft-offload", "taste-twin-publish",
-            "jjho-refresh", "baby-pool-sync", "dashboard-probes"} <= ids
+            "jjho-refresh", "baby-pool-sync", "dashboard-probes", "mac-disk",
+            "box-disk"} <= ids
     assert "km-tracker-cloudflared-1" in reg.get("box-containers").expect
     assert reg.get("minecraft-offload").max_lag_bytes == 21474836480
     assert reg.get("taste-twin-publish").informational
     assert reg.get("mac-probe").late_means
+    # 25 GiB / 90% on the Mac (clear-the-staging-copies level);
+    # 50 GiB / 85% on the box. A disk job carries no schedule.
+    mac_disk = reg.get("mac-disk")
+    assert (mac_disk.min_free_bytes, mac_disk.max_used_pct) == (26843545600, 90)
+    assert mac_disk.deadline_s is None and not mac_disk.scheduled
+    assert not mac_disk.informational
+    assert (reg.get("box-disk").min_free_bytes, reg.get("box-disk").max_used_pct) == (53687091200, 85)
 
 
 def test_test_doc_parses():
     reg = parse_registry(JOBS_DOC)
-    assert len(reg) == 8
+    assert len(reg) == 9
     assert reg.get("snap").has_probe and reg.get("snap").deadline_s == 600
     assert reg.by_machine()["box"][0].id == "snap"
     assert [j.id for j in reg.probed()] == ["snap"]
@@ -70,6 +78,7 @@ def test_top_level_errors(doc, msg):
     ({"probe": None}, "db_snapshot requires probe.rclone_path"),
     ({"expect": ["a"]}, "'expect' is only valid for kind: container"),
     ({"manual": {"max_age_s": 5}}, "only valid for kind: manual"),
+    ({"disk": {"min_free_bytes": 5}}, "only valid for kind: disk"),
     ({"typo_field": 1}, "unknown job key"),
 ])
 def test_per_job_errors(overrides, msg):
@@ -189,3 +198,74 @@ def test_example_file_probe_intervals_are_documented_for_the_big_trees():
     with open(EXAMPLE_JOBS, encoding="utf-8") as fh:
         text = fh.read()
     assert text.count("#   interval_s: 1800") == 2
+
+
+# -- disk --------------------------------------------------------------------
+
+DISK_IDX = 8  # the disk job in JOBS_DOC
+
+
+def _disk_doc(block):
+    doc = copy.deepcopy(JOBS_DOC)
+    if block is None:
+        doc["jobs"][DISK_IDX].pop("disk")
+    else:
+        doc["jobs"][DISK_IDX]["disk"] = block
+    return doc
+
+
+def test_disk_thresholds_parse():
+    job = parse_registry(JOBS_DOC).get("disk")
+    assert job.kind == "disk" and job.min_free_bytes == 25 * 1024 ** 3
+    assert job.max_used_pct == 90 and not job.informational
+    # Not scheduled, not probeable: no dead-man's switch and no destination listing.
+    assert not job.scheduled and job.deadline_s is None
+    assert job.id not in [j.id for j in parse_registry(JOBS_DOC).probed()]
+
+
+def test_disk_without_thresholds_is_informational():
+    job = parse_registry(_disk_doc(None)).get("disk")
+    assert job.informational and job.min_free_bytes is None and job.max_used_pct is None
+    job = parse_registry(_disk_doc({})).get("disk")
+    assert job.informational
+
+
+def test_disk_one_threshold_is_enough_to_alert():
+    assert not parse_registry(_disk_doc({"max_used_pct": 90})).get("disk").informational
+    assert not parse_registry(_disk_doc({"min_free_bytes": 1})).get("disk").informational
+
+
+@pytest.mark.parametrize("block,msg", [
+    ({"min_free_bytes": 1, "bogus": 2}, "unknown disk key"),
+    ({"min_free_bytes": 0}, "positive integer"),
+    ({"min_free_bytes": "25G"}, "positive integer"),
+    ({"max_used_pct": 101}, "percentage"),
+    ({"max_used_pct": 26843545600}, "percentage"),   # bytes pasted into the wrong field
+])
+def test_disk_block_errors(block, msg):
+    with pytest.raises(RegistryError, match=msg):
+        parse_registry(_disk_doc(block))
+
+
+def test_disk_is_not_a_mapping():
+    with pytest.raises(RegistryError, match="'disk' must be a mapping"):
+        parse_registry(_disk_doc(["25G"]))
+
+
+@pytest.mark.parametrize("idx", [0, 1, 4, 6])  # db_snapshot, copy tree, manual, probe
+def test_disk_block_rejected_on_other_kinds(idx):
+    doc = copy.deepcopy(JOBS_DOC)
+    doc["jobs"][idx]["disk"] = {"max_used_pct": 90}
+    with pytest.raises(RegistryError, match="only valid for kind: disk"):
+        parse_registry(doc)
+
+
+def test_disk_job_has_no_schedule_or_probe():
+    doc = copy.deepcopy(JOBS_DOC)
+    doc["jobs"][DISK_IDX]["cadence_s"] = 300
+    with pytest.raises(RegistryError, match="disk jobs have no schedule"):
+        parse_registry(doc)
+    doc = copy.deepcopy(JOBS_DOC)
+    doc["jobs"][DISK_IDX]["probe"] = {"rclone_path": "g:x"}
+    with pytest.raises(RegistryError, match="cannot have a 'probe' block"):
+        parse_registry(doc)

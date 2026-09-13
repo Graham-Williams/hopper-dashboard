@@ -3,14 +3,19 @@
 #
 # Fields: id ([a-z0-9-]+), name, machine (box|mac), kind, protects, method,
 #   destination (optional), cadence_s + grace_s (required for every kind except
-#   manual; LATE fires after cadence+grace of silence), probe.rclone_path +
+#   manual and disk, and rejected on those two; LATE fires after cadence+grace of
+#   silence — a disk gauge instead goes LATE if its reading is never refreshed for
+#   48 h), probe.rclone_path +
 #   probe.state_dir (required for db_snapshot; OPTIONAL for rclone_copy_tree and
 #   manual — the container lists the destination itself, so newest-object time +
 #   count come from the box; without it the card shows only what the Mac probe
 #   reports), probe.interval_s (optional — probe THIS destination only every N
 #   seconds instead of every PROBE_INTERVAL_S cycle; for big trees, see pa-backup
-#   below. Capped at half the freshness window on db_snapshot), manual.max_age_s / manual.max_lag_bytes (manual
-#   only; omit both for an informational job that never alerts), expect (container
+#   below. Capped at half the freshness window on db_snapshot),
+#   manual.max_age_s / manual.max_lag_bytes (manual
+#   only; omit both for an informational job that never alerts),
+#   disk.min_free_bytes / disk.max_used_pct (disk only — same rule: omit both for
+#   an informational gauge), expect (container
 #   only — names that must appear in metrics.running), late_means (optional text
 #   shown when the job is LATE, e.g. "Mac offline or asleep").
 jobs:
@@ -64,6 +69,22 @@ jobs:
       - hopper-messaging-postgres-1
       - hopper-messaging-gmessages-1
 
+  - id: box-disk
+    name: Box disk
+    machine: box
+    kind: disk
+    protects: Every container's data volume + the DB snapshots staged before upload
+    method: statvfs / on the box (available space, so the percent reads a little off df), posted by the same 5-min timer as box-containers
+    # A `disk` job is a GAUGE, not a scheduled job: no cadence_s/grace_s, and no per-cadence
+    # dead-man's switch — box-containers, on this same timer, already carries that silence.
+    # It does go LATE if nothing refreshes the reading for 48 h (state.DISK_METRIC_MAX_AGE_S),
+    # which is the only way a feeder that stopped on its own would ever show up.
+    disk:
+      # Early-warning, not crisis, levels: BEHIND at 50 GiB free (room for an image rebuild
+      # plus a DB snapshot) or 85% used.
+      min_free_bytes: 53687091200   # 50 GiB
+      max_used_pct: 85
+
   - id: dashboard-probes
     name: Dashboard probe cycle
     machine: box
@@ -88,6 +109,22 @@ jobs:
     cadence_s: 3600
     grace_s: 50400              # 14 h: the Mac sleeps overnight; LATE only past a full night + a working day
     late_means: Not heard from the Mac in 15 hours — it is probably offline or asleep, not broken.
+
+  - id: mac-disk
+    name: Mac disk
+    machine: mac
+    kind: disk
+    protects: Headroom for OBS recordings, Whisper runs and the Drive mirror's local copies
+    method: statvfs /System/Volumes/Data (available space — df prints a lower percent, see DESIGN.md), posted by the hourly Mac probe
+    # No cadence_s/grace_s: mac-probe already says whether the Mac is awake, and these metrics
+    # arrive on the same hourly run. The gauge still goes LATE if the reading stops being
+    # refreshed for 48 h (state.DISK_METRIC_MAX_AGE_S) — comfortably past a Mac that is merely
+    # switched off for a day, which mac-probe alerts for on its own.
+    disk:
+      # 25 GiB free is the point at which the offload staging copies are worth clearing out;
+      # 90% is the long-standing watch level for this disk. Either one trips BEHIND.
+      min_free_bytes: 26843545600   # 25 GiB
+      max_used_pct: 90
 
   - id: pa-backup
     name: personal-assistant → Drive

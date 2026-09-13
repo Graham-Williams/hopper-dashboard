@@ -52,7 +52,8 @@ def pin_created_at(settings, iso: str = PINNED_CREATED_AT) -> None:
         conn.close()
 
 # One job per kind + the dashboard's own probe job. Cadences are short so
-# LATE arithmetic is easy to reason about in tests.
+# LATE arithmetic is easy to reason about in tests. Appended, not inserted:
+# several suites address these by index (doc["jobs"][4] etc.).
 JOBS_DOC = {
     "jobs": [
         {"id": "snap", "name": "Snap DB", "machine": "box", "kind": "db_snapshot",
@@ -77,6 +78,9 @@ JOBS_DOC = {
          "late_means": "Mac offline or asleep"},
         {"id": "dashboard-probes", "name": "Probe cycle", "machine": "box", "kind": "probe",
          "protects": "the watcher", "method": "scheduler", "cadence_s": 300, "grace_s": 600},
+        {"id": "disk", "name": "Mac disk", "machine": "mac", "kind": "disk",
+         "protects": "headroom", "method": "statvfs",
+         "disk": {"min_free_bytes": 25 * 1024 ** 3, "max_used_pct": 90}},
     ]
 }
 

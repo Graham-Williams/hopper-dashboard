@@ -31,7 +31,12 @@ METRIC_KEY_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")   # used with fullmatch
 METRIC_MAX_KEYS = 50
 METRIC_STR_MAX = 1000
 METRIC_LIST_MAX = 100
-INT_ABS_MAX = 2 ** 63   # SQLite INTEGER / JSON consumers; bigger ints are rejected
+# Magnitude ceiling for every numeric metric (SQLite INTEGER / JSON consumers).
+# Floats are held to it too: a finite-but-absurd `1e308` passes json.loads happily, and
+# `state.disk_info`'s int() then wrote a 309-digit integer into /api/v1/status and ~310
+# characters into the gauge's heading. No real metric — bytes, counts, seconds — comes
+# anywhere near 9.2e18, so one ceiling for both types is the honest rule.
+INT_ABS_MAX = 2 ** 63
 
 
 class PayloadError(ValueError):
@@ -52,6 +57,8 @@ def _scalar(value, where: str):
     if isinstance(value, float):
         if not math.isfinite(value):
             raise PayloadError(f"{where}: non-finite number")
+        if abs(value) > INT_ABS_MAX:
+            raise PayloadError(f"{where}: number out of range")
         return value
     if isinstance(value, str):
         if len(value) > METRIC_STR_MAX:

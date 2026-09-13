@@ -358,6 +358,22 @@ def test_num_treats_non_finite_as_absent():
     assert _num(" 42 ") == 42.0 and _num(7) == 7.0 and _num(True) is None and _num(None) is None
 
 
+def test_num_treats_an_absurd_magnitude_as_absent():
+    """ingest rejects a numeric 1e308, but "1e308" is a legal short STRING metric and
+    every probe may send numbers as text — so the cap lives here as well, or int() puts
+    a 309-digit figure in /api/v1/status and ~310 characters in the gauge heading."""
+    from dashboard.state import METRIC_ABS_MAX, _num, disk_info
+    from dashboard.registry import parse_job
+    from dashboard.state import Facts
+    assert _num("1e308") is None and _num(-1e308) is None
+    assert _num(METRIC_ABS_MAX) == METRIC_ABS_MAX      # exactly on the ceiling is fine
+    job = parse_job({"id": "d", "name": "D", "machine": "box", "kind": "disk",
+                     "protects": "space", "method": "statvfs"}, 0)
+    d = disk_info(job, Facts(last_metrics={"disk_free_bytes": "1e308",
+                                           "disk_total_bytes": "1e308"}))
+    assert d["free_bytes"] is None and d["used_pct"] is None
+
+
 @pytest.mark.parametrize("metrics", [
     {"dest_count": "nan"},
     {"missing_bytes": "inf"},

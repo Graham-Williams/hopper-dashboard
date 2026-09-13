@@ -16,9 +16,11 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
-from probes.common import RCLONE_TIMEOUT_S, ProbeError, run_cmd
+# disk_free lives in probes.common (the box disk probe needs it without dragging in rclone);
+# re-exported here because mac_probe has always called rclone_check.disk_free().
+from probes.common import RCLONE_TIMEOUT_S, ProbeError, disk_free, run_cmd  # noqa: F401
 
 # Filters copied VERBATIM from scripts/backup-personal-assistant.sh (personal-assistant → Drive).
 # The two '+' rules MUST precede '- .env*' so the template and example survive the secret sweep.
@@ -209,10 +211,3 @@ def rclone_size(rclone: str, remote_path: str, timeout: float = RCLONE_TIMEOUT_S
         raise ProbeError("rclone size %s failed (rc=%s): %s" % (remote_path, rc, summarize_stderr(err) or err.strip()[-300:]))
     return parse_size_json(out)
 
-
-def disk_free(path: str) -> Dict[str, int]:
-    st = os.statvfs(path)
-    return {
-        "disk_free_bytes": st.f_bavail * st.f_frsize,
-        "disk_total_bytes": st.f_blocks * st.f_frsize,
-    }
