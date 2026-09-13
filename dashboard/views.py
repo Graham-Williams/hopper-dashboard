@@ -57,6 +57,20 @@ def job_entry(conn, job: Job, row: dict | None, now: float,
         "last_run_reason": lr.get("reason"),
         "last_run_note": lr.get("note"),
         "late_means": job.late_means,
+        # The RESOLVED alert policy plus where this job stands in its current
+        # episode, so the policy is inspectable rather than inferred from
+        # jobs.yml. `after_s` is null when the job never pages; `source` names
+        # what decided it (an explicit key, `alert: never`, `informational`, or
+        # the conservative default); `bad_since` non-null means an episode is
+        # running (which it can be while the state reads OK — see
+        # services._resolve_alerts); `alerted_at` non-null means it was paged.
+        "alert": {
+            "after_s": None if job.alert_never else job.alert_after_s,
+            "never": job.alert_never,
+            "source": job.alert_source,
+            "bad_since": row.get("bad_since"),
+            "alerted_at": row.get("alerted_at"),
+        },
         "informational": job.informational,
         "expect": list(job.expect) if job.expect else None,
         "never_run": lr == {},
