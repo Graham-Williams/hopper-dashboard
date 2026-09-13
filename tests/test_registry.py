@@ -2,12 +2,18 @@ import copy
 
 import pytest
 
-from dashboard.registry import (RegistryError, load_registry, parse_registry)
+from dashboard.registry import (MAX_PROBE_INTERVAL_S, RegistryError, load_registry,
+                                parse_registry)
 from tests.conftest import EXAMPLE_JOBS, JOBS_DOC
 
 
 def _doc(**overrides):
     doc = copy.deepcopy(JOBS_DOC)
+    # The shared fixture carries `alert_after_s: 0`, and the two alert keys are
+    # mutually exclusive by KEY now — so an override that sets `alert` replaces it
+    # rather than colliding with it (unless the case is testing exactly that).
+    if "alert" in overrides and "alert_after_s" not in overrides:
+        doc["jobs"][0].pop("alert_after_s", None)
     doc["jobs"][0].update(overrides)
     return doc
 
@@ -80,10 +86,216 @@ def test_top_level_errors(doc, msg):
     ({"manual": {"max_age_s": 5}}, "only valid for kind: manual"),
     ({"disk": {"min_free_bytes": 5}}, "only valid for kind: disk"),
     ({"typo_field": 1}, "unknown job key"),
+    ({"alert_after_s": -1}, "non-negative integer"),
+    ({"alert_after_s": "86400"}, "non-negative integer"),
+    ({"alert_after_s": True}, "non-negative integer"),
+    ({"alert": "sometimes"}, "'alert' must be 'never'"),
+    ({"alert": False}, "'alert' must be a non-empty string"),
+    ({"alert": "never", "alert_after_s": 60}, "mutually exclusive"),
+    # Checked on KEY PRESENCE: with an `is not None` test, `alert: never` +
+    # `alert_after_s: null` parsed to "never" — silence that reads, in the file,
+    # like somebody set a threshold.
+    ({"alert": "never", "alert_after_s": None}, "mutually exclusive"),
+    ({"alert": None, "alert_after_s": 60}, "mutually exclusive"),
+    # A LONE null escaped that check — nothing to be exclusive with — and fell
+    # through to whatever an ABSENT key means: `never` on an informational job
+    # (silence that reads like a threshold), the 24 h default elsewhere.
+    ({"alert_after_s": None}, "present but null"),
+    ({"alert": None}, "present but null"),
+    # Magnitude was the one hostile value the validator accepted: a threshold of
+    # 10**20 seconds is silence, and NOTHING would say so.
+    ({"alert_after_s": 10 ** 20}, "over the 2592000 second"),
+    ({"alert_after_s": 2_592_001}, "over the 2592000 second"),
 ])
 def test_per_job_errors(overrides, msg):
     with pytest.raises(RegistryError, match=msg):
         parse_registry(_doc(**overrides))
+
+
+def test_alert_policy_resolution_and_its_conservative_default():
+    from dashboard.registry import DEFAULT_ALERT_AFTER_S
+    doc = copy.deepcopy(JOBS_DOC)
+    for raw in doc["jobs"]:
+        raw.pop("alert_after_s", None)
+    doc["jobs"][1]["alert_after_s"] = 108000
+    doc["jobs"][2]["alert"] = "never"
+    doc["jobs"][5]["alert_after_s"] = 60        # `info`: explicit beats informational
+    reg = parse_registry(doc)
+    # Declares nothing, not informational → 24 h. Never silence.
+    assert reg.get("snap").alert_after_s == DEFAULT_ALERT_AFTER_S == 86400
+    assert reg.get("snap").alert_never is False and reg.get("snap").alert_source == "default"
+    assert reg.get("tree").alert_after_s == 108000
+    assert reg.get("tree").alert_source == "alert_after_s"
+    assert reg.get("mirror").alert_never is True and reg.get("mirror").alert_source == "alert"
+    # `info` is a manual job with no thresholds — informational — but it asked.
+    assert reg.get("info").informational and reg.get("info").alert_never is False
+    assert reg.get("info").alert_after_s == 60
+    # ...and with nothing declared, `informational` finally means what it says.
+    doc["jobs"][5].pop("alert_after_s")
+    quiet = parse_registry(doc).get("info")
+    assert quiet.informational and quiet.alert_never is True
+    assert quiet.alert_source == "informational"
+    # 0 is legal: "page on the first not-OK recompute" (what the shared fixtures use).
+    assert parse_registry(_doc(alert_after_s=0)).get("snap").alert_after_s == 0
+
+
+@pytest.mark.parametrize("bad", [
+    "Tree copy\r\nX-Injected: yes",          # the header-injection shape
+    "Tree\ncopy", "Tree\rcopy",              # a bare LF or CR does it too
+    "Tree\x00copy", "Tree\x1b[31mcopy",      # NUL, ESC
+    "Tree\x7fcopy",                          # DEL
+])
+def test_a_control_character_in_a_job_string_is_rejected_at_parse_time(bad):
+    """A control character in `job.name` makes that job PERMANENTLY un-pageable.
+    The name becomes the ntfy `Title` header; `http.client` refuses a header
+    value containing CR/LF, so nothing is ever injected (zero bytes reach the
+    socket) — but every POST raises, `send` swallows it and returns False, the
+    failed-push rollback hands the page straight back, and the next tick tries
+    again: 24 attempts over two simulated hours, `alerted_at` NULL throughout.
+    The page is never delivered and never spent, so the recovery can never fire
+    either, and the board shows a job that looks armed and cannot speak.
+
+    `.strip()` alone did not catch any of these — it only trims the ends."""
+    doc = copy.deepcopy(JOBS_DOC)
+    doc["jobs"][1]["name"] = bad
+    with pytest.raises(RegistryError, match=r"must not contain control characters"):
+        parse_registry(doc)
+    # ...and the same for every other free-text field that reaches a log or the page.
+    doc = copy.deepcopy(JOBS_DOC)
+    doc["jobs"][1]["destination"] = bad            # optional string → _opt_str
+    with pytest.raises(RegistryError, match=r"must not contain control characters"):
+        parse_registry(doc)
+    # A trailing newline from YAML is still fine: it is stripped before the check.
+    doc = copy.deepcopy(JOBS_DOC)
+    doc["jobs"][1]["name"] = "Tree copy\n"
+    assert parse_registry(doc).get("tree").name == "Tree copy"
+
+
+def test_a_lone_null_alert_key_is_an_error_not_a_resolution():
+    """The mutual-exclusion check is on key PRESENCE precisely so an accidental
+    silence cannot read like a configured threshold — but a LONE null slipped
+    past it, because there was nothing to be exclusive with. `_nonneg_int`
+    early-returns None and the job then resolves as if the key were ABSENT: on
+    an INFORMATIONAL job that is `alert: never`, i.e. permanent silence sitting
+    in the file under a key whose name says a threshold was set. (Elsewhere it
+    lands on the 24 h default — the safe direction, and still not what the file
+    says.) Present-but-null is a mistake in every case."""
+    doc = copy.deepcopy(JOBS_DOC)
+    doc["jobs"][5]["alert_after_s"] = None        # `info`: manual, no thresholds
+    with pytest.raises(RegistryError, match=r"'alert_after_s' is present but null"):
+        parse_registry(doc)
+    doc["jobs"][5]["alert_after_s"] = 3600        # the same job, said properly
+    assert parse_registry(doc).get("info").alert_after_s == 3600
+    doc = copy.deepcopy(JOBS_DOC)
+    doc["jobs"][5]["alert"] = None
+    with pytest.raises(RegistryError, match=r"'alert' is present but null"):
+        parse_registry(doc)
+
+
+def test_example_file_alert_policy_matches_the_documented_thresholds():
+    reg = load_registry(EXAMPLE_JOBS)
+    # Only the on-demand manual jobs opt out. A machine's `kind: probe` job must NOT —
+    # it is what mutes its siblings, so `never` there is silence for the whole machine.
+    assert {j.id for j in reg if j.alert_never} == {
+        "minecraft-offload", "taste-twin-publish", "jjho-refresh", "baby-pool-sync"}
+    assert all(not j.alert_never for j in reg if j.kind == "probe")
+    # 72 h on top of a 15 h LATE deadline: a weekend with the lid shut is silent, a Mac
+    # that is gone for ~3.6 days is not.
+    assert reg.get("mac-probe").alert_after_s == 259200
+    assert reg.get("km-backup").alert_after_s == 86400
+    assert reg.get("todoist-points-backup").alert_after_s == 86400
+    # 6 h, NOT 30 h. The threshold clock starts when the job goes not-OK, which for
+    # this one is already 38 h after the last backup (cadence 86400 + grace 50520), so
+    # 108000 shipped a page at 68 h ~ 2.8 days against a stated bar of "missed more
+    # than 24 hours". See the TIME-TO-PAGE test below.
+    assert reg.get("pa-backup").alert_after_s == 21600
+    assert reg.get("box-containers").alert_after_s == 1200
+    assert reg.get("dashboard-probes").alert_after_s == 21600
+    assert reg.get("drive-mirror").alert_after_s == 86400
+    # The disk gauges are 1 h, NOT the 24 h default: DISK_METRIC_MAX_AGE_S (48 h) has
+    # already served the "sustained" purpose, and a capacity threshold is a level.
+    assert reg.get("box-disk").alert_after_s == reg.get("mac-disk").alert_after_s == 3600
+    # Nothing ships with the "page on every blip" setting, and NOTHING is left to the
+    # default — a `default` in the shipped file means a job was forgotten.
+    assert all(j.alert_never or j.alert_after_s > 0 for j in reg)
+    assert [j.id for j in reg if j.alert_source == "default"] == []
+
+
+def _fmt_ttp(seconds: float) -> str:
+    """The canonical TIME-TO-PAGE string for a number of seconds."""
+    if seconds < 3600:
+        return "%dm" % round(seconds / 60)
+    return ("%.1fh" % (seconds / 3600.0)).replace(".0h", "h")
+
+
+def test_every_alerting_job_states_its_real_time_to_page():
+    """`alert_after_s` is NOT the time to a page, and four of the comments in
+    jobs.example.yml used to say it was — wrong by between 15 minutes (the two
+    disk gauges aside, `box-containers` reads 20 m and pages at 35 m) and 38
+    hours (`pa-backup` read "30 h means a whole night was genuinely missed" and
+    paged at 68 h).
+
+    A comment cannot be asserted, so this asserts a NUMBER inside one: every
+    job with a threshold carries a `# TIME-TO-PAGE: <n>` line, and the figure is
+    recomputed here from that job's own cadence/grace/threshold. Drift one and
+    the suite goes red — which is the only reason to believe the other prose
+    around it.
+
+    A `disk` gauge has no cadence, so its figure is the CAPACITY-breach one (the
+    threshold alone); a gauge nothing feeds is LATE at 48 h and pages a
+    threshold after that, which is stated in prose beside it."""
+    import re
+    reg = load_registry(EXAMPLE_JOBS)
+    with open(EXAMPLE_JOBS, encoding="utf-8") as fh:
+        text = fh.read()
+    blocks = {}
+    for m in re.finditer(r"^  - id: ([a-z0-9-]+)$((?:\n(?!  - id:).*)*)", text, re.M):
+        blocks[m.group(1)] = m.group(2)
+    assert set(blocks) == {j.id for j in reg}
+    checked = 0
+    for job in reg:
+        found = re.search(r"^    # TIME-TO-PAGE: (\S+)", blocks[job.id], re.M)
+        if job.alert_never:
+            assert found is None, f"{job.id} never pages; it must not claim a time"
+            continue
+        assert found is not None, f"{job.id} states no TIME-TO-PAGE"
+        want = _fmt_ttp((job.deadline_s or 0) + job.alert_after_s)
+        assert found.group(1) == want, (
+            f"{job.id}: comment says {found.group(1)}, arithmetic says {want} "
+            f"(deadline {job.deadline_s} + threshold {job.alert_after_s})")
+        checked += 1
+    assert checked == 9                                  # every job that can page
+
+
+def test_the_time_to_page_figures_are_the_ones_graham_was_quoted():
+    """The end-to-end numbers themselves, pinned. These are what "how long can
+    this be broken before my phone knows?" actually resolves to, and they are
+    the figures the deploy notes and DESIGN.md quote — so a threshold edit that
+    changes one has to change them everywhere, deliberately."""
+    reg = load_registry(EXAMPLE_JOBS)
+    assert {j.id: _fmt_ttp((j.deadline_s or 0) + j.alert_after_s)
+            for j in reg if not j.alert_never} == {
+        "km-backup": "24.3h", "todoist-points-backup": "24.3h",
+        "box-containers": "35m", "box-disk": "1h", "dashboard-probes": "6.3h",
+        "mac-probe": "87h", "mac-disk": "1h", "pa-backup": "44h",
+        "drive-mirror": "39h"}
+    # The bar Graham set was "backups missed more than 24 hours". Both DB
+    # snapshots clear it; pa-backup cannot (its 38 h deadline is a hard floor —
+    # below it a missed backup is indistinguishable from a sleeping Mac) but it
+    # is now the smallest miss the floor allows instead of nearly three days.
+    assert reg.get("pa-backup").deadline_s == 136920          # 38 h, the floor
+    assert (reg.get("pa-backup").deadline_s
+            + reg.get("pa-backup").alert_after_s) < 2 * 86400
+
+
+def test_the_magnitude_cap_still_admits_every_real_value():
+    """The cap must not be so tight it rejects a sane policy: 30 days is well past
+    the longest shipped threshold (72 h)."""
+    from dashboard.registry import MAX_ALERT_AFTER_S
+    reg = load_registry(EXAMPLE_JOBS)
+    assert max(j.alert_after_s for j in reg) <= MAX_ALERT_AFTER_S
+    assert parse_registry(_doc(alert_after_s=MAX_ALERT_AFTER_S)).get("snap").alert_after_s \
+        == MAX_ALERT_AFTER_S
 
 
 def test_error_names_the_job():
@@ -184,6 +396,31 @@ def test_probe_interval_s_capped_for_db_snapshot():
     doc["jobs"][1]["probe"] = {"rclone_path": "gdrive-ro:Backups",
                                "interval_s": 86400}
     assert parse_registry(doc).get("tree").probe_interval_s == 86400
+
+
+def test_probe_interval_s_has_a_magnitude_cap_on_every_kind():
+    """The semantic cap above is db_snapshot-only, so `rclone_copy_tree` and
+    `manual` — the two kinds DEPLOY.md §1d has the operator hand-edit
+    (`pa-backup`, `minecraft-offload`) — had no magnitude bound at all:
+    `interval_s: 18000000` parsed fine and meant 208 days between probes,
+    invisibly (a cycle with nothing due still records `dashboard-probes` as ok).
+    A day is the ceiling, and 86400 itself stays legal."""
+    doc = copy.deepcopy(JOBS_DOC)
+    doc["jobs"][1]["probe"] = {"rclone_path": "gdrive-ro:Backups",
+                               "interval_s": MAX_PROBE_INTERVAL_S}
+    assert parse_registry(doc).get("tree").probe_interval_s == MAX_PROBE_INTERVAL_S
+    doc["jobs"][1]["probe"]["interval_s"] = MAX_PROBE_INTERVAL_S + 1
+    with pytest.raises(RegistryError, match=r"over the 86400 second maximum"):
+        parse_registry(doc)
+    doc["jobs"][1]["probe"]["interval_s"] = 18_000_000        # the 208-day typo
+    with pytest.raises(RegistryError, match=r"over the 86400 second maximum"):
+        parse_registry(doc)
+    # ...and on a manual job, the other kind that may carry a probe block.
+    doc = copy.deepcopy(JOBS_DOC)
+    doc["jobs"][4]["probe"] = {"rclone_path": "gdrive-ro:Gremlins",
+                               "interval_s": 10 ** 20}
+    with pytest.raises(RegistryError, match=r"over the 86400 second maximum"):
+        parse_registry(doc)
 
 
 def test_example_file_probe_intervals_are_documented_for_the_big_trees():

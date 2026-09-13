@@ -237,6 +237,13 @@ read from inside the container must send `Host: <APP_HOST>` or the Host pin answ
   `state_reason` (why the job is in its current state), `last_run_status`, `last_run_reason`, `last_run_note`,
   `late_means`, `informational`, `expect`, `never_run` (true until the first real run — manual cards say
   "Never run" explicitly), `created_at`,
+  `alert` (`{after_s, never, source, bad_since, alerted_at, cooldown_s, last_paged_at}` — the RESOLVED policy
+  plus the open episode: `after_s` is null when the job never pages, `source` is one of `alert_after_s` /
+  `alert` / `informational` / `default` (see "Resolving a job's policy"), `bad_since` non-null means an
+  episode is running — which it can be while the state reads OK — and `alerted_at` non-null means it was
+  paged. `cooldown_s` + `last_paged_at` are the per-job page rate limit, and reading them together answers
+  the only question worth asking when the phone is quiet but the board is not: is this job unpaged because
+  nothing crossed a threshold, or because it paged recently?),
   `summary.total`, `summary.computed_at` (newest state recompute — a stale value means the scheduler is down).
   Unauthenticated API calls get a JSON 401, not a redirect.
 - `GET /api/v1/jobs/<id>?limit=100` → `{generated_at, job, runs, state_changes, probes|null}`.
@@ -274,8 +281,13 @@ Validation is strict and fails startup with the job id + field: ids `^[a-z0-9-]+
 `destination`, a `probe` block is accepted only on `db_snapshot` / `rclone_copy_tree` / `manual`, a `disk`
 block only on `disk` (with `max_used_pct` bounded to 1-100, so bytes pasted into the wrong field are
 rejected rather than silently disabling the threshold), `container` requires a non-empty `expect`,
-`probe.interval_s` is a positive int and on a `db_snapshot` may not exceed half the freshness window
-(`cadence_s * DEST_FRESH_MULTIPLIER / 2`), unknown keys anywhere are errors.
+every schema string is rejected if it contains a control character (C0 or DEL — `job.name` becomes the ntfy
+`Title` header, and a CR/LF there makes `http.client` refuse every POST for that job for ever: not an
+injection, but a job that can never page and can never spend its page, so it is caught where a human sees it),
+`probe.interval_s` is a positive int, may not exceed `MAX_PROBE_INTERVAL_S` (86400 — a magnitude cap on
+EVERY kind, because `interval_s: 18000000` is 208 days of not looking and nothing on the board says so), and
+on a `db_snapshot` may not exceed half the freshness window (`cadence_s * DEST_FRESH_MULTIPLIER / 2`),
+unknown keys anywhere are errors.
 State computation runs on every ping (for ALL jobs, so LATE keeps firing even if the ticker thread dies) and
 on a 60 s ticker (so LATE fires without traffic). Every state transition is written to `state_changes` and
 dispatched to ntfy (`NTFY_URL` + `NTFY_TOPIC` env; disabled when empty) with title `[dashboard] <job> → <STATE>`
@@ -300,7 +312,11 @@ are informational lag shown on the card and mentioned in the OK reason — a wor
 combined `lag_bytes` no longer drives staleness for this kind. `drive_mirror` → `BEHIND` when
 `pending + mismatch > 0` (the Mac probe reports each read of the mirror DB as an `ok` RUN, since reading it
 IS the check; no DB → `fail`). `manual`: never LATE; `FAIL` if last run failed; `BEHIND` if age of last
-success > `max_age_s` or `lag_bytes` > `max_lag_bytes`; no thresholds = informational, never alerts.
+success > `max_age_s` or `lag_bytes` > `max_lag_bytes`; no thresholds = informational, which RESOLVES to
+`alert: never` — but note the two are not the same question, and the board now captions off the resolved
+policy rather than off `informational`. `minecraft-offload` is the case that matters: `alert: never` AND
+carrying `manual:` thresholds, so it is not informational, and a caption keyed on `informational` skipped it
+entirely — leaving the one job that sits at BEHIND as its resting state with nothing saying it never pages.
 `max_age_s` is inert until the first real run (the card says **Never run** until then — seed one ping after
 the first manual run). `disk`, in this precedence: `FAIL` when the newest word is a `fail` ping ("capacity
 unreadable (<note>)" — the probe could not `statvfs` at all, or its wrapper reported that the probe never
@@ -377,7 +393,10 @@ top of its cadence, or a slow cycle trades FAIL flapping for LATE flapping; see 
 against the destination's **own newest-object timestamp**, an absolute time that does not drift as the probe
 row ages — a longer interval only delays noticing a *new* object. The only kind whose state reads that age is
 `db_snapshot`, and those keep the default interval (300 s against a 3600 s window); `registry.py` refuses an
-`interval_s` above half the window for that kind so the invariant is enforced, not just reasoned about. The
+`interval_s` above half the window for that kind so the invariant is enforced, not just reasoned about. On
+top of that, **every** kind is capped at `MAX_PROBE_INTERVAL_S` = 86400: the semantic cap does not apply to
+`rclone_copy_tree`/`manual`, which are exactly the two the operator hand-edits (DEPLOY.md §1d), so an extra
+digit there used to buy months of silent not-looking. The
 two jobs set to 1800 s are `rclone_copy_tree` and `manual`, whose `STALE_DEST`/`BEHIND` verdicts come from
 heartbeat `missing_*`/lag metrics, and whose freshness windows (12 d / `max_age_s` 14 d) dwarf 1800 s.
 **Transient vs real:** a failure whose text matches `probes.TRANSIENT_MARKERS` (`rateLimitExceeded`, 429,
@@ -393,8 +412,201 @@ instead of paging at once. Transients are **not** exempt
 from the consecutive count or the backstop: a *persistent* quota failure is a real problem — it is one way a
 nightly backup stops working — and must still reach FAIL, including for a job with its own `interval_s`.
 
+**"Newest probe row" means newest by `id`, not by `probed_at`.** `probed_at` is the writer's wall clock, so a
+row written while the clock was ahead (an RTC booting wrong, an NTP step backwards afterwards) sits in the
+future and outranks every real probe after it, permanently — the newest row reads `ok`, so
+`db.failing_probe_job_ids` is empty, `db.probe_fail_streak` is 0, the damped-OK hold is switched off and the
+damping above can never un-damp. Clamping at insert does not help (at insert time the value *is* now; it
+becomes the future later), so every "which row is current" query orders by the rowid, which is monotonic
+because `probes` has exactly one writer. Durations are still measured from `probed_at`.
+
 ### Alerting rules
-- Every transition is persisted to `state_changes` and shown on the board; only *dispatch* is filtered.
+
+> **The governing rule: every ambiguity resolves toward paging, never toward silence.**
+> Paging on every transition was noisy but *accidentally self-healing* — a dropped push, a reset clock or a
+> weird intermediate state was corrected by the next transition, which paged again. One page per episode
+> removes that net, so every path that can consume or reset the single page must be exactly right, and every
+> undecidable case must err toward the phone. The rule applies to the safeguards themselves: each one keeps
+> an episode alive, and an episode that never ends holds its unspent page hostage too — so each is bounded,
+> and every bound is stated below and at its implementation in `services.py`.
+
+**ntfy hears about a SUSTAINED problem, not a transition.** Measured in production, 09-07 → 09-11: ~55 pushes,
+essentially all of them one job flapping on transient Google Drive errors. Graham's requirement was *"when
+something fails on ntfy, it actually means something. Like it should be pretty rare. Only if like backups
+missed more than 24 hours or something."* So:
+
+- A job pages **once**, after it has been **continuously not-OK for its own `alert_after_s`** — an *episode*.
+  It pages again only after that episode ends and a new one starts. A `→ OK` recovery is sent only if the
+  episode was actually paged for.
+- **The board is unchanged.** Every blip is still computed, written to `state_changes`, and shown on the card
+  and in `/api/v1/status`. This filters the phone, not the history.
+- **Dispatch is LEVEL-triggered, not edge-triggered.** `db.set_state` returns None when nothing changed, so an
+  edge-driven dispatcher can never say "still FAIL, and now past six hours" — which is the whole event. The
+  episode pass (`Core._resolve_alerts`) therefore walks **every** job on **every** recompute. Both write paths
+  — the 60 s ticker (`recompute_all`) and every ping (`record_ping`) — run the identical pass.
+
+**The episode** lives in two `jobs` columns, `bad_since` and `alerted_at` (additive `ALTER TABLE`; NULL for
+every existing row, so a job already broken at upgrade time starts a fresh clock and pages one threshold late
+— late, never silent). `jobs.since` cannot serve: it is reset by every state change, and a `LATE → FAIL`
+mid-episode is the *same* outage. Episode state is deliberately **not** in `last_metrics`, which the ingest
+route can write.
+
+| rule | why |
+|---|---|
+| `bad_since` is set on the first not-OK recompute and never moved until the episode ends | the question is "has this been broken for a day?", not "did something change?" |
+| `alerted_at` caps the episode at ONE page | the noise this feature exists to remove |
+| `UNKNOWN` is not alertable and starts no episode; entering it **clears** the bookkeeping with no recovery | "no data yet" ≠ "broken" (real silence is already the never-pinged → LATE rule). Clearing matters: a paged job that passed through UNKNOWN used to keep `alerted_at` for ever and be un-pageable |
+| a failed ntfy POST rolls `alerted_at` back to NULL so a later tick retries, keyed on **episode identity** (`bad_since`+`alerted_at`), never on "is the job not-OK now" | one unlucky POST otherwise bought permanent silence. The identity test is load-bearing: the dwell and the hold both keep an episode open while the job reads OK, so a state-based guard skips exactly the case it was written for |
+| retries are spaced `ALERT_RETRY_MIN_S` (5 min) per episode; a **first** page is never delayed | "the next tick" is the ticker *plus* every ping — 72 blocking 5 s POSTs an hour into a dead ntfy, inside the scheduler thread and the ingest request |
+| a failed **recovery** is logged (`recovery push for …`) and dropped | its episode is already closed, so there is nothing to hand it back to; re-sending later could announce "→ OK" for a job that has broken again. Losing it costs good news, never a page |
+| an episode ends only after the job holds a **verified** OK for the *dwell*: `max(min(5 min, alert_after_s/10), min(2 × cadence_s, 15 min))` | one OK tick used to end it, so a container on `restart: unless-stopped` backoff (19 min down, 1 min up — broken 95% of the day) reset its clock 72×/day and never paged. The **cadence term** is the second half of that fix: a dwell shorter than the job's own sampling interval is decided by ONE observation, and `box-containers` is sampled every 300 s while its threshold-derived dwell was 120 s — so a container crash-looping at 50/67/75 % down for six hours closed its episode over and over and paged NOTHING. Cost: a recovery arrives up to one dwell late (600 s for the box jobs, 900 s for the Mac's), which beats announcing a recovery that is about to be taken back. Cadence-less jobs (`manual`, `disk`) keep the threshold-derived value — there is nothing to sample. The 15 min cap is not cosmetic: `pa-backup`'s 24 h cadence would otherwise give it a two-DAY dwell, i.e. a page held hostage for two days |
+| **the per-job cooldown**: after a page for a job, the next PAGE for that job waits `max(alert_after_s, 6 h)`, persisted in `jobs.last_paged_at` | one page per EPISODE says nothing about how often an episode may RESTART. Measured over a simulated day at `box-containers`' real threshold: **132 pushes** at 19-min-down / 20-min-up, and an independently measured 30-min crash-loop cycle at 48/day. It **delays** a page and can never **cancel** one: a held page stamps nothing, so the episode keeps it and the ceiling re-offers it every pass. It binds on exactly three shipped jobs (threshold under 6 h); above the floor a new episode already takes longer than the cooldown to reach its own threshold. Persisted, not in memory, because an in-memory cooldown resets on every deploy and a deploy is what makes containers flap |
+| **the hard ceiling**: an open episode past its threshold and unpaged pages on **every** pass, whatever the job currently reads — the not-OK branch, the unverifiable-OK hold, the pass that gives that hold up, and the dwell | every branch that can end an episode is a way to lose its page. See "Both holds are bounded" below for the two reproductions that came from scoping it to one branch |
+| an **unverified** OK does not end the episode at all (the *hold*) | see below |
+| an unparseable or **future** `bad_since` is healed — clock restarted, `alerted_at` dropped | an NTP step backwards makes `now − bad_since` permanently negative: a job that can never page |
+| an unparseable or **future** `last_paged_at` is refused **and** healed to NULL | the same trap on the cooldown's column: a negative age is a cooldown that never expires. Refused in `_cooling_until` (which runs before the healing loop) and cleared in the loop, so neither order can trust it |
+| a failed ntfy POST returns `last_paged_at` as well as `alerted_at` | half a rollback is worse than none: the episode gets its page back and then cannot spend it for six hours, because a POST that never reached anyone still looked like a page to the rate limiter |
+| `alert_after_s` is capped at **30 days** at parse time, loudly, and `probe.interval_s` at **24 h** on every kind | magnitude was the one hostile input the validator accepted; one extra digit silently means "never page" / "never look again". Say `alert: never` if that is what you mean |
+
+**"OK" is not always evidence of health.** `compute_state` must return one of six states, so a check that
+*could not be made* falls through to OK on the heartbeat alone (`db_snapshot_stale` returning `None` matches
+neither branch). Clearing the episode on that is how a genuinely stale backup goes quiet for ever: one failed
+rclone listing a day resets a 24 h clock, and a failing destination probe is exactly what a rate-limited Drive
+produces. Two shapes of unverified OK are held, on different grounds:
+
+- **`state.ok_is_unverified`** — the destination check did not happen (no usable probe, no heartbeat evidence
+  of its own). This holds a `STALE_DEST`/`BEHIND` episode only: those were statements *about the destination*.
+  A `LATE`/`FAIL` episode is about silence or a failed run, which the returning heartbeat positively settles —
+  holding those broke recovery for every unprobed job.
+- **the damped self-heartbeat** — `dashboard-probes` writes its own run, and the flap damping above records it
+  as `ok` while a probed destination is failing. That `ok` is not evidence of anything, so it holds whatever
+  the episode was about. Derived from the `probes` table (`db.failing_probe_job_ids`), never from a metric.
+  Without it, an alternating fail/damped-ok pattern resets the clock every few minutes and the page is
+  deferred **indefinitely** — `PROBE_NO_SUCCESS_S` guarantees the *state* reaches FAIL, not that a page behind
+  a timer ever fires.
+
+Both holds are bounded, and the bound has two halves:
+
+- **THE HARD CEILING — the invariant the whole episode model rests on:**
+
+  > **While an episode is open (`bad_since` set), past its threshold, and not yet paged — page. Regardless of
+  > what the job's current state reads.**
+
+  `Core._page` is therefore called on **every** pass over an open episode: from the not-OK branch, from the
+  held-open-by-an-unverifiable-OK branch *including the pass that gives that hold up*, and from the dwell.
+  It names the state the episode is really about (`snap: STALE_DEST for over 1h`, not the OK on the card).
+  The rule has no exceptions and no windows, and that is the point: the two structural bugs found in review
+  were both a ceiling scoped to one branch, so the episode could end from another branch without ever
+  speaking. Scoped inside the hold it was live only while `began + A ≤ now < since + A` — a window exactly as
+  long as the job was *observed* not-OK — so a destination 30 days stale whose probe went blind five seconds
+  in, heartbeat still arriving, produced **zero pushes** and then closed itself. The dwell had the same hole
+  from the other side: any recovery longer than `min(5 min, A/10)` ended the episode, so a container 19 min
+  down / 3 min up against a 20 min threshold was broken 86% of the time, indefinitely, and paged nothing.
+- **`ok_hold_s` = `max(5 min, alert_after_s)`.** After that much continuous OK the episode closes **silently**
+  (no recovery — nothing was verified fixed). Held for ever, a destination that can never be probed again (a
+  revoked remote, rclone's shared Drive OAuth client being retired) would pin `alerted_at` and mute every
+  later failure of that job, including the backup dying outright. At most one threshold is spent on a
+  destination we cannot see.
+
+**The ceiling's deliberate consequence:** a job that is broken for at least its threshold and *then* recovers
+now produces a page **and** a recovery, sometimes seconds apart. That is correct — it crossed the bar Graham
+set, so the gap is real news, and saying so late beats not saying it — and it is rare by construction: the job
+has to outlive its whole threshold and then recover inside one dwell.
+
+**The cost of that, which the cooldown exists to pay:** a job whose outages *each* exceed its threshold pages
+once per outage, for ever. Measured over a simulated day at `box-containers`' real 20 min threshold: 19 min
+down / 20 min up produced **132 pushes/day**, and a 30-min crash-loop cycle 48/day. "A genuinely broken
+container reported once per genuine outage" is a fair description and still an alert storm — the exact shape
+this feature exists to remove, relocated from "every transition" to "every episode". The answer is NOT a
+longer threshold on that job: that re-opens the silence window the hard ceiling just closed, so a container
+down for an hour would go quiet again. It is the per-job cooldown, which caps the RATE without touching the
+bar. Same pattern after: 47 episodes/day → **4 pages + 4 recoveries**, because a held-back page is never
+stamped and therefore never recovers either.
+
+**Residuals, stated rather than hidden:**
+
+- **The ceiling bounds the *window*, not the silence.** A new failure that lands while a hold is still
+  running joins the still-open episode and gets no push of its own for as long as that episode lasts. That is
+  correct under one-page-per-episode — the job was never verifiably OK in between, and it did page once — but
+  it is the sharp edge. `dest.probe_error` on the card and `dashboard-probes` going FAIL are what name a dead
+  probe.
+- **The cooldown makes that window longer for the three jobs it binds on.** A second, genuinely different
+  outage inside the same six hours is silent: `box-containers` pages for the tunnel dying at 09:00 and says
+  nothing about `km-tracker-app-1` dying at 10:00. The board shows both; the phone hears one. Deliberate —
+  they are the same job and the same fact ("a container is down") — but it is a rate limit on a pager and it
+  does cost information, not just noise. The cooldown is flat: it does not escalate for a worse state, so a
+  job that goes LATE and then FAILs inside the window pages once for the LATE.
+- **The dwell makes every threshold SOFT by up to one dwell, in the paging direction.** The ceiling measures
+  the episode, and an episode includes the dwell it is serving out — so a job broken for
+  `alert_after_s − dwell` that then recovers still crosses the bar and pages. For `box-containers` that is a
+  container down for 10 minutes paging against a 20 minute threshold. The skew existed before (the old dwell
+  made it 2 minutes); this change grew it to 10. It errs toward paging and it is rate-limited by the
+  cooldown, which is why it was not "fixed" — narrowing the ceiling to count only not-OK time would need a
+  new accumulator in the one place this branch has already produced two silence bugs.
+
+**The ceiling vs. the machine-offline rule.** The ceiling asks `_suppressed_offline` like every other page, so
+a sibling's LATE episode that is muted behind a sleeping Mac stays muted — including for the minutes its
+episode stays open after the sibling recovers (the dwell). That span is covered by `Core._returning_probes`:
+the mute lasts while the *probe job's own* LATE episode is still open, which is bounded by the probe's dwell
+and cannot outlive the sibling's, since the siblings are pinged first and `mac-probe`'s dwell is the longest
+any job can have (the cadence term saturates at the 15 min cap, and its 1 h cadence reaches it). That last
+clause used to read "no dwell exceeds 5 min", which the cadence-aware dwell made false; it is now asserted
+directly (`test_the_machine_probes_dwell_is_never_shorter_than_its_siblings`) rather than argued.
+
+**The mute may only borrow an alert that EXISTS**, and that is now two checks, not one. A probe with
+`alert: never` voids the rule (otherwise a Mac gone for a week pages nothing at all) — and so does a probe
+whose own page is currently held back by its cooldown, which is the same condition made temporary. Without
+the second check, a Mac that dies a few hours after its probe last paged is: the probe silent on its
+cooldown, every sibling muted behind it, a real multi-day outage and zero pushes. Unreachable on the shipped
+file (`mac-probe`'s 72 h threshold is above the 6 h floor, so its cooldown can never bind) and reachable the
+moment anyone shortens that threshold, which is not an edit anybody would expect to silence a machine.
+Without it, every weekend with the lid shut would end in a `drive-mirror: LATE for over 1d` push the moment
+the Mac woke — the exact noise the machine-offline rule exists to prevent. A sibling that comes back and is
+*still* broken (or breaks again) is not a plain `LATE → OK` and pages normally.
+
+**Resolving a job's policy** (`registry.parse_job`, surfaced at `/api/v1/status` → `jobs[].alert` with a
+`source` field so it never has to be inferred from `jobs.yml`):
+
+| declared | result | `source` |
+|---|---|---|
+| `alert: never` | never pages | `alert` |
+| `alert_after_s: N` | pages after N s continuously not-OK (0 = on the first not-OK recompute; still one page per episode) | `alert_after_s` |
+| nothing, and `Job.informational` | never pages | `informational` |
+| nothing otherwise | `DEFAULT_ALERT_AFTER_S` = 86400 | `default` |
+
+`alert` and `alert_after_s` are mutually exclusive **checked on key presence** — with an `is not None` test,
+`alert: never` + `alert_after_s: null` parsed to "never", i.e. silence that reads like a threshold in the file.
+A **lone** `alert_after_s: null` (or `alert: null`) is an **error** for the same reason: it escapes the
+presence check because there is nothing to be exclusive with, and then resolves as if the key were absent —
+which on an informational job is `never`, a permanent silence filed under a key whose name says otherwise.
+An explicit `alert_after_s` wins even on an informational job, so there is always a way to alert on one.
+**`informational` now means what it always claimed.** `registry.py` documented it as "shown, never alerted
+on" and *nothing consulted it* — such a job pushed on every transition like any other. It is now resolved into
+the alert policy at parse time rather than being a second, overlapping concept.
+
+**`alert_after_s` is NOT the time to a page.** The threshold clock starts when the job goes not-OK, which for
+a scheduled job is already `cadence_s + grace_s` after its last good run — and for the long-grace Mac jobs the
+deadline is the bigger half. End to end: `km-backup`/`todoist-points-backup` **24.3 h**, `box-containers`
+**35 m**, `box-disk`/`mac-disk` **1 h** (capacity breach; 49 h for a gauge nothing feeds),
+`dashboard-probes` **6.3 h**, `mac-probe` **87 h**, `pa-backup` **44 h**, `drive-mirror` **39 h**. Every job
+in `jobs.example.yml` states its own figure on a `# TIME-TO-PAGE:` line, and
+`test_every_alerting_job_states_its_real_time_to_page` recomputes all nine from that same file — four of
+those comments used to describe the threshold as if it were the wait, wrong by between 15 minutes and
+38 hours.
+
+**Shipped thresholds** (`jobs.example.yml` carries the per-job rationale):
+
+| job | `alert_after_s` | why |
+|---|---|---|
+| `km-backup`, `todoist-points-backup` | 86400 (24 h) | 5-min cadence: one missed run is nothing, a day is a gap in the history |
+| `pa-backup` | 21600 (6 h) | **NOT 30 h.** Its LATE deadline alone is 38 h (cadence 86400 + grace 50520), so the old 108000 — commented "30 h means a whole night was genuinely missed" — actually paged at **68 h ≈ 2.8 days**, the worst miss in the file against Graham's stated bar of "backups missed more than 24 hours". 6 h on top of 38 h pages at 44 h. The 38 h is a hard floor (below it a missed backup is indistinguishable from a sleeping Mac) and a shorter threshold could not cause a false page anyway: while the Mac sleeps `mac-probe` is LATE and this job is muted entirely |
+| `box-containers` | 1200 (20 m) | a container down IS the outage; long enough to ride out our own deploys and a reboot's restart storm |
+| `dashboard-probes` | 21600 (6 h) | the job that flapped 27× in four days; six hours means the checks have really stopped |
+| `drive-mirror` | 86400 (24 h) | pending uploads clear themselves once the Mac is awake |
+| `mac-probe` | 259200 (72 h) | with its 15 h LATE deadline ≈ 87 h: a weekend with the lid shut pages nobody, a dead Mac pages once. **Never `alert: never`** — see below |
+| `box-disk`, `mac-disk` | 3600 (1 h) | the gauge already has a 48 h fuse of its own (`DISK_METRIC_MAX_AGE_S`), so a day on top would mean hearing about a dead gauge at 72 h; and a capacity threshold is a *level*, not a flap — an hour only rides out a reading hovering at the boundary |
+| `minecraft-offload`, `taste-twin-publish`, `jjho-refresh`, `baby-pool-sync` | `never` | on-demand; "behind" is information, not an incident |
+
 - `UNKNOWN → OK` (first sighting) is never alerted.
 - **Machine-offline rule:** each machine's `kind: probe` job (`mac-probe`; the dashboard's own
   `dashboard-probes` never counts) stands for "this machine is reachable". While it is LATE, the other jobs on

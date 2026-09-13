@@ -53,7 +53,7 @@
         <dt>Cadence</dt><dd>every {{ j.cadence_s|human_duration }} <span class="muted">(+{{ j.grace_s|human_duration }} grace)</span></dd>
         {% endif %}
         {% if j.disk %}
-        <dt>Capacity</dt><dd>{{ disk_gauge(j.disk, now) }}</dd>
+        <dt>Capacity</dt><dd>{{ disk_gauge(j.disk, now, j.alert) }}</dd>
         {% endif %}
         {% if j.lag %}
         <dt>{{ 'Missing' if j.kind == 'rclone_copy_tree' else 'Behind' }}</dt>
@@ -64,7 +64,13 @@
           {% if j.lag.bytes is none and j.lag.files is none %}<span class="muted">no lag reported</span>{% endif %}
           {% if j.lag.differ_files is not none %}<br><span class="muted">{{ j.lag.differ_files }} file{{ '' if j.lag.differ_files == 1 else 's' }}{% if j.lag.differ_bytes is not none %} / {{ j.lag.differ_bytes|human_bytes }}{% endif %} edited since last copy (normal lag)</span>{% endif %}
           {% if j.lag.max_age_s %}<br><span class="muted">target: done within {{ j.lag.max_age_s|human_duration }}{% if j.lag.age_s is not none %} · currently {{ j.lag.age_s|human_duration }}{% endif %}</span>{% endif %}
-          {% if j.informational %}<br><span class="muted">informational — never alerts</span>{% endif %}
+          {#- Captioned off "will this job ever page", NOT off `informational`. They are different
+              questions and the difference is load-bearing: `minecraft-offload` is `alert: never`
+              AND has manual thresholds, so it is NOT informational — it used to get no caption at
+              all and sat on the board reading BEHIND (its normal resting state between offloads)
+              with nothing saying it will never page. That is the exact informational-vs-alert_never
+              confusion this branch fixed in the code, and this is the one place Graham looks. -#}
+          {% if j.alert.never %}<br><span class="muted">never alerts — {% if j.informational %}informational: no thresholds set{% else %}<code>alert: never</code> in jobs.yml{% endif %}</span>{% endif %}
         </dd>
         {% endif %}
         {% if j.dest.newest or j.dest.count is not none or j.dest.probe_error %}

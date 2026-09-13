@@ -31,7 +31,7 @@ roles in one process for local dev.
 ```
 uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -r requirements-dev.txt
 # (or: python3.12 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt)
-.venv/bin/python -m pytest -q                         # ~425 tests, no network, ~5 s
+.venv/bin/python -m pytest -q                         # ~530 tests, no network, ~15 s
 /usr/bin/python3 -m pytest -o addopts="" tests/test_probes_*.py -q   # ~100 probe tests, MUST pass stdlib-only
 /usr/bin/python3 -m compileall -qf probes/             # 3.9 syntax gate (CI also RUNS the probe tests on 3.9)
 
@@ -64,14 +64,46 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
 - `registry.py` — `jobs.yml` schema + strict validation → `Registry` of frozen `Job`s. Kinds, states,
   `PROBEABLE_KINDS` (`probe` block: required on db_snapshot, optional on rclone_copy_tree / manual — the
   box's `gdrive-ro` remote can list `Backups/` and `Gremlins/`), and `DEST_FRESH_MULTIPLIER` (12) live here.
-  `probe.interval_s` (optional per-job probe cadence) is capped at half the freshness window on db_snapshot,
-  the one kind whose STALE_DEST verdict reads the probe's newest-object time.
+  `probe.interval_s` (optional per-job probe cadence) is capped twice: semantically at half the freshness
+  window on db_snapshot, the one kind whose STALE_DEST verdict reads the probe's newest-object time, and by
+  magnitude at `MAX_PROBE_INTERVAL_S` (86400) on **every** kind. The second cap is not redundant — the
+  semantic one does not apply to `rclone_copy_tree`/`manual`, which are precisely the two DEPLOY.md §1d has
+  the operator hand-edit, and `interval_s: 18000000` there means 208 days of never looking with nothing on
+  the board to show for it.
   `disk` is a kind but NOT in `SCHEDULED_KINDS`/`PROBEABLE_KINDS`: it is a capacity gauge (`disk:` block,
   `min_free_bytes` / `max_used_pct`), never probed, no cadence, and `informational` when both thresholds
   are omitted — same rule as a thresholdless `manual` job. It has no *per-cadence* dead-man's switch, but
   it is not exempt from silence: see `state.DISK_METRIC_MAX_AGE_S`.
-- `db.py` — schema (`jobs` incl. `created_at`, `runs`, `probes`, `state_changes`), WAL connection, all
-  queries, ISO helpers (`from_iso` clamps to 1970..9999 and never raises).
+  **Alert policy** (`alert_after_s: N` | `alert: never`, mutually exclusive *by key presence*) is resolved
+  HERE, once, into `Job.alert_after_s` / `alert_never` / `alert_source` — `never` > explicit `N` >
+  `informational` > `DEFAULT_ALERT_AFTER_S` (86400). Nothing downstream re-decides what an absent key means.
+  **`informational` and `alert_never` are NOT the same question and the UI must never conflate them** —
+  `minecraft-offload` is `alert: never` AND carries `manual:` thresholds, so `informational` is False and a
+  board caption keyed on it skipped the one job whose resting state is BEHIND. Caption off "will this job
+  ever page" (`j.alert.never`), and state the capacity thresholds from the thresholds. Same rule in the disk
+  gauge macro, where the two used to be read off one `if`.
+  `informational` is no longer a broken promise: it feeds this resolution instead of being a second,
+  overlapping concept nothing consulted. `alert_after_s` is capped at `MAX_ALERT_AFTER_S` (30 d) — magnitude
+  is the one hostile input this validator would otherwise accept, since one extra digit silently means
+  "never page". A **present-but-null** `alert` / `alert_after_s` is an ERROR, not a resolution: alone it
+  escaped the presence check (nothing to be exclusive with) and fell through to what an ABSENT key means,
+  which on an informational job is `never` — silence filed under a key that reads like a threshold.
+  Every schema string is also rejected if it contains a **control character**: `job.name` is the only free
+  text that leaves the box (the ntfy `Title` header), and a CR/LF in it makes `http.client` refuse the POST
+  for ever — not an injection (zero bytes reach the socket) but a job that can never page and never spend
+  its page, which is worse. Loud at parse time; the container refuses to start, naming the job.
+- `db.py` — schema (`jobs` incl. `created_at`, `bad_since`, `alerted_at`; `runs`, `probes`,
+  `state_changes`), WAL connection, all queries, ISO helpers (`from_iso` clamps to 1970..9999 and never
+  raises). **"Which probe row is newest" is decided by `id` (insert order), never by `probed_at`** —
+  `last_probe`, `last_ok_probe`, `oldest_probe`, `probe_fail_streak` and `failing_probe_job_ids` all order by
+  id, and `probes_job_seq` is the index for it. `probed_at` is the writer's wall clock, so one row written
+  while the clock was ahead outranks every real probe after it for ever: the newest row reads `ok`, the
+  damped-OK hold switches off, and PR #8's damping can never un-damp. Clamping at insert cannot fix that (at
+  insert time the value IS now), and `prune` already keeps rows by `id DESC`. Durations are still measured
+  from `probed_at`; only row selection changed. Additive `jobs` columns go in `JOBS_COLUMNS` **and** `SCHEMA`; `init_schema` migrates under
+  `BEGIN IMMEDIATE` with a duplicate-column-tolerant `_add_column`, because `create_app` runs it for BOTH
+  roles and `entrypoint.sh` starts every gunicorn together — the loser of that race used to kill a worker
+  and restart-loop the container. Don't "simplify" either guard away.
 - `state.py` — pure state machine: `compute_state(job, Facts, now)`, `lag_info`, `dest_info`, `disk_info`
   (capacity block for `kind: disk`; `used_pct` is None on a 0/missing total — never a ZeroDivisionError),
   `db_snapshot_stale` (dedup-aware), `copy_tree_stale` (missing vs differ), never-pinged → LATE via
@@ -87,10 +119,61 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   `used_pct` is `(total-available)/total`, so it does NOT match `df`'s `Use%` — the free bytes do. Say so
   rather than "fixing" it; DESIGN.md → `disk` and `probes/common.disk_free` carry the measurement.
 - `services.py` — `Core`: record ping → shallow-merge metrics → recompute ALL jobs → persist transitions →
-  notify (with the **machine-offline rule**: sibling `→ LATE` alerts muted while the machine's `probe` job is
-  LATE, and sibling plain `LATE → OK` recoveries muted while the probe is still LATE or recovers in the same
-  batch — the Mac probe posts its sub-jobs before its own heartbeat, so siblings recover one batch early;
-  FAIL/STALE_DEST/BEHIND after LATE always alert); `run_probe_cycle` (probes the jobs `due_probes()` says are
+  run the **episode pass** → notify.
+  **Alerting is by EPISODE, not by transition** (DESIGN.md "Alerting rules" is the spec; read the module
+  docstring before touching any of it). A job pages once, after it has been continuously not-OK for its own
+  `alert_after_s`, and recovers only if that page went out. Three `jobs` columns hold it: `bad_since` (episode
+  start; `jobs.since` cannot serve, it resets on every state change), `alerted_at` (one page per episode) and
+  `last_paged_at` (the per-job COOLDOWN, which spans episodes — see below).
+  **Dispatch is LEVEL-triggered** — `_resolve_alerts` walks EVERY job on EVERY recompute, because "still
+  FAIL, now past six hours" is the event and it is not a transition. `recompute_all` and `record_ping` are
+  two entry points into the same `_recompute_pass`; keep them that way.
+  **The governing rule: every ambiguity resolves toward paging, never toward silence.** Transition-paging was
+  accidentally self-healing (the next transition re-paged); one page per episode removes that net. So: a
+  failed POST hands the page back keyed on **episode identity**, never on "is the job not-OK now" (the dwell
+  and the hold both keep an episode open while the job reads OK — a state-based guard skips exactly the case
+  it was written for); an episode closes only after a **verified** OK holds for `ok_dwell_s` — which is
+  `max(min(5 min, A/10), min(2 * cadence_s, 15 min))`, i.e. **at least two of the job's OWN samples**, because
+  a dwell below the sampling interval is decided by one observation (`box-containers` is posted every 300 s
+  and its threshold-derived dwell was 120 s, so a container crash-looping at 50-80 % down paged NOTHING); an
+  *unverified*
+  OK does not close it at all (`state.ok_is_unverified` for a destination that could not be checked, and
+  `db.failing_probe_job_ids` for `dashboard-probes` reporting `ok` while the damping below suppresses a real
+  probe failure); a future/unparseable `bad_since` is healed; UNKNOWN clears the episode without recovering.
+  **THE HARD CEILING, which every hold is bounded by: while an episode is open (`bad_since` set), past its
+  threshold and not yet paged, it pages — regardless of what the job's current state reads.** `_page` is
+  called on EVERY pass over an open episode (not-OK; held open by an unverifiable OK, including the pass that
+  gives that hold up; and the dwell), never inside one branch — a ceiling scoped to one branch was two
+  separate blockers, because the episode could then end from a different branch without ever speaking. The
+  second bound is `ok_hold_s`, after which the episode closes silently; without it a destination that can
+  never be probed again pins `alerted_at` and mutes every later failure of that job. Accepted consequence,
+  documented in DESIGN.md rather than re-suppressed: an outage that outlives the threshold and *then* recovers
+  sends a page and a recovery seconds apart. When adding anything here, the question is never "is the job
+  OK?" but "is the EPISODE still open?"
+  **THE PER-JOB COOLDOWN** (`cooldown_s` = `max(alert_after_s, 6 h)`, persisted in `jobs.last_paged_at`): one
+  page per episode says nothing about how often an episode may RESTART, and a container on `restart:
+  unless-stopped` backoff restarts one every ~20 min for ever (measured: 132 pushes/day). It **delays** a page
+  and can never **cancel** one — `_page` returns WITHOUT stamping `alerted_at`, so the episode keeps its
+  unspent page and the ceiling re-offers it every pass; the moment the cooldown expires a job still (or again)
+  past its threshold pages. **If you ever make that branch stamp anything, you have built the permanent
+  silence this whole file is organised against.** It binds only on a job whose threshold is under the 6 h
+  floor (shipped: `box-containers`, `box-disk`, `mac-disk`); above it a new episode already takes longer than
+  the cooldown to reach its own threshold. Persisted, not in memory, because a deploy is exactly what makes
+  containers flap. The failed-push rollback returns `last_paged_at` with `alerted_at` — half a rollback lets
+  one 429 buy a whole cooldown of silence — and an unparseable or future `last_paged_at` is refused and
+  healed, for the same reason `bad_since` is.
+  Also the **machine-offline rule** ( sibling `→ LATE` alerts muted while the machine's `probe` job is
+  LATE, and sibling plain `LATE → OK` recoveries muted while the probe is still LATE, recovers in the same
+  batch, **or is still inside its own LATE episode** (`_returning_probes`) — the Mac probe posts its sub-jobs
+  before its own heartbeat, so siblings recover first, and the hard ceiling made that gap last for the
+  sibling's whole dwell rather than one batch: without the third clause every lid-shut weekend ends in a
+  `drive-mirror: LATE for over 1d` push the moment the Mac wakes;
+  FAIL/STALE_DEST/BEHIND after LATE always alert). It is **void when the machine's probe job can never page**
+  (`alert_never`) **or while the probe's own page is held back by its cooldown** (`_cooled_probes`): the rule
+  mutes siblings on the premise that the probe sends one alert for the machine, so without those guards a Mac
+  gone for days pages nobody at all. "Suppression may only borrow an alert that EXISTS" is one static check
+  and one for the moment. A suppressed alert must also never stamp
+  `alerted_at` — it would burn the episode's one page and lose its recovery with it. `run_probe_cycle` (probes the jobs `due_probes()` says are
   due + the `dashboard-probes` self-heartbeat + `prune` — one `DELETE … NOT IN (… ORDER BY id DESC LIMIT n)`
   per table, not O(n²)). **Flap damping** (`probe_trouble` / `_classify_trouble`): the self-job records `fail`
   when any probed job is tripped — `hard` (error is not a quota/timeout: first failure, never damped),
@@ -121,8 +204,10 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   Unavailable`), never as bare digits. A dated snapshot name like `km_tracker-20260503-0312.db` contains
   `503`; as bare substrings those markers made a permission-denied on an ordinary nightly path look
   transient. Don't classify on raw stderr, and don't re-add a bare status-code substring marker.
-- `notify.py` — ntfy `Notifier`; body is `job_id: FROM → TO` only (no reason text leaves the box);
-  `should_notify` suppresses `UNKNOWN→OK`; never raises.
+- `notify.py` — ntfy `Notifier`, deliberately dumb: it decides nothing about *whether* to page, `Core` does.
+  `notify_alert(name, id, state, after_s)` for a sustained problem (`job_id: STATE for over 6h`),
+  `notify_recovery(name, id, from_state)` for the end of an episode that was paged. No reason text ever
+  leaves the box; never raises; returns False on a failed POST, which `Core` acts on (see below).
 - `ingest.py` — blueprint + pure payload parsers (`parse_json_payload`, `parse_form_payload`, `parse_metrics`).
 - `web.py` — read blueprint: gate, host pin, security headers (per-request CSP nonce), HTML + JSON routes.
 - `views.py` — builds the `/api/v1/status` contract and job detail from the store.
@@ -156,6 +241,47 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   `run_probe_cycle` passes `timeout=` to `probe_job`, so a stub must accept it (`lambda job, **kw: …`).
 - Test fixtures pin `jobs.created_at` to 2030 (`conftest.pin_created_at`) so the never-pinged → LATE rule
   only fires in the tests that set `created_at` explicitly. Remember this when a new test uses a fixed clock.
+- `conftest.JOBS_DOC` is **index-addressed** by several suites (`doc["jobs"][4]`) — APPEND only, never
+  insert. Every job in it carries `alert_after_s: 0` so those suites still assert dispatch at transition
+  time; `info` is the deliberate exception (it declares nothing, so it exercises the informational → never
+  resolution in place). The threshold layer itself is tested with realistic values in
+  `tests/test_alert_thresholds.py`, whose `core_with()` opts every unnamed job out with `alert: never` so one
+  job's episode is under test and the rest cannot add noise.
+- **Never hard-code a dwell in a test.** It is cadence-aware, so a flat `+ 300` stops being long enough the
+  moment a cadence moves — and "the test advanced the clock, but not past the dwell" fails as SILENCE, which
+  is indistinguishable from the bugs these suites exist to catch. Use the `dwell(core, job_id)` /
+  `_dwell(job_id)` helpers, which derive it from the job. Note `alert_after_s: 0` no longer implies an
+  immediate recovery for a job WITH a cadence: its episode still has to serve two samples.
+- **Two tests of the same job that both expect a page must be ≥ 6 h apart** (the per-job cooldown), and a
+  loop that re-runs a scenario must build a FRESH `settings` each time — `core_with()` reuses the SQLite
+  file, so `last_paged_at` carries over and the second iteration is silently suppressed. Parametrise instead
+  of looping; both traps were hit writing these suites.
+- `RecordingNotifier` overrides `_post`, not `send` — `send`'s try/except is part of what is under test, and
+  a double that overrides `send` would make every retry path look like it worked. It has two failure modes
+  (`fail` raises, `refuse` returns non-2xx) because `send` flattens both to False.
+- **Adding a job to `jobs.example.yml` means giving it an alert policy.** `registry` will fall back to the
+  24 h default, but a shipped job inheriting the default is a job somebody forgot — `test_example_file_alert_
+  policy_matches_the_documented_thresholds` asserts no job has `alert_source == "default"`. Say `alert: never`
+  if that is what you mean, and put the reasoning next to it in the file.
+  **It also means a `# TIME-TO-PAGE:` line.** `alert_after_s` is NOT the time to a page — the clock starts
+  when the job goes not-OK, which for a scheduled job is already `cadence_s + grace_s` later, and for the
+  long-grace Mac jobs the deadline is the bigger half. Four of those comments described the threshold as if
+  it were the wait (`pa-backup` read "30 h" and paged at 68 h). Every alerting job now states the end-to-end
+  figure and `test_every_alerting_job_states_its_real_time_to_page` recomputes all nine from the file, so a
+  drifted comment is a red test rather than a wrong number somebody reads at 2 a.m.
+- **`jobs.yml` on the box is gitignored, so a `git pull` delivers schema but never values.** Any new
+  `jobs.yml` key needs a scripted, idempotent recipe in DEPLOY.md §1d, and every check in it must be scoped
+  to one job's own block — a file-wide search finds a LATER job's key, concludes "already done", and skips
+  this one silently, with a clean parse and no error. Three more rules that recipe earned the hard way:
+  it must `set -e` and `sys.exit(1)` on every failure path (it sits immediately upstream of a
+  `docker compose up -d --build`, so a warning + `exit 0` deploys on defaults and scrolls the warning away);
+  its backup must be timestamped to the second (`$(date +%F-%H%M%S)`, because two runs in one day overwrote
+  the pre-edit backup with the edited file); and **any new key makes an image rollback require restoring that
+  backup FIRST** — `main`'s registry rejects unknown keys, so the container restart-loops otherwise.
+- **A post-deploy check that cannot FAIL is not a check.** `docker exec … python - <<PY` without `-i` does
+  not forward stdin: `python -` reads EOF, prints nothing, exits 0, and reads exactly like a clean pass.
+  Verification commands in DEPLOY.md pass `-i`, get their secrets via `-e`, tolerate an old image with
+  `.get()`, and end in an explicit PASS/FAIL that exits non-zero.
 - Machine IPs, account ids and Drive folder ids never go in code, tests or docs — use
   `<box-tailscale-ip>`-style placeholders; real values live in the gitignored `.env`/`jobs.yml`/env files.
 - Hopper's bearer reads go through the public hostname (`https://dashboard.graham-williams.com/api/v1/status`

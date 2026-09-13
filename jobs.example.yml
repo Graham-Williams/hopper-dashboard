@@ -11,17 +11,64 @@
 #   count come from the box; without it the card shows only what the Mac probe
 #   reports), probe.interval_s (optional — probe THIS destination only every N
 #   seconds instead of every PROBE_INTERVAL_S cycle; for big trees, see pa-backup
-#   below. Capped at half the freshness window on db_snapshot),
+#   below. Capped at half the freshness window on db_snapshot, and at 24 h on
+#   every kind — a probe that never runs again is invisible),
 #   manual.max_age_s / manual.max_lag_bytes (manual
 #   only; omit both for an informational job that never alerts),
 #   disk.min_free_bytes / disk.max_used_pct (disk only — same rule: omit both for
 #   an informational gauge), expect (container
 #   only — names that must appear in metrics.running), late_means (optional text
-#   shown when the job is LATE, e.g. "Mac offline or asleep").
+#   shown when the job is LATE, e.g. "Mac offline or asleep"),
+#   alert_after_s / alert (see below).
+#
+# ALERT POLICY — `alert_after_s: N` or `alert: never`, never both (that is an error
+#   even when one of them is null). ntfy hears about a SUSTAINED problem, not a
+#   transition: a job pages ONCE, after it has been CONTINUOUSLY not-OK for its own
+#   alert_after_s, and again ("→ OK") only if that episode was actually paged for.
+#   Every blip still lands on the board and in state_changes — this filters the phone,
+#   not the history. Resolution, in precedence order:
+#     alert: never          → never pages
+#     alert_after_s: N      → pages after N seconds (0 = on the first non-OK recompute;
+#                             capped at 30 days, because a longer value is a typo, not
+#                             a policy). An explicit N wins even on an informational job.
+#     nothing + informational (a manual/disk job with no thresholds) → never pages
+#     nothing at all        → 86400 (24 h). Conservative on purpose: a job nobody
+#                             thought about must page LATE, never not at all.
+#   /api/v1/status shows the resolved policy per job under `alert` (with `source`
+#   naming what decided it), so you never have to infer it from this file.
+#
+# ⚠️ `alert_after_s` IS NOT THE TIME TO A PAGE. The threshold clock starts when the job
+#   goes NOT-OK, and for a scheduled job that is already cadence_s + grace_s after its
+#   last good run. The two add up, and for the long-grace Mac jobs the deadline is the
+#   bigger half: `pa-backup` is not-OK 38 h after its last backup, so even a 6 h
+#   threshold pages at 44 h. Every job below therefore carries a
+#
+#       # TIME-TO-PAGE: <n>
+#
+#   line stating the END-TO-END figure — deadline + threshold, the number that answers
+#   "how long can this be broken before my phone knows?". Four of these comments used
+#   to describe the threshold alone and were wrong by between 15 minutes and 38 hours;
+#   `test_every_alerting_job_states_its_real_time_to_page` recomputes all of them from
+#   the values in this file, so one cannot drift again without the suite going red.
+#   (A `disk` gauge has no cadence: its figure is for a CAPACITY breach, which is what
+#   the thresholds under `disk:` trip. A gauge that stops being fed altogether is LATE
+#   only after state.DISK_METRIC_MAX_AGE_S = 48 h, so that page is 48 h + the threshold.)
+#
+# ⚠️ AND THE PAGE RATE IS CAPPED PER JOB. After a page for a job, the next page for that
+#   job waits `max(alert_after_s, 6 h)` — see services.cooldown_s. It only ever BINDS on
+#   a job whose threshold is under 6 h (here: box-containers and the two disk gauges);
+#   above that, a new episode already takes longer than the cooldown to reach its own
+#   threshold. A held-back page is DELAYED, never cancelled: the episode keeps its
+#   unspent page and goes out the moment the cooldown expires. A suppressed page also
+#   sends no "→ OK", so a flapping container costs nothing in either direction.
 jobs:
   # ------------------------------------------------------------------ box --
   - id: km-backup
     name: km-tracker DB → Drive
+    # Alert policy: page only after a FULL DAY with no working backup. At a 5-min
+    # cadence one missed run is nothing; a day of them is a real gap in the history.
+    # TIME-TO-PAGE: 24.3h  (LATE 20 min after a missed run, then the 24 h threshold)
+    alert_after_s: 86400        # 24 h
     machine: box
     kind: db_snapshot
     protects: km-tracker SQLite (prod game-night history)
@@ -35,6 +82,8 @@ jobs:
 
   - id: todoist-points-backup
     name: todoist-points DB → Drive
+    # TIME-TO-PAGE: 24.3h  (same arithmetic as km-backup)
+    alert_after_s: 86400        # 24 h, same reasoning as km-backup
     machine: box
     kind: db_snapshot
     protects: todoist-points ledger SQLite (points earned/spent)
@@ -48,6 +97,19 @@ jobs:
 
   - id: box-containers
     name: Box containers
+    # The shortest threshold here: a container being down IS the outage (apps are
+    # offline), so 20 min. Long enough to ride out our own `docker compose up -d
+    # --build` deploys and a host reboot's restart storm without paging for them.
+    # The 15 min of deadline is part of the wait, so the real figure is 35 min, not 20.
+    # TIME-TO-PAGE: 35m  (LATE 15 min after a missed 5-min post, then the 20 m threshold)
+    #
+    # This is the one job the per-job cooldown really governs: a container on
+    # `restart: unless-stopped` backoff opens a fresh episode every ~20 min for ever
+    # (measured: 132 pages/day before the cooldown, 4 after). It is also why the OK
+    # dwell counts SAMPLES and not seconds - `docker ps` is posted every 300 s, so the
+    # old 120 s dwell was satisfied by any single OK sample and a container down 50-80%
+    # of the time closed its episode over and over and paged NOTHING.
+    alert_after_s: 1200         # 20 m
     machine: box
     kind: container
     protects: Every self-hosted app + the Cloudflare tunnel that fronts them
@@ -71,6 +133,16 @@ jobs:
 
   - id: box-disk
     name: Box disk
+    # 1 h, NOT the 24 h default. This gauge already has a long fuse of its own: a
+    # feeder that dies is LATE only after DISK_METRIC_MAX_AGE_S (48 h), so a day on
+    # top would mean hearing about a dead gauge at 72 h — the 48 h has already served
+    # the "sustained" purpose. And a tripped capacity threshold is a LEVEL, not a flap
+    # (a disk does not un-fill itself), so all a threshold buys here is riding out a
+    # reading hovering at the boundary (84.9 / 85.1 %), which an hour does easily.
+    # A gauge has no cadence, so for a CAPACITY breach the threshold is the whole wait.
+    # A gauge nothing feeds any more is LATE only at 48 h, and pages an hour after that.
+    # TIME-TO-PAGE: 1h  (capacity breach; a dead gauge is 48 h + 1 h = 49 h)
+    alert_after_s: 3600         # 1 h
     machine: box
     kind: disk
     protects: Every container's data volume + the DB snapshots staged before upload
@@ -87,6 +159,12 @@ jobs:
 
   - id: dashboard-probes
     name: Dashboard probe cycle
+    # 6 h — the longest fuse of the box jobs, because this is the job that flapped 27
+    # times in four days on transient Drive rate limits (DESIGN.md "Probe cadence and
+    # flap damping"). Six hours of a failing probe means the destination checks have
+    # genuinely stopped working, not that Drive pushed back once.
+    # TIME-TO-PAGE: 6.3h  (LATE 20 min after a missed cycle, then the 6 h threshold)
+    alert_after_s: 21600        # 6 h
     machine: box
     kind: probe
     protects: This dashboard's own destination probes (the watcher is watched)
@@ -102,16 +180,27 @@ jobs:
   # ------------------------------------------------------------------ mac --
   - id: mac-probe
     name: Mac probe
+    # 72 h — and NEVER `alert: never`. This is the job whose alert the machine-offline
+    # rule borrows: while it is LATE the other Mac jobs' LATE alerts are suppressed, so
+    # silencing it silences the whole machine. (services.py refuses to suppress behind
+    # a probe that cannot page, but the threshold is what makes the rule worth having.)
+    # 72 h on top of the 15 h LATE deadline is ~87 h of silence: a weekend with the lid
+    # shut pages nobody; a Mac that is dead, stolen or whose launchd job was unloaded
+    # pages exactly once.
+    # TIME-TO-PAGE: 87h  (LATE 15 h after the last hourly post, then the 72 h threshold)
+    alert_after_s: 259200       # 72 h
     machine: mac
     kind: probe
     protects: Visibility into everything Mac-side (backup log, offload lag, disk, Drive mirror)
     method: launchd com.hopper.dashboard-probe hourly (+ RunAtLoad) posts metrics over Tailscale
     cadence_s: 3600
     grace_s: 50400              # 14 h: the Mac sleeps overnight; LATE only past a full night + a working day
-    late_means: Not heard from the Mac in 15 hours — it is probably offline or asleep, not broken.
+    late_means: Not heard from the Mac in 15 hours — probably offline or asleep, not broken. Only a Mac that stays gone for ~3.5 days pages.
 
   - id: mac-disk
     name: Mac disk
+    # TIME-TO-PAGE: 1h  (capacity breach; a dead gauge is 48 h + 1 h = 49 h)
+    alert_after_s: 3600         # 1 h, same reasoning as box-disk
     machine: mac
     kind: disk
     protects: Headroom for OBS recordings, Whisper runs and the Drive mirror's local copies
@@ -128,6 +217,22 @@ jobs:
 
   - id: pa-backup
     name: personal-assistant → Drive
+    # 6 h, and the arithmetic is the whole point. This job's LATE deadline is cadence
+    # 86400 + grace 50520 = 38 h, so the threshold clock does not even START until 38 h
+    # after the last backup - by which time a whole night has been missed, twice over.
+    # The old value (108000, commented "30 h means a whole night was genuinely missed")
+    # described the threshold as if it were the wait, and shipped a job that paged at
+    # 68 h ~ 2.8 days. Against the stated bar - "backups missed more than 24 hours" -
+    # that was the worst miss in this file.
+    #
+    # 6 h on top of the 38 h deadline pages at 44 h. The 38 h is a hard floor and is not
+    # negotiable: below it a missed backup cannot be told apart from the Mac being
+    # asleep. Note a shorter threshold could not cause a false page anyway - while the
+    # Mac is asleep `mac-probe` is LATE and the machine-offline rule mutes this job
+    # entirely, so the only thing a short threshold can reach is a Mac that is awake and
+    # not backing up, which is exactly the thing worth hearing about.
+    # TIME-TO-PAGE: 44h  (LATE 38 h after the last backup, then the 6 h threshold)
+    alert_after_s: 21600        # 6 h
     machine: mac
     kind: rclone_copy_tree
     protects: Hopper's docs, memory, scripts and logs (~/personal-assistant)
@@ -159,6 +264,11 @@ jobs:
 
   - id: drive-mirror
     name: Google Drive mirror
+    # 24 h: pending uploads clear themselves once the Mac is awake and online, so a
+    # backlog only means something once it has survived a day. On top of the 15 h
+    # deadline that is 39 h, not 24 - the deadline is nearly half the wait here.
+    # TIME-TO-PAGE: 39h  (LATE 15 h after the last hourly post, then the 24 h threshold)
+    alert_after_s: 86400        # 24 h
     machine: mac
     kind: drive_mirror
     protects: Documents, Desktop and minecraft-channel mirrored by Drive for Desktop
@@ -183,6 +293,10 @@ jobs:
 
   - id: minecraft-offload
     name: Minecraft recordings offload
+    # On-demand, run when Graham feels like it: BEHIND is information, not an
+    # incident. (It has manual: thresholds, so it is not `informational` and would
+    # otherwise inherit the 24 h default — say it explicitly.)
+    alert: never
     machine: mac
     kind: manual
     protects: OBS recordings, world backups and Flashback replays (~/minecraft-channel)
@@ -205,6 +319,8 @@ jobs:
 
   - id: taste-twin-publish
     name: taste-twin report publish
+    alert: never                # on-demand; also informational (no manual: thresholds),
+                                # which resolves to `never` on its own — stated anyway
     machine: mac
     kind: manual
     protects: Friend-facing Letterboxd taste reports on taste-twin.graham-williams.com
@@ -213,6 +329,7 @@ jobs:
 
   - id: jjho-refresh
     name: JJHo transcript refresh
+    alert: never                # on-demand
     machine: mac
     kind: manual
     protects: JJHo Fan Almanac episode index + transcripts
@@ -221,6 +338,7 @@ jobs:
 
   - id: baby-pool-sync
     name: baby-pool entries sync
+    alert: never                # on-demand; the entries are final
     machine: mac
     kind: manual
     protects: Baby pool entries served at baby-pool.graham-williams.com

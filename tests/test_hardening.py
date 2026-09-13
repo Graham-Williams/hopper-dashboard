@@ -5,8 +5,10 @@ key cap, ISO clamping, ingest parsing bounds, ntfy body, probe argv."""
 
 from __future__ import annotations
 
+import copy
 import json
 import re
+import sqlite3
 
 import pytest
 
@@ -18,9 +20,24 @@ from dashboard.state import Facts, compute_state, dest_info, lag_info
 from tests.conftest import (INGEST_TOKEN, JOBS_DOC, PASSWORD, READ_TOKEN, auth,
                             pin_created_at)
 from dashboard.registry import parse_registry
+from dashboard.services import Core, ok_dwell_s
 
 NOW = 1_800_000_000.0
 REG = parse_registry(JOBS_DOC)
+
+
+def _example_dwell(reg, job_id) -> float:
+    """Same idea for a core built over the shipped jobs.example.yml."""
+    return ok_dwell_s(reg.get(job_id))
+
+
+def _dwell(job_id) -> float:
+    """The job's own OK dwell — derived, never a flat constant, because it is
+    cadence-aware (services.ok_dwell_s) and a wait that is too short fails as
+    SILENCE, which is what these tests are here to tell apart."""
+    return ok_dwell_s(REG.get(job_id))
+
+
 POISON_ISO = "0001-01-01T00:00:00+14:00"   # datetime.timestamp() raises OverflowError on this
 
 
@@ -89,6 +106,157 @@ def test_schema_migration_backfills_created_at(tmp_path):
     db.init_schema(conn)
     row = db.job_row(conn, "old")
     assert row["created_at"] == "2026-01-01T00:00:00Z" and row["state_reason"] is None
+
+
+# --------------------------------------------------------------------------- #
+# 8b. Schema migration: the alert-episode columns, and the race that adds them
+# --------------------------------------------------------------------------- #
+
+LEGACY_JOBS = """
+CREATE TABLE jobs (
+    id              TEXT PRIMARY KEY,
+    state           TEXT NOT NULL DEFAULT 'UNKNOWN',
+    since           TEXT,
+    state_reason    TEXT,
+    last_metrics    TEXT,
+    last_metrics_at TEXT,
+    updated_at      TEXT,
+    created_at      TEXT
+);
+"""
+
+
+def _legacy_db(tmp_path, name="legacy.db"):
+    """A live 0.1 database: no `bad_since`, no `alerted_at`, one real row."""
+    path = str(tmp_path / name)
+    conn = db.connect(path)
+    conn.executescript(LEGACY_JOBS)
+    conn.execute("INSERT INTO jobs (id, state, since, updated_at, created_at, last_metrics) "
+                 "VALUES ('km-backup','FAIL',?,?,?,'{\"bytes\": 7}')",
+                 (to_iso(NOW), to_iso(NOW), to_iso(NOW)))
+    conn.close()
+    return path
+
+
+def test_schema_migration_adds_the_alert_episode_columns(tmp_path):
+    """The live box DB predates bad_since/alerted_at. Migrating must add them
+    without touching a row: NULL means "not currently in an episode", so a job
+    that is already broken starts a fresh clock and pages one threshold later —
+    late, never silent."""
+    conn = db.connect(_legacy_db(tmp_path))
+    try:
+        db.init_schema(conn)
+        db.init_schema(conn)                               # idempotent: a redeploy re-runs it
+        row = db.job_row(conn, "km-backup")
+        assert row["bad_since"] is None and row["alerted_at"] is None
+        assert row["state"] == "FAIL" and row["last_metrics"] == {"bytes": 7}   # no data lost
+        with conn:
+            db.set_alert_episode(conn, "km-backup", to_iso(NOW + 60), None)
+        row = db.job_row(conn, "km-backup")
+        assert row["bad_since"] == to_iso(NOW + 60)
+        assert row["updated_at"] == to_iso(NOW)            # the liveness column is untouched
+    finally:
+        conn.close()
+
+
+def test_concurrent_init_schema_never_raises_duplicate_column(tmp_path):
+    """`create_app` calls init_store() for BOTH roles and entrypoint.sh starts
+    ingest (1 worker) + the read workers together, so on the very deploy that
+    adds a column those processes race PRAGMA table_info → ALTER TABLE. The
+    losers used to raise `OperationalError: duplicate column name` out of
+    create_app, killing a worker; the entrypoint then stops the other gunicorn
+    and compose restarts the container. It self-heals on the second boot, but
+    "the dashboard is down" is the loudest silence there is."""
+    import threading
+    path = _legacy_db(tmp_path)
+    workers = 6
+    ready = threading.Barrier(workers, timeout=10)
+    errors: list[BaseException] = []
+
+    def migrate():
+        conn = db.connect(path)
+        try:
+            ready.wait()                       # everyone reads the old schema at once
+            db.init_schema(conn)
+        except BaseException as exc:           # noqa: BLE001 - the point of the test
+            errors.append(exc)
+        finally:
+            conn.close()
+
+    threads = [threading.Thread(target=migrate) for _ in range(workers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert errors == []
+    conn = db.connect(path)
+    try:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(jobs)")}
+        assert {"bad_since", "alerted_at", "created_at"} <= cols
+        assert conn.execute("SELECT created_at FROM jobs WHERE id='km-backup'"
+                            ).fetchone()["created_at"] == to_iso(NOW)   # backfilled once
+    finally:
+        conn.close()
+
+
+class _RacingConn:
+    """A connection whose `PRAGMA table_info` answers a moment before the column
+    appears — the exact window between the read and the ALTER."""
+
+    def __init__(self, conn, column="bad_since"):
+        self._conn = conn
+        self._column = column
+        self._fired = False
+
+    def execute(self, sql, *args):
+        cur = self._conn.execute(sql, *args)
+        if sql.startswith("PRAGMA table_info") and not self._fired:
+            self._fired = True
+            stale = cur.fetchall()                     # what WE saw...
+            self._conn.execute(                        # ...and what somebody else did
+                f"ALTER TABLE jobs ADD COLUMN {self._column} TEXT")
+            return stale
+        return cur
+
+    def executescript(self, sql):
+        return self._conn.executescript(sql)
+
+
+def test_migration_survives_a_column_added_between_the_read_and_the_alter(tmp_path):
+    """The deterministic form of the race above: we decide to add `bad_since`,
+    another process adds it first, and our ALTER then raises
+    `OperationalError: duplicate column name` out of create_app — killing the
+    worker and, via entrypoint.sh, the whole container."""
+    conn = db.connect(_legacy_db(tmp_path))
+    try:
+        db.init_schema(_RacingConn(conn))              # must not raise
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(jobs)")}
+        assert {"bad_since", "alerted_at"} <= cols
+    finally:
+        conn.close()
+
+
+def test_add_column_tolerates_having_lost_the_race_but_not_a_real_error(tmp_path):
+    conn = db.connect(_legacy_db(tmp_path))
+    try:
+        db._add_column(conn, "jobs", "bad_since", "TEXT")
+        db._add_column(conn, "jobs", "bad_since", "TEXT")     # lost the race
+        with pytest.raises(sqlite3.OperationalError):         # real errors still raise
+            db._add_column(conn, "nope_not_a_table", "x", "TEXT")
+    finally:
+        conn.close()
+
+
+def test_init_schema_is_idempotent_on_a_fresh_db(tmp_path):
+    conn = db.connect(str(tmp_path / "fresh.db"))
+    try:
+        for _ in range(3):
+            db.init_schema(conn)
+        db.ensure_jobs(conn, ["km-backup"])
+        db.init_schema(conn)
+        assert db.job_row(conn, "km-backup")["bad_since"] is None
+    finally:
+        conn.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -184,6 +352,12 @@ def test_mac_comes_back_one_recovery_alert(core, notifier):
     core.record_ping(mirror, {"status": "ok"}, now=NOW + 100_101)   # recovers while probe still LATE
     assert notifier.sent == []
     core.record_ping(mac, {"status": "ok"}, now=NOW + 100_102)
+    assert notifier.sent == []                     # OK, but not yet HELD: no episode has closed
+    # One pass past the probe's own dwell closes all three episodes at once. The
+    # siblings recovered a couple of seconds EARLIER, so their episodes close in
+    # this same pass — still muted, because the probe's episode is only now
+    # ending and `_returning_probes` reads the pre-recompute rows.
+    core.recompute_all(now=NOW + 100_102 + _dwell("macprobe"))
     assert [t for t, _, _ in notifier.sent] == ["[dashboard] Mac probe → OK"]
     conn = core.connect()   # the muted recoveries are still persisted and visible
     assert db.job_row(conn, "tree")["state"] == "OK" and db.job_row(conn, "mirror")["state"] == "OK"
@@ -200,6 +374,7 @@ def test_mac_sibling_waking_into_fail_still_alerts(core, notifier):
     core.record_ping(tree, {"status": "fail", "reason": "rclone exit 1"}, now=NOW + 100_100)
     assert [t for t, _, _ in notifier.sent] == ["[dashboard] Tree copy → FAIL"]
     core.record_ping(mac, {"status": "ok"}, now=NOW + 100_101)
+    core.recompute_all(now=NOW + 100_101 + _dwell("macprobe"))
     assert [t for t, _, _ in notifier.sent][-1] == "[dashboard] Mac probe → OK"
 
 
@@ -212,15 +387,13 @@ def test_mac_offline_rule_is_a_pure_function_of_probe_state(core, notifier):
     core.recompute_all(now=NOW + 5000)             # mirror LATE (4200), probe still OK (10800)
     assert [t for t, _, _ in notifier.sent] == ["[dashboard] Drive mirror → LATE"]
     core.record_ping(mirror, {"status": "ok"}, now=NOW + 5001)
+    core.recompute_all(now=NOW + 5001 + _dwell("mirror"))
     assert [t for t, _, _ in notifier.sent][-1] == "[dashboard] Drive mirror → OK"
 
 
-def test_example_jobs_sleep_and_wake_produce_exactly_one_alert_each(settings, notifier):
-    """End-to-end against the shipped jobs.example.yml: a night's sleep pages once (mac-probe → LATE) and
-    the morning's three sequential pings page once (mac-probe → OK). Also exercises the tick-straddle: the
-    ticker runs every 60 s, so with equal graces a tick could land between drive-mirror's deadline (pinged
-    a few seconds before the probe) and mac-probe's; the example file gives siblings grace_s >= probe + 120
-    so drive-mirror's deadline is always strictly AFTER the probe's."""
+def _example_core(settings, notifier):
+    """A Core over the SHIPPED jobs.example.yml, woken once (pa-backup, drive-mirror, then the probe's
+    own heartbeat — the real HTTP order, seconds apart) with the notifier cleared."""
     from dashboard.registry import load_registry
     from dashboard.services import Core
     from tests.conftest import EXAMPLE_JOBS
@@ -230,30 +403,77 @@ def test_example_jobs_sleep_and_wake_produce_exactly_one_alert_each(settings, no
     pin_created_at(settings)                       # never-pinged box jobs must not go LATE during the test
     mac, pa, mirror = reg.get("mac-probe"), reg.get("pa-backup"), reg.get("drive-mirror")
     assert pa.grace_s >= mac.grace_s + 120 and mirror.grace_s >= mac.grace_s + 120
-    # Wake order over HTTP: pa-backup, drive-mirror, then the probe's own heartbeat (seconds apart).
     core.record_ping(pa, {"status": "ok", "metrics": {"missing_files": 0}}, now=NOW)
     core.record_ping(mirror, {"status": "ok", "metrics": {"pending": 0, "mismatch": 0}}, now=NOW + 3)
     core.record_ping(mac, {"status": "ok"}, now=NOW + 5)
     notifier.sent.clear()
-    # Mac sleeps. Tick every 60 s across every Mac deadline (probe: 3600+50400 after its ping; the
-    # siblings' deadlines are later by construction; pa-backup's is a day later still).
-    t = NOW
-    while t < NOW + 86400 + 50520 + 120:
+    return core, reg, (mac, pa, mirror)
+
+
+def _tick(core, start, stop, step=60):
+    t = start
+    while t < stop:
         core.recompute_all(now=t)
-        t += 60
+        t += step
+    return t
+
+
+def test_example_jobs_a_night_or_a_weekend_asleep_pages_nobody(settings, notifier):
+    """End-to-end against the shipped jobs.example.yml: an ordinary sleep pages NOBODY. Not because
+    `mac-probe` is muted — it carries a 72 h threshold (see the multi-day test below) — but because every
+    Mac threshold outlasts a weekend, and the machine-offline rule mutes the siblings behind the probe
+    while it is LATE. Also exercises the tick-straddle the graces exist for: the ticker runs every 60 s,
+    so with equal graces a tick could land between drive-mirror's deadline (pinged a few seconds before
+    the probe) and mac-probe's; the example file gives siblings grace_s >= probe + 120 so drive-mirror's
+    deadline is always strictly AFTER the probe's."""
+    core, _reg, (mac, pa, mirror) = _example_core(settings, notifier)
+    assert not mac.alert_never                     # the machine must be ABLE to page (see below)
+    # Sleep through every Mac deadline: the probe's (3600+50400 after its ping), the siblings' (later by
+    # construction), and pa-backup's (a day later still). Then keep sleeping to a full weekend.
+    t = _tick(core, NOW, NOW + 86400 + 50520 + 120)
     conn = core.connect()
     assert {jid: db.job_row(conn, jid)["state"] for jid in ("mac-probe", "pa-backup", "drive-mirror")} \
         == {"mac-probe": "LATE", "pa-backup": "LATE", "drive-mirror": "LATE"}
-    assert [t_ for t_, _, _ in notifier.sent] == ["[dashboard] Mac probe → LATE"]
-    notifier.sent.clear()
+    assert notifier.sent == []                     # the board shows it; the phone stays quiet
+    t = _tick(core, t, NOW + 60 * 3600, step=300)  # 60 h: a Friday-night-to-Monday-morning lid-shut
+    assert notifier.sent == []
+    # ...and the episodes ARE running, so a problem that outlives the threshold would still page.
+    assert db.job_row(conn, "drive-mirror")["bad_since"] is not None
+    assert db.job_row(conn, "drive-mirror")["alerted_at"] is None
     # Mac wakes: three sequential pings, each its own recompute.
     wake = t
     core.record_ping(pa, {"status": "ok", "metrics": {"missing_files": 0}}, now=wake)
     core.record_ping(mirror, {"status": "ok", "metrics": {"pending": 0, "mismatch": 0}}, now=wake + 3)
     core.record_ping(mac, {"status": "ok"}, now=wake + 5)
-    assert [t_ for t_, _, _ in notifier.sent] == ["[dashboard] Mac probe → OK"]
+    assert notifier.sent == []                     # nothing was paged, so nothing "recovers"
     assert {jid: db.job_row(conn, jid)["state"] for jid in ("mac-probe", "pa-backup", "drive-mirror")} \
         == {"mac-probe": "OK", "pa-backup": "OK", "drive-mirror": "OK"}
+    # Each job turned OK when ITS ping landed (wake, wake+3, wake+5), so the
+    # last of them closes one dwell after that — 900 s here, two of mac-probe's
+    # hourly cadences, not the old flat 300.
+    core.recompute_all(now=wake + 5 + _example_dwell(_reg, "drive-mirror"))
+    assert db.job_row(conn, "drive-mirror")["bad_since"] is None
+
+
+def test_example_jobs_a_mac_gone_for_days_pages_exactly_once(settings, notifier):
+    """Silence is only correct while it is temporary. A Mac that is simply GONE — dead, stolen, launchd
+    probe unloaded — must not page nothing at all, which is what `alert: never` on `mac-probe` would buy:
+    it is the job whose alert the machine-offline rule borrows, so on the strength of its LATE it mutes
+    every sibling too. Now the machine itself pages, ONCE, at 15 h LATE + 72 h — and still only once,
+    because the siblings are (correctly) suppressed behind it."""
+    core, _reg, (mac, pa, mirror) = _example_core(settings, notifier)
+    deadline = mac.cadence_s + mac.grace_s
+    _tick(core, NOW, NOW + deadline + mac.alert_after_s - 600, step=300)
+    assert notifier.sent == []                     # 87 h minus ten minutes: still nothing
+    _tick(core, NOW + deadline + mac.alert_after_s - 600,
+          NOW + 10 * 86400, step=300)              # ...and then ten days of gone
+    assert [t for t, _, _ in notifier.sent] == ["[dashboard] Mac probe → LATE"]
+    assert notifier.sent[0][1] == "mac-probe: LATE for over 3d"
+    conn = core.connect()
+    assert db.job_row(conn, "mac-probe")["alerted_at"] is not None
+    for jid in ("pa-backup", "drive-mirror"):      # siblings: episode running, page unspent
+        assert db.job_row(conn, jid)["bad_since"] is not None
+        assert db.job_row(conn, jid)["alerted_at"] is None
 
 
 def test_mac_sibling_recovery_in_same_batch_as_probe_is_muted(core, notifier, monkeypatch):
@@ -268,6 +488,8 @@ def test_mac_sibling_recovery_in_same_batch_as_probe_is_muted(core, notifier, mo
         db.insert_run(conn, "macprobe", received_at=to_iso(NOW + 20_100), status="ok")
         db.insert_run(conn, "mirror", received_at=to_iso(NOW + 20_100), status="ok")
     core.recompute_all(now=NOW + 20_101)
+    assert notifier.sent == []                     # both OK; neither episode has closed yet
+    core.recompute_all(now=NOW + 20_101 + _dwell("macprobe"))
     assert [t for t, _, _ in notifier.sent] == ["[dashboard] Mac probe → OK"]
 
 
@@ -292,8 +514,95 @@ def test_ntfy_body_never_carries_reason_text(core, notifier):
     core.record_ping(job, {"status": "ok", "metrics": {"running": "app-1"}}, now=NOW + 1)
     title, body, _ = notifier.sent[-1]
     assert title == "[dashboard] Containers → FAIL"
-    assert body == "containers: OK → FAIL"
+    assert body == "containers: FAIL"
     assert "tunnel-1" not in body and "not running" not in body
+
+
+LEAK = "ZZLEAK"          # one marker prefix, so the assertion can be total
+
+
+def _hostile_doc():
+    """The shared registry with every free-text field loaded with a marker.
+
+    `name` deliberately keeps its innocuous value: the job NAME is the one piece
+    of free text that is *supposed* to reach ntfy (it is what makes a push
+    readable on a phone, it is byte-identical to pre-0.2 behaviour, and it is
+    documented as such). Everything else here — what the job protects, how, the
+    destination path, what LATE means, the expected container names — is local
+    detail that must never leave the box."""
+    doc = copy.deepcopy(JOBS_DOC)
+    for raw in doc["jobs"]:
+        raw["protects"] = f"{LEAK}-PROTECTS /Users/someone/secret.db"
+        raw["method"] = f"{LEAK}-METHOD rclone --config /etc/rclone.conf"
+        raw["alert_after_s"] = 0                      # page on the first not-OK pass
+        if raw.get("destination") is not None:
+            raw["destination"] = f"gdrive:{LEAK}-DRIVE-FOLDER-ID"
+        if raw.get("late_means") is not None:
+            raw["late_means"] = f"{LEAK}-LATE-MEANS the machine is asleep"
+        if raw.get("expect"):
+            raw["expect"] = [f"{LEAK}-container-1", f"{LEAK}-container-2"]
+        if raw.get("probe"):
+            raw["probe"] = {"rclone_path": f"gdrive:{LEAK}-PROBE-PATH",
+                            "state_dir": f"/state/{LEAK}-STATE-DIR"}
+    return doc
+
+
+def test_no_free_text_from_a_ping_or_the_registry_can_reach_ntfy(settings, notifier):
+    """THE privacy invariant of the alerting layer, asserted rather than
+    promised: ntfy.sh is a third party, and the ONLY things that may reach it
+    are the job's name, its id, its state and its own configured threshold.
+
+    Three docstrings said so and nothing checked it. The existing body test
+    looks at ONE push for TWO specific substrings, and the three tests that pass
+    a `reason` never inspect the payload for it — so a future signature change
+    (`notify_alert(..., reason=reason)`, a "helpful" reason in the body, a
+    metric echoed into the title) would ship green. This drives real episodes
+    through `Core` with markers in every free-text field a human or a probe can
+    write — reason, note, metric keys AND values, and the registry's own
+    protects/method/destination/late_means/expect — and asserts that not one
+    push, attempted or delivered, contains any of them."""
+    core = Core(settings, parse_registry(_hostile_doc()), notifier)
+    core.init_store()
+    pin_created_at(settings, "2020-01-01T00:00:00Z")     # never pinged → LATE
+    reason = (f"{LEAK}-REASON km-tracker-app-1 exited; rclone stderr: directory "
+              f"not found gdrive:{LEAK}/Backups")
+    note = f"{LEAK}-NOTE box is 100.64.0.1, password is hunter2"
+    hostile_metrics = {f"{LEAK}_metric_key": f"{LEAK}_metric_value",
+                       "running": f"{LEAK}-container-1", "note": note}
+
+    core.recompute_all(now=NOW)                          # every job LATE → pages
+    tree = core.registry.get("tree")
+    core.record_ping(tree, {"status": "fail", "reason": reason, "note": note,
+                            "exit_code": 1, "metrics": hostile_metrics},
+                     now=NOW + 1)                        # LATE → FAIL
+    core.record_ping(tree, {"status": "ok", "reason": reason, "note": note},
+                     now=NOW + 2)                        # → OK; the recovery waits out the dwell
+    core.record_ping(core.registry.get("containers"),
+                     {"status": "ok", "reason": reason, "note": note,
+                      "metrics": {"running": f"{LEAK}-container-1"}}, now=NOW + 3)
+    core.record_ping(core.registry.get("disk"),
+                     {"status": "metric",
+                      "metrics": {"disk_free_bytes": 1, "disk_total_bytes": 100,
+                                  "path": f"/Users/someone/{LEAK}-PATH"}},
+                     now=NOW + 4)
+    core.recompute_all(now=NOW + 5)
+    # Past `tree`'s dwell, so the recovery push is in the sample too — it is its
+    # own free-text opportunity (it names the state the episode was about).
+    core.recompute_all(now=NOW + 2 + _dwell("tree"))
+
+    assert len(notifier.attempts) >= 6                   # not vacuous: it really paged
+    assert notifier.attempts == notifier.sent            # nothing swallowed en route
+    for title, body, priority in notifier.attempts:
+        assert LEAK not in title, title
+        assert LEAK not in body, body
+        assert LEAK not in priority, priority
+    # Positively: the push says who and what, and nothing else. The name is the
+    # one deliberate disclosure; the id, state and threshold are the rest.
+    titles = {t for t, _, _ in notifier.sent}
+    assert "[dashboard] Tree copy → FAIL" in titles
+    assert "[dashboard] Tree copy → OK" in titles
+    assert {b for _, b, _ in notifier.sent if b.startswith("tree:")} == {
+        "tree: FAIL", "tree: FAIL → OK"}      # its LATE is the Mac's, and muted
 
 
 # --------------------------------------------------------------------------- #

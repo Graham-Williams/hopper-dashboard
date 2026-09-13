@@ -11,6 +11,7 @@ import time
 
 from . import db
 from .registry import Job, Registry
+from .services import cooldown_s
 from .state import Facts, dest_info, disk_info, lag_info
 
 HISTORY_LEN = 30
@@ -57,6 +58,29 @@ def job_entry(conn, job: Job, row: dict | None, now: float,
         "last_run_reason": lr.get("reason"),
         "last_run_note": lr.get("note"),
         "late_means": job.late_means,
+        # The RESOLVED alert policy plus where this job stands in its current
+        # episode, so the policy is inspectable rather than inferred from
+        # jobs.yml. `after_s` is null when the job never pages; `source` names
+        # what decided it (an explicit key, `alert: never`, `informational`, or
+        # the conservative default); `bad_since` non-null means an episode is
+        # running (which it can be while the state reads OK — see
+        # services._resolve_alerts); `alerted_at` non-null means it was paged.
+        # `cooldown_s`/`last_paged_at` are the per-job page rate limit: after a
+        # page, the next one for this job is held back for `cooldown_s` —
+        # delayed, never cancelled (services.cooldown_s). Both are null for a
+        # job that never pages. Reading them together answers the only question
+        # worth asking when the phone is quiet but the board is not: is this job
+        # unpaged because nothing crossed a threshold, or because it paged
+        # recently?
+        "alert": {
+            "after_s": None if job.alert_never else job.alert_after_s,
+            "never": job.alert_never,
+            "source": job.alert_source,
+            "bad_since": row.get("bad_since"),
+            "alerted_at": row.get("alerted_at"),
+            "cooldown_s": None if job.alert_never else int(cooldown_s(job)),
+            "last_paged_at": row.get("last_paged_at"),
+        },
         "informational": job.informational,
         "expect": list(job.expect) if job.expect else None,
         "never_run": lr == {},

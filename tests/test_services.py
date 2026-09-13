@@ -4,6 +4,7 @@ probe cycle recording, scheduler resilience."""
 from dashboard import db, probes
 from dashboard.probes import ProbeResult
 from dashboard.scheduler import Scheduler
+from dashboard.services import ok_dwell_s
 from tests.conftest import RecordingNotifier
 
 NOW = 1_800_000_000.0
@@ -30,14 +31,18 @@ def test_fail_transition_alerts_high_priority(core, notifier, registry):
     assert len(notifier.sent) == 1
     title, body, priority = notifier.sent[0]
     assert title == "[dashboard] Snap DB → FAIL" and priority == "high"
-    # Body is the bare transition: the free-text reason never goes to ntfy.sh.
-    assert body == "snap: OK → FAIL" and "timeout" not in body
+    # Body is the job id + the state the episode is about: the free-text reason
+    # never goes to ntfy.sh. (These fixtures use alert_after_s: 0, so there is no
+    # "for over …" suffix — see tests/test_alert_thresholds.py for that.)
+    assert body == "snap: FAIL" and "timeout" not in body
 
 
 def test_recovery_alerts_default_priority(core, notifier, registry):
     job = registry.get("snap")
     core.record_ping(job, {"status": "fail"}, now=NOW)
     core.record_ping(job, ok(), now=NOW + 10)
+    assert [p for _, _, p in notifier.sent] == ["high"]   # the OK is not yet held
+    core.recompute_all(now=NOW + 10 + ok_dwell_s(job))    # episode closes -> recovery
     priorities = [p for _, _, p in notifier.sent]
     assert priorities == ["high", "default"]
     assert notifier.sent[-1][0].endswith("→ OK")
@@ -60,8 +65,10 @@ def test_ticker_fires_late_without_traffic(core, notifier, registry):
     assert states["snap"] == "LATE"
     assert notifier.sent[-1][0] == "[dashboard] Snap DB → LATE"
     assert notifier.sent[-1][2] == "default"
-    # Heartbeat resumes → recovery alert.
+    # Heartbeat resumes -> recovery alert, once the OK has been HELD for the
+    # job's own dwell (two of its 300 s cadences).
     assert core.record_ping(job, ok(), now=NOW + 700) == "OK"
+    core.recompute_all(now=NOW + 700 + ok_dwell_s(job))
     assert notifier.sent[-1][0].endswith("→ OK")
 
 
@@ -109,7 +116,7 @@ def test_metric_ping_flips_disk_job_to_behind_and_alerts(core, notifier, registr
         "disk_free_bytes": 10 * gib}}, now=NOW + 10)       # shallow merge keeps the total
     assert state == "BEHIND"
     title, body, priority = notifier.sent[-1]
-    assert body == "disk: OK → BEHIND" and priority == "default"   # not urgent, but actionable
+    assert body == "disk: BEHIND" and priority == "default"   # not urgent, but actionable
     assert db.job_row(core.connect(), "disk")["state_reason"].startswith("only 10.0 GiB free")
 
 
@@ -122,7 +129,7 @@ def test_disk_job_has_no_cadence_deadline_but_does_go_stale(core, registry, noti
     assert core.recompute_all(now=NOW + 6 * 3600)["disk"] == "OK"
     # Two days of it is a different thing: nothing is feeding the gauge any more.
     assert core.recompute_all(now=NOW + 49 * 3600)["disk"] == "LATE"
-    assert notifier.sent[-1][1] == "disk: OK → LATE"
+    assert notifier.sent[-1][1] == "disk: LATE"
 
 
 def test_disk_fail_ping_changes_the_board_and_alerts(core, registry, notifier):
@@ -137,7 +144,7 @@ def test_disk_fail_ping_changes_the_board_and_alerts(core, registry, notifier):
                                    "note": "statvfs /data: [Errno 2] No such file"},
                              now=NOW + 300)
     assert state == "FAIL"
-    assert notifier.sent[-1][1] == "disk: OK → FAIL"
+    assert notifier.sent[-1][1] == "disk: FAIL"
     assert "statvfs" in db.job_row(core.connect(), "disk")["state_reason"]
     # …and a later good reading clears it (the failed run stays the newest run row).
     assert core.record_ping(job, {"status": "metric", "metrics": {
@@ -164,7 +171,8 @@ def test_notifier_disabled_when_env_empty():
     from dashboard.notify import Notifier
     n = Notifier("", "")
     assert not n.enabled
-    assert n.notify_transition("x", "x", "OK", "FAIL", None) is False
+    assert n.notify_alert("x", "x", "FAIL", 86400) is False
+    assert n.notify_recovery("x", "x", "FAIL") is False
     n2 = Notifier("https://ntfy.sh", "")
     assert not n2.enabled
 
@@ -345,15 +353,22 @@ def test_intervening_success_resets_the_streak(core, notifier, monkeypatch):
     assert [t for t, _, _ in notifier.sent] == []
 
 
-def test_recovery_from_fail_is_immediate(core, notifier, monkeypatch):
+def test_one_good_cycle_clears_fail_immediately(core, notifier, monkeypatch):
+    """Damping delays a FAIL; it must never delay the clearing of one. The
+    STATE goes back to OK on the first clean cycle - what waits is the recovery
+    PUSH, which needs the job's dwell (two probe cycles) of unbroken OK before
+    the episode is believed to be over."""
     _probe_results(monkeypatch, ok=False, error="rclone exit 7: rateLimitExceeded",
                    transient=True)
     core.run_probe_cycle(now=NOW)
     core.run_probe_cycle(now=NOW + 300)
     assert db.job_row(core.connect(), "dashboard-probes")["state"] == "FAIL"
     _probe_results(monkeypatch, ok=True)
-    core.run_probe_cycle(now=NOW + 600)          # ONE good cycle is enough
+    core.run_probe_cycle(now=NOW + 600)          # ONE good cycle clears the state
     assert db.job_row(core.connect(), "dashboard-probes")["state"] == "OK"
+    assert notifier.sent[-1][0] == "[dashboard] Probe cycle → FAIL"
+    job = core.registry.get("dashboard-probes")
+    core.run_probe_cycle(now=NOW + 600 + ok_dwell_s(job))
     assert notifier.sent[-1][0] == "[dashboard] Probe cycle → OK"
 
 

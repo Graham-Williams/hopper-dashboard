@@ -32,7 +32,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     last_metrics    TEXT,               -- JSON object, shallow-merged over time
     last_metrics_at TEXT,
     updated_at      TEXT,
-    created_at      TEXT                -- first seen in jobs.yml; drives UNKNOWN -> LATE for never-pinged jobs
+    created_at      TEXT,               -- first seen in jobs.yml; drives UNKNOWN -> LATE for never-pinged jobs
+    bad_since       TEXT,               -- start of the current continuously-not-OK episode (NULL = no episode)
+    alerted_at      TEXT,               -- when THIS episode was paged for (NULL = not paged; one page per episode)
+    last_paged_at   TEXT                -- when this JOB last paged, across episodes (drives the per-job cooldown)
 );
 CREATE TABLE IF NOT EXISTS runs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,6 +63,11 @@ CREATE TABLE IF NOT EXISTS probes (
     error            TEXT
 );
 CREATE INDEX IF NOT EXISTS probes_job_at ON probes (job_id, probed_at DESC);
+-- Insert order, which is what "the newest probe" is actually decided on (see
+-- `last_probe`). `probes_job_at` cannot serve those queries: its rows are
+-- ordered by probed_at first, so an `ORDER BY id DESC` over one job would fall
+-- back to sorting up to `prune`'s 2000 rows per job on every recompute.
+CREATE INDEX IF NOT EXISTS probes_job_seq ON probes (job_id, id DESC);
 CREATE TABLE IF NOT EXISTS state_changes (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id     TEXT NOT NULL,
@@ -124,17 +132,71 @@ def connect(db_path: str) -> sqlite3.Connection:
     return conn
 
 
+# Additive `jobs` columns, oldest first. Every one of these must also be in
+# SCHEMA (for a fresh DB); this list is what migrates a live box DB in place.
+# The alert-episode pair gets no backfill: NULL means "not currently in an
+# episode", so a job that is already broken at upgrade time starts a fresh
+# episode on the next recompute and pages one threshold later. That is the safe
+# direction — a late page, never a silent one.
+JOBS_COLUMNS = (
+    ("state_reason", "TEXT"),   # pre-0.1 databases
+    ("created_at", "TEXT"),
+    ("bad_since", "TEXT"),
+    ("alerted_at", "TEXT"),
+    # No backfill here either, and the direction is deliberate: NULL reads as
+    # "this job has never paged", so the first upgrade cannot start life inside
+    # a cooldown it never earned. The worst case is one extra page just after a
+    # deploy — and deploys are exactly when containers flap, which is why this
+    # lives in the DB at all rather than in memory.
+    ("last_paged_at", "TEXT"),
+)
+
+
+def _add_column(conn: sqlite3.Connection, table: str, column: str,
+                decl: str) -> None:
+    """``ALTER TABLE … ADD COLUMN`` that tolerates having already lost the race.
+
+    SQLite has no ``ADD COLUMN IF NOT EXISTS``, and the loser of a concurrent
+    migration gets ``OperationalError: duplicate column name``. Anything else
+    still raises — a real schema problem must stay loud.
+    """
+    try:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+    except sqlite3.OperationalError as exc:
+        if "duplicate column name" not in str(exc).lower():
+            raise
+
+
 def init_schema(conn: sqlite3.Connection) -> None:
+    """Create the schema and apply the additive migrations. Safe to run from
+    several processes at once.
+
+    ``create_app`` calls this for BOTH roles and ``entrypoint.sh`` starts the
+    ingest worker and the read workers together, so on the deploy that
+    introduces a column those processes race ``PRAGMA table_info`` →
+    ``ALTER TABLE``. The losers used to raise out of ``create_app`` and kill a
+    worker, which takes the whole container down (the entrypoint stops the
+    other gunicorn when either dies) — and "the dashboard is down" is the
+    loudest silence there is. Two guards: the migration runs inside
+    ``BEGIN IMMEDIATE`` so only one process reads-then-writes at a time, and a
+    duplicate column is tolerated anyway in case something migrated outside
+    that lock.
+    """
     conn.executescript(SCHEMA)
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(jobs)")}
-    if "state_reason" not in cols:  # pre-0.1 databases
-        conn.execute("ALTER TABLE jobs ADD COLUMN state_reason TEXT")
-    if "created_at" not in cols:
-        conn.execute("ALTER TABLE jobs ADD COLUMN created_at TEXT")
-    # Backfill: the best "first seen" we have for an old row is its UNKNOWN
-    # `since`, else updated_at, else now.
-    conn.execute("UPDATE jobs SET created_at = COALESCE(since, updated_at, ?) "
-                 "WHERE created_at IS NULL", (now_iso(),))
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(jobs)")}
+        for column, decl in JOBS_COLUMNS:
+            if column not in cols:
+                _add_column(conn, "jobs", column, decl)
+        # Backfill: the best "first seen" we have for an old row is its UNKNOWN
+        # `since`, else updated_at, else now.
+        conn.execute("UPDATE jobs SET created_at = COALESCE(since, updated_at, ?) "
+                     "WHERE created_at IS NULL", (now_iso(),))
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    conn.execute("COMMIT")
 
 
 def ensure_jobs(conn: sqlite3.Connection, job_ids: Iterable[str]) -> None:
@@ -210,6 +272,38 @@ def set_state(conn: sqlite3.Connection, job_id: str, new_state: str,
         "INSERT INTO state_changes (job_id, changed_at, from_state, to_state, "
         "reason) VALUES (?,?,?,?,?)", (job_id, at, prev, new_state, reason))
     return prev
+
+
+def set_alert_episode(conn: sqlite3.Connection, job_id: str,
+                      bad_since: str | None, alerted_at: str | None) -> None:
+    """Record where the job stands in its current not-OK episode.
+
+    ``bad_since`` is when the job last stopped being OK (NULL once the episode
+    is over); ``alerted_at`` is when THIS episode was paged for (NULL until it
+    crosses the job's threshold — that NULL is what caps an episode at one
+    page). Deliberately does not touch ``updated_at``: that column is the
+    board's "the scheduler is alive" signal and belongs to :func:`set_state`.
+    """
+    conn.execute("UPDATE jobs SET bad_since=?, alerted_at=? WHERE id=?",
+                 (bad_since, alerted_at, job_id))
+
+
+def set_last_paged_at(conn: sqlite3.Connection, job_id: str,
+                      at: str | None) -> None:
+    """Record when this JOB last paged — across episodes, unlike
+    ``alerted_at``, which belongs to one episode and is cleared when it closes.
+
+    This is the per-job alert cooldown's only state, and it is persisted rather
+    than held in memory on purpose: an in-memory cooldown resets on every
+    restart, and a deploy (`docker compose up -d --build`) is precisely the
+    event that makes containers flap. A cooldown that forgets itself exactly
+    when it is needed is not a cooldown.
+
+    Written NULL again by the failed-push rollback: a page that never left the
+    box must not start a cooldown, or one unlucky POST buys a whole cooldown of
+    silence (see ``services.Core._return_unsent_pages``).
+    """
+    conn.execute("UPDATE jobs SET last_paged_at=? WHERE id=?", (at, job_id))
 
 
 def prune(conn: sqlite3.Connection, keep_runs: int = 2000,
@@ -289,24 +383,46 @@ def recent_runs(conn: sqlite3.Connection, job_id: str,
 
 
 def last_probe(conn: sqlite3.Connection, job_id: str) -> dict | None:
+    """The newest probe row for this job — **by insert order, not by clock.**
+
+    Every "which probe row is current" query below orders by ``id``, and that
+    is load-bearing rather than a style choice. ``probed_at`` is the writer's
+    wall clock, so a clock that was ahead when a row was written (a box RTC
+    booting wrong, NTP stepping back afterwards — the same step this branch
+    already heals for ``bad_since``) leaves a row dated in the FUTURE, and a
+    future row outranks every real one after it, permanently. Proved: with one
+    `NOW+2h` ok row followed by a genuine failure, ``failing_probe_job_ids``
+    returned an empty set and ``probe_fail_streak`` returned 0 — so the damped-
+    OK hold was disabled and PR #8's damping could never un-damp.
+
+    Clamping ``probed_at`` at INSERT cannot fix that: at insert time the value
+    IS "now" by definition; it only becomes the future when the clock later
+    steps back. The rowid is the one monotonic sequence we control, and
+    ``probes`` has exactly one writer (the ingest process's scheduler thread),
+    so insert order is the true order of observations. ``probed_at`` is still
+    what every DURATION is measured from — this only decides *which row*.
+    """
     return row_to_dict(conn.execute(
-        "SELECT * FROM probes WHERE job_id=? ORDER BY probed_at DESC, id DESC "
+        "SELECT * FROM probes WHERE job_id=? ORDER BY id DESC "
         "LIMIT 1", (job_id,)).fetchone())
 
 
 def last_ok_probe(conn: sqlite3.Connection, job_id: str) -> dict | None:
     """Newest successful probe row — "when was this destination last actually
-    listed", which is what the no-success backstop in services.py measures."""
+    listed", which is what the no-success backstop in services.py measures.
+    Insert order, for the reason in :func:`last_probe`."""
     return row_to_dict(conn.execute(
-        "SELECT * FROM probes WHERE job_id=? AND ok=1 ORDER BY probed_at DESC, "
+        "SELECT * FROM probes WHERE job_id=? AND ok=1 ORDER BY "
         "id DESC LIMIT 1", (job_id,)).fetchone())
 
 
 def oldest_probe(conn: sqlite3.Connection, job_id: str) -> dict | None:
     """Oldest retained probe row. Used only as the reference point for a job
-    that has never had a successful probe."""
+    that has never had a successful probe. Insert order, like every other
+    ordering over this table (:func:`last_probe`) — and it matches ``prune``,
+    which already keeps rows by ``id DESC``."""
     return row_to_dict(conn.execute(
-        "SELECT * FROM probes WHERE job_id=? ORDER BY probed_at ASC, id ASC "
+        "SELECT * FROM probes WHERE job_id=? ORDER BY id ASC "
         "LIMIT 1", (job_id,)).fetchone())
 
 
@@ -319,9 +435,13 @@ def probe_fail_streak(conn: sqlite3.Connection, job_id: str,
     (no row is written), and — unlike a metric on the jobs table — the ingest
     route cannot write the `probes` table at all, so the streak is not
     forgeable by anything holding INGEST_TOKEN.
+
+    Counted in insert order (:func:`last_probe`): a single future-dated row
+    otherwise sits at the head of this scan for ever and reads as "the last
+    probe was fine".
     """
     rows = conn.execute(
-        "SELECT ok FROM probes WHERE job_id=? ORDER BY probed_at DESC, id DESC "
+        "SELECT ok FROM probes WHERE job_id=? ORDER BY id DESC "
         "LIMIT ?", (job_id, max(1, int(limit)))).fetchall()
     streak = 0
     for row in rows:
@@ -329,6 +449,48 @@ def probe_fail_streak(conn: sqlite3.Connection, job_id: str,
             break
         streak += 1
     return streak
+
+
+def failing_probe_job_ids(conn: sqlite3.Connection,
+                          job_ids: Iterable[str]) -> set[str]:
+    """Of the given jobs, the ones whose NEWEST probe row is a failure.
+
+    The same fact ``services.Core.probe_trouble`` is built on, in one query and
+    without the per-job detail — used on every recompute to tell a genuinely
+    healthy ``dashboard-probes`` heartbeat apart from one that is only reading
+    ``ok`` because a transient probe failure is being damped. Read from the
+    ``probes`` table rather than from a metric because the ingest route cannot
+    write ``probes`` at all (see ``services.LEGACY_METRIC_KEYS``).
+
+    Partitioned by insert order, for the reason in :func:`last_probe`, and
+    deliberately the SAME ordering ``probe_trouble`` uses: if the two disagreed
+    about which row is newest, one would hold an episode open while the other
+    computed the self-job as healthy.
+    """
+    ids = [str(j) for j in job_ids]
+    if not ids:
+        return set()
+    marks = ",".join("?" * len(ids))
+    rows = conn.execute(
+        f"SELECT job_id FROM (SELECT job_id, ok, ROW_NUMBER() OVER ("
+        f"  PARTITION BY job_id ORDER BY id DESC) AS rn "
+        f"  FROM probes WHERE job_id IN ({marks})) WHERE rn = 1 AND ok = 0",
+        ids).fetchall()
+    return {r["job_id"] for r in rows}
+
+
+def last_non_ok_state(conn: sqlite3.Connection, job_id: str) -> str | None:
+    """The most recent state this job was in that was not OK.
+
+    Only used to name the FROM half of a *deferred* verdict: an episode held
+    open past the job's return to OK (the OK dwell, or an OK we could not
+    verify) may finally page or recover while the job's previous state is
+    already OK, and "job: OK → OK" would be nonsense.
+    """
+    row = conn.execute(
+        "SELECT to_state FROM state_changes WHERE job_id=? AND to_state<>'OK' "
+        "ORDER BY changed_at DESC, id DESC LIMIT 1", (job_id,)).fetchone()
+    return row["to_state"] if row else None
 
 
 def forget_metrics(conn: sqlite3.Connection, job_id: str,

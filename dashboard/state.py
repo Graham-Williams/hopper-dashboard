@@ -33,6 +33,12 @@ from .db import from_iso
 from .humanize import human_gib
 from .registry import Job
 
+# States that mean "this job is broken" for ALERTING purposes. UNKNOWN is
+# deliberately absent: it means "no data yet", not "broken" — real silence is
+# already modelled by the never-pinged → LATE rules above, so an UNKNOWN job
+# never starts an alert episode (DESIGN.md "Alerting rules").
+ALERTABLE_STATES = ("LATE", "FAIL", "STALE_DEST", "BEHIND")
+
 # Largest magnitude any metric may have (mirrors ingest.INT_ABS_MAX; see _num).
 METRIC_ABS_MAX = float(2 ** 63)
 
@@ -91,6 +97,11 @@ class Facts:
     last_metrics_at: str | None = None
     probe: dict | None = None           # newest probes row for this job
     created_at: str | None = None       # jobs.created_at (first seen in jobs.yml)
+
+
+def is_alertable(state: str) -> bool:
+    """Is this state worth starting an alert episode for? (see ALERTABLE_STATES)"""
+    return state in ALERTABLE_STATES
 
 
 def _num(value) -> float | None:
@@ -338,6 +349,43 @@ def dest_info(job: Job, f: Facts, now: float) -> dict:
             "probe_error": ((f.probe or {}).get("error")
                             if job.has_probe and f.probe and not f.probe.get("ok")
                             else None)}
+
+
+def ok_is_unverified(job: Job, f: Facts, now: float) -> bool:
+    """Is this job's ``OK`` merely "could not judge" rather than "verified OK"?
+
+    ``compute_state`` has to return one of six states, so a destination check
+    that cannot be made falls through to ``OK`` on the strength of the
+    heartbeat alone (``db_snapshot_stale`` returning ``None`` matches neither
+    branch in ``compute_state``). For the board that is the right answer — we
+    have nothing bad to report. For the alert *episode* bookkeeping it is not:
+    clearing ``bad_since`` on an unjudged OK is how a genuinely stale
+    destination stays silent for ever, because one failed rclone listing a day
+    resets a 24 h clock — and a failing destination probe is exactly what
+    happens when Drive rate-limits us.
+
+    Ambiguity must resolve toward paging, so an unverified OK keeps the episode
+    running instead of ending it. Only two shapes qualify, both of them "the
+    destination check itself did not happen":
+
+    - ``db_snapshot``: ``db_snapshot_stale`` returned None (no successful
+      probe, so no newest-object time to compare against the pushed sha).
+    - any other probed kind whose last probe errored (or never ran) *and* whose
+      heartbeat metrics carry no destination evidence of their own — a copy
+      tree reporting ``missing_files: 0`` is still positively verified.
+
+    Kinds with no ``probe`` block (``container``, ``probe``, ``disk``, and the
+    manual jobs Graham pings by hand) are never "unverified" here: their OK
+    rests on a heartbeat, which either arrived or did not. The one exception
+    lives in ``services.py`` — ``dashboard-probes`` writes its own heartbeat
+    and reports ``ok`` while damping a transient probe failure, so that job's
+    OK is judged against the ``probes`` table instead.
+    """
+    if job.kind == "db_snapshot":
+        return db_snapshot_stale(job, f, now)[0] is None
+    if job.has_probe and not _probe_ok(job, f):
+        return dest_info(job, f, now)["fresh"] is None
+    return False
 
 
 def _never_pinged_late(job: Job, f: Facts, now: float) -> bool:
