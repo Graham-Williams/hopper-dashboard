@@ -265,7 +265,7 @@ class Core:
     def _suppressed_offline(self, job: Job, prev: str, state: str,
                             states: dict[str, str],
                             transitions: dict[str, tuple],
-                            returning: set[str] = frozenset()) -> bool:  # type: ignore[assignment]
+                            returning: set[str]) -> bool:
         """Machine-offline rule: while a machine's probe job is LATE, the other
         jobs on that machine going LATE is the same single fact ("the Mac is
         asleep"), so only the probe's own alert is sent. The sibling
