@@ -1,9 +1,32 @@
 """The write-side core shared by the ingest routes and the scheduler.
 
 Everything that mutates the store goes through :class:`Core` so the rules
-(record → recompute → transition → notify) live in one place. Each call opens
-its own short-lived SQLite connection; WAL + busy_timeout make that safe across
+(record → recompute → episode → notify) live in one place. Each call opens its
+own short-lived SQLite connection; WAL + busy_timeout make that safe across
 gunicorn threads, the scheduler thread, and the read process.
+
+**State and alert-worthiness are separate concerns.** Every transition is
+persisted and shown on the board; only a job that has been *continuously*
+not-OK for longer than its own ``alert_after_s`` reaches ntfy, and only once
+per episode. See DESIGN.md "Alerting rules".
+
+**THE GOVERNING RULE: every ambiguity resolves toward paging, never toward
+silence.** The pre-0.2 behaviour — page on every transition — was noisy but
+*accidentally self-healing*: a dropped push, a reset clock or a weird
+intermediate state was corrected by the next transition, which paged again.
+Collapsing to ONE page per episode removed that safety net, so every path that
+can consume or reset the single page has to be exactly right. That rule is
+where the failed-push rollback (:meth:`Core._return_unsent_pages`), the
+unverified-OK hold (``state.ok_is_unverified``), the minimum OK dwell, the
+hard ceiling that pages through a hold, the healing of an unusable
+``bad_since``, and the refusal to suppress behind a probe job that cannot page
+for itself all come from.
+
+**The rule applies to the safeguards themselves.** Each of those safeguards
+keeps an episode alive, and an episode that never ends holds its unspent page
+hostage too — so each one is bounded and each bound is stated where it is
+implemented. A guard that asks "is the job OK right now?" is almost always
+asking the wrong question; ask whether the **episode** is still open.
 """
 
 from __future__ import annotations
@@ -11,17 +34,42 @@ from __future__ import annotations
 import logging
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 
 from . import db, probes
 from .config import Settings
 from .notify import Notifier
 from .registry import Job, Registry
-from .state import Facts, compute_state
+from .state import Facts, compute_state, is_alertable, ok_is_unverified
 
 log = logging.getLogger(__name__)
 
 SELF_JOB_ID = "dashboard-probes"
 NOTE_MAX = 500
+
+# How long a job must hold a VERIFIED OK before its episode counts as over,
+# capped at 5 minutes and never more than a tenth of its own threshold (so a
+# job asking to be paged immediately — ``alert_after_s: 0`` — still clears
+# immediately). Without a dwell, ONE OK tick ends an episode: a container
+# flapping on `restart: unless-stopped` backoff (19 min down, 1 min up) is
+# broken 95% of the day and would never page, because each minute of OK put the
+# clock back to zero.
+MAX_OK_DWELL_S = 300
+
+# States whose verdict comes from the DESTINATION rather than from the
+# heartbeat. An episode that was in one of these must not be closed by an OK we
+# could not verify (see the hold in :meth:`Core._resolve_alerts`); an episode
+# about silence (LATE) or a failed run (FAIL) IS positively resolved by the
+# heartbeat itself, and holding those broke recovery for every unprobed job.
+DEST_DRIVEN_STATES = ("STALE_DEST", "BEHIND")
+
+# Shortest gap between two ntfy attempts for the SAME episode. The rollback in
+# :meth:`Core._return_unsent_pages` makes the next pass retry, and "the next
+# pass" is the 60 s ticker plus every ping that lands — ~72 blocking 5 s POSTs
+# an hour while ntfy is down, inside the scheduler thread AND inside whichever
+# ingest request delivered the heartbeat. The delay is only ever on a RETRY:
+# the FIRST page of an episode is never held back (see Core._retry_due).
+ALERT_RETRY_MIN_S = 300
 # How far back a per-job failure streak is counted. Far above any sane
 # PROBE_FAIL_THRESHOLD; bounds the scan on a job that has been failing for
 # weeks.
@@ -38,6 +86,60 @@ LEGACY_METRIC_KEYS = ("fail_streak",)
 def _monotonic() -> float:
     """Indirection so tests can make a probe cycle "take" wall-clock time."""
     return time.monotonic()
+
+
+def ok_dwell_s(job: Job) -> float:
+    """Seconds of continuous, VERIFIED OK needed to end ``job``'s episode."""
+    return min(MAX_OK_DWELL_S, job.alert_after_s / 10)
+
+
+def ok_hold_s(job: Job) -> float:
+    """How long an OK we cannot verify may hold ``job``'s episode open.
+
+    The hold keeps the episode clock running while the evidence for "it is
+    fine now" is missing, which is what stops one failed rclone listing a day
+    from resetting a 24 h threshold. Unbounded, though, it is its own silence:
+    a destination that can never be probed again — a revoked remote, rclone's
+    shared Drive OAuth client finally retired — would keep ``alerted_at`` for
+    ever, and the job's NEXT failure (the backup dying outright and sitting
+    LATE for a week) could never page. One threshold is the most a single
+    episode may cost, so the hold expires after the job's own
+    ``alert_after_s`` — never less than the dwell cap, so a job that pages
+    immediately still gets a few minutes for a transient probe error.
+    """
+    return max(MAX_OK_DWELL_S, job.alert_after_s)
+
+
+@dataclass(frozen=True)
+class AlertIntent:
+    """One ntfy dispatch decided by the episode rules and already committed to
+    the DB (``alerted_at`` written / cleared). Sent after the transaction.
+
+    ``bad_since``/``alerted_at`` carry the episode this intent belongs to, so a
+    failed POST can hand the page back to exactly that episode and nothing else
+    (:meth:`Core._return_unsent_pages`).
+    """
+    job: Job
+    kind: str          # "alert" | "recovery"
+    state: str         # the state the episode is about
+    bad_since: str | None = None
+    alerted_at: str | None = None
+
+
+@dataclass(frozen=True)
+class Episode:
+    """One job's finished recompute, handed to the episode/alert pass."""
+    job: Job
+    prev: str          # state before this recompute
+    state: str         # state after it
+    row: dict          # the job row as it was BEFORE this recompute
+    # The state is OK, but only for want of evidence. Two independent flavours,
+    # resolved differently (see Core._resolve_alerts):
+    #   dest_unverified  — the destination check could not be made at all.
+    #   damped_failure   — this job's own `ok` heartbeat is a damped probe
+    #                      failure (`dashboard-probes` only).
+    dest_unverified: bool = False
+    damped_failure: bool = False
 
 
 @contextmanager
@@ -63,6 +165,10 @@ class Core:
         # wall time). The scheduler schedules the next cycle from this, never
         # from the pre-cycle clock.
         self.last_cycle_end: float | None = None
+        # job id -> (episode bad_since, epoch of the last ntfy attempt for it).
+        # In memory on purpose (see _retry_due): a restart simply retries
+        # sooner, which is the safe direction, and it needs no migration.
+        self._alert_attempted: dict[str, tuple[str, float]] = {}
 
     # -- plumbing ---------------------------------------------------------- #
 
@@ -78,8 +184,8 @@ class Core:
             conn.close()
 
     @staticmethod
-    def gather_facts(conn, job: Job) -> Facts:
-        row = db.job_row(conn, job.id) or {}
+    def gather_facts(conn, job: Job, row: dict | None = None) -> Facts:
+        row = (db.job_row(conn, job.id) if row is None else row) or {}
         return Facts(
             last_run=db.last_run(conn, job.id),
             last_success=db.last_success(conn, job.id),
@@ -92,15 +198,22 @@ class Core:
     # -- state ------------------------------------------------------------- #
 
     def _recompute_locked(self, conn, job: Job, now: float
-                          ) -> tuple[str, tuple | None]:
-        """Recompute inside an open transaction. Returns (state, transition)
-        where transition is (from, to, reason) or None."""
-        facts = self.gather_facts(conn, job)
+                          ) -> tuple[str, tuple | None, dict, Facts]:
+        """Recompute inside an open transaction.
+
+        Returns ``(state, transition, row, facts)`` where ``transition`` is
+        ``(from, to, reason)`` or None, and ``row`` is the job row as it was
+        BEFORE this recompute — its ``state``, ``since``, ``bad_since`` and
+        ``alerted_at`` are what the episode bookkeeping reads. ``facts`` goes
+        on to answer whether an OK was actually verified.
+        """
+        row = db.job_row(conn, job.id) or {}
+        facts = self.gather_facts(conn, job, row)
         state, reason = compute_state(job, facts, now)
         prev = db.set_state(conn, job.id, state, db.to_iso(now), reason)
         if prev is None:
-            return state, None
-        return state, (prev, state, reason)
+            return state, None, row, facts
+        return state, (prev, state, reason), row, facts
 
     def _machine_probe(self, machine: str) -> Job | None:
         """The ``probe``-kind job that stands for "this machine is reachable"
@@ -127,9 +240,26 @@ class Core:
         the probe does, while it is still LATE. Without this the wake-up would
         page once per Mac job plus once for the probe. Only plain recoveries
         are muted: a sibling waking into FAIL / STALE_DEST / BEHIND is news of
-        its own and alerts normally."""
+        its own and alerts normally.
+
+        Adapted to the level-triggered model: ``prev``/``state`` are still
+        edge-shaped, but they are now read off the *episode* rather than off
+        "the last recompute changed something". For an alert, ``prev`` is the
+        state before this recompute and ``state`` is the state now — so a job
+        sitting LATE past its threshold, with no transition anywhere, is still
+        matched by the first rule. For a recovery, ``prev`` is the state the
+        EPISODE ended in (the dwell means the episode can close minutes after
+        the job came back), which is what the second rule needs.
+
+        **The rule is void when the probe job cannot page for itself.** The
+        whole premise is "one alert for the machine instead of five" — a probe
+        job that never pages deletes that one alert, and a Mac that is gone for
+        days then pages NOTHING while ``pa-backup`` sits LATE with a week-old
+        ``bad_since``. Suppression may only borrow an alert that exists."""
         probe = self._machine_probe(job.machine)
         if probe is None or probe.id == job.id:
+            return False
+        if probe.alert_never:
             return False
         probe_state = states.get(probe.id)
         if state == "LATE" and probe_state == "LATE":
@@ -142,38 +272,347 @@ class Core:
                 return True
         return False
 
-    def _dispatch(self, transitions: list[tuple[Job, tuple]],
-                  states: dict[str, str] | None = None) -> None:
-        states = states or {}
-        by_id = {job.id: tr for job, tr in transitions}
-        for job, (prev, state, reason) in transitions:
-            log.info("state %s: %s -> %s (%s)", job.id, prev, state, reason)
-            if self._suppressed_offline(job, prev, state, states, by_id):
-                log.info("alert for %s suppressed: its machine's probe job is "
-                         "offline (one alert for the machine instead)", job.id)
+    @staticmethod
+    def _ok_held_s(prev: str, row: dict, now: float) -> float:
+        """How long the job has been continuously OK as of ``now``.
+
+        ``jobs.since`` is when it entered its current state, so it only means
+        "OK since" while ``prev`` is already OK; a job that turned OK in THIS
+        recompute has held it for zero seconds. An unreadable or future
+        ``since`` also reads as zero — the shortest dwell keeps the episode
+        open, which is the paging direction.
+        """
+        if prev != "OK":
+            return 0.0
+        since = db.from_iso(row.get("since"))
+        if since is None or since > now:
+            return 0.0
+        return now - since
+
+    def _retry_due(self, job_id: str, bad_since: str, now: float) -> bool:
+        """May we POST for this episode yet?
+
+        Always yes for an episode we have not tried to page for — the FIRST
+        alert of an episode is never delayed, which is the whole point of the
+        threshold. Only a retry of the same episode (the previous POST failed
+        and :meth:`_return_unsent_pages` gave the page back) waits out
+        ``ALERT_RETRY_MIN_S``. A clock that steps backwards reads as due rather
+        than as "wait": late-but-noisy over silent, as everywhere else.
+
+        The map is per-``Core``, and only the ingest role dispatches — it runs
+        ``gunicorn --workers 1 --threads 4`` (see ``entrypoint.sh``), so one
+        process, one map, shared by the ticker thread and every ingest thread.
+        If ingest is ever given more than one worker the backoff multiplies by
+        the worker count; that is more pushes, not fewer, but check here first.
+        """
+        last = self._alert_attempted.get(job_id)
+        if last is None or last[0] != bad_since:
+            return True
+        waited = now - last[1]
+        return waited >= ALERT_RETRY_MIN_S or waited < 0
+
+    def _page(self, conn, ep: Episode, about: str, bad_since: str, began: float,
+              alerted_at: str | None, states: dict[str, str],
+              transitions: dict[str, tuple], now: float, at: str,
+              intents: list[AlertIntent]) -> None:
+        """Spend this episode's one page, if everything says we should.
+
+        ``about`` is the state the page is *about* — the current state for a
+        job that is not-OK, or the state the episode was in for one held open
+        across an OK we cannot verify. Called from both the not-OK branch and
+        the held branch of :meth:`_resolve_alerts`, which is the hard ceiling
+        (decision 2): the episode clock is authoritative, so an episode that
+        outlives its threshold pages even while the job reads an unverified OK.
+        """
+        job = ep.job
+        if job.alert_never or alerted_at:
+            return                            # opted out, or already paged
+        if now - began < job.alert_after_s:
+            return                            # not sustained long enough yet
+        if self._suppressed_offline(job, ep.prev, ep.state, states, transitions):
+            # Deliberately do NOT stamp alerted_at: a suppressed alert must not
+            # burn the episode's single page, or its recovery would be lost too.
+            log.info("alert for %s suppressed: its machine's probe job is "
+                     "offline (one alert for the machine instead)", job.id)
+            return
+        if not self._retry_due(job.id, bad_since, now):
+            # A POST for THIS episode failed recently and the page was handed
+            # back. Retrying on every tick and every ping means a blocking 5 s
+            # urllib call ~72×/hour while ntfy is down — in the scheduler thread
+            # and in the ingest request. Space them out; nothing is lost, the
+            # next attempt is a few minutes later. Only retries wait.
+            return
+        # Optimistic stamp, inside the transaction: it is what stops the 60 s
+        # ticker paging again mid-batch. If the POST then fails, _dispatch hands
+        # the page straight back (see _return_unsent_pages).
+        self._alert_attempted[job.id] = (bad_since, now)
+        db.set_alert_episode(conn, job.id, bad_since, at)
+        intents.append(AlertIntent(job, "alert", about, bad_since=bad_since,
+                                   alerted_at=at))
+
+    def _resolve_alerts(self, conn, episodes: list[Episode],
+                        states: dict[str, str], transitions: dict[str, tuple],
+                        now: float) -> list[AlertIntent]:
+        """Advance every job's alert episode and decide what reaches ntfy.
+
+        Runs as a second pass inside the recompute transaction, once every
+        job's new state is known (the machine-offline rule needs the whole
+        batch). It is **level-triggered**: it walks every job on every
+        recompute, not only the ones that changed, because "still FAIL, and now
+        past six hours" is exactly the event this feature exists to send and it
+        is not a transition. The episode clock is on the *episode*, not on the
+        state: a job that goes LATE and later FAILs keeps its original
+        ``bad_since``, which is the whole point — the question is "has this
+        been broken for a day?", not "did something change?".
+
+        There is exactly one page per episode, so every way an episode can end
+        is a way to lose a page. Each is therefore biased toward keeping the
+        episode alive: an OK we could not verify does not end it, and neither
+        does an OK too short to believe. Keeping an episode alive is itself
+        bounded, though, because an episode that never ends holds its page too.
+        The dwell is at most 5 minutes; the unverifiable-OK hold is at most one
+        threshold (:func:`ok_hold_s`) and then closes silently — and while it
+        holds, the episode can still cross its threshold and page.
+        """
+        at = db.to_iso(now)
+        intents: list[AlertIntent] = []
+        for ep in episodes:
+            job, prev, state, row = ep.job, ep.prev, ep.state, ep.row
+            bad_since = row.get("bad_since")
+            alerted_at = row.get("alerted_at")
+
+            # A `bad_since` we cannot use: unparseable, or in the FUTURE after a
+            # clock step (NTP walking the clock back, a box RTC ahead at boot).
+            # A future start makes `now - began` forever negative — a job that
+            # can never page. Heal rather than trust, and drop `alerted_at` with
+            # it, because a fresh clock is a fresh episode. Done before anything
+            # else reads the pair, so no branch below can trust a poisoned one.
+            began = db.from_iso(bad_since)
+            if bad_since is not None and (began is None or began > now):
+                log.warning("healing unusable bad_since %r for %s", bad_since,
+                            job.id)
+                bad_since = began = alerted_at = None
+                db.set_alert_episode(conn, job.id, None, None)
+
+            if state == "OK":
+                if not (bad_since or alerted_at):
+                    continue                  # healthy, and was already
+                # A deferred verdict can arrive while the job is already OK, so
+                # name the state the episode is actually about.
+                about = prev if prev != "OK" else (
+                    db.last_non_ok_state(conn, job.id) or prev)
+                held = self._ok_held_s(prev, row, now)
+                if self._holding(ep, about):
+                    if held < ok_hold_s(job):
+                        log.info("episode for %s held open: %s ended in an OK "
+                                 "we cannot verify", job.id, about)
+                        # THE HARD CEILING. Being blind is not being fine: if
+                        # the episode itself outlives the job's threshold while
+                        # we cannot confirm a recovery, page for it rather than
+                        # sit on it. Without this, an alternating
+                        # failure/damped-ok probe pattern defers the page for
+                        # ever — the state never settles long enough to be
+                        # believed and the episode never gets to speak.
+                        if bad_since is not None:
+                            self._page(conn, ep, about, bad_since, began,
+                                       alerted_at, states, transitions, now, at,
+                                       intents)
+                        continue
+                    # ...but only for one threshold. Held for ever, a probe that
+                    # never comes back (revoked remote, retired OAuth client)
+                    # keeps `alerted_at` and mutes every LATER failure of this
+                    # job. Close it, with NO recovery: nothing was verified
+                    # fixed, so "→ OK" would be a lie. A destination that is
+                    # still stale re-opens the episode the moment a probe can
+                    # see it, and a new failure pages on a clock of its own.
+                    log.warning("episode for %s closed unverified: %s never "
+                                "recovered usable evidence within %ss of OK",
+                                job.id, about, ok_hold_s(job))
+                    db.set_alert_episode(conn, job.id, None, None)
+                    continue
+                if held < ok_dwell_s(job):
+                    # Too short to believe. A single OK tick used to end the
+                    # episode outright, so a container flapping 19 min down /
+                    # 1 min up — broken 95% of the day — reset its clock 72
+                    # times and never paged once. The episode stays open, and
+                    # with it `alerted_at`: closing it here and recovering would
+                    # re-arm the page for the next 19 minutes and turn one
+                    # outage into a flap storm on the phone.
+                    continue
+                # The episode really is over: close it, and say so if Graham was
+                # told about it in the first place. The recovery is therefore up
+                # to `ok_dwell_s` late (5 min at most, 0 for a 0 threshold) — a
+                # deliberate trade against announcing a recovery that is about
+                # to be taken back.
+                if (alerted_at and not job.alert_never
+                        and not self._suppressed_offline(
+                            job, about, state, states, transitions)):
+                    intents.append(AlertIntent(job, "recovery", about))
+                db.set_alert_episode(conn, job.id, None, None)
                 continue
+
+            if not is_alertable(state):
+                # UNKNOWN: "no data yet", not "broken". Clear the bookkeeping
+                # exactly like an OK — a job that passes through UNKNOWN while
+                # paged would otherwise keep `alerted_at` for ever and never be
+                # pageable again — but send NO recovery: nothing was verified
+                # fixed, and a "→ OK" for it would be a lie.
+                if bad_since or alerted_at:
+                    db.set_alert_episode(conn, job.id, None, None)
+                continue
+
+            # Not OK, and worth alerting on. An episode is only CLOSED by a
+            # recompute that sees the dwell served (the branch above). The 60 s
+            # ticker guarantees one, and every ping recomputes the whole board
+            # as well. If both ever stopped, a stale `bad_since` would make this
+            # job page sooner than its threshold rather than later — the right
+            # direction.
+            if bad_since is None:
+                bad_since, began, alerted_at = at, now, None
+                db.set_alert_episode(conn, job.id, bad_since, None)
+            self._page(conn, ep, state, bad_since, began, alerted_at, states,
+                       transitions, now, at, intents)
+        return intents
+
+    @staticmethod
+    def _holding(ep: Episode, about: str) -> bool:
+        """Does this OK leave the episode open for want of evidence?
+
+        Two flavours, and they are held on different grounds:
+
+        - ``dest_unverified`` — the destination check could not be made. Only
+          holds a ``STALE_DEST``/``BEHIND`` episode, because that episode was a
+          statement about the destination. A LATE/FAIL episode is about silence
+          or a failed run, and the heartbeat coming back settles that fact on
+          its own; holding those broke recovery for every unprobed job.
+        - ``damped_failure`` — ``dashboard-probes`` writes its own heartbeat and
+          reports ``ok`` while damping a transient probe failure (PR #8), so for
+          that one job an ``ok`` run is not evidence of health at all. Holds
+          whatever the episode was about, for exactly that reason: the heartbeat
+          cannot settle a fact it is currently suppressing.
+        """
+        if ep.damped_failure:
+            return True
+        return ep.dest_unverified and about in DEST_DRIVEN_STATES
+
+    def _recompute_pass(self, conn, now: float
+                        ) -> tuple[dict[str, str], list[AlertIntent]]:
+        """Recompute every declared job inside an open transaction, then run the
+        episode/alert pass over the finished batch."""
+        states: dict[str, str] = {}
+        transitions: dict[str, tuple] = {}
+        episodes: list[Episode] = []
+        # One query for the whole batch: which probed destinations are currently
+        # failing. Used only to judge the self-job's heartbeat (see _holding).
+        failing_probes = db.failing_probe_job_ids(
+            conn, (j.id for j in self.registry.probed()))
+        for job in self.registry:
+            state, tr, row, facts = self._recompute_locked(conn, job, now)
+            states[job.id] = state
+            prev = row.get("state") or "UNKNOWN"
+            if tr:
+                transitions[job.id] = tr
+                log.info("state %s: %s -> %s (%s)", job.id, *tr)
+            is_ok = state == "OK"
+            episodes.append(Episode(
+                job, prev, state, row,
+                dest_unverified=is_ok and ok_is_unverified(job, facts, now),
+                damped_failure=(is_ok and job.id == SELF_JOB_ID
+                                and bool(failing_probes))))
+        return states, self._resolve_alerts(conn, episodes, states,
+                                            transitions, now)
+
+    def _dispatch(self, intents: list[AlertIntent]) -> None:
+        """Send each decided alert, then give back the page for any that did not
+        land. ``Notifier.send`` returns False for a 429, a 5xx, a DNS failure or
+        a timeout — and the episode had already been stamped, so without this
+        one unlucky POST buys permanent silence for the whole episode: the next
+        pass short-circuits on ``alerted_at``, and even the recovery is
+        suppressed (it only fires for an episode we paged for).
+
+        **A failed RECOVERY is logged and dropped** — accepted, not overlooked.
+        Its episode is already closed (``bad_since``/``alerted_at`` NULL), so
+        there is no episode to hand it back to, and re-sending it later from an
+        in-memory queue risks announcing "→ OK" for a job that has broken again
+        in the meantime. Losing it costs a piece of good news, never a page: the
+        next real problem opens a fresh episode with an unspent page. Grep
+        ``recovery push for`` in the container log if one seems to be missing.
+        """
+        unsent: list[AlertIntent] = []
+        for intent in intents:
+            job = intent.job
+            sent = False
             try:
-                self.notifier.notify_transition(job.name, job.id, prev, state,
-                                                reason)
+                if intent.kind == "recovery":
+                    sent = self.notifier.notify_recovery(job.name, job.id,
+                                                         intent.state)
+                else:
+                    sent = self.notifier.notify_alert(job.name, job.id,
+                                                      intent.state,
+                                                      job.alert_after_s)
             except Exception:  # noqa: BLE001 — belt and braces
                 log.exception("notifier raised; ignoring")
+            if not sent and intent.kind == "recovery" and self.notifier.enabled:
+                log.warning("recovery push for %s (%s → OK) did not land; its "
+                            "episode is already closed, so it is dropped",
+                            job.id, intent.state)
+            if intent.kind == "alert" and not sent:
+                unsent.append(intent)
+        # `notify_alert` also returns False when ntfy is simply switched off;
+        # rolling back then would rewrite the row every 60 s for ever, so only a
+        # configured-and-failing notifier gets the retry.
+        if unsent and self.notifier.enabled:
+            self._return_unsent_pages(unsent)
+
+    def _return_unsent_pages(self, unsent: list[AlertIntent]) -> None:
+        """Clear ``alerted_at`` for alerts whose POST failed, so the next tick
+        retries. A short follow-up transaction, after dispatch, never holding
+        the write lock across an HTTP call.
+
+        Only for the SAME episode: if the job has recovered, moved on, or been
+        re-stamped since, the page belongs to whatever is there now. The failure
+        direction becomes "possibly one duplicate page" (the alert landed but we
+        could not tell), which is the correct side to err on.
+
+        **Episode identity is the ONLY test**, deliberately. An earlier version
+        skipped any job whose state was no longer alertable, on the reasoning
+        that its episode must be over — which is false here: the OK dwell and
+        the unverified-OK hold both keep an episode open while the job reads OK.
+        A container flapping on `restart: unless-stopped` backoff can easily be
+        up for the 5 s an ntfy timeout takes, and the rollback would then be
+        skipped for the one episode that most needed it — stamped, undelivered,
+        and unable to page again for as long as the outage lasted. A genuinely
+        closed episode cannot be mistaken for an open one here: closing clears
+        ``bad_since`` to NULL, so the identity check below rejects it anyway.
+        """
+        conn = self.connect()
+        try:
+            with transaction(conn):
+                for intent in unsent:
+                    row = db.job_row(conn, intent.job.id) or {}
+                    if (row.get("bad_since") != intent.bad_since
+                            or row.get("alerted_at") != intent.alerted_at):
+                        continue              # a different episode owns the row
+                    log.warning("ntfy push for %s did not land; returning the "
+                                "episode's page so the next tick retries",
+                                intent.job.id)
+                    db.set_alert_episode(conn, intent.job.id,
+                                         intent.bad_since, None)
+        except Exception:  # noqa: BLE001 — alerting must never raise into ingest
+            log.exception("could not return the page for a failed ntfy push")
+        finally:
+            conn.close()
 
     def recompute_all(self, now: float | None = None) -> dict[str, str]:
         """Ticker entry point: recompute every declared job."""
         now = time.time() if now is None else now
         conn = self.connect()
-        states: dict[str, str] = {}
-        transitions: list[tuple[Job, tuple]] = []
         try:
             with transaction(conn):
-                for job in self.registry:
-                    state, tr = self._recompute_locked(conn, job, now)
-                    states[job.id] = state
-                    if tr:
-                        transitions.append((job, tr))
+                states, intents = self._recompute_pass(conn, now)
         finally:
             conn.close()
-        self._dispatch(transitions, states)
+        self._dispatch(intents)
         return states
 
     # -- ingest ------------------------------------------------------------ #
@@ -190,7 +629,6 @@ class Core:
         now = time.time() if now is None else now
         at = db.to_iso(now)
         conn = self.connect()
-        transitions: list[tuple[Job, tuple]] = []
         try:
             with transaction(conn):
                 metrics = payload.get("metrics") or {}
@@ -205,21 +643,16 @@ class Core:
                         source=source)
                 if metrics:
                     db.merge_metrics(conn, job.id, metrics, at)
-                # Recompute the whole board so LATE keeps firing for other
-                # jobs even if the ticker thread ever dies.
-                state = "UNKNOWN"
-                states: dict[str, str] = {}
-                for j in self.registry:
-                    s, tr = self._recompute_locked(conn, j, now)
-                    states[j.id] = s
-                    if j.id == job.id:
-                        state = s
-                    if tr:
-                        transitions.append((j, tr))
+                # Recompute the whole board so LATE keeps firing for other jobs
+                # even if the ticker thread ever dies — and run the SAME episode
+                # pass the ticker runs, so a threshold can be crossed on a ping
+                # as well as on a tick. These are the two dispatch paths and
+                # they must not diverge.
+                states, intents = self._recompute_pass(conn, now)
         finally:
             conn.close()
-        self._dispatch(transitions, states)
-        return state
+        self._dispatch(intents)
+        return states.get(job.id, "UNKNOWN")
 
     # -- probes ------------------------------------------------------------ #
 

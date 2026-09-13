@@ -1,4 +1,10 @@
-"""ntfy alerts on state transitions.
+"""ntfy alerts for sustained problems.
+
+The Notifier is deliberately dumb: it decides nothing about *whether* a job is
+worth paging for. :class:`dashboard.services.Core` owns the episode clock and
+calls in only when a job has been continuously not-OK past its own threshold
+(:meth:`Notifier.notify_alert`) or has come out of an episode it was actually
+paged for (:meth:`Notifier.notify_recovery`).
 
 Disabled when either ``NTFY_URL`` or ``NTFY_TOPIC`` is empty. Never raises into
 request handling or the scheduler — a broken ntfy must not break ingest.
@@ -9,6 +15,8 @@ from __future__ import annotations
 import logging
 import urllib.error
 import urllib.request
+
+from .humanize import human_duration
 
 log = logging.getLogger(__name__)
 
@@ -25,26 +33,36 @@ class Notifier:
     def enabled(self) -> bool:
         return bool(self.url and self.topic)
 
-    def should_notify(self, from_state: str, to_state: str) -> bool:
-        # First sighting of a healthy job is not a "recovery" — don't page for it.
-        if from_state == "UNKNOWN" and to_state == "OK":
-            return False
-        return from_state != to_state
+    def notify_alert(self, job_name: str, job_id: str, state: str,
+                     after_s: int) -> bool:
+        """One page for a job that has been not-OK for ``after_s`` seconds.
 
-    def notify_transition(self, job_name: str, job_id: str, from_state: str,
-                          to_state: str, reason: str | None) -> bool:
-        """Dispatch one alert for a transition. Returns True if a POST was
-        attempted and succeeded."""
-        if not self.enabled or not self.should_notify(from_state, to_state):
+        ``state`` is the state the episode is *about*, which need not be the
+        state the job is in right now: a mid-episode LATE → FAIL does not
+        restart the clock, and an episode held open across an OK we could not
+        verify is still reported as the problem it started as. Returns True if
+        a POST was attempted and succeeded.
+        """
+        if not self.enabled:
             return False
-        # Only the transition goes to ntfy.sh (a third party): never the
-        # free-text reason, which can carry container names, client-supplied
-        # notes or rclone stderr. The reason stays on the board.
-        del reason
-        title = f"[dashboard] {job_name} → {to_state}"
-        body = f"{job_id}: {from_state} → {to_state}"
-        priority = "high" if to_state in HIGH_PRIORITY_STATES else "default"
+        # Only the job id, its state and its own configured threshold go to
+        # ntfy.sh (a third party): never the free-text reason, which can carry
+        # container names, client-supplied notes or rclone stderr. The reason
+        # stays on the board.
+        title = f"[dashboard] {job_name} → {state}"
+        body = (f"{job_id}: {state} for over {human_duration(after_s)}"
+                if after_s > 0 else f"{job_id}: {state}")
+        priority = "high" if state in HIGH_PRIORITY_STATES else "default"
         return self.send(title, body, priority)
+
+    def notify_recovery(self, job_name: str, job_id: str,
+                        from_state: str) -> bool:
+        """The end of an episode that was paged for. Never sent for an episode
+        Graham was not told about — that check lives in ``Core``."""
+        if not self.enabled:
+            return False
+        return self.send(f"[dashboard] {job_name} → OK",
+                         f"{job_id}: {from_state} → OK", "default")
 
     def send(self, title: str, body: str, priority: str = "default") -> bool:
         if not self.enabled:
