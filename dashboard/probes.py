@@ -72,7 +72,9 @@ _OBJECT_NOISE_RE = re.compile(r"\((?:dir|file)\b[^\)]*\)|\"[^\"]*\"")
 # whitespace-delimited token containing a `/` is a path, not diagnosis, so it
 # is dropped too. This matters for ordinary names, not just adversarial ones:
 # the backup trees are dated (`gdrive:Backups/km-tracker/2026-05-03/` contains
-# `503`), and a hard error on one of those must page immediately.
+# `503`), and a hard error on one of those must trip FAIL immediately rather
+# than buy itself damping. (Immediately on the BOARD. The push still waits out
+# `dashboard-probes`' own alert threshold — see services._classify_trouble.)
 _PATH_TOKEN_RE = re.compile(r"\S*/\S*")
 
 # Bare HTTP status codes are too weak to be substring markers — three digits

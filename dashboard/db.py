@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_at      TEXT,               -- first seen in jobs.yml; drives UNKNOWN -> LATE for never-pinged jobs
     bad_since       TEXT,               -- start of the current continuously-not-OK episode (NULL = no episode)
     alerted_at      TEXT,               -- when THIS episode was paged for (NULL = not paged; one page per episode)
-    last_paged_at   TEXT                -- when this JOB last paged, across episodes (drives the per-job cooldown)
+    last_paged_at   TEXT,               -- when this JOB last paged, across episodes (drives the per-job cooldown)
+    alerted_state   TEXT                -- the state THIS episode was paged about (escalation + recovery read it)
 );
 CREATE TABLE IF NOT EXISTS runs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -77,6 +78,12 @@ CREATE TABLE IF NOT EXISTS state_changes (
     reason     TEXT
 );
 CREATE INDEX IF NOT EXISTS sc_job_at ON state_changes (job_id, changed_at DESC);
+-- Insert order, for the same reason `probes_job_seq` exists: `not_ok_seconds`
+-- reconstructs a job's state timeline and has to walk it in the order the rows
+-- were WRITTEN (a clock that stepped backwards reorders `changed_at`). Without
+-- this index that walk sorts the job's whole history on every recompute, and
+-- `state_changes` is the one table `prune` does not bound.
+CREATE INDEX IF NOT EXISTS sc_job_seq ON state_changes (job_id, id DESC);
 """
 
 
@@ -149,6 +156,13 @@ JOBS_COLUMNS = (
     # deploy — and deploys are exactly when containers flap, which is why this
     # lives in the DB at all rather than in memory.
     ("last_paged_at", "TEXT"),
+    # Which state THIS episode was paged about. No backfill, and the one row
+    # shape that matters — an episode that is open AND paged at upgrade time,
+    # i.e. `alerted_at` set with this NULL — is healed on the next recompute by
+    # recording the state the episode is about then (services.Core._page).
+    # Ranking it instead would either duplicate the page that already went out
+    # or swallow a real escalation; recording it does neither.
+    ("alerted_state", "TEXT"),
 )
 
 
@@ -275,17 +289,27 @@ def set_state(conn: sqlite3.Connection, job_id: str, new_state: str,
 
 
 def set_alert_episode(conn: sqlite3.Connection, job_id: str,
-                      bad_since: str | None, alerted_at: str | None) -> None:
+                      bad_since: str | None, alerted_at: str | None,
+                      alerted_state: str | None = None) -> None:
     """Record where the job stands in its current not-OK episode.
 
     ``bad_since`` is when the job last stopped being OK (NULL once the episode
     is over); ``alerted_at`` is when THIS episode was paged for (NULL until it
     crosses the job's threshold — that NULL is what caps an episode at one
-    page). Deliberately does not touch ``updated_at``: that column is the
-    board's "the scheduler is alive" signal and belongs to :func:`set_state`.
+    page); ``alerted_state`` is WHAT that page said, which the escalation check
+    compares against and the recovery is named from.
+
+    All three are written on every call, ``alerted_state`` included: the three
+    belong to one episode and a partial write is how a spent page ends up
+    attached to the wrong episode. It defaults to NULL because every caller that
+    is not stamping a page wants NULL there — an episode opening, an episode
+    closing, or a poisoned row being healed.
+
+    Deliberately does not touch ``updated_at``: that column is the board's "the
+    scheduler is alive" signal and belongs to :func:`set_state`.
     """
-    conn.execute("UPDATE jobs SET bad_since=?, alerted_at=? WHERE id=?",
-                 (bad_since, alerted_at, job_id))
+    conn.execute("UPDATE jobs SET bad_since=?, alerted_at=?, alerted_state=? "
+                 "WHERE id=?", (bad_since, alerted_at, alerted_state, job_id))
 
 
 def set_last_paged_at(conn: sqlite3.Connection, job_id: str,
@@ -491,6 +515,81 @@ def last_non_ok_state(conn: sqlite3.Connection, job_id: str) -> str | None:
         "SELECT to_state FROM state_changes WHERE job_id=? AND to_state<>'OK' "
         "ORDER BY changed_at DESC, id DESC LIMIT 1", (job_id,)).fetchone()
     return row["to_state"] if row else None
+
+
+def not_ok_seconds(conn: sqlite3.Connection, job_id: str, start: float,
+                   end: float, bad_states: Iterable[str],
+                   limit: int = 2000) -> float:
+    """How many of the seconds in ``[start, end]`` this job spent in one of
+    ``bad_states``, reconstructed from the transition log.
+
+    This is the episode accumulator's only input, and it is **derived, not
+    stored** — the same choice, for the same reasons, as
+    :func:`probe_fail_streak`: nothing to migrate, nothing to keep in step with
+    reality, it survives a restart, and the ingest route cannot write
+    ``state_changes`` at all, so a holder of ``INGEST_TOKEN`` cannot manufacture
+    (or erase) accumulated badness.
+
+    ``bad_states`` is passed in rather than imported so this module stays free of
+    ``state``, which imports it.
+
+    **Walked in INSERT order**, not by ``changed_at``: the timeline is a chain
+    where each row ends the previous row's span, and a clock that steps backwards
+    (NTP, a box RTC ahead at boot — the step this code already heals for
+    ``bad_since``) reorders the timestamps while leaving the rowids alone. A row
+    whose stamp is not strictly older than the span being closed is skipped for
+    the same reason: it cannot be used as a boundary, and one poisoned row must
+    not be able to invent hours of badness.
+
+    **How accurate this actually is** — measured, because the wording here used
+    to overclaim:
+
+    - For a MONOTONE timeline it is **exact**, not merely an under-estimate
+      (4000 randomised histories, worst deviation 0.000 s). What under-counts is
+      missing history: a scan that runs out of rows (or of ``limit``) leaves the
+      older part of the window unattributed rather than assuming the worst.
+    - **A single** clock step cannot inflate it: the out-of-order row is skipped
+      as unusable and the span it would have opened is closed by the next older
+      usable row instead. That is true of *one* step and false of a **sawtooth**
+      — every backwards row is dropped, so the surviving older row's state claims
+      the whole gap, and when the dropped rows are the recoveries, nearly the
+      entire window reads as bad: measured at **42 900 s of a 43 200 s window**
+      where 21 600 s was real. Both are pinned by
+      ``test_not_ok_seconds_cannot_be_inflated_by_a_clock_that_stepped_back``.
+    - Sub-second truncation **over**-counts slightly: ``changed_at`` is ISO to
+      whole seconds while ``end`` is a float, worth up to 1 s per span (measured
+      worst case 3.1 s).
+
+    **The hard ceiling in every case is ``end - start``** — the caller's window,
+    i.e. ``BAD_WINDOW_MULTIPLE × alert_after_s``, which is exactly twice the bar
+    it is compared against. So the worst a poisoned clock can buy is a page one
+    window early, and never a page for a job that is fine right now: the
+    accumulator is an OR beside the episode clock, never a replacement for it
+    (see ``services.Core._past_bar``), it is only consulted for an episode that
+    is open, and it is only ever asked about the state that episode is in. An
+    under-estimate degrades to the behaviour the clock already had; an
+    over-estimate pages early. Both are the direction the governing rule asks
+    for, which is why this is documented rather than defended against.
+    """
+    if end <= start:
+        return 0.0
+    bad = set(bad_states)
+    rows = conn.execute(
+        "SELECT changed_at, to_state FROM state_changes WHERE job_id=? "
+        "ORDER BY id DESC LIMIT ?", (job_id, max(1, int(limit)))).fetchall()
+    total = 0.0
+    upper = end                      # the span being closed ends here
+    for r in rows:
+        ts = from_iso(r["changed_at"])
+        if ts is None or ts >= upper:
+            continue                 # unusable or out-of-order: not a boundary
+        lower = max(ts, start)
+        if r["to_state"] in bad:
+            total += upper - lower
+        upper = lower
+        if ts <= start:
+            break                    # this row reaches back past the window
+    return total
 
 
 def forget_metrics(conn: sqlite3.Connection, job_id: str,

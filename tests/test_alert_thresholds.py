@@ -20,7 +20,10 @@ import pytest
 from dashboard import db, probes
 from dashboard.probes import ProbeResult
 from dashboard.registry import parse_registry
-from dashboard.services import COOLDOWN_FLOOR_S, Core, cooldown_s, ok_dwell_s
+from dashboard.state import ALERTABLE_STATES
+from dashboard.services import (BAD_WINDOW_MULTIPLE, COOLDOWN_FLOOR_S, Core,
+                                alert_severity, bad_window_s, cooldown_s,
+                                ok_dwell_s)
 from tests.conftest import JOBS_DOC, pin_created_at
 
 NOW = 1_800_000_000.0
@@ -259,7 +262,14 @@ def test_flapping_below_the_threshold_sends_nothing(settings, notifier):
 
 
 def test_sustained_failure_after_flapping_still_pages(settings, notifier):
-    """Muting the flaps must not mute the real thing that follows them."""
+    """Muting the flaps must not mute the real thing that follows them.
+
+    Since the accumulator (issue #15) the flaps also do not COST anything: each
+    blip's 300 s of FAIL is still inside the 12 h window when the real outage
+    crosses the bar, so the page arrives that much earlier than the threshold
+    alone would give. Unpaged badness is carried, not discarded — and only
+    unpaged badness can bring a page forward, because anything that already
+    paged runs into the cooldown instead."""
     core = core_with(settings, notifier, {"dashboard-probes": {"alert_after_s": 21600}})
     job = core.registry.get("dashboard-probes")
     t = NOW
@@ -270,13 +280,18 @@ def test_sustained_failure_after_flapping_still_pages(settings, notifier):
     # Now it breaks for real: the probe cycle keeps recording a failing run every
     # 300 s (that is what a broken rclone remote looks like), for six hours.
     broke = t
-    while t < broke + 21600:
+    credit = 5 * 300                                     # five blips, 300 s of FAIL each
+    while t < broke + 21600 - credit:
         core.record_ping(job, {"status": "fail"}, now=t)
         t += 300
-    assert notifier.sent == []                           # 21300 s in: still holding fire
-    core.record_ping(job, {"status": "fail"}, now=broke + 21600)
+    assert notifier.sent == []                           # still holding fire
+    core.record_ping(job, {"status": "fail"}, now=broke + 21600 - credit)
     assert titles(notifier) == ["[dashboard] Probe cycle → FAIL"]
-    assert notifier.sent[0][1] == "dashboard-probes: FAIL for over 6h"
+    # ...and the body says which of the two rules spoke, rather than claiming six
+    # unbroken hours it did not see.
+    assert notifier.sent[0][1] == "dashboard-probes: FAIL for over 6h in the last 12h"
+    # The episode's own clock is untouched: it still starts at the break.
+    assert row(core, "dashboard-probes")["bad_since"] == db.to_iso(broke)
 
 
 # --------------------------------------------------------------------------- #
@@ -1002,14 +1017,21 @@ def test_a_short_blip_is_still_muted_and_a_real_recovery_still_ends_the_episode(
     core.recompute_all(now=NOW + 300 + dwell(core, "dashboard-probes"))
     assert row(core, "dashboard-probes")["bad_since"] is None
     assert notifier.sent == []
-    # Hours later it breaks for good: the clock starts NOW, not back at the blip.
-    t = NOW + 4 * 3600
-    while t < NOW + 4 * 3600 + 21600:
+    # Hours later it breaks for good. The episode CLOCK starts at the break, not
+    # back at the blip — but the blip's 300 s of FAIL is still inside the 12 h
+    # accumulator window, so the bar is reached 300 s sooner than the threshold
+    # alone (issue #15). Late-and-honest, in the paging direction, and the body
+    # says which rule spoke.
+    broke = NOW + 4 * 3600
+    t = broke
+    while t < broke + 21600 - 300:
         core.record_ping(job, {"status": "fail"}, now=t)
         t += 300
     assert notifier.sent == []
-    core.record_ping(job, {"status": "fail"}, now=NOW + 4 * 3600 + 21600)
+    assert row(core, "dashboard-probes")["bad_since"] == db.to_iso(broke)
+    core.record_ping(job, {"status": "fail"}, now=broke + 21600 - 300)
     assert titles(notifier) == ["[dashboard] Probe cycle → FAIL"]
+    assert notifier.sent[0][1] == "dashboard-probes: FAIL for over 6h in the last 12h"
 
 
 # --------------------------------------------------------------------------- #
@@ -1750,3 +1772,913 @@ def test_the_returning_probe_mute_does_not_depend_on_registry_order(
     # probe was declared at.
     assert titles(notifier) == ["[dashboard] Mac probe → LATE",
                                 "[dashboard] Mac probe → OK"]
+
+
+# --------------------------------------------------------------------------- #
+# THE EPISODE ACCUMULATOR (issue #15)
+#
+# PR #8 gave the DAMPING a cumulative backstop — `PROBE_NO_SUCCESS_S`, measured
+# from the last successful probe — so a persistent failure reaches FAIL however
+# the streak arithmetic falls. PR #11 gave the EPISODE nothing of the kind: an
+# episode is destroyed by one verified OK that outlasts the dwell, so a
+# destination failing for an hour and listing successfully once every quarter of
+# an hour restarted its 6 h clock for ever. Measured over 24 h against the real
+# `run_probe_cycle` with production values: 60/15 failed 73% of its probes and
+# paged ZERO times; 300/30 failed 90% and paged ZERO times.
+#
+# Google Drive's `rateLimitExceeded` is intermittent by nature, so this was the
+# likeliest shape to matter — and it is the one that took out the real nightly
+# backup on 2026-09-10.
+#
+# Issue #13 item 4 had explicitly DECLINED an accumulator here, because two
+# attempts at one during review each produced a silence bug. Both replaced the
+# episode clock with a not-OK sum, which can only ever page later. This one is an
+# OR beside the clock, so it cannot page later than before, and the first test
+# below is the guard that it cannot page for noise either.
+# --------------------------------------------------------------------------- #
+
+STORM_CYCLES = 1152           # 4 days at the 300 s probe interval (real: 1159)
+STORM_FAILURES = 27           # FAIL->OK flaps in the real incident (21 + 6)
+PROBE_A = 21600               # `dashboard-probes`' real threshold: 6 hours
+
+
+@pytest.fixture
+def no_prune(monkeypatch):
+    """Switch off `db.prune` for the long simulations below.
+
+    Not a behaviour patch: `prune` has nothing to do with alerting. It is a
+    speed one, and the factor is not small — its `id NOT IN (SELECT … LIMIT n)`
+    is correlated, so SQLite re-runs the subquery per candidate row and the cost
+    grows with the rows retained. The 1152-cycle replay takes **113 s** with it
+    and **2 s** without. (Worth knowing for production too: `prune` runs inside
+    every probe cycle, against tables it keeps at 2000 rows per job.)
+    """
+    monkeypatch.setattr(db, "prune", lambda *a, **kw: None)
+
+
+def _isolated_failures(count, total):
+    """`count` cycle indexes spread over `total`, never two adjacent — the shape
+    of the real incident (21 of 1159 `gdrive:Backups` probes failed, 6 of 1159
+    `gdrive:Gremlins` probes, and NO two failures were consecutive)."""
+    picked = {int(i * total / count) for i in range(count)}
+    assert len(picked) == count
+    assert not any(i + 1 in picked for i in picked), "adjacent failures"
+    return picked
+
+
+def _failing_probe_rows(core, job_id="snap"):
+    conn = core.connect()
+    try:
+        return conn.execute("SELECT COUNT(*) FROM probes WHERE job_id=? AND ok=0",
+                            (job_id,)).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _fail_runs(core, job_id="dashboard-probes"):
+    conn = core.connect()
+    try:
+        return conn.execute("SELECT COUNT(*) FROM runs WHERE job_id=? AND "
+                            "status='fail'", (job_id,)).fetchone()[0]
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("fail_threshold,expect_fail_states", [(2, 0), (1, 27)])
+def test_the_historical_flap_storm_still_pages_nothing(
+        settings, notifier, monkeypatch, no_prune, fail_threshold,
+        expect_fail_states):
+    """**THE REGRESSION GUARD FOR THE ACCUMULATOR.** Replay the incident this
+    whole branch exists because of — 27 isolated transient probe failures in
+    1152 cycles over four days, none of them adjacent, nothing actually broken —
+    and assert the phone stays silent. The pre-0.2 dispatcher sent ~55 pushes for
+    exactly this.
+
+    Parametrised over the damping, because the two parameters ask different
+    questions:
+
+    - **2 (shipped)** — the faithful replay. Isolated transient failures never
+      reach an alertable STATE at all, so no episode ever opens and the
+      accumulator has nothing to add up. This is the "damping filters upstream"
+      argument, asserted rather than assumed.
+    - **1 (damping off)** — the adversarial version, and the one that actually
+      tests the accumulator. Every failure now trips FAIL, so the state flaps 27
+      times and the transition log carries 27 real not-OK spans for the
+      accumulator to find. It must still not page: 27 spans of ~300 s spread over
+      four days is ~1000 s inside any 12 h window, against a 6 h bar.
+
+    A cumulative rule that pages on this pattern would be worse than the bug it
+    fixes, so this test comes first."""
+    settings.probe_fail_threshold = fail_threshold
+    core = core_with(settings, notifier, {"dashboard-probes": {"alert_after_s": PROBE_A}})
+    bad = _isolated_failures(STORM_FAILURES, STORM_CYCLES)
+    t = NOW
+    for i in range(STORM_CYCLES):
+        _cycle(core, monkeypatch, t, ok=i not in bad)
+        t += 300
+    # Not vacuous: every failure really was recorded, and the damping really did
+    # (or did not) keep it off the board.
+    assert _failing_probe_rows(core) == STORM_FAILURES
+    states = [c["to_state"] for c in changes(core, "dashboard-probes", limit=500)]
+    assert states.count("FAIL") == expect_fail_states
+    assert notifier.sent == []
+    # The MARGIN, as a number rather than as "no pushes": over every 12 h window
+    # of those four days, the most not-OK time the accumulator can find is
+    # **1200 s against a 21600 s bar — 18x under it**. Measured and pinned here
+    # because "zero pushes" on its own would read the same for a rule that was
+    # one loosening away from paging; this says how much room there actually is.
+    window = bad_window_s(core.registry.get("dashboard-probes"))
+    conn = core.connect()
+    try:
+        worst = max(db.not_ok_seconds(conn, "dashboard-probes", w, w + window,
+                                      ALERTABLE_STATES)
+                    for w in range(int(NOW - window), int(t), 3600))
+    finally:
+        conn.close()
+    assert worst <= (1500 if fail_threshold == 1 else 0)
+    # The ticker is deliberately not interleaved here: every probe cycle already
+    # ends in the identical `recompute_all`, the dwell arithmetic lands on the
+    # same 300 s boundaries either way, and it was measured both ways at zero
+    # pushes. Running 4 days of 60 s ticks costs 8 s of suite time to assert the
+    # same zero.
+
+
+@pytest.mark.parametrize("down_min,up_min,fail_pct", [(60, 15, 73),
+                                                     (180, 15, 90),
+                                                     (300, 30, 90)])
+def test_an_intermittently_failing_destination_now_pages(
+        settings, notifier, monkeypatch, no_prune, down_min, up_min, fail_pct):
+    """The three patterns issue #15 measured at **zero pushes a day**.
+
+    `fail_pct` is the share of probe cycles the self-job recorded as `fail`,
+    i.e. how much of the day the board read FAIL — reproduced here to prove this
+    is the same scenario the issue measured and not a friendlier one.
+
+    Bounded at both ends on purpose. A silence test that only asserts "> 0"
+    passes just as well for a fix that pages sixty times, which is the failure
+    mode on the other side; the upper bound is the per-job cooldown's, and it is
+    the reason an accumulator is safe to add at all."""
+    core = core_with(settings, notifier, {"dashboard-probes": {"alert_after_s": PROBE_A}})
+    period = (down_min + up_min) * 60
+    t = NOW
+    while t < NOW + DAY:
+        _cycle(core, monkeypatch, t, ok=((t - NOW) % period) >= down_min * 60)
+        t += 300
+    cycles = int(DAY / 300)
+    assert abs(100 * _fail_runs(core) // cycles - fail_pct) <= 2   # same scenario
+    alerts, recoveries = _alerts(notifier), _recoveries(notifier)
+    assert alerts, f"{fail_pct}% of the day FAIL, and zero pushes"
+    # The cooldown is the only rate guarantee in the file, and it still holds:
+    # at most one page per 6 h, each of which may cost one recovery as well.
+    cap = DAY // COOLDOWN_FLOOR_S
+    assert len(alerts) <= cap and len(recoveries) <= cap
+    assert len(notifier.sent) <= 2 * cap
+    assert all(t.endswith("→ FAIL") for t in alerts)
+    # And the body is honest about WHICH rule spoke: this destination was not
+    # broken for six unbroken hours, it was broken for six of the last twelve.
+    assert notifier.sent[0][1] == "dashboard-probes: FAIL for over 6h in the last 12h"
+    assert notifier.sent[0][2] == "high"
+
+
+def test_a_muted_late_cannot_accumulate_into_a_page_for_something_else(settings, notifier):
+    """The accumulator counts time in the state being paged about, NOT "any
+    badness" — and this is the test that forced that.
+
+    A flat accumulator laundered deliberately MUTED time into an unrelated page:
+    every night the Mac sleeps, each of its jobs sits LATE for hours with its
+    alert suppressed by the machine-offline rule ("one alert for the machine, not
+    five"), and the next morning the first genuinely new `drive-mirror: BEHIND`
+    episode paged the INSTANT it opened on the strength of that sleep. Per-state,
+    muted LATE time can no longer speak for a page about a DIFFERENT state.
+
+    Scoped precisely, because this docstring used to overclaim: it does **not**
+    follow that "the same mute still gags it". Muted LATE time still counts
+    toward a page about a later *LATE* episode — see
+    `test_muted_late_time_can_still_bring_a_later_late_page_forward`, which
+    reproduces that on the shipped `drive-mirror` numbers."""
+    core = core_with(settings, notifier, {"mirror": {"alert_after_s": 3600},
+                                          "macprobe": {"alert_after_s": 3 * DAY}})
+    mac, mirror = core.registry.get("macprobe"), core.registry.get("mirror")
+    core.record_ping(mac, {"status": "ok"}, now=NOW)
+    core.record_ping(mirror, {"status": "ok"}, now=NOW)
+    core.recompute_all(now=NOW + 20_000)                 # asleep: both LATE
+    core.recompute_all(now=NOW + 24_000)                 # mirror past its threshold
+    assert row(core, "mirror")["state"] == "LATE"
+    assert notifier.sent == []                           # muted: the Mac is asleep
+    # The Mac wakes cleanly (siblings first, then the probe's own heartbeat) and
+    # the muted episode closes with nothing said — 5.5 h of LATE, unpaged.
+    core.record_ping(mirror, {"status": "ok", "metrics": {"pending": 0, "mismatch": 0}},
+                     now=NOW + 30_000)
+    core.record_ping(mac, {"status": "ok"}, now=NOW + 30_002)
+    core.recompute_all(now=NOW + 30_000 + dwell(core, "mirror"))
+    assert row(core, "mirror")["bad_since"] is None
+    assert notifier.sent == []
+    # Now a genuinely new problem of its own: pending uploads, a fresh episode,
+    # seconds old. This must NOT page yet — the hours of LATE in the window were
+    # declared not-news by the machine-offline rule, and a flat accumulator
+    # turned them straight into a push here.
+    core.record_ping(mirror, {"status": "ok", "metrics": {"pending": 4}},
+                     now=NOW + 30_400)
+    assert row(core, "mirror")["state"] == "BEHIND"
+    assert notifier.sent == []
+    # ...and it pages on its OWN hour, not on the Mac's night.
+    core.record_ping(mirror, {"status": "ok", "metrics": {"pending": 4}},
+                     now=NOW + 30_400 + 3600)
+    assert titles(notifier) == ["[dashboard] Drive mirror → BEHIND"]
+    assert notifier.sent[0][1] == "mirror: BEHIND for over 1h"   # continuous, not cumulative
+
+
+def _shipped_core(settings, notifier):
+    """A Core over the REAL `jobs.example.yml`, so the two tests below are about
+    the thresholds actually deployed rather than a fixture's. Every job that is
+    not pinged stays UNKNOWN (`pin_created_at`), so it contributes no pushes."""
+    from dashboard.registry import load_registry
+    from tests.conftest import EXAMPLE_JOBS
+    core = Core(settings, load_registry(EXAMPLE_JOBS), notifier)
+    core.init_store()
+    pin_created_at(settings)
+    return core
+
+
+def late_onset_s(job) -> int | None:
+    """How long this job must be unheard-from before it reads LATE, or None if it
+    can never read LATE at all.
+
+    `deadline_s` for a scheduled kind; a `disk` gauge has no cadence and is
+    judged on the age of its newest reading instead (`DISK_METRIC_MAX_AGE_S`);
+    `manual` is neither, so it has no dead-man's switch and None is the honest
+    answer — which also means the machine-offline rule can never mute it, since
+    that rule is about LATE. Derived rather than typed out, because it is the
+    number the muted-time residual below turns on.
+    """
+    from dashboard.state import DISK_METRIC_MAX_AGE_S
+    if job.scheduled:
+        return job.deadline_s
+    return DISK_METRIC_MAX_AGE_S if job.kind == "disk" else None
+
+
+def test_muted_late_time_can_still_bring_a_later_late_page_forward(settings, notifier):
+    """The residual the test above does NOT cover, reproduced rather than
+    described — because the claim "the same mute still gags it" was in three
+    places and is false.
+
+    The mute (`_suppressed_offline`) reads the probe's state RIGHT NOW;
+    `db.not_ok_seconds` reads across episode boundaries. So muted LATE seconds
+    are unpaged badness with nothing behind them — a suppressed page stamps
+    neither `alerted_at` nor `last_paged_at`, deliberately, which is exactly why
+    no cooldown absorbs the next one. A mute is not a cooldown.
+
+    Run on `drive-mirror`'s real numbers (24 h threshold, 15 h LATE onset, 48 h
+    window): a 40 h sleep, awake just long enough to serve out the dwell, then
+    15 h of silence — and the fresh episode pages at age ZERO, carrying "for over
+    1d in the last 2d".
+
+    **This is a residual, not a defect.** It pages EARLY, never silently; the job
+    really is LATE at that moment; the seconds counted really were never
+    reported; and it is still one page per episode. Fixing it by discarding
+    accrued badness would push in the one direction this feature may not go."""
+    core = _shipped_core(settings, notifier)
+    mirror, probe = core.registry.get("drive-mirror"), core.registry.get("mac-probe")
+    assert mirror.alert_after_s > late_onset_s(mirror)    # why it is reachable here
+    ok = {"status": "ok", "metrics": {"pending": 0, "mismatch": 0}}
+    t = NOW
+    core.record_ping(mirror, ok, now=t)
+    core.record_ping(probe, {"status": "ok"}, now=t)
+    while t < NOW + 40 * 3600:                           # the lid is shut
+        t += 900
+        core.recompute_all(now=t)
+    # Both LATE, and NOT ONE PUSH: the sibling is muted behind the probe, and the
+    # probe's own 72 h threshold is nowhere near. ~25 h of LATE, unreported.
+    assert row(core, "drive-mirror")["state"] == "LATE"
+    assert row(core, "mac-probe")["state"] == "LATE"
+    assert notifier.sent == []
+    assert row(core, "drive-mirror")["alerted_at"] is None
+    assert row(core, "drive-mirror")["last_paged_at"] is None   # a mute stamps nothing
+    # It wakes. The episode closes silently once the dwell is served out.
+    wake = t
+    while t < wake + dwell(core, "drive-mirror") + 900:
+        core.record_ping(mirror, ok, now=t)
+        core.record_ping(probe, {"status": "ok"}, now=t)
+        core.recompute_all(now=t)
+        t += 300
+    assert row(core, "drive-mirror")["bad_since"] is None and notifier.sent == []
+    # Now the Mac is up and reporting, but this one sub-probe stops posting: a
+    # genuinely NEW episode, with no mute available to it.
+    late_at = None
+    stop = t + late_onset_s(mirror) + 2 * 3600
+    while t < stop and not notifier.sent:
+        t += 300
+        core.record_ping(probe, {"status": "ok"}, now=t)
+        core.recompute_all(now=t)
+        if late_at is None and row(core, "drive-mirror")["state"] == "LATE":
+            late_at = t
+    assert titles(notifier) == ["[dashboard] Google Drive mirror → LATE"]
+    # The page is the ACCUMULATOR's ("in the last 2d"), not the clock's, and it
+    # lands on the first pass of an episode that is one tick old against a
+    # 24 h bar.
+    assert notifier.sent[0][1] == "drive-mirror: LATE for over 1d in the last 2d"
+    assert late_at is not None and t - late_at == 0
+
+
+def test_which_shipped_jobs_can_have_muted_time_brought_forward(settings, notifier):
+    """The guard that makes the residual above a KNOWN one instead of a surprise.
+
+    Laundering muted time into a *later* episode needs the earlier badness to
+    still be inside the window when the new episode opens — and the gap between
+    two episodes is at least the job's own LATE onset, since that is how long the
+    silence must last for the new episode to begin. So the window (`2 ×
+    alert_after_s`) has to hold one whole threshold of old badness PLUS that gap,
+    which is only possible when `alert_after_s > late_onset_s`. Measured at the
+    boundary: at `alert_after_s == late_onset_s` the page still comes from the
+    clock at the full threshold; one tick above it, the accumulator fires at age
+    zero.
+
+    A job also has to be MUTABLE at all, which rules out three groups before the
+    arithmetic: a machine with no non-self probe job has no machine-offline rule
+    (`_machine_probe("box")` is None), a job that never pages cannot page early,
+    and a job that can never read LATE (`late_onset_s` is None — `manual` has no
+    dead-man's switch) has no muted LATE time to launder in the first place.
+
+    Pinned as an exact set so that adding a Mac job with a threshold above its
+    own LATE onset — or shortening `drive-mirror`'s to close this — fails here and
+    is read, rather than silently widening a residual DESIGN.md calls narrow."""
+    from dashboard.services import SELF_JOB_ID
+    core = _shipped_core(settings, notifier)
+    machines = {j.machine for j in core.registry
+                if j.kind == "probe" and j.id != SELF_JOB_ID}
+    assert machines == {"mac"}                    # box jobs cannot be muted
+    mutable = [j for j in core.registry
+               if j.machine in machines and not j.alert_never
+               and j.kind != "probe" and late_onset_s(j) is not None]
+    assert {j.id for j in mutable} == {"pa-backup", "drive-mirror", "mac-disk"}
+    exposed = {j.id for j in mutable if j.alert_after_s > late_onset_s(j)}
+    assert exposed == {"drive-mirror"}
+    # Not vacuous: the other two mutable Mac jobs are inside the bound, with the
+    # margins that keep them there.
+    assert late_onset_s(core.registry.get("pa-backup")) == 86400 + 50520
+    assert late_onset_s(core.registry.get("mac-disk")) == 48 * 3600
+    for job_id in ("pa-backup", "mac-disk"):
+        job = core.registry.get(job_id)
+        assert job.alert_after_s < late_onset_s(job), job_id
+
+
+def test_badness_older_than_the_window_does_not_count(settings, notifier):
+    """The window is what keeps the accumulator from being a permanent black
+    mark. A day of FAIL last week must not make a fresh five-minute episode
+    page — otherwise a job's first bad week silences its threshold for ever."""
+    core = core_with(settings, notifier, {"tree": {"alert_after_s": 3600}})
+    job = core.registry.get("tree")
+    t = NOW
+    while t < NOW + 3600:                                # an hour of FAIL: pages once
+        core.record_ping(job, {"status": "fail"}, now=t)
+        t += 300
+    core.record_ping(job, {"status": "fail"}, now=NOW + 3600)
+    assert len(_alerts(notifier)) == 1
+    core.record_ping(job, {"status": "ok"}, now=NOW + 3700)
+    core.recompute_all(now=NOW + 3700 + dwell(core, "tree"))
+    assert row(core, "tree")["bad_since"] is None
+    # Well past the 2 h window (and past the 6 h cooldown, so the cooldown is not
+    # what is being tested here), it breaks again briefly.
+    late = NOW + 8 * 3600
+    core.record_ping(job, {"status": "fail"}, now=late)
+    core.recompute_all(now=late + 600)
+    assert len(_alerts(notifier)) == 1                    # the old hour is forgotten
+    core.recompute_all(now=late + 3600)                   # its own hour, its own page
+    assert len(_alerts(notifier)) == 2
+
+
+def test_the_accumulator_window_is_derived_from_the_job_not_hard_coded():
+    """`bad_window_s` is a multiple of the job's OWN threshold, so a job that
+    pages after a day is judged over two days and one that pages after an hour
+    over two hours. A constant here would mean "broken half the time" for one job
+    and "broken 1% of the time" for another."""
+    from dashboard.registry import load_registry
+    from tests.conftest import EXAMPLE_JOBS
+    for j in load_registry(EXAMPLE_JOBS):
+        assert bad_window_s(j) == BAD_WINDOW_MULTIPLE * j.alert_after_s
+        # It can never fire EARLIER than the continuous rule: accruing a whole
+        # threshold of not-OK time takes at least that long.
+        assert bad_window_s(j) >= j.alert_after_s
+
+
+# --------------------------------------------------------------------------- #
+# `db.not_ok_seconds` — the accumulator's only input
+#
+# Derived from `state_changes` rather than stored, for the reasons
+# `probe_fail_streak` is: nothing to migrate, nothing to keep in step, survives a
+# restart, and the ingest route cannot write that table, so accumulated badness
+# is not forgeable by a holder of INGEST_TOKEN.
+# --------------------------------------------------------------------------- #
+
+def _change(core, job_id, at, to_state, from_state="OK"):
+    conn = core.connect()
+    try:
+        with conn:
+            conn.execute("INSERT INTO state_changes (job_id, changed_at, "
+                         "from_state, to_state) VALUES (?,?,?,?)",
+                         (job_id, db.to_iso(at), from_state, to_state))
+    finally:
+        conn.close()
+
+
+def _bad_s(core, job_id, start, end, states=("FAIL",)):
+    conn = core.connect()
+    try:
+        return db.not_ok_seconds(conn, job_id, start, end, states)
+    finally:
+        conn.close()
+
+
+def test_not_ok_seconds_sums_only_the_named_states_inside_the_window(settings, notifier):
+    core = core_with(settings, notifier, {})
+    _change(core, "tree", NOW, "FAIL")                   # FAIL from NOW
+    _change(core, "tree", NOW + 600, "OK", "FAIL")       # ...to NOW+600
+    _change(core, "tree", NOW + 1200, "LATE")            # LATE from NOW+1200
+    _change(core, "tree", NOW + 1500, "OK", "LATE")      # ...to NOW+1500
+    _change(core, "tree", NOW + 1800, "FAIL")            # FAIL from NOW+1800, open
+    assert _bad_s(core, "tree", NOW, NOW + 2400) == 1200        # 600 + 600 open
+    assert _bad_s(core, "tree", NOW, NOW + 2400, ("LATE",)) == 300
+    assert _bad_s(core, "tree", NOW, NOW + 2400, ("FAIL", "LATE")) == 1500
+    # The window clips both ends rather than counting whole spans that overlap it.
+    assert _bad_s(core, "tree", NOW + 300, NOW + 2400) == 900
+    assert _bad_s(core, "tree", NOW + 1900, NOW + 2400) == 500
+    assert _bad_s(core, "tree", NOW + 700, NOW + 1000) == 0
+    # A degenerate window is zero, not a negative or a whole span.
+    assert _bad_s(core, "tree", NOW + 2400, NOW) == 0.0
+    # A job with no transition log at all accrues nothing — unaccounted time
+    # reads as OK, so the sum can only ever UNDER-estimate.
+    assert _bad_s(core, "snap", NOW, NOW + 2400) == 0.0
+
+
+def test_not_ok_seconds_cannot_be_inflated_by_a_clock_that_stepped_back(settings, notifier):
+    """`state_changes.changed_at` is the writer's wall clock, so an NTP step
+    backwards (or a box RTC ahead at boot — the step this code already heals for
+    `bad_since`) leaves rows out of order and one dated in the FUTURE. The walk
+    is by rowid, and a row whose stamp is not strictly older than the span being
+    closed is skipped: one poisoned row must not be able to invent hours of
+    badness and page for an outage that never happened.
+
+    **True of ONE step — and the second half of this test is why the docstring in
+    `db.not_ok_seconds` no longer claims more than that.** A clock that keeps
+    stepping (a sawtooth) has every backwards row dropped, so the surviving older
+    row's state claims the whole gap; when the dropped rows are the RECOVERIES,
+    nearly the entire window reads as bad. Deliberately not defended against: the
+    hard ceiling is `end - start`, which is exactly twice the bar, so the worst it
+    buys is a page one window early for a job that IS in that state right now —
+    the direction the governing rule asks for. Pinned so the SIZE of it is on
+    record rather than discovered."""
+    core = core_with(settings, notifier, {})
+    _change(core, "tree", NOW, "FAIL")
+    _change(core, "tree", NOW + 300, "OK", "FAIL")
+    _change(core, "tree", NOW + 50 * DAY, "FAIL", "OK")  # written while the clock was ahead
+    _change(core, "tree", NOW + 600, "OK", "FAIL")       # the clock is back
+    assert _bad_s(core, "tree", NOW, NOW + 1200) == 300  # the poisoned row adds nothing
+    # An unparseable stamp is skipped for the same reason (it cannot be a
+    # boundary), and cannot make the walk raise inside a recompute transaction.
+    conn = core.connect()
+    with conn:
+        conn.execute("INSERT INTO state_changes (job_id, changed_at, from_state, "
+                     "to_state) VALUES ('tree','not-a-timestamp','OK','FAIL')")
+    conn.close()
+    assert _bad_s(core, "tree", NOW, NOW + 1200) == 300
+    # The sawtooth. 12 h of a job alternating FAIL/OK every 5 min, so 6 h of it
+    # is really bad — written by a clock that is 5 min behind on every other row.
+    # WHICH rows are the late ones decides the direction, and both are here: the
+    # skewed row is the one that gets dropped as unusable, so skewing the FAILs
+    # drops the OK boundaries and the surviving FAIL spans swallow the gaps.
+    window = 12 * 3600
+    for job_id, skewed in (("snap", "FAIL"), ("containers", "OK")):
+        state, k = "OK", 0
+        while k * 300 < window:
+            state = "FAIL" if state == "OK" else "OK"
+            at = NOW + k * 300 - (300 if state == skewed else 0)
+            _change(core, job_id, at, state, "OK" if state == "FAIL" else "FAIL")
+            k += 1
+        got = _bad_s(core, job_id, NOW, NOW + window)
+        assert got <= window                   # the only hard bound there is
+        if skewed == "FAIL":
+            # The recoveries are dropped: 6 h of real badness reads as 11 h 55 m,
+            # i.e. the window itself is the only thing holding it down.
+            assert got == 42900.0
+        else:
+            assert got == 0.0                  # the other phase under-counts
+
+
+# --------------------------------------------------------------------------- #
+# ESCALATION: an episode that gets WORSE (issue #16)
+#
+# `_page` short-circuited on `alerted_at`, so an episode had exactly one page —
+# and for a capacity gauge that is inverted. Confirmed on `box-disk`: it paged
+# "BEHIND for over 1h" at priority=default, then free space fell to 1 GiB, then
+# `statvfs` failed outright (FAIL), and NOTHING further was sent — no push, and
+# no high-priority push ever, because the priority is read off the state and the
+# state that was paged was the mild one. BEHIND is the early warning; FAIL is the
+# event you actually wanted to hear about.
+#
+# So severity is an ORDER (not a change detector), read off
+# `notify.HIGH_PRIORITY_STATES` so it cannot drift from the priority the push
+# carries, and an episode may page once more when it crosses from the
+# default-priority rank to the high-priority one. Two ranks is also the bound:
+# there is nowhere above rank 2 to go, so a worsening cannot become a storm.
+# --------------------------------------------------------------------------- #
+
+DISK_A = 3600             # `box-disk` / `mac-disk`' real threshold: 1 hour
+UNREADABLE = {"status": "fail", "reason": "statvfs failed"}
+
+
+def test_severity_is_the_ntfy_priority_and_nothing_invented(settings, notifier):
+    """The ordering has exactly one source of truth. If someone adds a state to
+    `HIGH_PRIORITY_STATES` and not to some second table here, the escalation and
+    the `Priority` header would disagree — which IS the defect in #16, where the
+    push that mattered was never sent at any priority."""
+    from dashboard.notify import HIGH_PRIORITY_STATES
+    for state in ("FAIL", "STALE_DEST"):
+        assert state in HIGH_PRIORITY_STATES
+        assert alert_severity(state) == 2
+        assert notifier.priority_for(state) == "high"
+    for state in ("BEHIND", "LATE"):
+        assert alert_severity(state) == 1
+        assert notifier.priority_for(state) == "default"
+    for state in ("OK", "UNKNOWN", "", "nonsense"):
+        assert alert_severity(state) == 0    # never a page, and below every rank
+
+
+def test_a_gauge_that_worsens_after_paging_pages_again_at_high_priority(settings, notifier):
+    """The confirmed #16 sequence, end to end."""
+    core = core_with(settings, notifier, {"disk": {"alert_after_s": DISK_A}})
+    job = core.registry.get("disk")                      # min_free 25 GiB
+    t = NOW
+    while t <= NOW + DISK_A:
+        core.record_ping(job, _capacity(10), now=t)      # 97.5% used → BEHIND
+        t += 300
+    assert notifier.sent == [("[dashboard] Mac disk → BEHIND",
+                              "disk: BEHIND for over 1h", "default")]
+    assert row(core, "disk")["alerted_state"] == "BEHIND"
+    # It fills further. Still BEHIND: the same fact, and no new push — the
+    # escalation is an ORDER on states, not "something changed".
+    core.record_ping(job, _capacity(1), now=t)
+    assert len(notifier.sent) == 1
+    # ...and then the reading fails outright. FAIL outranks BEHIND, so this goes
+    # out, and at the priority FAIL has always carried.
+    core.record_ping(job, UNREADABLE, now=t + 60)
+    assert row(core, "disk")["state"] == "FAIL"
+    assert notifier.sent[-1] == ("[dashboard] Mac disk → FAIL",
+                                 "disk: BEHIND → FAIL", "high")
+    assert row(core, "disk")["alerted_state"] == "FAIL"
+    # ONCE. The board keeps saying FAIL for hours; the phone does not.
+    t += 120
+    while t < NOW + 6 * 3600:
+        core.recompute_all(now=t)
+        t += 60
+    assert len(notifier.sent) == 2
+    # And the recovery names what was last PAGED, which is now FAIL.
+    core.record_ping(job, _capacity(200), now=t)
+    core.recompute_all(now=t + dwell(core, "disk") + 60)
+    assert notifier.sent[-1][1] == "disk: FAIL → OK"
+
+
+def test_a_milder_state_after_a_severe_page_never_re_pages(settings, notifier):
+    """The order runs one way only. A gauge whose reading comes BACK (FAIL →
+    BEHIND: the disk is readable again and merely low) has got BETTER, and a
+    "better, but still bad" push is the noise this whole branch removes."""
+    core = core_with(settings, notifier, {"disk": {"alert_after_s": DISK_A}})
+    job = core.registry.get("disk")
+    core.record_ping(job, _capacity(200), now=NOW)       # a reading, then failure
+    core.record_ping(job, UNREADABLE, now=NOW + 60)
+    core.recompute_all(now=NOW + 60 + DISK_A)
+    assert notifier.sent == [("[dashboard] Mac disk → FAIL",
+                              "disk: FAIL for over 1h", "high")]
+    core.record_ping(job, _capacity(10), now=NOW + 60 + DISK_A + 300)
+    assert row(core, "disk")["state"] == "BEHIND"        # readable again, still low
+    core.recompute_all(now=NOW + 60 + DISK_A + 1200)
+    assert len(notifier.sent) == 1
+    assert row(core, "disk")["alerted_state"] == "FAIL"  # unchanged by a milder state
+
+
+def test_the_escalation_is_not_held_by_the_cooldown_but_does_stamp_it(settings, notifier):
+    """`cooldown_s(disk)` is 6 h against a 1 h threshold, so a cooldown-gated
+    escalation would mean "the disk is now unreadable" arriving up to six hours
+    late — which is the residual PR #11 wrote down and left. The cooldown exists
+    to stop the SAME fact repeating; a strictly worse state is a different fact.
+
+    It is bounded without a timer (one per paged episode, and a paged episode is
+    itself one per cooldown), and it still STAMPS `last_paged_at`, so the next
+    episode's first page is pushed out by a full cooldown from the escalation.
+    The rate limit moves; it is not lifted."""
+    core = core_with(settings, notifier, {"disk": {"alert_after_s": DISK_A}})
+    job = core.registry.get("disk")
+    core.record_ping(job, _capacity(10), now=NOW)
+    core.recompute_all(now=NOW + DISK_A)                 # BEHIND page
+    first = row(core, "disk")["last_paged_at"]
+    assert first == db.to_iso(NOW + DISK_A)
+    # Deep inside the cooldown, the gauge fails outright.
+    core.record_ping(job, UNREADABLE, now=NOW + DISK_A + 600)
+    assert len(notifier.sent) == 2                       # not held for six hours
+    assert row(core, "disk")["last_paged_at"] == db.to_iso(NOW + DISK_A + 600)
+    # ...and the NEXT episode is rate-limited from the escalation, not from the
+    # first page: it recovers, breaks again, and stays quiet inside the window.
+    t = NOW + DISK_A + 660
+    core.record_ping(job, _capacity(200), now=t)
+    core.recompute_all(now=t + dwell(core, "disk") + 60)
+    assert row(core, "disk")["bad_since"] is None
+    assert len(notifier.sent) == 3                       # + the recovery
+    t = NOW + DISK_A + 600 + COOLDOWN_FLOOR_S - 2 * 3600
+    while t < NOW + DISK_A + 600 + COOLDOWN_FLOOR_S - 300:
+        core.record_ping(job, _capacity(10), now=t)      # low again, for hours
+        t += 300
+    assert len(notifier.sent) == 3                       # still inside the cooldown
+    assert row(core, "disk")["alerted_at"] is None        # the page is UNSPENT
+    core.recompute_all(now=NOW + DISK_A + 600 + COOLDOWN_FLOOR_S + 60)
+    assert len(notifier.sent) == 4                        # delayed, never cancelled
+
+
+def test_an_escalation_that_does_not_land_is_retried_without_resending_the_first_page(
+        settings, notifier):
+    """The rollback has to put back the PAIR the escalation replaced, not NULL:
+    NULL means "this episode has never paged", so the next pass would send the
+    BEHIND page a second time as well. Restoring the pair leaves the escalation
+    still due — the worse state is still worse — so it is delayed, never
+    cancelled, like every other hold in this file."""
+    core = core_with(settings, notifier, {"disk": {"alert_after_s": DISK_A}})
+    job = core.registry.get("disk")
+    core.record_ping(job, _capacity(10), now=NOW)
+    core.recompute_all(now=NOW + DISK_A)
+    assert len(notifier.sent) == 1
+    paged_at = row(core, "disk")["alerted_at"]
+    notifier.fail = True                                 # ntfy unreachable
+    core.record_ping(job, UNREADABLE, now=NOW + DISK_A + 600)
+    assert len(notifier.attempts) == 2 and len(notifier.sent) == 1
+    # Handed back to the pair it replaced, not to NULL.
+    assert row(core, "disk")["alerted_at"] == paged_at
+    assert row(core, "disk")["alerted_state"] == "BEHIND"
+    assert row(core, "disk")["last_paged_at"] == paged_at
+    notifier.fail = False
+    core.recompute_all(now=NOW + DISK_A + 600 + RETRY_MIN)
+    assert titles(notifier) == ["[dashboard] Mac disk → BEHIND",
+                                "[dashboard] Mac disk → FAIL"]
+    assert notifier.sent[-1][2] == "high"
+    assert row(core, "disk")["alerted_state"] == "FAIL"
+
+
+def test_the_escalation_backoff_does_not_delay_it_behind_the_first_page(settings, notifier):
+    """The retry backoff is keyed on the episode AND the rank being paged. Keyed
+    on the episode alone, an escalation seconds after a successful first page
+    reads as a retry of it and waits out `ALERT_RETRY_MIN_S` — a five-minute
+    delay imposed by a mechanism that exists only to avoid hammering a dead
+    ntfy."""
+    core = core_with(settings, notifier, {"disk": {"alert_after_s": DISK_A}})
+    job = core.registry.get("disk")
+    core.record_ping(job, _capacity(10), now=NOW)
+    core.recompute_all(now=NOW + DISK_A)                 # page, POST attempted now
+    core.record_ping(job, UNREADABLE, now=NOW + DISK_A + 1)   # one second later
+    assert len(notifier.sent) == 2
+    assert notifier.sent[-1] == ("[dashboard] Mac disk → FAIL",
+                                 "disk: BEHIND → FAIL", "high")
+
+
+def test_an_oscillating_episode_cannot_defeat_the_retry_backoff(settings, notifier):
+    """The other half of the rank-keyed backoff — and the only test in this file
+    whose failure mode is the MACHINE rather than the phone.
+
+    The two ranks have to be held side by side (one entry per job, a timestamp
+    per rank). Folded into a single flat `dict[job_id, (key, when)]` they evict
+    each other, so a state that oscillates across the rank boundary makes every
+    pass read as a page that has never been tried, and the backoff stops
+    applying at all. Measured on exactly the input below — a gauge flipping
+    BEHIND ↔ FAIL every 60 s with ntfy 503-ing for an hour: **60** attempts with
+    one slot per job, against **12** for the same hour with a non-oscillating
+    episode. At 5 s per blocking `urllib` call that is five minutes an hour spent
+    inside the scheduler thread and the ingest request, 83% of the way back to
+    the ~72/hour `ALERT_RETRY_MIN_S` exists to prevent.
+
+    Not reachable at the shipped cadences — every feeder is ≥ 300 s, so nothing
+    flips this fast — which is why this guards the mechanism rather than
+    reproducing an incident. A looping `probes/ping.sh` or one faster
+    `probe.interval_s` is the whole distance to it."""
+    notifier.fail = True                                 # ntfy 503, every time
+    core = core_with(settings, notifier, {"disk": {"alert_after_s": DISK_A}})
+    job = core.registry.get("disk")
+    core.record_ping(job, _capacity(10), now=NOW)
+    core.recompute_all(now=NOW + DISK_A)                 # threshold crossed
+    assert len(notifier.attempts) == 1 and notifier.sent == []
+    t, low = NOW + DISK_A, False
+    while t < NOW + DISK_A + 3600:
+        t += 60
+        core.record_ping(job, _capacity(10) if low else UNREADABLE, now=t)
+        low = not low
+    # Two ranks, each allowed one attempt per RETRY_MIN. Derived, not a literal:
+    # the number that matters is that it is nowhere near 60. (Measured: 20 — the
+    # two ranks' 300 s cycles interleave rather than lining up.)
+    assert len(notifier.attempts) - 1 <= 2 * (3600 // RETRY_MIN)
+    # ...and the page is only DELAYED. It is still unspent, and it goes out as
+    # soon as ntfy answers — a backoff that dropped it would be a silence.
+    assert row(core, "disk")["alerted_at"] is None
+    notifier.fail = False
+    core.recompute_all(now=t + RETRY_MIN)
+    assert len(notifier.sent) == 1
+
+
+def test_the_worst_case_push_rate_per_cooldown_window(settings, notifier):
+    """The arithmetic `cooldown_s`'s docstring quotes, asserted instead of
+    argued. The pathological job for the escalation is one that crosses its
+    threshold, gets strictly worse, then genuinely recovers — over and over, for
+    ever. Per cooldown window that is page + escalation + recovery = THREE
+    pushes, 12/day at the 6 h floor.
+
+    That is the honest cost of both halves of this change, and it is still a
+    third of the storm this branch removed (~55 pushes in 5 days from one job,
+    for nothing at all) — and unlike that storm it takes a job that is genuinely
+    broken, genuinely getting worse, every six hours."""
+    core = core_with(settings, notifier, {"disk": {"alert_after_s": DISK_A}})
+    job = core.registry.get("disk")
+    t = NOW
+    while t < NOW + DAY:
+        stop = t + DISK_A + 600                          # low: crosses its hour
+        while t < stop:
+            core.record_ping(job, _capacity(10), now=t)
+            t += 300
+        core.record_ping(job, UNREADABLE, now=t)         # ...then unreadable
+        t += 300
+        stop = t + dwell(core, "disk") + 600             # ...then genuinely fine
+        while t < stop:
+            core.record_ping(job, _capacity(200), now=t)
+            t += 300
+    windows = DAY // COOLDOWN_FLOOR_S
+    assert len(_alerts(notifier)) <= 2 * windows          # page + escalation
+    assert len(_recoveries(notifier)) <= windows
+    assert len(notifier.sent) <= 3 * windows
+    # ...and not vacuous: the escalation really is reaching the phone, at the
+    # priority that was missing entirely before this change.
+    assert any(s[1] == "disk: BEHIND → FAIL" and s[2] == "high"
+               for s in notifier.sent)
+
+
+def test_the_fleet_wide_push_ceiling_is_the_sum_over_the_alerting_jobs():
+    """The number above is PER JOB, and the incident this feature removed was
+    ~11 pushes/day from a single job — so the figure that matters on the phone
+    is the fleet's, not one job's. It is not a simulation: the per-job ceiling is
+    3 pushes per cooldown window (page + escalation + recovery), so the fleet's
+    is that summed over every job that can page.
+
+    Asserted over the shipped file, with the shape of the sum pinned too, so that
+    adding a job with a fast threshold changes this number here rather than only
+    in production."""
+    from dashboard.registry import load_registry
+    from tests.conftest import EXAMPLE_JOBS
+    reg = load_registry(EXAMPLE_JOBS)
+    alerting = [j for j in reg if not j.alert_never]
+    per_job = {j.id: 3 * DAY / cooldown_s(j) for j in alerting}
+    assert len(alerting) == 9
+    assert sum(per_job.values()) == 70.0
+    # The floor is what dominates it: the five jobs whose threshold is under 6 h
+    # each contribute the full 12/day (60), and the four day-or-longer ones
+    # contribute 10 between them (3 + 3 + 3 + 1).
+    at_floor = {i for i, n in per_job.items() if n == 12}
+    assert at_floor == {"box-containers", "box-disk", "dashboard-probes",
+                        "mac-disk", "pa-backup"}
+    assert sum(n for i, n in per_job.items() if i not in at_floor) == 10.0
+
+
+def test_the_recovery_names_the_state_that_was_paged_not_the_latest_one(settings, notifier):
+    """From the same audit. `about` reads the LATEST non-OK state, so an episode
+    paged as "BEHIND for over 1h" that later touched a different state recovered
+    as "<that state> → OK" — a resolution for an alert that was never sent,
+    which on a phone reads as a page you missed. `alerted_state` is the half that
+    matches what was actually sent.
+
+    Uses two states of the SAME rank, so the escalation is not involved: the bug
+    is about naming, and it has to be fixed for the no-escalation case too."""
+    core = core_with(settings, notifier, {"mirror": {"alert_after_s": 3600}})
+    job = core.registry.get("mirror")                    # cadence 3600 + grace 600
+    core.record_ping(job, {"status": "ok"}, now=NOW)
+    core.recompute_all(now=NOW + 4300)                   # silence → LATE
+    core.recompute_all(now=NOW + 4300 + 3600)            # ...pages about LATE
+    assert titles(notifier) == ["[dashboard] Drive mirror → LATE"]
+    assert row(core, "mirror")["alerted_state"] == "LATE"
+    # It comes back, but with pending uploads: BEHIND, same rank, no new page.
+    core.record_ping(job, {"status": "ok", "metrics": {"pending": 4}},
+                     now=NOW + 8000)
+    assert row(core, "mirror")["state"] == "BEHIND"
+    assert len(notifier.sent) == 1
+    # ...then really recovers. The recovery is about the LATE we paged for.
+    core.record_ping(job, {"status": "ok", "metrics": {"pending": 0, "mismatch": 0}},
+                     now=NOW + 8300)
+    core.recompute_all(now=NOW + 8300 + dwell(core, "mirror"))
+    assert notifier.sent[-1] == ("[dashboard] Drive mirror → OK",
+                                 "mirror: LATE → OK", "default")
+
+
+def test_an_episode_paged_before_alerted_state_existed_is_recorded_not_re_paged(
+        settings, notifier):
+    """The upgrade shape: an episode that is open AND paged when the column is
+    added, so `alerted_at` is set and `alerted_state` is NULL. Ranked as 0 it
+    would read as "worse than nothing" and duplicate the page that already went
+    out; ranked at the top it would swallow a real escalation. It is recorded
+    instead — from what the episode is about on the next pass — and then behaves
+    like any other episode."""
+    core = core_with(settings, notifier, {"disk": {"alert_after_s": DISK_A}})
+    job = core.registry.get("disk")
+    core.record_ping(job, _capacity(10), now=NOW)
+    core.recompute_all(now=NOW + DISK_A)
+    assert len(notifier.sent) == 1
+    conn = core.connect()
+    with conn:                                           # the pre-upgrade row
+        conn.execute("UPDATE jobs SET alerted_state=NULL WHERE id='disk'")
+    conn.close()
+    core.recompute_all(now=NOW + DISK_A + 60)
+    assert len(notifier.sent) == 1                        # no duplicate page
+    assert row(core, "disk")["alerted_state"] == "BEHIND"  # recorded from `about`
+    # ...and a genuine escalation still works afterwards.
+    core.record_ping(job, UNREADABLE, now=NOW + DISK_A + 300)
+    assert notifier.sent[-1] == ("[dashboard] Mac disk → FAIL",
+                                 "disk: BEHIND → FAIL", "high")
+
+
+def test_a_job_that_never_pages_never_escalates_either(settings, notifier):
+    """`alert: never` is checked before everything, escalation included — it
+    cannot page, so it can have nothing to escalate from."""
+    core = core_with(settings, notifier, {})             # every job opted out
+    job = core.registry.get("disk")
+    core.record_ping(job, _capacity(10), now=NOW)
+    core.recompute_all(now=NOW + DISK_A)
+    core.record_ping(job, UNREADABLE, now=NOW + DISK_A + 300)
+    core.recompute_all(now=NOW + 2 * DISK_A)
+    assert notifier.sent == []
+    assert row(core, "disk")["alerted_state"] is None
+
+
+# --------------------------------------------------------------------------- #
+# `Episode.damped_failure` — direct coverage
+#
+# It had NONE (zero occurrences under tests/): every damping test reached it
+# through a 1-cycle good run, which the hold survives, so they passed either way.
+# It is the flag that makes `dashboard-probes`' own `ok` heartbeat untrustworthy
+# while a probed destination is failing, and it is the one hold that applies to
+# EVERY state rather than only the destination-driven ones.
+# --------------------------------------------------------------------------- #
+
+def _episodes(core, now):
+    """The `Episode` list `_recompute_pass` builds, without dispatching."""
+    conn = core.connect()
+    captured = {}
+    original = Core._resolve_alerts
+
+    def spy(self, conn, episodes, states, transitions, now):
+        captured["episodes"] = episodes
+        return original(self, conn, episodes, states, transitions, now)
+
+    try:
+        Core._resolve_alerts = spy
+        with conn:
+            core._recompute_pass(conn, now)
+    finally:
+        Core._resolve_alerts = original
+        conn.close()
+    return {ep.job.id: ep for ep in captured["episodes"]}
+
+
+def test_damped_failure_is_set_only_for_the_self_job_and_only_while_a_probe_fails(
+        settings, notifier):
+    """Three things at once, because the flag is a conjunction: it is about the
+    SELF job (nothing else writes its own heartbeat), it needs the newest probe
+    row of some probed job to be a FAILURE, and it only means anything while the
+    self-job reads OK (a FAIL needs no help to hold its episode open)."""
+    core = core_with(settings, notifier, {"dashboard-probes": {"alert_after_s": PROBE_A}})
+    probe_job = core.registry.get("dashboard-probes")
+    core.record_ping(probe_job, {"status": "ok"}, now=NOW)
+    core.record_ping(core.registry.get("snap"), {"status": "ok"}, now=NOW)
+    _probe(core, "snap", NOW, ok=True, newest_iso=db.to_iso(NOW), count=1)
+    eps = _episodes(core, NOW + 60)
+    assert eps["dashboard-probes"].state == "OK"
+    assert eps["dashboard-probes"].damped_failure is False
+    # The destination starts failing. The damping keeps the self-job's own run
+    # `ok` (streak 1 of 2), so its STATE is OK — and that OK is not evidence.
+    _probe(core, "snap", NOW + 300, ok=False, error="rclone exit 7: rateLimitExceeded")
+    core.record_ping(probe_job, {"status": "ok"}, now=NOW + 300)
+    eps = _episodes(core, NOW + 360)
+    assert eps["dashboard-probes"].state == "OK"
+    assert eps["dashboard-probes"].damped_failure is True
+    # ...and it is the SELF job's flag alone. `snap` is probed and failing, and
+    # its own OK is judged by `dest_unverified`, which is a different question.
+    assert eps["snap"].damped_failure is False
+    # One good listing clears it: recovery is immediate, by design (PR #8).
+    _probe(core, "snap", NOW + 600, ok=True, newest_iso=db.to_iso(NOW + 600), count=1)
+    core.record_ping(probe_job, {"status": "ok"}, now=NOW + 600)
+    assert _episodes(core, NOW + 660)["dashboard-probes"].damped_failure is False
+
+
+def test_a_damped_failure_holds_an_episode_about_any_state(settings, notifier):
+    """The two holds differ, and this is the difference. `dest_unverified` holds
+    only a `STALE_DEST`/`BEHIND` episode — those were statements about the
+    destination, and a returning heartbeat settles LATE/FAIL on its own.
+    `damped_failure` holds whatever the episode was about, because the heartbeat
+    itself is what is suppressing the fact: it cannot settle it."""
+    from dashboard.services import Episode
+    job = parse_registry(JOBS_DOC).get("dashboard-probes")
+    for about in ("LATE", "FAIL", "STALE_DEST", "BEHIND"):
+        damped = Episode(job, about, "OK", {}, damped_failure=True)
+        assert Core._holding(damped, about) is True
+        unverified = Episode(job, about, "OK", {}, dest_unverified=True)
+        assert Core._holding(unverified, about) is (about in ("STALE_DEST", "BEHIND"))
+    plain = Episode(job, "FAIL", "OK", {})
+    assert Core._holding(plain, "FAIL") is False

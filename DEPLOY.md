@@ -368,12 +368,18 @@ Expect nine `"source": "alert_after_s"`, four `"source": "alert"` with `"never":
 `"source": "default"` and no `"source": "informational"` at all — a `default` means that job was missed, and
 an `informational` means an `alert: never` line went missing and the job is only silent by accident.
 `mac-probe` must read `{"after_s": 259200, "never": false}`; `never: true` there silences the whole Mac.
-Each `alert` block also carries `cooldown_s` and `last_paged_at` (the per-job page rate limit).
+Each `alert` block also carries `cooldown_s` and `last_paged_at` (the per-job page rate limit) and
+`alerted_state` — what the episode's page actually said, which is not always the state on the card — and
+`window_s`, the window the accumulator adds not-OK time up over (`2 x alert_after_s`).
 
-The `bad_since` / `alerted_at` / `last_paged_at` columns are added to the existing SQLite by `init_schema` at
-start-up — additive `ALTER TABLE`, no data loss, NULL for every row. A job that is already broken at upgrade
-time therefore starts a **fresh** episode and pages one threshold later: late, never silent. A NULL
-`last_paged_at` reads as "has never paged", so no job starts life inside a cooldown it did not earn.
+The `bad_since` / `alerted_at` / `alerted_state` / `last_paged_at` columns are added to the existing SQLite by
+`init_schema` at start-up — additive `ALTER TABLE`, no data loss, NULL for every row. A job that is already
+broken at upgrade time therefore starts a **fresh** episode and pages one threshold later: late, never silent.
+A NULL `last_paged_at` reads as "has never paged", so no job starts life inside a cooldown it did not earn. The
+one row shape that could confuse the newest column — an episode that is open AND already paged when
+`alerted_state` arrives — is healed on the first recompute after the deploy (`docker logs hopper-dashboard |
+grep 'recording .* as the paged state'`), with no extra push. An index (`sc_job_seq`) is created on
+`state_changes` at the same time; on this box's row counts that is instant.
 
 ## 2. Box — heartbeats (systemd drop-ins + container timer)
 
@@ -564,11 +570,12 @@ until then. Right after the first successful `/offload-recordings` run, seed one
 **Phone alerts (Graham's manual step):** install the **ntfy** app (iOS/Android), tap *Subscribe to topic*,
 enter the `NTFY_TOPIC` value from the box `.env` (server `https://ntfy.sh`). The topic name is the only
 secret — anyone who knows it can read alerts, so don't paste it anywhere else. Alerts carry only
-`job_id: STATE for over <duration>` (no free text). Test from the box:
+`job_id: STATE for over <duration>` (plus `… in the last <window>` when the accumulator decided it, or
+`job_id: FROM → TO` for an escalation or a recovery) — never free text. Test from the box:
 `curl -d "dashboard test" https://ntfy.sh/$(grep '^NTFY_TOPIC=' ~/hopper-dashboard/.env | cut -d= -f2-)`.
 
-**A push means a SUSTAINED problem, not a blip.** A job pages once, after it has been continuously not-OK
-for its own `alert_after_s` (§1d; per-job rationale in `jobs.example.yml`, model in DESIGN.md "Alerting
+**A push means a SUSTAINED problem, not a blip.** A job pages once, after it has been not-OK for its own
+`alert_after_s` (§1d; per-job rationale in `jobs.example.yml`, model in DESIGN.md "Alerting
 rules"), and sends a `→ OK` only if that page actually went out. So the board and `/api/v1/status` will
 regularly show a `LATE` or `FAIL` the phone never heard about — that is the design, not a bug. Two
 consequences when reading the board:
@@ -576,6 +583,21 @@ consequences when reading the board:
   API to see whether an episode is running and whether it has been paged;
 - a job can read `OK` with its episode still open (it has not held OK long enough to be believed, or the
   evidence for the OK is missing). The card says so.
+
+**Two push shapes to recognise, both added after the first release:**
+- `dashboard-probes: FAIL for over 6h in the last 12h` — the "in the last …" clause means the job was not
+  broken for six unbroken hours but for six of the last twelve. A destination that fails for an hour and then
+  lists successfully once used to reset its clock for ever and page **never**; a job can now reach its bar
+  cumulatively (DESIGN.md "the accumulator"). Same threshold, same cooldown; only the way the bar is reached
+  is new, and the body always says which rule spoke.
+- `box-disk: BEHIND → FAIL` at **high** priority, after a `BEHIND for over 1h` at default — an *escalation*.
+  An episode that already paged may page once more if it gets strictly worse, at the worse state's own
+  priority. This is why a gauge that pages "low on space" and then fills up is no longer silent. At most one
+  escalation per episode; the job page's *Alerts* line shows what was last paged about.
+
+The phone therefore sees up to three pushes per cooldown window for one job (page + escalation + recovery)
+rather than two. Reaching that takes a job that crosses its threshold, gets worse, and genuinely recovers,
+every six hours.
 
 **Overnight sleep is not an incident — but a Mac that stays gone is.** The hourly Mac jobs carry a 14 h
 grace, and while `mac-probe` is LATE the dashboard suppresses the LATE alerts of the other Mac jobs (states
@@ -647,6 +669,11 @@ script, but that is per-repo work).
       `2 × cadence` = 600 s — TWO of the 5-minute `docker ps` posts, because one OK sample cannot tell a
       recovery from the up-phase of a crash loop. So stop → start → stop inside that window is deliberately
       ONE outage.
+      **Do not repeat this test several times in quick succession and read a push as a bug.** Unpaged not-OK
+      time now accumulates inside `2 × alert_after_s` (40 min for this job), so three drills in half an hour
+      total more than the 20 min threshold between them and DO page — correctly: a container that is down
+      eleven minutes out of every twenty is broken, and that is the silence the accumulator closes. Wait out
+      the window between drills, or read `state_changes` instead of the phone.
 - [ ] Cooldown test (the other half): after a page for `box-containers`, break it again → the board shows the
       new episode with `alert.bad_since` counting and `alert.alerted_at` **null**, and **no push** until
       `alert.last_paged_at + alert.cooldown_s` (6 h). Leave it broken across that moment and it DOES page —
@@ -691,9 +718,11 @@ several. (That is also why they are timestamped to the second now: `$(date +%F)`
 same day overwrote the pre-edit backup with the edited file, destroying the only copy of the state this
 procedure depends on.)
 
-**The database needs nothing.** `bad_since`, `alerted_at` and `last_paged_at` are additive columns; an older
-image simply never reads them, and leaving them in place is harmless — there is no down-migration to run and
-nothing to drop. Rolling forward again finds them already there.
+**The database needs nothing.** `bad_since`, `alerted_at`, `alerted_state` and `last_paged_at` are additive
+columns (and `sc_job_seq` an additive index); an older image simply never reads them, and leaving them in
+place is harmless — there is no down-migration to run and nothing to drop. Rolling forward again finds them
+already there. Rolling BACK loses the escalation and the accumulator, so an intermittently-failing destination
+goes quiet again: that is the bug the roll-forward fixed, not a new one.
 
 ### Full teardown
 
@@ -761,6 +790,9 @@ restore data; the dashboard's own SQLite is derived state that repopulates withi
 | A job flaps just under its threshold for ever (`box-containers` on `restart: unless-stopped` backoff) | One page per EPISODE says nothing about how often an episode may RESTART: measured 132 pushes/day at 19-min-down / 20-min-up, and 48/day on a 30-min crash-loop cycle. The alert storm this feature removed, relocated | Fixed twice over: the OK dwell is now at least two of the job's OWN samples (600 s for `box-containers`, sampled every 300 s) so a single OK sample cannot close an episode; and a per-job cooldown holds the next PAGE for `max(alert_after_s, 6 h)`. Measured after: 47 episodes/day → 4 pages + 4 recoveries. `alert.cooldown_s` / `alert.last_paged_at` on `/api/v1/status`; `docker logs hopper-dashboard \| grep 'held back'` |
 | The per-job cooldown swallows a page instead of delaying it | Would be the worst failure this feature could have: a rate limit that silently becomes silence, on the one job whose outage IS the outage | Can't happen by construction: a held-back page stamps NOTHING, so the episode keeps its unspent page and the hard ceiling re-offers it on every pass — the moment the cooldown expires, a job still (or again) past its threshold pages. Has its own test and its own mutation. The cooldown also only ever BINDS on a job whose threshold is under 6 h (`box-containers`, `box-disk`, `mac-disk`); above that a new episode already takes longer than the cooldown to reach its own threshold |
 | A failed ntfy POST leaves a cooldown behind | The episode gets its page back (the existing rollback) and then cannot spend it for six hours, because a POST that never reached anyone still looked like a page to the rate limiter. One unlucky 429 = a whole cooldown of silence | Fixed: the rollback returns `last_paged_at` alongside `alerted_at` — both halves or neither. `docker logs hopper-dashboard \| grep 'did not land'` |
+| A destination that fails MOST of the time but lists successfully now and then (Drive `rateLimitExceeded`, which is intermittent by nature) | Every good listing ended the episode and restarted the 6 h clock, so the phone heard **nothing at all**: measured over 24 h, 60 min down / 15 min up failed 73% of probes and pushed **0**; 300 min down / 30 min up failed 90% and pushed **0**. The damping had a cumulative backstop (`PROBE_NO_SUCCESS_S`); the episode had none. This is the failure that took out the nightly backup on 2026-09-10 | Fixed: an episode is also past its bar after `alert_after_s` spent in that state within `2 x alert_after_s`. Those three patterns now push 3 alerts + 3 recoveries a day, capped by the same cooldown. The body says which rule spoke — `… FAIL for over 6h in the last 12h`. If one of these ever goes quiet again, check `alert.bad_since` + `state_changes` on the job page: the accumulator reads the transition log, so a job with no recorded transitions accrues nothing |
+| A gauge pages while merely lowish and then genuinely fills up (`box-disk`: BEHIND at 40 GiB free, then 1 GiB, then `statvfs` fails) | One page per episode meant the escalation was swallowed — and with it the HIGH priority, since priority is read off the state and the state that paged was the mild one. Confirmed: 1 push, `priority=default`, and no high-priority push ever. For a capacity gauge that is inverted: BEHIND is the early warning, FAIL is the event | Fixed: an episode that gets strictly worse pages once more, at the worse state's priority (`box-disk: BEHIND → FAIL`, high). It is not held by the cooldown but does stamp it. At most one escalation per episode. `alert.alerted_state` on `/api/v1/status` says what the phone was actually told |
+| A recovery names a state that was never paged (`… FAIL → OK` for an episode paged as BEHIND) | The recovery read the LATEST non-OK state while the alert named the state the episode started in, so the resolution looked like the tail of a page nobody received | Fixed: the recovery names `alerted_state`, i.e. exactly what was sent |
 | `jobs.last_paged_at` in the FUTURE (clock step) or unparseable (hand-edited row) | `now - last_paged_at` is permanently negative, i.e. a cooldown that never expires — a job that can never page again. The same trap as a poisoned `bad_since`, on the column this release adds | Fixed the same way: an unusable stamp is refused AND healed to NULL. `docker logs hopper-dashboard \| grep 'healing unusable last_paged_at'` |
 | A machine's probe job is inside its OWN cooldown when the machine dies | The machine-offline rule mutes every sibling on the premise that the probe sends one alert for the machine — but the probe's page is being held back, so nothing pages at all for the length of the cooldown. The static `alert: never` guard does not catch this, because the policy is fine; only the moment is wrong | Fixed: suppression may only borrow an alert that EXISTS, checked both statically (`alert_never`) and for the moment (the probe's cooldown). Siblings page instead — several alerts for one fact, which is the tell. Unreachable on the shipped file (`mac-probe` is 72 h, above the 6 h floor, so its cooldown can never bind) and reachable the moment anyone shortens that threshold |
 | `alert_after_s` read as "the time until my phone knows" | It is not: the threshold clock starts when the job goes NOT-OK, which is already cadence+grace after the last good run. `pa-backup` shipped `108000` commented "30 h" and paged at **68 h** | Fixed in `jobs.example.yml`: every alerting job carries a `# TIME-TO-PAGE:` line with the end-to-end figure, and `test_every_alerting_job_states_its_real_time_to_page` recomputes all nine from that same file, so a comment cannot drift again |
