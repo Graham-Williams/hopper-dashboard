@@ -32,5 +32,19 @@ curl -X POST -H 'Authorization: Bearer devtoken' -d result=success http://127.0.
   nightly backup outcome, split into never-uploaded vs edited-since). If the Mac is asleep you get one
   "Mac offline" alert, not one per Mac job.
 
+## The Inbox (`/inbox`)
+A voice-first work queue on the same app: record a note on your phone and it lands in one table alongside
+every open GitHub issue across your repos and your plain-text backlog file. Filed items stay, with their
+issue links and live open/closed state.
+
+**Audio never leaves your own machines.** The browser uploads the recording to the box and does nothing else
+with it — there is deliberately no in-browser speech recognition, because the Web Speech API sends your
+microphone to a third party's servers to do the work. Transcription runs locally instead, on a Mac, via
+`probes/inbox_transcribe.py` and mlx-whisper. It is a job on the board like any other, so a transcription
+worker that stopped running shows up rather than being noticed weeks later.
+
+Because this turns the app into a store of original data, it also ships its own off-box backup
+(`deploy/box/backup.sh`) — until then there was nothing here that the next heartbeat could not reproduce.
+
 See `DESIGN.md` for the design and API contract, `CLAUDE.md` for how to run and test, `DEPLOY.md` for the box
 recipe. Jobs are declared in `jobs.yml` (gitignored; start from `jobs.example.yml`).
