@@ -489,8 +489,14 @@ there is no default URL in the code, by design.
   this repo exists to catch). Snapshots `dashboard.db` AND `inbox.db` from INSIDE the container via
   `docker exec` (WAL sidecars are uid 10001; a host-side online backup fails "attempt to write a readonly
   database"), sha256-dedupes, keeps a local ring + a `daily/` tier, and pushes with **`rclone copy`, never
-  `sync`**. The audio tree gets its own two-hop additive copy so the Inbox's 90-day prune cannot propagate
-  off-box. `deploy/box/verify_snapshot.py` holds the all-empty-snapshot guard (rc 3) so it is testable in
+  `sync`** for the two DBs. The audio tree is the deliberate EXCEPTION: it MIRRORS deletions (copy, then an
+  explicit logged delete pass for remote extras) so that Delete and the unconditional privacy ceiling
+  actually reach the off-box copy — Graham's call 2026-09-19, because DESIGN.md sells Delete as the way to
+  retract a recording that caught something private, and an additive backup silently broke that promise.
+  Guarded against mirroring a wipe: a missing audio dir skips, a >50% file-count drop since the last clean
+  mirror refuses and fails loudly, and an empty tree against a non-empty Drive refuses
+  (`AUDIO_ALLOW_MASS_DELETE=1` overrides). Only a clean mirror advances the stored count.
+  `deploy/box/verify_snapshot.py` holds the all-empty-snapshot guard (rc 3) so it is testable in
   Python rather than only in bash.
 - Manual jobs: `probes/ping.sh <job_id> <ok|fail|skipped> [note]`. `minecraft-offload` needs one seed ping
   after the first offload or its `max_age_s` stays inert (card says "Never run").

@@ -115,7 +115,9 @@ def test_backup_sh_snapshots_inside_the_container_and_never_syncs():
     """The two facts that make this script correct rather than merely present."""
     body = _read("backup.sh")
     assert "docker exec" in body and ".backup(d)" in body
-    # rclone sync would let a local prune bug — or a wiped volume — delete the off-box copy.
+    # rclone sync would let a local prune bug — or a wiped volume — delete the off-box copy
+    # in ONE blunt command, with the DB ring sitting next to it. The audio tree does mirror
+    # deletions (see the guard tests below), but via an explicit, logged, guarded delete pass.
     assert "rclone sync" not in body
     assert "rclone copy" in body
     # Both DBs and the audio tree.
@@ -252,3 +254,69 @@ def test_the_mac_uninstaller_knows_about_both_agents():
     assert "com.hopper.dashboard-probe" in uninstall
     assert "com.hopper.inbox-transcribe" in uninstall
     assert "--inbox-only" in uninstall
+
+
+# --- the audio mirror deletes, so its guards are load-bearing ----------------------
+#
+# The two DBs are additive: nothing this script does can remove an off-box copy of a
+# transcript. The AUDIO tree is the deliberate exception — Graham asked for Delete and the
+# privacy ceiling to actually reach Drive, so this is the one place the backup can destroy
+# data. These tests pin the guards that stand between "mirror a deletion" and "mirror a wipe".
+#
+# NOTE: these are static assertions on the script text, in the style of the test above. The
+# guards were additionally driven end-to-end against fake docker/rclone binaries during
+# development (normal run, single deletion, mass-delete refusal, missing dir, override), but
+# that harness is not checked in — see the follow-up issue.
+
+
+def test_the_audio_mirror_can_delete_but_only_through_the_guarded_path():
+    body = _read("backup.sh")
+    # Deletion of remote extras happens in exactly one function...
+    assert "delete_remote_extras()" in body
+    # ...and that function is only ever reached from the audio push, never from the DB path.
+    audio = body[body.index("push_audio()"):]
+    assert "delete_remote_extras" in audio
+    before_audio = body[:body.index("push_audio()")]
+    assert "delete_remote_extras " not in before_audio
+
+
+def test_a_mass_deletion_is_refused_rather_than_mirrored():
+    body = _read("backup.sh")
+    # A proportional drop guard, expressed as a percentage that is itself validated.
+    assert "AUDIO_MAX_DROP_PCT" in body
+    assert 'require_positive_int AUDIO_MAX_DROP_PCT' in body
+    # The comparison must be integer arithmetic against the PREVIOUS count, and must only
+    # apply once a previous count exists (a first run has nothing to compare against).
+    assert "prev > 0 && count * 100 < prev * (100 - AUDIO_MAX_DROP_PCT)" in body
+    # Refusing must leave the off-box copies alone and say so.
+    assert "REFUSING to mirror" in body
+
+
+def test_an_empty_local_tree_never_wipes_a_populated_drive():
+    """The degenerate case: a lost volume must not read as 'Graham deleted everything'."""
+    body = _read("backup.sh")
+    assert "REFUSING to delete them all" in body
+
+
+def test_a_deliberate_purge_has_exactly_one_override_and_it_is_off_by_default():
+    body = _read("backup.sh")
+    assert 'AUDIO_ALLOW_MASS_DELETE="${AUDIO_ALLOW_MASS_DELETE:-0}"' in body
+    # Both refusal sites must honour the same override, or one of them is unescapable.
+    assert body.count('"${AUDIO_ALLOW_MASS_DELETE}" != "1"') == 2
+
+
+def test_only_a_clean_mirror_advances_the_stored_count():
+    """The subtle one. If a run that REFUSED (or half-failed) still recorded the new, lower
+    count, the drop guard would compare the next run against a number Drive never reflected —
+    so the second run would see no drop and happily mirror the wipe the first one prevented.
+    The remembered count must therefore move only on a fully clean mirror."""
+    body = _read("backup.sh")
+    audio = body[body.index("push_audio()"):body.index("delete_remote_extras()")]
+    assert 'count_file="${STATE_DIR}/last_audio_count"' in audio
+    # The write must be guarded by rc == 0, and the guard must open before the write.
+    assert "if (( rc == 0 )); then" in audio
+    assert audio.index("if (( rc == 0 )); then") < audio.index('> "${count_file}"')
+    # A refusal returns before ever reaching the write.
+    assert audio.index("REFUSING to mirror") < audio.index("if (( rc == 0 )); then")
+    # And a failed deletion pass must set rc, not be swallowed.
+    assert "delete_remote_extras" in audio and "|| rc=1" in audio
