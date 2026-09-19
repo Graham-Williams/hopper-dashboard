@@ -61,7 +61,9 @@ from probes.common import (  # noqa: E402
     api_json,
     api_request,
     build_ping,
+    flatten_for_log,
     load_config,
+    minimal_env,
     now_iso,
     require_dashboard_url,
     run_cmd,
@@ -71,6 +73,19 @@ from probes.common import (  # noqa: E402
 
 #: Item ids are uuid4 hex and go straight into a URL path. Validated before interpolation.
 ITEM_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+#: The server's own ceiling (``dashboard.inbox_db.MAX_TEXT``). A transcript longer than this
+#: is REJECTED, not truncated, server-side — and a rejection on the success path used to abort
+#: the whole run at this item for ever, because the queue is oldest-first. Truncating here
+#: makes an hour-long recording a lossy transcript instead of a wedged queue. Keep in step
+#: with the server; a mismatch only costs a few characters.
+MAX_TEXT = 20000
+
+#: A 401/403 is never one item's problem: the token is wrong, revoked, or pointed at the
+#: wrong host, and every remaining item would fail the same way — burning all their attempts
+#: and marking Graham's voice notes permanently failed. Matched on the message ``api_request``
+#: raises ("… rejected: HTTP 401 …"), which never contains the token itself.
+AUTH_FAILURE_RE = re.compile(r"HTTP (?:401|403)\b")
 
 #: mime → suffix for the temp file. ffmpeg sniffs the content, but a correct extension keeps
 #: the failure mode honest and makes a stray temp file identifiable.
@@ -275,10 +290,18 @@ def transcribe_file(cfg: Dict[str, str], path: str) -> Tuple[Dict[str, object], 
     argv = [cfg["INBOX_WHISPER_PYTHON"], "-c", WHISPER_SCRIPT,
             path, cfg["INBOX_WHISPER_MODEL"], SENTINEL]
     t0 = time.time()
+    # An ALLOWLISTED environment, not this process's. `load_config` overlays INBOX_* from the
+    # real environment for one-off runs, so INBOX_TOKEN can be in os.environ — and this child
+    # is an interpreter from another repo's venv. It needs PATH (ffmpeg), HOME (the
+    # HuggingFace model cache) and TMPDIR; it needs no credential of ours.
     rc, out, err = run_cmd(argv, timeout=float(_int(cfg, "INBOX_TRANSCRIBE_TIMEOUT",
-                                                    DEFAULT_TIMEOUT_S)))
+                                                    DEFAULT_TIMEOUT_S)),
+                           env=minimal_env())
     took = round(time.time() - t0, 2)
-    tail = (err or "").strip()[-400:]
+    # Flattened, not raw: whisper's stderr is untrusted child output going into a timestamped
+    # log file, where an embedded newline forges a log line and an ESC sequence runs in
+    # whoever's terminal is tailing it. Same rule as the server side (commit 54209c3).
+    tail = flatten_for_log(err, 400)
     if rc == -2:
         raise EnvironmentFault("could not execute INBOX_WHISPER_PYTHON %r: %s"
                                % (cfg["INBOX_WHISPER_PYTHON"], tail))
@@ -303,13 +326,48 @@ def suffix_for(mime: object) -> str:
     return AUDIO_SUFFIXES.get(str(mime or "").split(";")[0].strip().lower(), DEFAULT_SUFFIX)
 
 
+def is_auth_failure(err: object) -> bool:
+    """True for the one class of API error that is the RUN's problem, not the item's."""
+    return bool(AUTH_FAILURE_RE.search(str(err)))
+
+
+def report_failure(cfg: Dict[str, str], item_id: str, error: object, log: Logger) -> str:
+    """Record this item's failure server-side, burning one of its three attempts.
+
+    Always returns 'failed'. If even the failure report cannot be delivered, that is logged
+    and swallowed: the attempt counter simply does not advance this run, and the NEXT item
+    still gets its turn. An auth failure is re-raised — the whole run is doomed, and burning
+    every queued item's attempts on a revoked token would destroy transcripts.
+    """
+    detail = flatten_for_log(error, 300)
+    log.error("%s: %s" % (item_id, detail))
+    try:
+        post_transcript(cfg, item_id, {"failed": True, "error": detail})
+    except ProbeError as e:
+        if is_auth_failure(e):
+            raise
+        log.error("%s: the failure report could not be delivered either: %s"
+                  % (item_id, flatten_for_log(e, 200)))
+    return "failed"
+
+
 def handle_item(cfg: Dict[str, str], item: Dict[str, object], log: Logger,
                 dry_run: bool) -> str:
     """Transcribe one item. Returns 'done' | 'failed' | 'skipped'.
 
-    Raises ``EnvironmentFault`` to abort the WHOLE run; every other error is reported to the
-    server as this item's failure (which burns one of its three attempts) and returns
-    'failed'. The temp file is removed on every path, including an EnvironmentFault.
+    ⚠️ THE CONTAINMENT RULE, and it is the whole shape of this function: **only an
+    ``EnvironmentFault`` or an auth failure may escape.** Everything else — the download, the
+    transcription AND the success-path POST — is caught here, reported as this ITEM's failure,
+    and the run moves on.
+
+    Why it matters: the queue is oldest-first, so one item that reliably 4xxs (a 413 on an
+    over-long transcript, a 400, a persistent 429, an audio body over the read ceiling) used
+    to abort the whole run at the same item every five minutes — never burning an attempt,
+    never being marked failed, and silently starving EVERY newer voice note behind it. The
+    board would not notice for 24 h. An item that cannot be transcribed must cost one attempt,
+    not the queue.
+
+    The temp file is removed on every path, including an EnvironmentFault.
     """
     item_id = str(item["id"])
     if dry_run:
@@ -317,47 +375,51 @@ def handle_item(cfg: Dict[str, str], item: Dict[str, object], log: Logger,
                 % (item_id, item.get("audio_mime"), item.get("audio_bytes")))
         return "skipped"
 
-    status, raw = download_audio(cfg, item_id)
-    if status in (404, 410):
-        log.log("%s: audio is gone (HTTP %d) — reporting a permanent failure" % (item_id, status))
-        post_transcript(cfg, item_id, {"failed": True,
-                                       "error": "audio unavailable (HTTP %d)" % status})
-        return "failed"
-    if not raw:
-        post_transcript(cfg, item_id, {"failed": True, "error": "audio body was empty"})
-        return "failed"
-
-    fd, path = tempfile.mkstemp(prefix="hopper-inbox-", suffix=suffix_for(item.get("audio_mime")))
+    path = None
     try:
+        status, raw = download_audio(cfg, item_id)
+        if status in (404, 410):
+            log.log("%s: audio is gone (HTTP %d) — reporting a permanent failure"
+                    % (item_id, status))
+            return report_failure(cfg, item_id, "audio unavailable (HTTP %d)" % status, log)
+        if not raw:
+            return report_failure(cfg, item_id, "audio body was empty", log)
+
+        fd, path = tempfile.mkstemp(prefix="hopper-inbox-",
+                                    suffix=suffix_for(item.get("audio_mime")))
         with os.fdopen(fd, "wb") as fh:
             fh.write(raw)
-        try:
-            result, took = transcribe_file(cfg, path)
-        except ProbeError as e:
-            log.error("%s: %s" % (item_id, e))
-            post_transcript(cfg, item_id, {"failed": True, "error": truncate(str(e), 300)})
-            return "failed"
+        result, took = transcribe_file(cfg, path)
         text = result.get("text")
         text = text.strip() if isinstance(text, str) else ""
         if not text:
             log.log("%s: whisper returned nothing — reporting a failure" % item_id)
-            post_transcript(cfg, item_id, {"failed": True,
-                                           "error": "whisper returned an empty transcript"})
-            return "failed"
-        body = {"text": text, "engine": ENGINE, "model": cfg["INBOX_WHISPER_MODEL"],
-                "duration_s": took}
+            return report_failure(cfg, item_id, "whisper returned an empty transcript", log)
+        # Truncated to the server's own ceiling. Over it the POST is REJECTED, and on the
+        # success path that rejection is exactly what used to wedge the queue.
+        clipped = len(text) > MAX_TEXT
+        body = {"text": truncate(text, MAX_TEXT), "engine": ENGINE,
+                "model": cfg["INBOX_WHISPER_MODEL"], "duration_s": took}
         language = result.get("language")
         if isinstance(language, str) and language:
             body["language"] = language[:16]
         post_transcript(cfg, item_id, body)
-        log.log("%s: transcribed %d bytes → %d chars in %ss"
-                % (item_id, len(raw), len(text), took))
+        log.log("%s: transcribed %d bytes → %d chars in %ss%s"
+                % (item_id, len(raw), len(text), took,
+                   " (truncated to %d for the server's limit)" % MAX_TEXT if clipped else ""))
         return "done"
+    except EnvironmentFault:
+        raise                                  # the machine's problem: abort the run
+    except ProbeError as e:
+        if is_auth_failure(e):
+            raise                              # the credential's problem: abort the run
+        return report_failure(cfg, item_id, e, log)
     finally:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
