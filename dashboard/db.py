@@ -127,6 +127,30 @@ def now_iso() -> str:
 # Connection
 # --------------------------------------------------------------------------- #
 
+def connect_query_only(db_path: str) -> sqlite3.Connection:
+    """A connection that CANNOT write, enforced by SQLite rather than by comment.
+
+    "Only the ingest process writes" was a convention this whole file rests on,
+    and conventions are how a stray ``INSERT`` in a view ends up racing the
+    scheduler's transactions at 3 a.m. The Inbox makes the read role a writer
+    for the first time — of ``inbox.db``, never of this one — so the rule is now
+    enforced where it matters: every request-path connection the read role opens
+    to ``dashboard.db`` issues ``PRAGMA query_only=ON`` and any write raises
+    ``SQLITE_READONLY`` at once.
+
+    ``PRAGMA query_only``, deliberately NOT a ``file:…?mode=ro`` URI: a
+    read-only connection to a WAL database fails with ``SQLITE_CANTOPEN`` when
+    the ``-shm`` file does not exist yet (a cold start, or the very first
+    request after the data volume is created), which would take the board down
+    for the one case where it has nothing to say anyway. ``query_only`` is a
+    per-connection flag on an ordinary read-write handle, so WAL recovery still
+    works and only *writes* are refused.
+    """
+    conn = connect(db_path)
+    conn.execute("PRAGMA query_only=ON")
+    return conn
+
+
 def connect(db_path: str) -> sqlite3.Connection:
     os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
     conn = sqlite3.connect(db_path, timeout=10, isolation_level=None,

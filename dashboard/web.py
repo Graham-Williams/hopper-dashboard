@@ -190,7 +190,13 @@ def logout():
 # --------------------------------------------------------------------------- #
 
 def _conn():
-    return db.connect(_settings().db_path)
+    """Every request-path connection to ``dashboard.db`` from the read role is
+    ``query_only``. The board has never written this file; now it cannot.
+
+    (``Core.init_store`` still opens a writable connection at app construction —
+    before any request, once per process — to run the additive migration.)
+    """
+    return db.connect_query_only(_settings().db_path)
 
 
 @bp.get("/")

@@ -942,3 +942,64 @@ def test_time_elements_carry_machine_datetime(authed, core):
     html = authed.get("/jobs/snap").data.decode()
     assert re.search(r'<time datetime="2027-01-15T08:00:00Z" title="2027-01-15 08:00:00 UTC">', html)
     assert "querySelectorAll('time[datetime]')" in html
+
+
+# --------------------------------------------------------------------------- #
+# The read role cannot write dashboard.db (enforced, not documented)
+# --------------------------------------------------------------------------- #
+
+def test_the_read_roles_request_path_connection_refuses_to_write(read_app, settings):
+    """"Only ingest writes" was a convention, and the Inbox makes the read role
+    a writer for the first time — of inbox.db. So the rule is now enforced on
+    THIS file: a stray write from a read worker raises SQLITE_READONLY instead
+    of racing the scheduler's transactions."""
+    import sqlite3
+
+    import pytest as _pytest
+
+    from dashboard import db
+    with read_app.test_request_context("/"):
+        from dashboard.web import _conn
+        conn = _conn()
+        try:
+            assert conn.execute("PRAGMA query_only").fetchone()[0] == 1
+            # Reads still work — the board is built from them.
+            assert conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] > 0
+            for sql, args in (
+                    ("INSERT INTO jobs (id, state) VALUES ('evil','OK')", ()),
+                    ("UPDATE jobs SET state='OK'", ()),
+                    ("DELETE FROM probes", ()),
+                    ("INSERT INTO runs (job_id, received_at, status)"
+                     " VALUES ('snap','2026-01-01T00:00:00Z','ok')", ())):
+                with _pytest.raises(sqlite3.OperationalError,
+                                    match="readonly|read-only"):
+                    conn.execute(sql, args)
+        finally:
+            conn.close()
+    # The ingest side is untouched: it is the writer.
+    w = db.connect(settings.db_path)
+    try:
+        assert w.execute("PRAGMA query_only").fetchone()[0] == 0
+    finally:
+        w.close()
+
+
+def test_query_only_works_on_a_cold_wal_database(tmp_path):
+    """Why PRAGMA query_only and not a `mode=ro` URI: a read-only handle to a
+    WAL db fails SQLITE_CANTOPEN when the -shm sidecar does not exist yet, which
+    is exactly the first request after a fresh data volume."""
+    import os
+
+    from dashboard import db
+    path = str(tmp_path / "cold.db")
+    conn = db.connect(path)
+    db.init_schema(conn)
+    conn.close()
+    for sidecar in ("-wal", "-shm"):
+        if os.path.exists(path + sidecar):
+            os.remove(path + sidecar)
+    ro = db.connect_query_only(path)
+    try:
+        assert ro.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
+    finally:
+        ro.close()
