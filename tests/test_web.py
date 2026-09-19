@@ -298,6 +298,8 @@ MALFORMED_APP_HOSTS = [
     "dashboard.example.test:8080",          # port
     "dashboard.example.test?x=1",           # query
     "dash board.example.test",              # whitespace
+    "dashboard-.example.test",              # trailing-hyphen label
+    "dashboard..example.test",              # empty label
 ]
 
 

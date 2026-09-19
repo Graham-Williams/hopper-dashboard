@@ -26,8 +26,12 @@ MAX_FAIL_THRESHOLD = 10
 # NOTE \A/\Z with `.fullmatch()`, NEVER ^...$ with `.match()`: in Python "$"
 # also matches immediately before a TRAILING NEWLINE, so "evil.net\n" would
 # sail through a "^...$" check and reach a response header.
+# Per-LABEL pattern (each dot-separated label 1-63 chars, no leading or
+# trailing hyphen) — byte-identical to the one in jjho-fan-almanac, so all
+# five sibling apps agree on exactly what a hostname is.
 _HOSTNAME_RE = re.compile(
-    r"\A[A-Za-z0-9](?:[A-Za-z0-9.-]{0,252}[A-Za-z0-9])?\Z")
+    r"\A[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\Z")
 
 
 def _env_int(name: str, default: int) -> int:
