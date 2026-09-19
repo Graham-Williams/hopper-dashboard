@@ -86,7 +86,10 @@
       its transcript is Whisper-quality <em>and</em> you have ticked Reviewed
       <em>and</em> it is more than {{ retention_days }} days old — and in any
       case after {{ retention_days * 2 }} days, whatever state it is in. Delete
-      removes a row and its recording immediately.
+      removes a row and its recording immediately — everywhere, including the
+      off-box backup, within a few minutes. The transcript <em>text</em> is a
+      different matter: database backups already taken still contain it, and
+      those age out after about 30 days.
     </p>
   </form>
 </section>

@@ -656,24 +656,64 @@ What it does, and the two things that are non-negotiable about how:
   `docker cp`s the tree into a **fresh** staging directory (copying into a persistent one would resurrect
   deleted files, since `docker cp` only adds) and then `rclone copy`s it up and deletes the remote files
   the container no longer has, one at a time, logged.
-- **The brake on that mirror.** A mass deletion is far likelier to be a wiped volume or a mis-set path
-  than an intentional purge, so the run REFUSES to propagate one and exits non-zero (the heartbeat goes
-  `fail`, the board pages after the job's threshold) when: the container's audio directory is missing
-  entirely; its file count has dropped by more than `AUDIO_MAX_DROP_PCT` (default 50) since the last
-  **clean** mirror; or the container has no recordings at all while Drive has some. Drive keeps what it
-  has in every one of those cases. **The very first run is guarded too**: with no remembered count yet
-  (fresh state dir, or the first run after this script learned to propagate deletions) the comparison
-  falls back to the file count already in `~/hopper-dashboard-backups/audio`, which is what Drive holds —
-  otherwise the one run most likely to meet a backlog of app-side prunes would be the one with no brake.
-  For a deliberate purge, run once with `AUDIO_ALLOW_MASS_DELETE=1`:
+- **The brakes on that mirror — three of them, and each can refuse on its own.** A mass deletion is far
+  likelier to be a wiped volume or a mis-set path than an intentional purge, so the run REFUSES to
+  propagate one and exits non-zero (the heartbeat goes `fail`, the board pages after the job's threshold):
+
+  | Knob | Default | Refuses when |
+  |---|---|---|
+  | `AUDIO_MAX_DROP_PCT` | `50` | the count has fallen by more than this share of the baseline |
+  | `AUDIO_MAX_DROP_FILES` | `25` | more than this many files would be deleted in ONE run, whatever the share |
+  | `AUDIO_DROP_WINDOW_MIN` | `1440` | the percentage is measured against the highest count in this window, not only the previous run |
+
+  It also refuses, with no knob involved, when: the container's audio directory is missing entirely (that
+  is a *skip*, never a deletion); the STAGED tree does not hold what the container said it holds; the
+  remote cannot be listed; or the container has no recordings at all while Drive has some. Drive keeps
+  what it has in every one of those cases, and the remembered count does not move.
+
+  **Why three.** A percentage alone cannot see cumulative loss: 45% per run against a 50% brake never
+  trips, and a 1024-file tree walks down to 1 in ten runs — fifty minutes at the five-minute cadence. The
+  absolute limit catches the big single step; the window catches the drip.
+
+  ⚠️ **`AUDIO_MAX_DROP_PCT` is validated to 1–99 and `100` is REFUSED.** It is a percentage, not "a
+  positive integer": at `100` the comparison becomes `count * 100 < prev * 0`, which is never true, so
+  the brake would be silently OFF on every run; at `200` the right-hand side goes negative, which is off
+  *and* inverted. A leading zero (`050`) is forced to base 10 rather than read as octal 40. To opt out of
+  the audio mirror entirely, set `BACKUP_AUDIO=0` — there is no "percentage that means no brake".
+
+  **The baseline is what DRIVE holds, not a file on the box.** With no remembered count — the first run
+  after deploy, a cleared state dir, a changed `BACKUP_ROOT`/`HOME`, a rebuild-from-Drive — it comes from
+  an `rclone lsf` of `…/audio`. (It used to fall back to `~/hopper-dashboard-backups/audio`, a directory
+  nothing ever created, so the baseline was 0 and a baseline of 0 opens the brake completely — on exactly
+  the runs that need it most.) A run that **cannot** obtain that listing uploads and deletes nothing, and
+  deliberately records no baseline either: recording one it just failed to verify is how the next run
+  would be handed a licence to delete whatever it could not see.
+
+  **For a deliberate purge, the override names the count it should LEAVE BEHIND.** It is one-shot by
+  construction — a boolean left behind in `.env.backup` would disable every brake for ever with nothing
+  but a WARN line, whereas a count describes one specific purge and, once that purge has happened,
+  authorises nothing. The refusal message tells you the exact number to use:
   ```bash
-  cd ~/hopper-dashboard && AUDIO_ALLOW_MASS_DELETE=1 deploy/box/backup.sh
+  # the log line says: "... re-run ONCE with AUDIO_ALLOW_MASS_DELETE=7"
+  cd ~/hopper-dashboard && AUDIO_ALLOW_MASS_DELETE=7 deploy/box/backup.sh
   ```
+  Then remove it from the environment. Leaving it set is harmless but pointless: the next purge will have
+  a different resulting count and will be refused.
+- **⚠️ Delete does not retract the TEXT from backups already taken.** Delete removes the row and the
+  recording immediately, and the recording leaves Drive within one backup cycle. But every `inbox_*.db`
+  snapshot already on Drive — the ring plus the `daily/` tier — still contains the transcript, and those
+  age out on `DAILY_RETENTION`, i.e. **up to 30 days**. Do not "fix" this by rewriting historical
+  snapshots; a backup that can be edited after the fact is not a backup. Keeping the DB backups is
+  correct, and the UI and DESIGN.md say so plainly instead of promising more than Delete delivers.
 - **Retention values are validated before anything is pruned.** `LOCAL_RETENTION`, `DRIVE_RETENTION`,
-  `DAILY_RETENTION` and `AUDIO_MAX_DROP_PCT` must each be an integer ≥ 1 or the run dies with a named
-  error. A value of `0` (or `" "`) is NOT caught by `${VAR:-60}` — it is non-empty — and would make every
-  prune slice cover the whole list, deleting every snapshot on the box AND in `gdrive:hopper-dashboard-backups`
-  on a single tick.
+  `DAILY_RETENTION`, `AUDIO_MAX_DROP_FILES` and `AUDIO_DROP_WINDOW_MIN` must each be an integer ≥ 1 (and
+  at most 9 digits) or the run dies with a named error; `AUDIO_MAX_DROP_PCT` must be 1–99. A value of `0`
+  (or `" "`) is NOT caught by `${VAR:-60}` — it is non-empty — and would make every prune slice cover the
+  whole list, deleting every snapshot on the box AND in `gdrive:hopper-dashboard-backups` on a single tick.
+- **These guards are tested by running the real script**, not by grepping it: `tests/test_deploy_backup.py`
+  puts a fake `docker` and a fake `rclone` (`tests/fakes/`) on `PATH`, drives `deploy/box/backup.sh`
+  end-to-end against a fake container and a fake remote, and asserts on what is left in the remote
+  afterwards. If you change a guard, that is where to prove it still refuses.
 - **`deploy/box/.env.backup` is refused if it is group- or other-writable.** It is `source`d — executed as
   shell — every five minutes as a user in the `docker` group, so `chmod 600` it (the recipe above does).
 - **`~/hopper-dashboard-backups/` and everything under it is created 0700**, and audio files are tightened

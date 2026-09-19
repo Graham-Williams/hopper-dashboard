@@ -493,9 +493,26 @@ there is no default URL in the code, by design.
   explicit logged delete pass for remote extras) so that Delete and the unconditional privacy ceiling
   actually reach the off-box copy — Graham's call 2026-09-19, because DESIGN.md sells Delete as the way to
   retract a recording that caught something private, and an additive backup silently broke that promise.
-  Guarded against mirroring a wipe: a missing audio dir skips, a >50% file-count drop since the last clean
-  mirror refuses and fails loudly, and an empty tree against a non-empty Drive refuses
-  (`AUDIO_ALLOW_MASS_DELETE=1` overrides). Only a clean mirror advances the stored count.
+  Guarded against mirroring a wipe by THREE independent brakes, any one of which refuses and fails the run
+  loudly: proportional (`AUDIO_MAX_DROP_PCT`, default 50, **validated 1–99** — `require_positive_int` was
+  the wrong validator, since 100 makes the comparison never true and silently disables the brake, 200
+  inverts it, and a leading zero would be read as octal), absolute (`AUDIO_MAX_DROP_FILES`, default 25 —
+  a percentage alone cannot see a large tree losing a sub-threshold slice every five minutes), and
+  windowed (`AUDIO_DROP_WINDOW_MIN`, default 24 h — the percentage is measured against the highest count
+  in the window, so a cumulative drip is visible). It also refuses when a missing audio dir is found (skip,
+  never a deletion), when the STAGED tree disagrees with the in-container count, when `rclone lsf` cannot
+  list the remote, and when the container is empty while Drive is not. **The baseline is the REMOTE
+  LISTING, not a file on the box** — falling back to a host directory made the brake fully open on exactly
+  the runs that need it (first deploy, cleared state dir, changed `BACKUP_ROOT`, rebuild-from-Drive), and a
+  run that cannot list the remote deletes nothing and records no baseline. `AUDIO_ALLOW_MASS_DELETE` is
+  **one-shot by construction**: it carries the exact resulting count (`AUDIO_ALLOW_MASS_DELETE=7`), so a
+  value left in `.env.backup` cannot authorise a later, different purge. Only a clean mirror advances the
+  stored count. ⚠️ **Delete removes the row and the recording everywhere (Drive included, within one
+  5-minute cycle), but the transcript TEXT stays in the `inbox_*.db` snapshots already on Drive for up to
+  30 days (`DAILY_RETENTION`)** — rewriting historical snapshots would not be a backup, so the claim is
+  documented honestly instead. All of this is pinned by a real behavioural harness in
+  `tests/test_deploy_backup.py` (fake `docker`/`rclone` on PATH, the real script, assertions on the
+  resulting fake remote) — the string-matching tests it replaced caught none of these.
   `deploy/box/verify_snapshot.py` holds the all-empty-snapshot guard (rc 3) so it is testable in
   Python rather than only in bash.
 - Manual jobs: `probes/ping.sh <job_id> <ok|fail|skipped> [note]`. `minecraft-offload` needs one seed ping

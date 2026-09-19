@@ -321,13 +321,40 @@ persistent one would itself resurrect deleted files) and the upload is `rclone c
 explicit delete pass for remote files the container no longer has. Delete now means deleted everywhere.
 The databases are untouched by this and stay additive.
 
-**The brake on that.** A mass deletion is far more likely to be a wiped volume, a mis-set path or a prune
-bug than an intentional purge, so `push_audio` refuses to propagate one: if the container's audio
-directory is missing entirely, or its file count has fallen by more than `AUDIO_MAX_DROP_PCT` (50%) since
-the last clean mirror, or the container has no recordings at all while Drive has some, the sync is skipped
-and the run FAILS loudly — Drive keeps what it has. `AUDIO_ALLOW_MASS_DELETE=1` is the deliberate
-override, and only a clean mirror updates the remembered count. Details and the restore procedure in
-DEPLOY.md §2b.
+**The brakes on that — three of them, each able to refuse on its own.** A mass deletion is far more
+likely to be a wiped volume, a mis-set path or a prune bug than an intentional purge, so `push_audio`
+refuses to propagate one. It refuses when the container's audio directory is missing entirely; when the
+count has fallen by more than `AUDIO_MAX_DROP_PCT` (default 50, validated to 1–99 — **100 is rejected,
+because it would silently disable the brake**); when more than `AUDIO_MAX_DROP_FILES` (default 25) files
+would be deleted in a single run, whatever the proportion; when the count has fallen that far from the
+highest count seen in the last `AUDIO_DROP_WINDOW_MIN` (default 24 h), which is what makes a steady
+sub-threshold drip visible; when the staged tree does not hold what the container said it holds; when the
+remote cannot be listed; or when the container has no recordings at all while Drive has some. In every
+one of those cases Drive keeps what it has, the remembered count does not move, and the run FAILS loudly.
+
+Two things about those brakes are load-bearing and were learned the hard way:
+
+- **The baseline comes from the REMOTE, not from a file on the box.** With no remembered count — the
+  first run after deploy, a cleared state dir, a changed `BACKUP_ROOT`/`HOME`, a rebuild-from-Drive —
+  the comparison is taken from an `rclone lsf` of `…/audio`, i.e. what Drive actually holds. A run that
+  cannot obtain that listing does not delete anything at all and records no baseline: "could not list
+  the remote" is not "the remote is empty".
+- **Everything is measured on the STAGED tree, the exact set that is uploaded and diffed.** Measuring
+  the brake on one set and running the deletion against another is the same bug in a different costume.
+
+`AUDIO_ALLOW_MASS_DELETE` is the deliberate override and it is **one-shot by construction**: it carries
+the exact count the purge should leave behind (`AUDIO_ALLOW_MASS_DELETE=7`), so a value left behind in
+`.env.backup` authorises a state that has already happened — which is to say, nothing. Only a clean
+mirror updates the remembered count. Details and the restore procedure in DEPLOY.md §2b.
+
+**What Delete does and does not reach.** Delete removes the row and the recording immediately, and the
+recording is gone from Drive within one backup cycle (≤5 min). **The transcript TEXT is not retracted
+from backups already taken.** Every `inbox_*.db` snapshot on Drive — the ring plus the `daily/` tier —
+still contains whatever was said, and those age out on `DAILY_RETENTION`, i.e. **up to 30 days**. That is
+the correct trade: rewriting historical database snapshots to erase a row would mean a backup that can be
+edited after the fact, which is not a backup. But the claim has to be stated honestly rather than sold as
+"deleted everywhere" — the audio is deleted everywhere; the words persist for up to 30 days in dated
+database backups.
 
 ### What the Inbox adds to the board
 
