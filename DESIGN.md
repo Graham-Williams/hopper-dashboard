@@ -270,10 +270,20 @@ role's writes into long transactions. The price is that files need reconciliatio
 scheduler sweeps for both directions of orphan: a row whose `audio_path` points at a file that is gone (the
 path is cleared; the row keeps its transcript and simply shows no player), and a file no row references.
 
-Deletion needs **all three** of: the transcript is `whisper`-quality, the item has been reviewed, and it is
-older than `INBOX_AUDIO_RETENTION_DAYS` (90). By the time all three hold, the text has been in the DB backup
-for months and the recording is no longer the only copy of the thought — which is what makes pruning
-tolerable at all.
+Automatic deletion happens on **either** of two rules. The convenience prune needs **all three** of: the
+transcript is `whisper`-quality, the item has been reviewed, and it is older than
+`INBOX_AUDIO_RETENTION_DAYS` (90). By the time all three hold, the text has been in the DB backup for
+months and the recording is no longer the only copy of the thought — which is what makes pruning
+tolerable at all. The **privacy ceiling** then deletes any audio at TWICE that age regardless of state.
+That second rule is not redundant: the first one is satisfiable only by Graham's own action, so a note he
+never reviews, or one Whisper failed three times on, would otherwise keep its recording of his voice
+forever — the setting would read like a maximum and behave like a minimum.
+
+`DELETE /api/v1/inbox/items/<id>` (session only, Origin-pinned, write-limited) removes a row and its
+audio immediately. It exists because the one class of data here that is unambiguously personal is the one
+class a user must be able to retract without `docker exec` and hand-written SQL — a recording that caught
+a background conversation, or a password read aloud. The row goes first and the file second; the orphan
+sweep makes that ordering safe.
 
 **Backup.** This is the part with the longest tail. Before the Inbox, this app's data was entirely
 re-derivable and it had no off-box backup — verified on the box: only `km-backup.timer` and

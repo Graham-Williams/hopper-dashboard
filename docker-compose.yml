@@ -36,6 +36,11 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    # Bounds a runaway (a hostile issue body, a pathological rclone listing) so it cannot
+    # take the box down with the other ten containers. Deliberately GENEROUS, not tight:
+    # measured steady state is ~116 MiB and the box has 30 GiB, so the only thing this can
+    # realistically stop is a genuine leak. Too low would OOM-kill the monitoring itself.
+    mem_limit: 768m
     read_only: true
     tmpfs:
       - /tmp:mode=1777,size=64m
@@ -59,7 +64,8 @@ services:
       # (401). The board being up matters more than the Inbox being up, and a compose that
       # refuses to start over an optional feature would invert that.
       INBOX_TOKEN: ${INBOX_TOKEN:-}
-      INBOX_AUDIO_MAX_BYTES: ${INBOX_AUDIO_MAX_BYTES:-8388608}
+      INBOX_AUDIO_MAX_BYTES: ${INBOX_AUDIO_MAX_BYTES:-2097152}
+      INBOX_AUDIO_MAX_TOTAL_BYTES: ${INBOX_AUDIO_MAX_TOTAL_BYTES:-3221225472}
       INBOX_AUDIO_RETENTION_DAYS: ${INBOX_AUDIO_RETENTION_DAYS:-90}
       INBOX_GITHUB_REPOS: ${INBOX_GITHUB_REPOS:-}
       INBOX_GITHUB_TOKEN: ${INBOX_GITHUB_TOKEN:-}

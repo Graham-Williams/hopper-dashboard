@@ -56,7 +56,8 @@ export APP_PASSWORD=devpass SESSION_SECRET=devsecret INGEST_TOKEN=devtoken READ_
 #            DASHBOARD_RCLONE_TIMEOUT_S (240 — NOT RCLONE_TIMEOUT*, that namespace is rclone's own),
 #            PROBE_FAIL_THRESHOLD (2), PROBE_NO_SUCCESS_S (3600)
 # Inbox knobs (all optional; empty INBOX_TOKEN = the machine endpoints fail closed, browser side still works):
-#            INBOX_TOKEN, INBOX_AUDIO_MAX_BYTES (8 MiB), INBOX_AUDIO_RETENTION_DAYS (90),
+#            INBOX_TOKEN, INBOX_AUDIO_MAX_BYTES (2 MiB/note), INBOX_AUDIO_MAX_TOTAL_BYTES (3 GB tree),
+#            INBOX_AUDIO_RETENTION_DAYS (90; audio also goes unconditionally at 2x that age),
 #            INBOX_GITHUB_REPOS (validated at startup), INBOX_GITHUB_TOKEN, INBOX_GITHUB_INTERVAL_S (900),
 #            INBOX_PRUNE_INTERVAL_S (3600)
 
