@@ -252,7 +252,8 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   the `Priority` header and `services.alert_severity` — keep it that way. No reason text ever leaves the box;
   never raises; returns False on a failed POST, which `Core` acts on (see below).
 - `ingest.py` — blueprint + pure payload parsers (`parse_json_payload`, `parse_form_payload`, `parse_metrics`).
-- `web.py` — read blueprint: gate, host pin, security headers (per-request CSP nonce), HTML + JSON routes.
+- `web.py` — read blueprint: http→https redirect, gate, host pin, security headers (per-request CSP nonce +
+  HSTS), HTML + JSON routes.
 - `views.py` — builds the `/api/v1/status` contract and job detail from the store.
 - `password_gate.py`, `ratelimit.py` — gate helpers (`client_ip(trusted_cidrs)` vs `remote_ip()`) +
   sliding-window limiters (hard key cap with stalest-eviction, keys truncated to 64 chars).
@@ -343,6 +344,19 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
 - Hopper's bearer reads go through the public hostname (`https://dashboard.graham-williams.com/api/v1/status`
   with `Authorization: Bearer $READ_TOKEN`) — that is the intended path. An in-container read against
   `127.0.0.1:8080` must also send `Host: <APP_HOST>` or the Host pin returns 403 (only `/healthz` is exempt).
+- **HTTPS at the origin (`web._https_redirect`) redirects ONLY when `X-Forwarded-Proto` is exactly `http`.**
+  An absent header must never redirect: the container HEALTHCHECK and that in-container/in-network read send
+  none, and a redirect there would break monitoring instead of protecting it. The target is built from the
+  `APP_HOST` pin (never the request's Host — reflection = open redirect) and from the RAW request target
+  (`RAW_URI`/`REQUEST_URI`), because `request.path` is already URL-decoded and would silently rewrite
+  `/a%2Fb` to `/a/b`. Unset `APP_HOST` → no redirect (fail open, which is what keeps the documented local
+  visual-QA path and the test suite working).
+- **The ingest listener is deliberately exempt from the redirect and from HSTS, and must stay that way.**
+  Both hooks live on `web.bp`, registered only for the read role — the exemption is structural, not a
+  condition. `:8081` is Tailscale-only, serves no TLS, and every heartbeat (systemd `ExecStopPost` curls,
+  `dashboard-containers.timer`, the Mac launchd probe) is plain HTTP with no `X-Forwarded-Proto`. Moving
+  those hooks onto the app factory would stop every heartbeat *quietly* — the board would keep rendering,
+  just with everything drifting to LATE. `tests/test_ingest.py` pins this in three tests.
 
 ## Git workflow
 Feature branches only; `main` is protected and only Graham merges (via PR). Commit/push freely on branches.

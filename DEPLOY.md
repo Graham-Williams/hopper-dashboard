@@ -653,6 +653,31 @@ script, but that is per-repo work).
       public host **with the READ_TOKEN** is 404/405 (ingest isn't tunnelled; see §3 for why 401 proves nothing).
 - [ ] `/api/v1/status` (READ_TOKEN) lists all 13 jobs; after ≤5 min box jobs are `OK`, after ≤1 h Mac jobs are
       `OK`/`BEHIND` (not `UNKNOWN`), manual jobs show **Never run** until their first `ping.sh`.
+- [ ] HTTPS at the origin: `curl -sI https://dashboard.graham-williams.com/healthz | grep -i strict-transport`
+      → `max-age=31536000` (no `includeSubDomains`, no `preload`), and a forwarded-http request 301s to the
+      pinned host without reflecting the one it was sent (`curl` is purged from the image — run it from the
+      box against the container, or from the Mac against the public host):
+      ```bash
+      docker exec -i hopper-dashboard python3 - <<'PY'
+      import os, urllib.request as u
+      host = os.environ.get("AH") or "dashboard.graham-williams.com"
+      r = u.Request("http://127.0.0.1:8080/healthz",
+                    headers={"Host": "evil.example", "X-Forwarded-Proto": "http"})
+      try:
+          u.urlopen(r, timeout=5)
+      except u.HTTPError as e:
+          loc = e.headers.get("Location", "")
+          ok = e.code == 301 and loc == f"https://{host}/healthz"
+          print(("PASS " if ok else "FAIL ") + f"{e.code} {loc}")
+          raise SystemExit(0 if ok else 1)
+      print("FAIL no redirect"); raise SystemExit(1)
+      PY
+      ```
+      Pass `-e AH="$(grep '^APP_HOST=' ~/hopper-dashboard/.env | cut -d= -f2-)"` to check the real pin.
+      **`-i` is required** — without it the heredoc is discarded and the check silently "passes".
+- [ ] The heartbeats still land after that deploy — the ingest listener is exempt from the redirect by
+      design, so prove it rather than assume it: `~/code/hopper-dashboard/probes/ping.sh jjho-refresh skipped
+      "https deploy check"` → 200, and `/api/v1/status` shows a fresh `last_run` for it.
 - [ ] `minecraft-offload` seeded with one `ok` ping after the first offload (§4).
 - [ ] `/api/v1/status` shows the right `alert` block per job (§1d): 9 `"source": "alert_after_s"`, 4
       `"source": "alert"` / `"never": true`, **zero** `"source": "default"` and zero `"source":
@@ -797,3 +822,4 @@ restore data; the dashboard's own SQLite is derived state that repopulates withi
 | A machine's probe job is inside its OWN cooldown when the machine dies | The machine-offline rule mutes every sibling on the premise that the probe sends one alert for the machine — but the probe's page is being held back, so nothing pages at all for the length of the cooldown. The static `alert: never` guard does not catch this, because the policy is fine; only the moment is wrong | Fixed: suppression may only borrow an alert that EXISTS, checked both statically (`alert_never`) and for the moment (the probe's cooldown). Siblings page instead — several alerts for one fact, which is the tell. Unreachable on the shipped file (`mac-probe` is 72 h, above the 6 h floor, so its cooldown can never bind) and reachable the moment anyone shortens that threshold |
 | `alert_after_s` read as "the time until my phone knows" | It is not: the threshold clock starts when the job goes NOT-OK, which is already cadence+grace after the last good run. `pa-backup` shipped `108000` commented "30 h" and paged at **68 h** | Fixed in `jobs.example.yml`: every alerting job carries a `# TIME-TO-PAGE:` line with the end-to-end figure, and `test_every_alerting_job_states_its_real_time_to_page` recomputes all nine from that same file, so a comment cannot drift again |
 | ntfy topic leaked or mistyped on the phone | Alerts fire (server-side) but never arrive | `curl -d test https://ntfy.sh/<topic>` and check the phone |
+| The read role's http→https hook (`web._https_redirect`) or its HSTS header is moved onto the app factory instead of `web.bp` | **Every heartbeat stops, quietly.** The `:8081` ingest listener is Tailscale-only plain HTTP; a 301 there is followed by nothing — systemd's `ExecStopPost` curl, `dashboard-containers.timer` and the Mac launchd probe all just stop recording runs, and the board drifts every job to LATE over hours while rendering perfectly | Can't happen silently: three tests in `tests/test_ingest.py` pin the ingest app as redirect-free and HSTS-free (including with an attacker-supplied `X-Forwarded-Proto: http`). After any deploy that touches `web.py`, run the §5 heartbeat check — `probes/ping.sh jjho-refresh skipped` must return 200 |

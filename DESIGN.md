@@ -162,6 +162,26 @@ Outputs:
   client notes, rclone stderr stay on the board).
 - CSP: `default-src 'self'`, `script-src 'nonce-<per-request>'` allowing exactly one inline script (the
   timestamp localizer in `base.html`); no `'self'`/`'unsafe-inline'` for scripts, no CDN.
+- **HTTPS enforced at the origin, not only at the edge** (`web._https_redirect`, `_security_headers`).
+  Cloudflare's zone-wide "Always Use HTTPS" is one dashboard toggle away from regressing, so the READ role
+  enforces it itself: when cloudflared forwards `X-Forwarded-Proto: http` it answers `301` to
+  `https://<APP_HOST><path?query>`, and every read-side response carries
+  `Strict-Transport-Security: max-age=31536000` (no `includeSubDomains`, no `preload` — each hostname owns
+  its own policy and preload is effectively irreversible; matches the apex landing page, the reference
+  implementation). Three rules make it safe rather than merely present:
+  - **Only an exactly-`http` header redirects** (case/whitespace normalised). An ABSENT header never does —
+    the container HEALTHCHECK and Hopper's in-network read (`curl -H 'Host: <APP_HOST>' http://…`) send none,
+    and redirecting them would break monitoring rather than protect anything. No per-path exemptions.
+  - **The target is built from the `APP_HOST` pin, never from the request's Host/URL** (reflection would be an
+    open redirect), from the RAW request target (`RAW_URI`/`REQUEST_URI`) so percent-encoding round-trips
+    byte-for-byte — `request.path` is already decoded, so `/a%2Fb` and `/a/b` are indistinguishable there.
+    A forged/absolute-form/over-long/control-byte target falls back to a re-quoted path, so no header
+    injection. Unset `APP_HOST` → **no redirect** (fail open: local dev, the local visual-QA path, tests).
+  - **The INGEST role is deliberately exempt**, structurally: both hooks live on `web.bp`, which only the read
+    role registers. `:8081` is reached directly over the tailnet, serves no TLS, and its heartbeats (systemd
+    `ExecStopPost` curls, `dashboard-containers.timer`, the Mac launchd probe) are plain HTTP with no
+    `X-Forwarded-Proto`. A redirect there would silently stop every heartbeat and leave the board lying.
+    Never move these hooks onto the app factory. Session cookies are `Secure` + `HttpOnly` + `SameSite=Lax`.
 - One writer: the container owns the SQLite file; everything external arrives via the ingest API.
 
 ## Box facts (recon 2026-09-04, read-only)
