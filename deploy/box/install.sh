@@ -11,11 +11,16 @@
 #      The token is read from --token-file (the compose .env: its INGEST_TOKEN= line) or, if that
 #      is omitted, prompted with a HIDDEN read. It is never accepted on the command line (shell
 #      history / `ps`). An existing env file is kept unless a token is supplied (then rewritten).
-#   2. drop-ins  /etc/systemd/system/{km-backup,todoist-points-backup}.service.d/heartbeat.conf
-#   3. dashboard-containers.service + .timer (template: @@REPO@@ → this checkout, @@USER@@ → --user,
-#      default $SUDO_USER, i.e. whoever ran sudo; must be in the docker group)
-#   4. systemctl daemon-reload; enable --now dashboard-containers.timer
+#   2. drop-ins  /etc/systemd/system/{km-backup,todoist-points-backup,hopper-dashboard-backup}.service.d/heartbeat.conf
+#   3. dashboard-containers.service + .timer AND hopper-dashboard-backup.service + .timer
+#      (templates: @@REPO@@ → this checkout, @@USER@@ → --user, default $SUDO_USER, i.e. whoever
+#      ran sudo; must be in the docker group)
+#   4. systemctl daemon-reload; enable --now both timers
 #   5. prints verification: systemctl cat of each unit, list-timers, and a dry-run of the container probe
+#
+# The backup timer and its heartbeat drop-in are installed TOGETHER, always. An unmonitored
+# backup fails silently and the board keeps showing the job as it last was — the exact failure
+# this repo exists to catch.
 #
 # Does NOT: restart or touch any container, restart the backup units, or modify ~/km-tracker or
 # ~/todoist-points. daemon-reload only re-reads unit files; the oneshot backup units simply pick
@@ -30,7 +35,8 @@ ENV_FILE="$ENV_DIR/ingest.env"
 SYSD=/etc/systemd/system
 URL=""; TOKEN=""; TOKEN_FILE=""
 RUN_USER="${SUDO_USER:-$(id -un)}"
-UNITS=(km-backup todoist-points-backup)
+UNITS=(km-backup todoist-points-backup)          # foreign units we only drop a heartbeat into
+OWN_UNITS=(hopper-dashboard-backup)              # units this repo ships AND heartbeats
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -98,23 +104,38 @@ install -m 0644 "$HERE/dashboard-containers.timer" "$SYSD/dashboard-containers.t
 chmod +x "$HERE/containers_probe.sh" "$REPO/probes/containers_probe.py" "$REPO/probes/disk_probe.py" 2>/dev/null || true
 echo "installed dashboard-containers.{service,timer}"
 
+# --- 3b. backup timer + its heartbeat drop-in (installed together, never apart) ---
+for u in "${OWN_UNITS[@]}"; do
+  sed -e "s|@@REPO@@|$REPO|g" -e "s|@@USER@@|$RUN_USER|g" "$HERE/$u.service" > "$SYSD/$u.service.tmp"
+  grep -q '@@' "$SYSD/$u.service.tmp" && { echo "ERROR: unrendered placeholder in $u.service"; rm -f "$SYSD/$u.service.tmp"; exit 1; }
+  mv "$SYSD/$u.service.tmp" "$SYSD/$u.service"
+  chmod 0644 "$SYSD/$u.service"
+  install -m 0644 "$HERE/$u.timer" "$SYSD/$u.timer"
+  install -d -m 0755 "$SYSD/$u.service.d"
+  install -m 0644 "$HERE/$u.service.d/heartbeat.conf" "$SYSD/$u.service.d/heartbeat.conf"
+  echo "installed $u.{service,timer} + its heartbeat drop-in"
+done
+chmod +x "$HERE/backup.sh" "$HERE/verify_snapshot.py" 2>/dev/null || true
+
 # --- 4. reload + enable ---------------------------------------------------------
 systemctl daemon-reload
 systemctl enable --now dashboard-containers.timer
 echo "enabled dashboard-containers.timer"
+for u in "${OWN_UNITS[@]}"; do systemctl enable --now "$u.timer"; echo "enabled $u.timer"; done
 
 # --- 5. verify ------------------------------------------------------------------
 echo; echo "=== systemd-analyze verify ==="
-systemd-analyze verify --man=no "$SYSD/dashboard-containers.service" "${UNITS[@]/%/.service}" && echo "ok"
+systemd-analyze verify --man=no "$SYSD/dashboard-containers.service" "${OWN_UNITS[@]/%/.service}" "${UNITS[@]/%/.service}" && echo "ok"
 echo; echo "=== drop-ins as systemd sees them ==="
-for u in "${UNITS[@]}"; do systemctl cat "$u.service" | grep -E 'heartbeat.conf|ExecStopPost' || echo "!! $u.service has no heartbeat drop-in"; done
+for u in "${UNITS[@]}" "${OWN_UNITS[@]}"; do systemctl cat "$u.service" | grep -E 'heartbeat.conf|ExecStopPost' || echo "!! $u.service has no heartbeat drop-in"; done
 echo; echo "=== timers ==="
-systemctl list-timers --no-pager | grep -E 'NEXT|km-backup|todoist-points-backup|dashboard-containers' || true
+systemctl list-timers --no-pager | grep -E 'NEXT|km-backup|todoist-points-backup|dashboard-containers|hopper-dashboard-backup' || true
 echo; echo "=== box probe dry run (as $RUN_USER): box-containers + box-disk ==="
 sudo -u "$RUN_USER" env "$(grep '^DASHBOARD_URL=' "$ENV_FILE")" "$REPO/deploy/box/containers_probe.sh" --dry-run || echo "dry run failed (rc=$?)"
 echo
 echo "First heartbeats: box-containers + box-disk within 5 min (or now: systemctl start dashboard-containers.service);"
-echo "km-backup / todoist-points-backup on their next timer tick (≤5 min). Check with:"
+echo "km-backup / todoist-points-backup / hopper-dashboard-backup on their next timer tick (≤5 min). Check with:"
+echo "  journalctl -u hopper-dashboard-backup.service -n 20 --no-pager   # the backup's own log lines"
 echo "  journalctl -u dashboard-containers.service -n 5 --no-pager"
 echo "  # read side (curl is not in the image; use python inside the container). Host MUST equal APP_HOST —"
 echo "  # the read role pins Host on everything but /healthz, so without the header this is a 403:"

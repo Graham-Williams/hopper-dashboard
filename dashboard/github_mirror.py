@@ -27,6 +27,30 @@ issue. It is stored verbatim and escaped at render; nothing here interpolates
 it anywhere. The only value interpolated into a URL is the repo name, which
 ``config.GITHUB_REPO_RE`` has already forced to start with an alphanumeric in
 both halves — so a repo of ``..`` cannot walk out of ``/repos/``.
+
+Three properties of :func:`default_fetch` are load-bearing and easy to lose in
+a refactor, which is why each is pinned by a test that drives a real HTTP
+server on loopback (``tests/test_inbox_mirror.py``):
+
+* **The response is read with a hard byte cap.** Anyone can open an issue on a
+  public repo, bodies run to 65 kB each, and up to 1000 of them accumulate in
+  memory before a single row is written — in a container with no ``mem_limit``.
+  Each issue is also projected down to the four fields this module reads before
+  it is kept, so a 20-field GitHub payload does not sit in the list either.
+* **Redirects are NOT followed off ``api.github.com``.** ``urlopen``'s default
+  opener follows up to ten redirects to any host and scheme, and
+  ``HTTPRedirectHandler`` does not strip ``Authorization`` cross-origin — so a
+  301 (which GitHub serves legitimately, for a renamed repo) could hand
+  ``INBOX_GITHUB_TOKEN`` to ``http://127.0.0.1:8081/`` or to a sibling
+  container on the shared docker network. :data:`_OPENER` refuses any redirect
+  whose target is not https + exactly ``api.github.com``.
+* **The token never reaches a log or the database.** ``http.client.putheader``
+  raises ``ValueError('Invalid header value %r' % value)`` with the whole
+  ``Bearer <token>`` inside it, and that string would become
+  ``MirrorResponse.error`` → ``log.warning`` → ``inbox_mirror_state.last_error``.
+  Two independent defences: ``config`` validates the token at startup so an
+  illegal header value cannot be built, and :func:`_redact` scrubs the token
+  out of every error string on the way back regardless.
 """
 
 from __future__ import annotations
@@ -40,7 +64,7 @@ import urllib.request
 from dataclasses import dataclass, field
 
 from . import inbox_db
-from .config import GITHUB_REPO_RE
+from .config import GITHUB_REPO_RE, GITHUB_TOKEN_RE
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +79,59 @@ HTTP_TIMEOUT_S = 20
 #: How long to stay away after the API says no. Overridden by an explicit
 #: ``Retry-After`` or ``X-RateLimit-Reset``.
 DEFAULT_BACKOFF_S = 900
+#: Hard cap on ONE response body. A page of 100 issues with 65 kB bodies is
+#: ~6.5 MB, so this is generous for anything real and still bounded — which an
+#: unlimited ``resp.read()`` in a container with no ``mem_limit`` was not.
+MAX_BODY_BYTES = 8 * 1024 * 1024
+#: The only host this module may end up talking to, after any redirect.
+API_HOST = "api.github.com"
+#: The fields ``_sync_repo`` actually reads. Everything else GitHub sends
+#: (reactions, labels, the whole `user` object, two dozen URLs) is dropped
+#: before the issue joins the in-memory list.
+ISSUE_FIELDS = ("number", "title", "body", "pull_request")
+
+
+class _GitHubOnlyRedirects(urllib.request.HTTPRedirectHandler):
+    """Follow a redirect ONLY when it stays on ``https://api.github.com``.
+
+    Returning ``None`` makes urllib raise the original ``HTTPError`` instead of
+    following, which lands on the ordinary error path here: the sync is PARTIAL
+    and therefore closes nothing. That is the right outcome — a repo whose
+    redirect we refuse is a repo we did not read.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        parts = urllib.parse.urlsplit(newurl)
+        if parts.scheme != "https" or parts.netloc.lower() != API_HOST:
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+#: Built once. `urlopen` uses a module-global default opener whose redirect
+#: handler follows anywhere; this one does not, and nothing else in the process
+#: is affected because it is used explicitly rather than installed.
+_OPENER = urllib.request.build_opener(_GitHubOnlyRedirects)
+
+
+def _redact(text: str, headers: dict | None) -> str:
+    """Strip the bearer token out of an error string.
+
+    ``http.client`` puts the offending header value verbatim into its
+    ``ValueError``, and that string is logged AND stored in
+    ``inbox_mirror_state.last_error``. Startup validation should make that
+    unreachable; this makes it harmless if it ever is not.
+    """
+    auth = str((headers or {}).get("Authorization") or "")
+    token = auth.partition(" ")[2].strip()
+    for secret in (auth, token):
+        if secret:
+            text = text.replace(secret, "<redacted>")
+    return text
+
+
+def _project_issue(raw: dict) -> dict:
+    """Keep the four fields this module reads and drop the rest."""
+    return {k: raw[k] for k in ISSUE_FIELDS if k in raw}
 
 
 @dataclass
@@ -72,26 +149,44 @@ class MirrorResponse:
 
 
 def default_fetch(url: str, headers: dict) -> MirrorResponse:
-    """The real HTTP call. Injected in tests so the suite stays network-free."""
+    """The real HTTP call. Injected in tests so the suite stays network-free.
+
+    Three things here are deliberate and tested against a live loopback server
+    rather than a fake, because a fake is exactly what let them go unnoticed:
+    the byte cap on ``read``, the redirect-refusing opener, and the timeout.
+    """
     request = urllib.request.Request(url, headers=headers, method="GET")
     try:
-        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_S) as resp:
-            raw = resp.read()
-            return MirrorResponse(status=resp.status,
-                                  headers=dict(resp.headers.items()),
+        with _OPENER.open(request, timeout=HTTP_TIMEOUT_S) as resp:
+            # One byte over the cap is enough to know it is over the cap, and
+            # the rest is never pulled into memory.
+            raw = resp.read(MAX_BODY_BYTES + 1)
+            resp_headers = dict(resp.headers.items())
+            if len(raw) > MAX_BODY_BYTES:
+                # status 0, not 200: the caller's PARTIAL logic then refuses to
+                # upsert or close anything off a body we did not fully read.
+                return MirrorResponse(
+                    status=0, headers=resp_headers,
+                    error=f"response body over {MAX_BODY_BYTES} bytes")
+            return MirrorResponse(status=resp.status, headers=resp_headers,
                                   body=json.loads(raw) if raw else None)
     except urllib.error.HTTPError as exc:
-        # 304 and 403 arrive here; both carry headers we need.
+        # 304 and 403 arrive here; both carry headers we need. A refused
+        # redirect arrives here too (redirect_request returning None re-raises
+        # the 3xx), which is why this path must not be a success.
         body = None
         try:
-            raw = exc.read()
-            body = json.loads(raw) if raw else None
+            raw = exc.read(MAX_BODY_BYTES + 1)
+            if len(raw) <= MAX_BODY_BYTES:
+                body = json.loads(raw) if raw else None
         except Exception:                                 # noqa: BLE001
             body = None
         return MirrorResponse(status=exc.code, headers=dict(exc.headers.items()),
                               body=body, error=f"HTTP {exc.code}")
     except Exception as exc:                              # noqa: BLE001
-        return MirrorResponse(status=0, error=f"{type(exc).__name__}: {exc}")
+        return MirrorResponse(
+            status=0,
+            error=_redact(f"{type(exc).__name__}: {exc}", headers))
 
 
 def _headers(token: str, etag: str | None) -> dict:
@@ -101,6 +196,13 @@ def _headers(token: str, etag: str | None) -> dict:
         "X-GitHub-Api-Version": "2022-11-28",
     }
     if token:
+        # `config` already refuses a token like this at startup. Checking again
+        # here is what keeps `http.client.putheader` — which embeds the whole
+        # header VALUE in its ValueError — from ever being handed one. The
+        # message below deliberately contains no part of the token.
+        if not GITHUB_TOKEN_RE.match(token):
+            raise ValueError("INBOX_GITHUB_TOKEN contains characters that "
+                             "cannot appear in an HTTP header value")
         headers["Authorization"] = f"Bearer {token}"
     if etag:
         headers["If-None-Match"] = etag
@@ -179,7 +281,8 @@ def _sync_repo(conn, repo: str, *, now: float, fetch, token: str) -> dict:
             return {"repo": repo, "status": "unchanged", "issues": 0}
         if resp.status != 200 or not isinstance(resp.body, list):
             backoff = _backoff_from(resp, now)
-            reason = (resp.error or f"HTTP {resp.status}")[:200]
+            reason = _redact(resp.error or f"HTTP {resp.status}",
+                             {"Authorization": f"Bearer {token}"} if token else None)[:200]
             with conn:
                 inbox_db.set_mirror_state(
                     conn, key, last_sync_at=now_text, last_status="error",
@@ -201,7 +304,11 @@ def _sync_repo(conn, repo: str, *, now: float, fetch, token: str) -> dict:
             # this loop reads the raw dict rather than a count.
             if "pull_request" in raw:
                 continue
-            issues.append(raw)
+            # Projected HERE, not later: `issues` holds up to MAX_PAGES *
+            # PER_PAGE entries before anything is written, and keeping the
+            # whole GitHub payload for each of them is hundreds of MB resident
+            # for no reason. Four fields is everything the loop below reads.
+            issues.append(_project_issue(raw))
         if len(resp.body) < PER_PAGE:
             break
     else:
@@ -280,8 +387,12 @@ def sync(conn, repos, *, now: float | None = None, fetch=None,
                                       token=token))
         except Exception as exc:                          # noqa: BLE001
             log.exception("inbox github mirror: %s raised", repo)
+            # Redacted before it is stored or logged: an exception raised while
+            # building the request can carry the header value with it.
+            reason = _redact(f"{type(exc).__name__}: {exc}",
+                             {"Authorization": f"Bearer {token}"} if token else None)
             results.append({"repo": repo, "status": "error",
-                            "error": f"{type(exc).__name__}: {exc}"[:200]})
+                            "error": reason[:200]})
     ok = sum(1 for r in results if r["status"] in ("ok", "unchanged"))
     return {
         "repos": len(results),

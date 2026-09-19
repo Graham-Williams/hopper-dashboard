@@ -76,6 +76,29 @@ def test_settings_from_env(monkeypatch, tmp_path):
         Settings.from_env()
 
 
+def test_an_illegal_github_token_fails_at_startup(monkeypatch, tmp_path):
+    """`http.client.putheader` embeds the WHOLE header value in its ValueError,
+    and the mirror logs that string AND stores it in
+    inbox_mirror_state.last_error. A token with a newline in it (the realistic
+    copy-paste accident) would therefore put the secret in both. Refusing at
+    startup means the illegal header value can never be constructed.
+
+    The error message must name the variable and the rule, never the value —
+    it is itself going to be logged."""
+    monkeypatch.setenv("DASHBOARD_DATA", str(tmp_path))
+    monkeypatch.setenv("INBOX_GITHUB_TOKEN", "ghp_legitLooking123.-_")
+    assert Settings.from_env().inbox_github_token == "ghp_legitLooking123.-_"
+    monkeypatch.setenv("INBOX_GITHUB_TOKEN", "")
+    assert Settings.from_env().inbox_github_token == ""
+    for bad in ("ghp_secret\nX-Evil: 1", "ghp_secret token", "ghp_secret\r\n",
+                "ghp_se\x00cret", "x" * 300):
+        monkeypatch.setenv("INBOX_GITHUB_TOKEN", bad)
+        with pytest.raises(ValueError) as exc:
+            Settings.from_env()
+        assert "INBOX_GITHUB_TOKEN" in str(exc.value)
+        assert "ghp_secret" not in str(exc.value), "the token leaked into the error"
+
+
 def test_probe_damping_knobs_from_env(monkeypatch, tmp_path):
     monkeypatch.setenv("DASHBOARD_DATA", str(tmp_path))
     s = Settings.from_env()
@@ -114,7 +137,7 @@ def test_create_app_from_env_loads_example_jobs(monkeypatch, tmp_path):
     monkeypatch.setenv("JOBS_FILE", "jobs.example.yml")
     monkeypatch.setenv("DASHBOARD_NO_SCHEDULER", "1")
     app = create_app("ingest")
-    assert len(app.extensions["registry"]) == 14
+    assert len(app.extensions["registry"]) == 17
     assert app.extensions["scheduler"]._thread is None
 
 

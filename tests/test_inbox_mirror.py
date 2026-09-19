@@ -5,6 +5,8 @@ and an item closes only when every one of its issues is closed."""
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from dashboard import github_mirror, inbox_db
@@ -290,3 +292,242 @@ def test_a_hostile_issue_title_survives_to_render_escaped(conn, authed, settings
     assert html.count("</script>") == html.count("<script")
     title = (html.split('<h3 class="item-title">', 1)[1].split("</h3>", 1)[0])
     assert "{{ 7*7 }}" in title and "49" not in title
+
+
+# --------------------------------------------------------------------------- #
+# default_fetch — the ONE function every other test in this file injects past
+# --------------------------------------------------------------------------- #
+#
+# Every test above hands `sync` a FakeGitHub, which is exactly why two real
+# defects lived in `default_fetch` unnoticed: an unbounded `resp.read()` and a
+# redirect handler that would follow a 301 to any host while still carrying the
+# Authorization header. Faking the transport cannot catch a transport bug, so
+# these drive a genuine `http.server` on loopback instead. They are hermetic
+# (127.0.0.1, ephemeral port, daemon thread, torn down per test) and each one
+# finishes in well under a second.
+
+class _Loopback:
+    """A throwaway HTTP server on 127.0.0.1 with a scripted handler."""
+
+    def __init__(self, handle):
+        import http.server
+        import threading
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.0"
+
+            def do_GET(self):                      # noqa: N802 - stdlib API
+                handle(self, outer)
+
+            def log_message(self, *_args):         # keep the test output clean
+                pass
+
+        self.headers_seen: list[dict] = []
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+        self.url = f"http://127.0.0.1:{self.port}/"
+        self.thread = threading.Thread(target=self.server.serve_forever,
+                                       kwargs={"poll_interval": 0.05},
+                                       daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+
+@pytest.fixture
+def loopback():
+    made: list[_Loopback] = []
+
+    def make(handle):
+        server = _Loopback(handle)
+        made.append(server)
+        return server
+
+    yield make
+    for server in made:
+        server.close()
+
+
+def test_default_fetch_refuses_a_body_over_the_cap(loopback, monkeypatch):
+    """1000 open issues x 65 kB bodies, all resident before a single row is
+    written, in a container with no `mem_limit`. Anyone can open an issue on a
+    public repo, so the size of this response is not ours to trust."""
+    monkeypatch.setattr(github_mirror, "MAX_BODY_BYTES", 4096)
+    oversized = b'["' + b"A" * 8192 + b'"]'
+
+    def handle(request, _server):
+        request.send_response(200)
+        request.send_header("Content-Type", "application/json")
+        request.send_header("Content-Length", str(len(oversized)))
+        request.end_headers()
+        request.wfile.write(oversized)
+
+    server = loopback(handle)
+    resp = github_mirror.default_fetch(server.url, {})
+    # status 0, NOT 200: `_sync_repo` treats anything but 200-with-a-list as a
+    # partial answer, so an over-cap page upserts nothing and closes nothing.
+    assert resp.status == 0
+    assert "over" in (resp.error or "") and resp.body is None
+
+
+def test_a_body_at_the_cap_is_still_read(loopback, monkeypatch):
+    """The refusal must be an over-cap refusal, not an always-refusal."""
+    monkeypatch.setattr(github_mirror, "MAX_BODY_BYTES", 4096)
+    payload = b'[{"number": 7, "title": "fits"}]'
+
+    def handle(request, _server):
+        request.send_response(200)
+        request.send_header("Content-Type", "application/json")
+        request.send_header("Content-Length", str(len(payload)))
+        request.end_headers()
+        request.wfile.write(payload)
+
+    resp = github_mirror.default_fetch(loopback(handle).url, {})
+    assert resp.status == 200 and resp.body == [{"number": 7, "title": "fits"}]
+
+
+def test_default_fetch_refuses_a_redirect_off_api_github_com(loopback):
+    """urlopen's default opener follows up to TEN redirects, to any host and
+    any scheme, and HTTPRedirectHandler does NOT strip Authorization when it
+    crosses an origin. GitHub 301s a renamed repo, so this path runs in normal
+    operation — and the box's own ingest port (127.0.0.1:8081) and every
+    sibling container on km-tracker_default are reachable from here.
+
+    Two servers: the first 302s to the second. The second must never be asked,
+    and above all must never see the bearer token.
+    """
+    target = loopback(lambda request, server: (
+        server.headers_seen.append(dict(request.headers)),
+        request.send_response(200),
+        request.send_header("Content-Length", "2"),
+        request.end_headers(),
+        request.wfile.write(b"[]"),
+    ))
+
+    def redirector(request, _server):
+        request.send_response(302)
+        request.send_header("Location", target.url)
+        request.send_header("Content-Length", "0")
+        request.end_headers()
+
+    source = loopback(redirector)
+    resp = github_mirror.default_fetch(
+        source.url, {"Authorization": "Bearer ghp_supersecrettoken"})
+    # The 302 is re-raised as an HTTPError rather than followed.
+    assert resp.status == 302 and resp.error == "HTTP 302"
+    assert target.headers_seen == [], "the redirect target was contacted"
+
+
+def test_a_redirect_that_stays_on_api_github_com_is_allowed():
+    """The refusal is scoped, not blanket: GitHub's own 301 for a renamed repo
+    still works, which is what keeps this from being a silent outage."""
+    handler = github_mirror._GitHubOnlyRedirects()
+    assert handler.redirect_request(
+        _fake_req(), None, 301, "Moved", {},
+        "https://api.github.com/repos/a/b/issues") is not None
+    for bad in ("http://api.github.com/x",            # downgraded scheme
+                "https://api.github.com.evil.test/x",  # suffix trick
+                "https://raw.githubusercontent.com/x",
+                "http://127.0.0.1:8081/api/v1/ping/snap"):
+        assert handler.redirect_request(_fake_req(), None, 301, "Moved", {},
+                                        bad) is None, bad
+
+
+def _fake_req():
+    import urllib.request
+    return urllib.request.Request("https://api.github.com/repos/a/b/issues",
+                                  headers={"Authorization": "Bearer x"},
+                                  method="GET")
+
+
+def test_default_fetch_applies_a_timeout(loopback, monkeypatch):
+    """A GitHub that accepts the connection and then says nothing would hold
+    the scheduler thread — the same thread that runs the probe cycle — for
+    ever. Driven for real with the timeout wound down to 0.3 s."""
+    import threading
+    release = threading.Event()
+
+    def handle(request, _server):
+        release.wait(5)                     # longer than the timeout, bounded
+        request.send_response(200)
+        request.send_header("Content-Length", "2")
+        request.end_headers()
+        request.wfile.write(b"[]")
+
+    monkeypatch.setattr(github_mirror, "HTTP_TIMEOUT_S", 0.3)
+    server = loopback(handle)
+    try:
+        started = time.monotonic()
+        resp = github_mirror.default_fetch(server.url, {})
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+    assert resp.status == 0 and resp.body is None
+    assert "timed out" in (resp.error or "").lower() or "timeout" in (resp.error or "").lower()
+    assert elapsed < 3, f"no timeout was applied ({elapsed:.1f}s)"
+
+
+def test_a_transport_error_never_carries_the_token(loopback, monkeypatch):
+    """`http.client.putheader` raises ValueError('Invalid header value %r') with
+    the WHOLE header in it, and that string is logged AND written to
+    inbox_mirror_state.last_error. Redaction is the second defence; the first
+    is config refusing the token at startup."""
+    monkeypatch.setattr(github_mirror, "HTTP_TIMEOUT_S", 0.3)
+    secret = "ghp_averysecrettokenvalue"
+
+    def handle(request, _server):
+        request.close_connection = True     # hang up mid-request
+
+    server = loopback(handle)
+    resp = github_mirror.default_fetch(server.url,
+                                       {"Authorization": f"Bearer {secret}"})
+    assert resp.status == 0
+    assert secret not in (resp.error or "")
+
+
+def test_the_mirror_keeps_only_the_four_fields_it_reads(conn):
+    """A GitHub issue payload is ~30 fields including the whole `user` object;
+    up to 1000 of them sit in `issues` before anything is written."""
+    fat = issue(1, "Wheel spins twice", "body text")
+    fat.update({"user": {"login": "someone", "avatar_url": "x" * 200},
+                "labels": [{"name": "bug"} for _ in range(50)],
+                "reactions": {"+1": 3}, "body_html": "y" * 5000})
+    captured: list[dict] = []
+    real = github_mirror._project_issue
+
+    def spy(raw):
+        out = real(raw)
+        captured.append(out)
+        return out
+
+    github_mirror._project_issue = spy
+    try:
+        github_mirror.sync(conn, [REPO], now=NOW, fetch=FakeGitHub([ok([fat])]))
+    finally:
+        github_mirror._project_issue = real
+    assert captured == [{"number": 1, "title": "Wheel spins twice",
+                         "body": "body text"}]
+    row = inbox_db.get_item_by_mirror_key(conn, inbox_db.github_key(REPO, 1))
+    assert row["title"] == "Wheel spins twice" and row["body"] == "body text"
+
+
+def test_an_illegal_token_is_refused_before_it_can_reach_a_header(conn):
+    """A copy-paste into `.env` that picks up a newline is the realistic way to
+    produce one. `_headers` refuses it, and the refusal names the RULE, never
+    the value."""
+    bad = "ghp_good\nX-Evil: 1"
+    with pytest.raises(ValueError) as exc:
+        github_mirror._headers(bad, None)
+    assert "ghp_good" not in str(exc.value)
+    # ...and it never reaches the store as `last_error` either.
+    out = github_mirror.sync(conn, [REPO], now=NOW,
+                             fetch=FakeGitHub([ok([])]), token=bad)
+    assert out["failed"] == 1
+    assert "ghp_good" not in str(out["results"])
+    state = inbox_db.get_mirror_state(
+        conn, f"{inbox_db.MIRROR_GITHUB}:{REPO}")
+    assert "ghp_good" not in str(state.get("last_error") or "")

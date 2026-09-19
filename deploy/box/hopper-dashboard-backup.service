@@ -1,0 +1,35 @@
+# hopper-dashboard off-box backup (local snapshot ring + throttled Drive push).
+# TEMPLATE — deploy/box/install.sh replaces @@REPO@@ with the checkout path
+# (~/hopper-dashboard) and @@USER@@ with the login that runs it. NEVER hand-copy this file to
+# /etc/systemd/system: systemd rejects the unrendered placeholders with "Neither a valid
+# executable name nor an absolute path", the unit fails on every tick, and the backup stops
+# QUIETLY. That exact mistake took down the box container heartbeat on 2026-09-12.
+#
+# Until the Inbox this app held nothing irreplaceable. inbox.db now holds Graham's voice notes'
+# transcripts and his triage state, and /app/data/inbox/audio holds the recordings — the only
+# copy of either. The dashboard exists to catch unbacked-up data; it must not be the last thing
+# on the box without a backup.
+#
+# The snapshot itself runs INSIDE the container via `docker exec` (the WAL DBs' -wal/-shm
+# sidecars are owned by UID 10001, so SQLite's online backup API cannot take its read lock
+# host-side), so User= must be in the `docker` group.
+[Unit]
+Description=hopper-dashboard SQLite backup (dashboard.db + inbox.db + audio → Drive)
+# The Drive push needs the network; the local snapshot still runs without it and the push half
+# just reports. Ordering-only on docker.service, deliberately no Requires=: on a box where it
+# is absent or named differently a hard dependency would stop this unit running at all,
+# whereas ordering is a no-op there and backup.sh fails loudly with its own diagnostics.
+Wants=network-online.target
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+User=@@USER@@
+ExecStart=@@REPO@@/deploy/box/backup.sh
+# A backup must never hang the box. 300 s matches km-backup; the work is two ~MB snapshots
+# plus a throttled rclone push that only actually runs every DRIVE_PUSH_INTERVAL_MIN.
+TimeoutStartSec=300
+NoNewPrivileges=true
+PrivateTmp=true
+# ProtectSystem/ProtectHome are deliberately omitted: they would need ReadWritePaths for
+# ~/hopper-dashboard-backups and ~/.config/rclone to keep working.

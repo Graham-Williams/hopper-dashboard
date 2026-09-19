@@ -202,6 +202,11 @@ def test_example_file_alert_policy_matches_the_documented_thresholds():
     # it is what mutes its siblings, so `never` there is silence for the whole machine.
     assert {j.id for j in reg if j.alert_never} == {
         "minecraft-offload", "taste-twin-publish", "jjho-refresh", "baby-pool-sync"}
+    # The Inbox's three jobs all page after a day: none of them is an emergency, and none of
+    # them is allowed to be silent either (a dead mirror or a dead worker LOOKS fine).
+    assert all(reg.get(i).alert_after_s == 86400
+               for i in ("hopper-dashboard-backup", "inbox-transcribe", "inbox-backlog",
+                         "inbox-github-sync"))
     assert all(not j.alert_never for j in reg if j.kind == "probe")
     # 72 h on top of a 15 h LATE deadline: a weekend with the lid shut is silent, a Mac
     # that is gone for ~3.6 days is not.
@@ -268,7 +273,7 @@ def test_every_alerting_job_states_its_real_time_to_page():
             f"{job.id}: comment says {found.group(1)}, arithmetic says {want} "
             f"(deadline {job.deadline_s} + threshold {job.alert_after_s})")
         checked += 1
-    assert checked == 10                                 # every job that can page
+    assert checked == 13                                 # every job that can page
 
 
 def test_the_time_to_page_figures_are_the_ones_graham_was_quoted():
@@ -282,7 +287,13 @@ def test_the_time_to_page_figures_are_the_ones_graham_was_quoted():
         "km-backup": "24.3h", "todoist-points-backup": "24.3h",
         "box-containers": "35m", "box-disk": "1h", "dashboard-probes": "6.3h",
         "mac-probe": "87h", "mac-disk": "1h", "pa-backup": "44h",
-        "drive-mirror": "39h", "inbox-github-sync": "24.5h"}
+        "drive-mirror": "39h", "inbox-github-sync": "24.5h",
+        "hopper-dashboard-backup": "24.3h",
+        # The two Mac Inbox jobs pay the same 14 h grace every Mac job pays (below it, a
+        # missed run is indistinguishable from a sleeping Mac), so a day-long threshold
+        # lands just under 40 h. A worker that CRASHED posts `fail` and is red at once —
+        # these figures cover silence, i.e. launchd never running it at all.
+        "inbox-transcribe": "38.1h", "inbox-backlog": "39h"}
     # The bar Graham set was "backups missed more than 24 hours". Both DB
     # snapshots clear it; pa-backup cannot (its 38 h deadline is a hard floor —
     # below it a missed backup is indistinguishable from a sleeping Mac) but it
@@ -434,7 +445,8 @@ def test_example_file_probe_intervals_are_documented_for_the_big_trees():
     reg = load_registry(EXAMPLE_JOBS)
     assert not reg.get("pa-backup").has_probe
     assert not reg.get("minecraft-offload").has_probe
-    assert [j.id for j in reg.probed()] == ["km-backup", "todoist-points-backup"]
+    assert [j.id for j in reg.probed()] == ["km-backup", "todoist-points-backup",
+                                            "hopper-dashboard-backup"]
     assert all(j.probe_interval_s is None for j in reg.probed())
     with open(EXAMPLE_JOBS, encoding="utf-8") as fh:
         text = fh.read()

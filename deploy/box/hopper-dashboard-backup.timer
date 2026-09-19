@@ -1,0 +1,15 @@
+# Fires hopper-dashboard-backup.service every 5 minutes — frequent, cheap LOCAL snapshots that
+# sha256-dedupe, with backup.sh throttling the off-box Drive push to ~every 15 minutes. The
+# 5-minute cadence matches the two sibling backup timers, so the job can use the same
+# cadence_s/grace_s in jobs.yml.
+[Unit]
+Description=Run the hopper-dashboard backup every 5 minutes
+
+[Timer]
+OnBootSec=4min
+OnUnitActiveSec=5min
+# Catch up a missed run (box asleep/off) instead of waiting a whole interval after boot.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

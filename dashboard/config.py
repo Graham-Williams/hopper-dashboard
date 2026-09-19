@@ -30,6 +30,22 @@ GITHUB_REPO_RE = re.compile(
 # A repo list long enough to blow the mirror's own cadence is a paste accident.
 MAX_GITHUB_REPOS = 50
 
+# The characters a GitHub token may contain. Every shape GitHub issues (`ghp_`,
+# `github_pat_`, the older 40-hex PATs, an installation token) fits inside this.
+#
+# Validated at STARTUP, and the reason is not typo-catching: the token goes into
+# an `Authorization: Bearer …` header, and `http.client.putheader` rejects an
+# illegal header value by raising `ValueError('Invalid header value %r' % value)`
+# — with the WHOLE header, token included, inside the message. That message
+# becomes `MirrorResponse.error`, which the mirror then both `log.warning`s and
+# writes to `inbox_mirror_state.last_error`. So a token with a stray newline or
+# space (trivially produced by a copy-paste into `.env`) would put the secret in
+# the log and in the database. Refusing it here means the illegal header value
+# can never be constructed; `github_mirror._redact` is the second, independent
+# defence for the same leak.
+GITHUB_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
+MAX_GITHUB_TOKEN = 255
+
 
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name, "")
@@ -75,6 +91,24 @@ def _env_github_repos(name: str) -> tuple[str, ...]:
         raise ValueError(f"{name}: {len(out)} repos is over the "
                          f"{MAX_GITHUB_REPOS} maximum")
     return tuple(out)
+
+
+def _env_github_token(name: str) -> str:
+    """The token, validated so it can never become an illegal header value.
+
+    The error message names the variable and the RULE, never the value — the
+    whole point of this function is that the token does not end up in a string
+    that gets logged.
+    """
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return ""
+    if len(raw) > MAX_GITHUB_TOKEN:
+        raise ValueError(f"{name} is longer than {MAX_GITHUB_TOKEN} characters")
+    if not GITHUB_TOKEN_RE.match(raw):
+        raise ValueError(f"{name} may only contain letters, digits, '_', '.' "
+                         f"and '-' (it becomes an HTTP header value)")
+    return raw
 
 
 @dataclass
@@ -229,7 +263,7 @@ class Settings:
                                            8 * 1024 * 1024),
             inbox_audio_retention_days=_env_int("INBOX_AUDIO_RETENTION_DAYS", 90),
             inbox_github_repos=_env_github_repos("INBOX_GITHUB_REPOS"),
-            inbox_github_token=os.environ.get("INBOX_GITHUB_TOKEN", "").strip(),
+            inbox_github_token=_env_github_token("INBOX_GITHUB_TOKEN"),
             inbox_github_interval_s=_env_int("INBOX_GITHUB_INTERVAL_S", 900),
             inbox_prune_interval_s=_env_int("INBOX_PRUNE_INTERVAL_S", 3600),
         )
