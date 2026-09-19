@@ -2,6 +2,20 @@
    CSP nonce the inline localizer carries (`script-src 'nonce-…'` has no 'self',
    so an external file without the nonce would simply not run).
 
+   PRIVACY GUARANTEE — the reason this file has no speech recognition in it.
+   Recorded audio is uploaded to THIS ORIGIN and nowhere else, and it is
+   transcribed LOCALLY by Whisper on Graham's own Mac. Nothing spoken into this
+   page is sent to Google, Apple, or any other third party at any point.
+
+   That is a deliberate product decision, not an accident of implementation.
+   The page used to run a live transcript through `webkitSpeechRecognition`,
+   which on every shipping browser streams the microphone to the vendor's own
+   servers for recognition. Graham was told, and chose: "Drop it — nothing
+   leaves the box." So a voice note is now always created with
+   transcript_status='pending' and the Mac worker (every 5 minutes) fills the
+   transcript in. If you are ever tempted to add live transcription back, it has
+   to be an on-device engine or it breaks this promise.
+
    Three rules this file may not break, all of them load-bearing:
 
    1. It NEVER assigns innerHTML and is never handed a JSON blob of transcripts.
@@ -11,13 +25,12 @@
    2. It NEVER plays audio from a `blob:` URL. That would need `media-src blob:`
       in the CSP, and the CSP is not being loosened for a preview — playback
       happens from /inbox/audio/<id> after the note is saved.
-   3. MediaRecorder is the SOURCE OF TRUTH and outranks live speech recognition.
-      On iOS Safari the two fight over the microphone; if starting recognition
-      throws, or the recorder stops within ~300 ms of recognition starting, the
-      live transcript is abandoned for that take and recording continues. The
-      row is simply created with transcript_status='pending' and Whisper fills
-      it in later. Losing a recording to a nice-to-have is not a trade worth
-      making.
+   3. The microphone is released on EVERY exit path. A stream assigned to a
+      variable that is then overwritten can never be stopped again, and a
+      recording light that will not go out is the worst thing this page could
+      do on a phone. Hence: release before starting, release in the failure
+      path, and refuse to start a second time while a permission prompt is
+      already open.
 
    And the page must degrade: with JavaScript off the table, the filters and
    the typed-note form all still work. Only the microphone needs this file. */
@@ -55,9 +68,12 @@
   var recordedBlob = null;
   var recordedSecs = 0;
   var startedAt = 0;
-  var speech = null;
-  var speechAbandoned = false;
-  var userStopped = false;
+  /* True from the moment getUserMedia is called until it settles. Without it a
+     double-tap (the ordinary way to hit this on a phone) opens a SECOND stream
+     whose assignment orphans the first — and an orphaned stream can never be
+     stopped, so the microphone stays live for the life of the page. */
+  var starting = false;
+  var timerId = null;
 
   /* Both formats the two devices Graham uses actually produce: Chrome/Android
      gives webm/opus, iOS Safari gives mp4/AAC. The server accepts both and the
@@ -95,69 +111,32 @@
     stream = null;
   }
 
-  /* The iOS rule, in one function: speech recognition is optional and the
-     recording is not, so anything that goes wrong with recognition ends
-     recognition — never the take. */
-  function abandonSpeech(why) {
-    if (speech) {
-      speech.onresult = null;
-      speech.onerror = null;
-      speech.onend = null;
-      try { speech.stop(); } catch (e) { /* already stopped */ }
-      speech = null;
-    }
-    if (!speechAbandoned) {
-      speechAbandoned = true;
-      status('Recording… live transcript off (' + why +
-             ') — Whisper will transcribe it.');
+  /* mm:ss. A spinner would prove the script is alive; a clock proves the
+     RECORDER is, which is the thing the user is actually anxious about. */
+  function clock(secs) {
+    var whole = Math.max(0, Math.floor(secs));
+    var mins = Math.floor(whole / 60);
+    var rest = whole % 60;
+    return mins + ':' + (rest < 10 ? '0' : '') + rest;
+  }
+
+  function elapsedSecs() {
+    return startedAt ? (Date.now() - startedAt) / 1000 : 0;
+  }
+
+  function stopTimer() {
+    if (timerId !== null) {
+      window.clearInterval(timerId);
+      timerId = null;
     }
   }
 
-  function startSpeech() {
-    var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) {
-      status('Recording… no live transcript in this browser; Whisper will do it.');
-      return;
-    }
-    try {
-      speech = new SR();
-      speech.continuous = true;
-      speech.interimResults = false;
-      speech.lang = navigator.language || 'en-US';
-      speech.onresult = function (event) {
-        if (speechAbandoned || !textEl) { return; }
-        var heard = '';
-        for (var i = event.resultIndex; i < event.results.length; i++) {
-          if (event.results[i].isFinal) { heard += event.results[i][0].transcript; }
-        }
-        if (!heard) { return; }
-        textEl.value = (textEl.value ? textEl.value + ' ' : '') + heard.trim();
-      };
-      speech.onerror = function (event) {
-        abandonSpeech((event && event.error) || 'speech error');
-      };
-      speech.start();
-    } catch (e) {
-      abandonSpeech('speech recognition would not start');
-      return;
-    }
-    /* If the recorder has died within ~300 ms of recognition starting, the two
-       are fighting over the microphone. Drop recognition and start the recorder
-       again on the same open stream, so the take survives. */
-    window.setTimeout(function () {
-      if (userStopped || !recorder) { return; }
-      if (recorder.state === 'recording') { return; }
-      abandonSpeech('it interrupted the recorder');
-      try {
-        recorder = new window.MediaRecorder(stream);
-        wireRecorder();
-        chunks = [];
-        startedAt = Date.now();
-        recorder.start();
-      } catch (e) {
-        status('Recording stopped unexpectedly — please try again, or type it.');
-      }
-    }, 300);
+  function startTimer() {
+    stopTimer();
+    status('● Recording… 0:00');
+    timerId = window.setInterval(function () {
+      status('● Recording… ' + clock(elapsedSecs()));
+    }, 250);
   }
 
   function wireRecorder() {
@@ -165,21 +144,23 @@
       if (event.data && event.data.size) { chunks.push(event.data); }
     };
     recorder.onstop = function () {
+      stopTimer();
       releaseStream();
       var type = recorder.mimeType || (chunks[0] && chunks[0].type) || 'audio/webm';
       recordedBlob = chunks.length ? new Blob(chunks, {type: type}) : null;
-      recordedSecs = startedAt ? Math.round((Date.now() - startedAt) / 100) / 10 : 0;
+      recordedSecs = Math.round(elapsedSecs() * 10) / 10;
       setRecording(false);
       if (recordedBlob) {
         /* Deliberately no preview player here: that needs a blob: URL and the
            CSP has no media-src blob:. It is playable from the row as soon as
            it is saved. */
-        status('Recorded ' + recordedSecs + 's — add it to the inbox.');
+        status('Recorded ' + clock(recordedSecs) + ' — press “Add to inbox” to save it.');
       } else {
         status('Nothing was recorded — try again, or type it instead.');
       }
     };
     recorder.onerror = function () {
+      stopTimer();
       status('The recorder failed — type it instead.');
       setRecording(false);
       releaseStream();
@@ -195,48 +176,77 @@
   }
 
   function startRecording() {
+    if (starting) { return; }             // a permission prompt is already open
     fail('');
-    userStopped = false;
-    speechAbandoned = false;
+    /* Belt and braces before anything else: if a previous take left a stream
+       open (an exception between assignment and start used to do exactly
+       that), it is stopped here rather than orphaned by the next assignment. */
+    releaseStream();
+    stopTimer();
     recordedBlob = null;
+    recordedSecs = 0;
+    starting = true;
+    if (recBtn) { recBtn.disabled = true; }
     status('Asking for the microphone…');
     navigator.mediaDevices.getUserMedia({audio: true}).then(function (granted) {
+      starting = false;
+      if (recBtn) { recBtn.disabled = false; }
       stream = granted;
-      var mime = preferredMime();
       try {
-        recorder = mime ? new window.MediaRecorder(stream, {mimeType: mime})
-                        : new window.MediaRecorder(stream);
+        var mime = preferredMime();
+        try {
+          recorder = mime ? new window.MediaRecorder(stream, {mimeType: mime})
+                          : new window.MediaRecorder(stream);
+        } catch (e) {
+          recorder = new window.MediaRecorder(stream);
+        }
+        chunks = [];
+        wireRecorder();
+        startedAt = Date.now();
+        recorder.start();
       } catch (e) {
-        recorder = new window.MediaRecorder(stream);
+        /* The construct-or-start path can throw on its own (an unsupported
+           mimeType, a track that died between grant and start). The stream is
+           already open at this point, so it MUST be released here or the
+           microphone stays live with no way to turn it off. */
+        releaseStream();
+        recorder = null;
+        setRecording(false);
+        status('The recorder would not start (' + ((e && e.name) || 'error') +
+               ') — type it instead.');
+        if (textEl) { textEl.focus(); }
+        return;
       }
-      chunks = [];
-      wireRecorder();
-      startedAt = Date.now();
-      recorder.start();
       setRecording(true);
-      status('Recording…');
-      /* Recognition starts only AFTER the recorder is running, so the recorder
-         has the microphone first. */
-      startSpeech();
+      startTimer();
     }).catch(function (err) {
-      /* Never a silently dead button: say what happened and put the cursor
-         where the note can still be written. */
-      recBtn.disabled = true;
-      status('Microphone unavailable (' + ((err && err.name) || 'denied') +
-             ') — type it instead.');
+      starting = false;
+      /* Release whatever may have been granted before the failure, always.
+         Nothing should be open on this path, but "should" is how a hot
+         microphone happens. */
+      releaseStream();
+      stopTimer();
+      setRecording(false);
+      var name = (err && err.name) || 'denied';
+      /* ONLY a refusal is permanent. NotReadableError (another app holds the
+         mic) and AbortError are transient, and disabling the button for them
+         used to cost a page reload to recover from. */
+      if (name === 'NotAllowedError' || name === 'SecurityError') {
+        if (recBtn) { recBtn.disabled = true; }
+        status('Microphone permission denied — type it instead.');
+      } else {
+        if (recBtn) { recBtn.disabled = false; }
+        status('Microphone unavailable (' + name + ') — try again, or type it.');
+      }
       if (textEl) { textEl.focus(); }
     });
   }
 
   function stopRecording() {
-    userStopped = true;
-    if (speech) {
-      try { speech.stop(); } catch (e) { /* already stopped */ }
-      speech = null;
-    }
     if (recorder && recorder.state !== 'inactive') {
-      recorder.stop();
+      recorder.stop();                    // onstop releases the stream + timer
     } else {
+      stopTimer();
       releaseStream();
       setRecording(false);
     }
@@ -252,8 +262,15 @@
       if (textEl) { textEl.focus(); }
     } else {
       recBtn.addEventListener('click', function () {
+        if (starting) { return; }
         if (recorder && recorder.state === 'recording') { stopRecording(); }
         else { startRecording(); }
+      });
+      /* If the tab is closed or navigated away mid-take, drop the microphone
+         rather than relying on the browser to notice. */
+      window.addEventListener('pagehide', function () {
+        stopTimer();
+        releaseStream();
       });
     }
   }
@@ -288,11 +305,18 @@
           if (!response.ok) {
             throw new Error(body.error || ('save failed (' + response.status + ')'));
           }
+          /* Say it landed BEFORE reloading. A voice note has no transcript yet
+             (nothing leaves this box, so Whisper on the Mac does it on its next
+             pass), and "did that even record?" is the question this page has to
+             answer out loud. */
+          status(recordedBlob
+                 ? 'Saved — transcribing… Whisper picks it up within a few minutes.'
+                 : 'Saved.');
           /* Reload rather than building a row here: rows are server-rendered,
              and that is the rule that keeps untrusted text out of the DOM by
              any path but Jinja's escaping. The query string (the filters) is
              preserved. */
-          window.location.reload();
+          window.setTimeout(function () { window.location.reload(); }, 700);
         });
       }).catch(function (err) {
         if (submitBtn) { submitBtn.disabled = false; }
@@ -332,6 +356,40 @@
         });
       });
     })(boxes[b]);
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Delete (the only way a recording of Graham's voice leaves the box)  */
+  /* ------------------------------------------------------------------ */
+
+  var deleters = document.querySelectorAll('.delete-item');
+  for (var d = 0; d < deleters.length; d++) {
+    (function (btn) {
+      btn.hidden = false;          // only shown once it actually works
+      btn.addEventListener('click', function () {
+        var id = btn.getAttribute('data-id');
+        /* A confirm step, because this destroys the row AND its audio and
+           there is no undo. `confirm` is deliberate: a bespoke modal would be
+           more DOM for no more safety. */
+        if (!window.confirm('Delete this item and its recording? This cannot ' +
+                            'be undone.')) { return; }
+        btn.disabled = true;
+        window.fetch('/api/v1/inbox/items/' + encodeURIComponent(id), {
+          method: 'DELETE',
+          credentials: 'same-origin',
+          headers: {'Accept': 'application/json'}
+        }).then(function (response) {
+          if (!response.ok && response.status !== 404) {
+            throw new Error('delete failed');
+          }
+          var row = document.getElementById('item-' + id);
+          if (row && row.parentNode) { row.parentNode.removeChild(row); }
+        }).catch(function () {
+          btn.disabled = false;
+          fail('Could not delete that item — check your connection.');
+        });
+      });
+    })(deleters[d]);
   }
 
   /* ------------------------------------------------------------------ */

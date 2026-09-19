@@ -60,15 +60,22 @@ TITLE_SOURCES = ("derived", "manual")
 #: and the worker has nothing to back off on. A ``failed`` row still shows on
 #: the board with its audio playable.
 TRANSCRIPT_PENDING = "pending"      # audio saved, no transcript yet
-TRANSCRIPT_LIVE = "live"            # the browser's speech API produced it
+#: RETIRED as a value anything PRODUCES. The browser speech API that wrote it
+#: streamed the microphone to Google/Apple for recognition, and Graham's ruling
+#: was "drop it — nothing leaves the box"; every voice note is now created
+#: ``pending`` and Whisper (on his Mac) fills it in. The value and its rendering
+#: are kept because rows written before that change may still carry it, and
+#: removing an enum value would be a migration for no gain. Nothing writes it.
+TRANSCRIPT_LIVE = "live"            # legacy: the browser's speech API
 TRANSCRIPT_WHISPER = "whisper"      # the Mac worker produced it
 TRANSCRIPT_TYPED = "typed"          # Graham typed it; nothing to transcribe
 TRANSCRIPT_FAILED = "failed"        # Whisper gave up after N attempts
 TRANSCRIPT_STATUSES = (TRANSCRIPT_PENDING, TRANSCRIPT_LIVE, TRANSCRIPT_WHISPER,
                        TRANSCRIPT_TYPED, TRANSCRIPT_FAILED)
-#: Statuses the Mac worker should still try: a live browser transcript is better
-#: than nothing but worse than Whisper, and a failed one is retried until the
-#: attempt counter stops it.
+#: Statuses the Mac worker should still try. ``live`` stays in the set purely
+#: for legacy rows (nothing produces it any more, see above): a stale browser
+#: transcript is better than nothing but worse than Whisper. A failed one is
+#: retried until the attempt counter stops it.
 TRANSCRIBABLE_STATUSES = (TRANSCRIPT_PENDING, TRANSCRIPT_LIVE, TRANSCRIPT_FAILED)
 #: Audio may only be deleted once the transcript is Whisper-quality. Anything
 #: less and the audio is still the only accurate record of what was said.
@@ -222,8 +229,8 @@ def _rows(cur) -> list[dict]:
 def clean_text(value: Any, max_len: int = MAX_TEXT) -> str:
     """Trim, cap, and strip C0 control characters except tab/newline.
 
-    Spoken transcripts arrive from a browser speech API and GitHub titles from
-    strangers' repos; neither has any business carrying NUL or ESC. This is not
+    Spoken transcripts arrive from Whisper and GitHub titles from strangers'
+    repos; neither has any business carrying NUL or ESC. This is not
     the XSS defence (that is escaping at render time) — it is keeping the store
     free of bytes that render as garbage in a log line or a terminal.
     """

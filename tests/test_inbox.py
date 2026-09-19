@@ -240,9 +240,9 @@ def test_typed_note_is_typed_and_never_queued_for_transcription(authed):
 
 @pytest.mark.parametrize("data,mime", [(WEBM, "audio/webm;codecs=opus"),
                                        (M4A, "audio/mp4")])
-def test_a_voice_note_with_no_live_transcript_is_pending(authed, data, mime):
-    """iOS Safari emits mp4 and Chrome/Android webm — both land as `pending`
-    when speech recognition produced nothing, and Whisper fills them in."""
+def test_a_voice_note_is_pending_until_whisper_runs(authed, data, mime):
+    """iOS Safari emits mp4 and Chrome/Android webm — both land as `pending`,
+    and the Mac's Whisper worker fills them in."""
     r = authed.post("/api/v1/inbox/items",
                     data={"text": "", "audio": (io_bytes(data), "note", mime)},
                     content_type="multipart/form-data",
@@ -253,14 +253,41 @@ def test_a_voice_note_with_no_live_transcript_is_pending(authed, data, mime):
     assert item["has_audio"] and item["awaiting_transcription"] is True
 
 
-def test_a_voice_note_with_a_live_transcript_is_live(authed):
+def test_typed_text_alongside_audio_is_still_pending_not_live(authed):
+    """`live` used to mean "the browser speech API transcribed it", and the
+    browser speech API streamed the microphone to Google/Apple. It is gone, so
+    NOTHING creates a `live` row any more: text next to a recording is
+    something Graham typed, and the row is still waiting on Whisper."""
     r = authed.post("/api/v1/inbox/items",
                     data={"text": "the wheel spins twice", "audio_secs": "12.5",
                           "audio": (io_bytes(WEBM), "note", "audio/webm")},
                     content_type="multipart/form-data",
                     headers={"Accept": "application/json"})
     item = r.get_json()
-    assert item["transcript_status"] == "live" and item["audio_secs"] == 12.5
+    assert item["transcript_status"] == "pending" and item["audio_secs"] == 12.5
+    assert item["awaiting_transcription"] is True
+
+
+def test_nothing_in_the_page_reaches_a_third_party_speech_service(read_app):
+    """The privacy guarantee, pinned in a test so a future edit has to argue
+    with it. `webkitSpeechRecognition` streams the microphone to Google (or
+    Apple) for recognition; Graham's ruling was "nothing leaves the box", so
+    the only thing that may touch a recording is the upload to this origin.
+
+    Comments are stripped first ON PURPOSE: the file explains at length WHY the
+    API is gone, and that explanation is the thing most worth keeping.
+    """
+    import re
+    with open(read_app.static_folder + "/inbox.js", encoding="utf-8") as fh:
+        source = fh.read()
+    code = re.sub(r"/\*.*?\*/", "", source, flags=re.S)
+    code = re.sub(r"(?m)//.*$", "", code)
+    for banned in ("SpeechRecognition", "speechSynthesis", "getUserMedia({video",
+                   "blob:"):
+        assert banned not in code, f"{banned} is back in inbox.js"
+    # ...and the recording path still exists, so this is not passing by virtue
+    # of an empty file.
+    assert "getUserMedia" in code and "MediaRecorder" in code
 
 
 def test_an_empty_submission_is_refused(authed):

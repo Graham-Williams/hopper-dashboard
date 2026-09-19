@@ -29,10 +29,15 @@ the two mutating routes, because READ_TOKEN is a read credential that Hopper's
 watch carries and it must not become a write one. **I** = ``INBOX_TOKEN``
 bearer; empty = fail closed (401), exactly like ``INGEST_TOKEN``.
 
-Everything a row carries is UNTRUSTED text: transcripts from a browser speech
-API, titles from GitHub, lines from backlog.txt. It is escaped at render (Jinja
-autoescape for HTML, ``jsonify`` for JSON) and the page's JS uses
-``textContent`` only — there is no path from a stored string to markup.
+Everything a row carries is UNTRUSTED text: Whisper transcripts, titles from
+GitHub, lines from backlog.txt. It is escaped at render (Jinja autoescape for
+HTML, ``jsonify`` for JSON) and the page's JS uses ``textContent`` only — there
+is no path from a stored string to markup.
+
+**Voice notes never leave the box.** Audio is uploaded to this origin, stored
+as a file on the data volume, and transcribed locally by Whisper on Graham's
+Mac. The browser speech API that used to produce a live transcript streamed the
+microphone to Google/Apple and was removed for exactly that reason.
 """
 
 from __future__ import annotations
@@ -321,9 +326,13 @@ def create_item():
     """S only. Multipart: ``text``, optional ``title``/``project``/``audio``.
 
     The transcript status is decided here and it is the contract the Mac worker
-    reads: audio with a live browser transcript is ``live`` (Whisper will
-    improve on it and may replace the body), audio with nothing said yet is
-    ``pending``, and a note with no audio is ``typed`` and is never queued.
+    reads, and since the browser speech API was dropped it has exactly two
+    outcomes: audio of any kind is ``pending`` (nothing in the browser
+    transcribes any more — that would mean streaming Graham's voice to Google
+    or Apple, and the ruling was "nothing leaves the box"), and a note with no
+    audio is ``typed`` and is never queued. The Mac's Whisper worker fills every
+    pending row in on its next pass.
+
     A MANUAL title is preserved through all of that — which is why anything
     Graham types that must survive the backfill belongs in the title.
     """
@@ -357,8 +366,10 @@ def create_item():
         except inbox_audio.AudioRejected as exc:
             return _err(exc.message, exc.status)
         audio_row = stored.as_row(secs=_float_or_none(request.form.get("audio_secs")))
-        status = (inbox_db.TRANSCRIPT_LIVE if text
-                  else inbox_db.TRANSCRIPT_PENDING)
+        # ALWAYS pending, even when `text` is non-empty: with live recognition
+        # gone, text alongside audio is something Graham typed, not a transcript
+        # of the recording, and the row is still waiting on Whisper.
+        status = inbox_db.TRANSCRIPT_PENDING
 
     conn = _conn()
     try:
