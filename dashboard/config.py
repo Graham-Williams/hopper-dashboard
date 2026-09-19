@@ -8,10 +8,21 @@ environment. Nothing here is logged — several fields are secrets.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 
 
 MAX_FAIL_THRESHOLD = 10
+
+# `owner/repo`, the only shape the unauthenticated GitHub issue mirror can use.
+# Validated at STARTUP (not at fetch time) so a typo in the box `.env` is a
+# container that refuses to come up naming the bad value, rather than a mirror
+# that quietly syncs nothing for ever — the same rule registry.py applies to
+# jobs.yml. It also means nothing interpolated into a GitHub URL has ever been
+# unvalidated.
+GITHUB_REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
+# A repo list long enough to blow the mirror's own cadence is a paste accident.
+MAX_GITHUB_REPOS = 50
 
 
 def _env_int(name: str, default: int) -> int:
@@ -38,6 +49,25 @@ def _env_cidrs(name: str) -> tuple[str, ...]:
         except ValueError as exc:
             raise ValueError(f"{name}: {part!r} is not a valid CIDR") from exc
         out.append(part)
+    return tuple(out)
+
+
+def _env_github_repos(name: str) -> tuple[str, ...]:
+    """Comma/whitespace-separated ``owner/repo`` list, validated here so a bad
+    value fails the container at startup instead of at the first sync."""
+    raw = os.environ.get(name, "")
+    out: list[str] = []
+    for part in re.split(r"[,\s]+", raw):
+        part = part.strip()
+        if not part:
+            continue
+        if not GITHUB_REPO_RE.match(part):
+            raise ValueError(f"{name}: {part!r} is not a valid owner/repo")
+        if part not in out:
+            out.append(part)
+    if len(out) > MAX_GITHUB_REPOS:
+        raise ValueError(f"{name}: {len(out)} repos is over the "
+                         f"{MAX_GITHUB_REPOS} maximum")
     return tuple(out)
 
 
@@ -85,11 +115,55 @@ class Settings:
     # container's network). Empty = never trust the header.
     trusted_proxy_cidrs: tuple[str, ...] = ()
     max_body_bytes: int = 64 * 1024
+    # -- Inbox (/inbox) ---------------------------------------------------- #
+    # Bearer token for the MACHINE side of the Inbox (the Mac transcription
+    # worker and the backlog mirror). Empty = fail closed, exactly like
+    # INGEST_TOKEN: every machine endpoint answers 401 and the browser side
+    # still works. Deliberately NOT a `${VAR:?}` in compose — the board booting
+    # matters more than the Inbox booting.
+    inbox_token: str = ""
+    # Per-upload cap for one voice note. 8 MB is ~40 minutes of 30 kbps Opus and
+    # comfortable against the container's 64 MB tmpfs /tmp, which multipart
+    # spools to above `max_form_memory_size`. Applied PER REQUEST on the create
+    # route only (`request.max_content_length`); the global 64 KB body cap that
+    # protects every other route is never raised.
+    inbox_audio_max_bytes: int = 8 * 1024 * 1024
+    # Audio is deleted only once its transcript is Whisper-quality AND the item
+    # has been reviewed AND it is older than this — see inbox_db.prunable_audio.
+    inbox_audio_retention_days: int = 90
+    # `owner/repo` list for the unauthenticated GitHub issue mirror. App config,
+    # not per-job data, so it lives in .env rather than the gitignored jobs.yml.
+    inbox_github_repos: tuple[str, ...] = ()
+    # Optional: lifts the unauthenticated 60 req/h rate limit (and would allow
+    # private repos). Empty = unauthenticated, which is the supported default.
+    inbox_github_token: str = ""
+    inbox_github_interval_s: int = 900
+    # How often the scheduler sweeps prunable audio + reconciles the file tree
+    # against the DB. Hourly: the work is a bounded DELETE plus a directory walk.
+    inbox_prune_interval_s: int = 3600
     extra: dict = field(default_factory=dict)
 
     @property
     def db_path(self) -> str:
         return os.path.join(self.data_dir, "dashboard.db")
+
+    @property
+    def inbox_db_path(self) -> str:
+        """A SEPARATE file from dashboard.db on purpose.
+
+        ``dashboard.db`` keeps exactly one request-path writer (ingest), now
+        enforced by ``db.connect_query_only``. The Inbox needs browser-driven
+        writes from the multi-worker read role, so those go to their own file,
+        coordinated with the scheduler's mirror/prune writes by WAL +
+        ``busy_timeout``."""
+        return os.path.join(self.data_dir, "inbox.db")
+
+    @property
+    def inbox_audio_dir(self) -> str:
+        """Voice notes are FILES, never BLOBs: the DB is snapshotted and
+        sha256-deduped on every change, and megabytes of per-note audio would
+        make every snapshot byte-unique and defeat that dedup entirely."""
+        return os.path.join(self.data_dir, "inbox", "audio")
 
     @property
     def effective_rclone_timeout_s(self) -> int:
@@ -144,4 +218,12 @@ class Settings:
             probe_no_success_s=_env_int("PROBE_NO_SUCCESS_S", 3600),
             start_scheduler=os.environ.get("DASHBOARD_NO_SCHEDULER", "") == "",
             trusted_proxy_cidrs=_env_cidrs("TRUSTED_PROXY_CIDR"),
+            inbox_token=os.environ.get("INBOX_TOKEN", ""),
+            inbox_audio_max_bytes=_env_int("INBOX_AUDIO_MAX_BYTES",
+                                           8 * 1024 * 1024),
+            inbox_audio_retention_days=_env_int("INBOX_AUDIO_RETENTION_DAYS", 90),
+            inbox_github_repos=_env_github_repos("INBOX_GITHUB_REPOS"),
+            inbox_github_token=os.environ.get("INBOX_GITHUB_TOKEN", "").strip(),
+            inbox_github_interval_s=_env_int("INBOX_GITHUB_INTERVAL_S", 900),
+            inbox_prune_interval_s=_env_int("INBOX_PRUNE_INTERVAL_S", 3600),
         )

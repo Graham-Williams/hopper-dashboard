@@ -497,3 +497,48 @@ def test_informational_disk_job_never_goes_behind():
     assert job.informational
     state, reason = compute_state(job, disk_facts(free=1, total=400 * GIB), NOW)
     assert state == "OK" and "free" in reason
+
+
+# --------------------------------------------------------------------------- #
+# kind: worker — the generic scheduled precedence, with no kind-specific branch
+# --------------------------------------------------------------------------- #
+
+WORKER = REG.get("worker")          # box, cadence 900 + grace 900 = 1800
+
+
+def test_worker_unknown_then_late_when_it_never_runs():
+    """A worker that has never pinged is UNKNOWN only while it is younger than
+    cadence+grace; after that its silence is the finding, exactly like every
+    other scheduled kind. Without it a mirror loop that was never wired up would
+    read "new" for ever."""
+    assert compute_state(WORKER, Facts(), NOW)[0] == "UNKNOWN"
+    fresh = Facts(created_at=to_iso(NOW - 1700))
+    assert compute_state(WORKER, fresh, NOW)[0] == "UNKNOWN"
+    old = Facts(created_at=to_iso(NOW - 1900))
+    state, reason = compute_state(WORKER, old, NOW)
+    assert state == "LATE" and "never pinged" in reason
+
+
+def test_worker_ok_late_fail_precedence():
+    ok = Facts(last_run=run(ago=100), last_success=run(ago=100))
+    assert compute_state(WORKER, ok, NOW)[0] == "OK"
+    assert compute_state(WORKER, Facts(last_run=run(ago=1799)), NOW)[0] == "OK"
+    assert compute_state(WORKER, Facts(last_run=run(ago=1801)), NOW)[0] == "LATE"
+    failed = Facts(last_run=run(status="fail", ago=10, reason="github 403"))
+    state, reason = compute_state(WORKER, failed, NOW)
+    assert state == "FAIL" and "github 403" in reason
+    # Silence outranks a failed run: the same rule as every other scheduled kind.
+    stale_fail = Facts(last_run=run(status="fail", ago=5000))
+    assert compute_state(WORKER, stale_fail, NOW)[0] == "LATE"
+
+
+def test_worker_has_no_destination_or_capacity_block():
+    """The kind exists to have NO kind-specific verdict. If a `dest`/`lag`/`disk`
+    block ever starts appearing here, something gave `worker` a second meaning."""
+    f = Facts(last_run=run(ago=10), last_metrics={"lag_bytes": 99, "free_bytes": 1})
+    # Metrics a worker has no business carrying change NOTHING about its verdict:
+    # it is judged on the heartbeat alone.
+    assert compute_state(WORKER, f, NOW)[0] == "OK"
+    assert disk_info(WORKER, f) is None
+    assert dest_info(WORKER, f, NOW)["fresh"] is None
+    assert lag_info(WORKER, Facts(last_run=run(ago=10)), NOW) is None

@@ -126,3 +126,42 @@ def test_scheduler_thread_starts_and_stops(settings, registry, notifier, monkeyp
     sched.stop()
     sched._thread.join(timeout=5)
     assert not sched._thread.is_alive()
+
+
+# --------------------------------------------------------------------------- #
+# Inbox settings (step 1)
+# --------------------------------------------------------------------------- #
+
+def test_inbox_settings_defaults_and_derived_paths(tmp_path):
+    from dashboard.config import Settings
+    s = Settings(data_dir=str(tmp_path))
+    assert s.inbox_db_path == str(tmp_path / "inbox.db")
+    assert s.inbox_db_path != s.db_path          # a SEPARATE file, on purpose
+    assert s.inbox_audio_dir == str(tmp_path / "inbox" / "audio")
+    assert s.inbox_token == "" and s.inbox_github_repos == ()
+    assert s.inbox_audio_max_bytes == 8 * 1024 * 1024
+    # The global body cap must stay where it is: the create route lifts its own
+    # limit per request, it never raises this.
+    assert s.max_body_bytes == 64 * 1024
+    assert s.inbox_audio_retention_days == 90
+    assert s.inbox_github_interval_s == 900
+
+
+def test_inbox_github_repos_are_validated_at_startup(monkeypatch):
+    """A typo'd repo must fail the container at boot, not sync nothing for ever.
+    It is also the only user-supplied text interpolated into a GitHub URL."""
+    from dashboard.config import Settings
+    monkeypatch.setenv("INBOX_GITHUB_REPOS", "Graham-Williams/km-tracker, a/b\nc/d")
+    assert Settings.from_env().inbox_github_repos == (
+        "Graham-Williams/km-tracker", "a/b", "c/d")
+    monkeypatch.setenv("INBOX_GITHUB_REPOS", "Graham-Williams/km-tracker, a/b, a/b")
+    assert Settings.from_env().inbox_github_repos == (
+        "Graham-Williams/km-tracker", "a/b")            # de-duped
+    for bad in ("not-a-repo", "a/b/c", "a/../b", "a/b?x=1", "https://x/a/b",
+                "a b/c", "a/"):
+        monkeypatch.setenv("INBOX_GITHUB_REPOS", bad)
+        with pytest.raises(ValueError, match="not a valid owner/repo"):
+            Settings.from_env()
+    monkeypatch.setenv("INBOX_GITHUB_REPOS", ",".join(f"a/r{i}" for i in range(51)))
+    with pytest.raises(ValueError, match="over the 50 maximum"):
+        Settings.from_env()

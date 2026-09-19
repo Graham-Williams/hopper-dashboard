@@ -40,7 +40,7 @@ def test_example_file_loads_and_has_required_jobs():
 
 def test_test_doc_parses():
     reg = parse_registry(JOBS_DOC)
-    assert len(reg) == 9
+    assert len(reg) == 10
     assert reg.get("snap").has_probe and reg.get("snap").deadline_s == 600
     assert reg.by_machine()["box"][0].id == "snap"
     assert [j.id for j in reg.probed()] == ["snap"]
@@ -506,3 +506,63 @@ def test_disk_job_has_no_schedule_or_probe():
     doc["jobs"][DISK_IDX]["probe"] = {"rclone_path": "g:x"}
     with pytest.raises(RegistryError, match="cannot have a 'probe' block"):
         parse_registry(doc)
+
+
+# --------------------------------------------------------------------------- #
+# kind: worker  (the Inbox's background loops)
+# --------------------------------------------------------------------------- #
+
+WORKER_IDX = 9
+
+
+def test_worker_is_a_scheduled_kind_with_no_extras():
+    """A `worker` is "did this background loop run?" and nothing else: it needs a
+    cadence + grace (so silence is LATE), and it may carry none of the blocks
+    that belong to a kind with a destination."""
+    from dashboard.registry import PROBEABLE_KINDS, SCHEDULED_KINDS
+    assert "worker" in SCHEDULED_KINDS and "worker" not in PROBEABLE_KINDS
+    job = parse_registry(JOBS_DOC).get("worker")
+    assert job.kind == "worker" and job.scheduled
+    assert job.deadline_s == 1800 and not job.has_probe
+    assert not job.informational and job.max_age_s is None
+
+
+@pytest.mark.parametrize("overrides,msg", [
+    ({"cadence_s": None}, "'cadence_s' is required"),
+    ({"grace_s": None}, "'grace_s' is required"),
+    ({"probe": {"rclone_path": "gdrive:x"}}, "cannot have a 'probe' block"),
+    ({"manual": {"max_age_s": 60}}, "'manual' block is only valid"),
+    ({"disk": {"max_used_pct": 90}}, "'disk' block is only valid"),
+    ({"expect": ["a"]}, "'expect' is only valid"),
+])
+def test_worker_rejects_blocks_that_are_not_its_own(overrides, msg):
+    doc = copy.deepcopy(JOBS_DOC)
+    for key, value in overrides.items():
+        if value is None:
+            doc["jobs"][WORKER_IDX].pop(key, None)
+        else:
+            doc["jobs"][WORKER_IDX][key] = value
+    with pytest.raises(RegistryError, match=msg):
+        parse_registry(doc)
+
+
+def test_exactly_one_non_self_probe_job_per_machine():
+    """PERMANENT GUARD. `services._machine_probe` returns the FIRST `kind: probe`
+    job for a machine, and the whole machine-offline rule hangs off it:
+
+    - a SECOND probe job on `mac` makes which job stands for "the Mac is
+      reachable" depend on the ORDER of jobs.yml, silently;
+    - the FIRST probe job on `box` switches sibling-LATE suppression on for every
+      box job at once — box jobs are currently never suppressed, which is why a
+      box outage pages per job.
+
+    Both are one-line edits with fleet-wide alerting consequences and neither
+    would fail anything else. That is why the Inbox's loops are `kind: worker`.
+    """
+    from dashboard.services import SELF_JOB_ID
+    reg = load_registry(EXAMPLE_JOBS)
+    per_machine = {}
+    for job in reg:
+        if job.kind == "probe" and job.id != SELF_JOB_ID:
+            per_machine.setdefault(job.machine, []).append(job.id)
+    assert per_machine == {"mac": ["mac-probe"]}, per_machine

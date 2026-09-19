@@ -212,8 +212,10 @@ def test_status_shape_matches_contract(read, core, registry):
     assert by_id["disk"]["last_run"] is None and by_id["disk"]["cadence_s"] is None
     assert all(j["disk"] is None for j in d["jobs"] if j["id"] != "disk")
     s = d["summary"]
-    assert (s["ok"], s["late"], s["fail"], s["stale_dest"], s["behind"], s["unknown"]) == (2, 1, 1, 1, 2, 2)
-    assert s["total"] == 9 and s["computed_at"]
+    # `worker` is the tenth fixture job and nothing pinged it, so it is the third
+    # UNKNOWN (its own never-pinged → LATE clock is pinned to 2030 like the rest).
+    assert (s["ok"], s["late"], s["fail"], s["stale_dest"], s["behind"], s["unknown"]) == (2, 1, 1, 1, 2, 3)
+    assert s["total"] == 10 and s["computed_at"]
 
 
 def test_alert_policy_is_exposed_additively(read, core, registry):

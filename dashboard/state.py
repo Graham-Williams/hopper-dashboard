@@ -13,6 +13,12 @@ testable with a fixed ``now``:
                  first registered (``jobs.created_at``); a scheduled job that has NEVER
                  pinged then goes LATE, so a mis-installed heartbeat can't stay silent forever
 
+``worker`` (a background loop that heartbeats on a cadence — the Inbox's GitHub mirror,
+the Mac transcription worker) has NO kind-specific branch below, and that is the whole
+point of the kind: it is judged purely on "did it run, and did the run succeed?", i.e.
+the generic scheduled precedence never-pinged → LATE → FAIL → OK. There is no
+destination to probe and nothing to be BEHIND on.
+
 Precedence for scheduled kinds: LATE > FAIL > kind-specific (STALE_DEST / BEHIND) > OK.
 A silent job is reported LATE even if its last word was "fail" — the silence is the
 more urgent fact, and the last-run status stays visible on the card either way.
