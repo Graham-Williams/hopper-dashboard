@@ -350,7 +350,11 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   `APP_HOST` pin (never the request's Host — reflection = open redirect) and from the RAW request target
   (`RAW_URI`/`REQUEST_URI`), because `request.path` is already URL-decoded and would silently rewrite
   `/a%2Fb` to `/a/b`. Unset `APP_HOST` → no redirect (fail open, which is what keeps the documented local
-  visual-QA path and the test suite working).
+  visual-QA path and the test suite working). **Because that failure is silent-by-design, `docker-compose.yml`
+  defaults `APP_HOST` to `dashboard.graham-williams.com` rather than to empty** — the value normally comes
+  from the gitignored `.env`, which no PR can edit, so an empty default would let a box with an older `.env`
+  bring the redirect up disabled (the same shape as the `jobs.yml` deploy trap). The app-level fail-open is
+  unchanged; only the container's default differs.
 - **`APP_HOST` is validated as a BARE hostname before it can reach a `Location`** — read it through
   `Settings.https_redirect_host`, never `settings.app_host`, on any path that emits it. It is operator-set,
   not attacker-set, but an unvalidated value is still a live footgun: `host@evil.example` parses as WHATWG

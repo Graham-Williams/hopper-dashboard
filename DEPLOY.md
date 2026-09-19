@@ -678,6 +678,15 @@ script, but that is per-repo work).
       ```
       Pass `-e AH="$(grep '^APP_HOST=' ~/hopper-dashboard/.env | cut -d= -f2-)"` to check the real pin.
       **`-i` is required** — without it the heredoc is discarded and the check silently "passes".
+- [ ] `APP_HOST` actually reached the container. It lives in `.env` (gitignored), so a PR cannot put it
+      there — an older `.env` would ship the redirect silently disabled. Compose now defaults it to
+      `dashboard.graham-williams.com`, which is the belt; this is the braces:
+      ```bash
+      ssh <user>@<box-tailscale-ip> "grep -c '^APP_HOST=' ~/hopper-dashboard/.env"   # expect 1
+      ssh <user>@<box-tailscale-ip> "docker logs hopper-dashboard 2>&1 | grep -i 'redirect is DISABLED'"  # expect EMPTY
+      ```
+      A non-empty second command means `APP_HOST` is set to something that is not a bare hostname (the
+      Host/Origin pin still works — it compares rather than emits — but the 307 is off).
 - [ ] The heartbeats still land after that deploy — the ingest listener is exempt from the redirect by
       design, so prove it rather than assume it: `~/code/hopper-dashboard/probes/ping.sh jjho-refresh skipped
       "https deploy check"` → 200, and `/api/v1/status` shows a fresh `last_run` for it.
