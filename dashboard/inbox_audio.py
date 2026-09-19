@@ -250,3 +250,67 @@ def sweep_orphans(audio_dir: str, known: set[str]) -> list[str]:
             except OSError:
                 continue
     return removed
+
+
+# --------------------------------------------------------------------------- #
+# Scheduler-side maintenance (never in a request path)
+# --------------------------------------------------------------------------- #
+#
+# Lives HERE rather than in `inbox.py` for a concrete reason: `inbox.py` imports
+# `web`, and `services` (which the scheduler drives) is imported BY `web` — so a
+# scheduler that reached into `inbox.py` would close an import cycle. This module
+# depends only on `inbox_db`, which depends on nothing of ours but `db`.
+
+def prune_audio(settings, now: float | None = None) -> dict:
+    """Delete audio whose transcript is safe, then reconcile files ↔ rows.
+
+    Three conditions for a delete, all required (see ``inbox_db.prunable_audio``):
+    the transcript is Whisper-quality, Graham has reviewed it, and it is past the
+    retention window. By then the words are in the database and therefore in the
+    database backup, which is what makes deleting the only recording of them
+    tolerable.
+
+    The reconciliation is the price of storing audio as files rather than BLOBs,
+    and it runs in BOTH directions: a row pointing at a file that is gone has its
+    ``audio_path`` cleared (otherwise the one control Graham taps to check a
+    transcript 404s), and a file no row points at is removed. Deliberately not
+    shaped like ``db.prune``, whose correlated DELETE was measured at 113 s; these
+    are bounded, indexed statements over a few hundred rows.
+    """
+    import time as _time
+
+    from . import inbox_db
+
+    now = _time.time() if now is None else now
+    cutoff = inbox_db.to_iso(now - settings.inbox_audio_retention_days * 86400)
+    audio_dir = settings.inbox_audio_dir
+    pruned = cleared = 0
+    conn = inbox_db.connect(settings.inbox_db_path)
+    try:
+        for row in inbox_db.prunable_audio(conn, cutoff):
+            delete(audio_dir, row["audio_path"])
+            with conn:
+                inbox_db.mark_audio_pruned(conn, row["id"])
+            pruned += 1
+        for row in inbox_db.dangling_audio_items(conn):
+            if open_path(audio_dir, row["audio_path"]) is None:
+                with conn:
+                    inbox_db.clear_audio_path(conn, row["id"])
+                cleared += 1
+        known = inbox_db.known_audio_paths(conn)
+    finally:
+        conn.close()
+    orphans = sweep_orphans(audio_dir, known)
+    return {"pruned": pruned, "cleared": cleared, "orphans": len(orphans)}
+
+
+def tree_bytes(audio_dir: str) -> int:
+    """Total bytes under the audio tree — a metric for the mirror's heartbeat."""
+    total = 0
+    for dirpath, _dirs, files in os.walk(audio_dir):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(dirpath, name))
+            except OSError:
+                continue
+    return total

@@ -38,7 +38,7 @@ import sqlite3
 import uuid
 from typing import Any, Iterable
 
-from .db import _add_column, now_iso, to_iso  # noqa: F401  (shared helpers)
+from .db import _add_column, enable_wal, now_iso, to_iso  # noqa: F401
 from .db import from_iso as from_iso_or_none  # noqa: F401  (never raises)
 
 # --------------------------------------------------------------------------- #
@@ -173,8 +173,13 @@ def connect(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, timeout=10, isolation_level=None,
                            check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    # busy_timeout first, then WAL through `db.enable_wal` — which retries,
+    # because the WAL switch itself takes an exclusive lock that does not always
+    # go through the busy handler. Two roles × several gunicorn workers open
+    # this file within milliseconds of each other at boot, so a simultaneous
+    # open is the normal case here, not the rare one.
     conn.execute("PRAGMA busy_timeout=10000")
+    enable_wal(conn)
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn

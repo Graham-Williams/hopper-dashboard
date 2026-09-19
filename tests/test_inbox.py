@@ -346,7 +346,7 @@ def test_audio_is_served_with_no_store_and_nosniff(authed):
 
 
 def test_audio_is_404_then_410_after_a_prune(authed, settings, read_app):
-    from dashboard import inbox as inbox_mod
+    from dashboard import inbox_audio as audio_mod
     r = authed.post("/api/v1/inbox/items",
                     data={"text": "", "audio": (io_bytes(WEBM), "n", "audio/webm")},
                     content_type="multipart/form-data",
@@ -363,7 +363,7 @@ def test_audio_is_404_then_410_after_a_prune(authed, settings, read_app):
         conn.execute("UPDATE inbox_items SET created_at='2020-01-01T00:00:00Z'"
                      " WHERE id=?", (item,))
     conn.close()
-    assert inbox_mod.prune_audio(settings)["pruned"] == 1
+    assert audio_mod.prune_audio(settings)["pruned"] == 1
     gone = authed.get(f"/inbox/audio/{item}")
     assert gone.status_code == 410 and "pruned" in gone.get_json()["error"]
 
@@ -514,9 +514,13 @@ def test_a_script_tag_in_a_transcript_is_escaped_in_html_and_json(bot, authed):
     assert "&lt;/script&gt;" in html and "&lt;img" in html
     # The only </script> in the document is our own single inline script's.
     assert html.count("</script>") == html.count("<script")
-    # Jinja renders, it does not re-evaluate: {{ 7*7 }} stays four characters.
+    # Jinja renders, it does not re-evaluate: the expression survives verbatim
+    # inside the title element. (Asserting "49" is absent from the page is not
+    # the check — a uuid4 row id contains "49" about a third of the time.)
     body = html.split('<ul class="items"', 1)[1]
-    assert "{{ 7*7 }}" in body and "49" not in body
+    assert "{{ 7*7 }}" in body
+    title = body.split('<h3 class="item-title">', 1)[1].split("</h3>", 1)[0]
+    assert "{{ 7*7 }}" in title and "49" not in title
     api = bot.get("/api/v1/inbox/items", headers=reader())
     raw = api.data.decode()
     # Flask 3 no longer HTML-escapes `</script>` inside a JSON body, so the

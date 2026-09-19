@@ -288,4 +288,5 @@ def test_a_hostile_issue_title_survives_to_render_escaped(conn, authed, settings
     assert "<img" not in html and 'onerror="alert(1)"' not in html
     assert "&lt;/script&gt;" in html and "&lt;img" in html
     assert html.count("</script>") == html.count("<script")
-    assert "{{ 7*7 }}" in html and "49" not in html.split('<ul class="items"', 1)[1]
+    title = (html.split('<h3 class="item-title">', 1)[1].split("</h3>", 1)[0])
+    assert "{{ 7*7 }}" in title and "49" not in title
