@@ -24,7 +24,11 @@ def test_example_file_loads_and_has_required_jobs():
     assert {"km-backup", "todoist-points-backup", "box-containers", "mac-probe",
             "pa-backup", "drive-mirror", "minecraft-offload", "taste-twin-publish",
             "jjho-refresh", "baby-pool-sync", "dashboard-probes", "mac-disk",
-            "box-disk"} <= ids
+            "box-disk", "inbox-github-sync"} <= ids
+    # The Inbox's mirror is a `worker`, not a `probe`: a probe job on `box`
+    # would switch sibling-LATE suppression on for every box job.
+    assert reg.get("inbox-github-sync").kind == "worker"
+    assert reg.get("inbox-github-sync").deadline_s == 1800
     assert "km-tracker-cloudflared-1" in reg.get("box-containers").expect
     assert reg.get("minecraft-offload").max_lag_bytes == 21474836480
     assert reg.get("taste-twin-publish").informational
@@ -264,7 +268,7 @@ def test_every_alerting_job_states_its_real_time_to_page():
             f"{job.id}: comment says {found.group(1)}, arithmetic says {want} "
             f"(deadline {job.deadline_s} + threshold {job.alert_after_s})")
         checked += 1
-    assert checked == 9                                  # every job that can page
+    assert checked == 10                                 # every job that can page
 
 
 def test_the_time_to_page_figures_are_the_ones_graham_was_quoted():
@@ -278,7 +282,7 @@ def test_the_time_to_page_figures_are_the_ones_graham_was_quoted():
         "km-backup": "24.3h", "todoist-points-backup": "24.3h",
         "box-containers": "35m", "box-disk": "1h", "dashboard-probes": "6.3h",
         "mac-probe": "87h", "mac-disk": "1h", "pa-backup": "44h",
-        "drive-mirror": "39h"}
+        "drive-mirror": "39h", "inbox-github-sync": "24.5h"}
     # The bar Graham set was "backups missed more than 24 hours". Both DB
     # snapshots clear it; pa-backup cannot (its 38 h deadline is a hard floor —
     # below it a missed backup is indistinguishable from a sleeping Mac) but it

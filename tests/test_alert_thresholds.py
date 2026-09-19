@@ -2528,15 +2528,16 @@ def test_the_fleet_wide_push_ceiling_is_the_sum_over_the_alerting_jobs():
     reg = load_registry(EXAMPLE_JOBS)
     alerting = [j for j in reg if not j.alert_never]
     per_job = {j.id: 3 * DAY / cooldown_s(j) for j in alerting}
-    assert len(alerting) == 9
-    assert sum(per_job.values()) == 70.0
+    assert len(alerting) == 10
+    assert sum(per_job.values()) == 73.0
     # The floor is what dominates it: the five jobs whose threshold is under 6 h
-    # each contribute the full 12/day (60), and the four day-or-longer ones
-    # contribute 10 between them (3 + 3 + 3 + 1).
+    # each contribute the full 12/day (60), and the five day-or-longer ones
+    # contribute 13 between them (3 + 3 + 3 + 3 + 1). `inbox-github-sync` is the
+    # fifth of those — a 24 h threshold, so it adds 3, not 12.
     at_floor = {i for i, n in per_job.items() if n == 12}
     assert at_floor == {"box-containers", "box-disk", "dashboard-probes",
                         "mac-disk", "pa-backup"}
-    assert sum(n for i, n in per_job.items() if i not in at_floor) == 10.0
+    assert sum(n for i, n in per_job.items() if i not in at_floor) == 13.0
 
 
 def test_the_recovery_names_the_state_that_was_paged_not_the_latest_one(settings, notifier):

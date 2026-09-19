@@ -188,6 +188,28 @@ jobs:
                                 # listings would trade FAIL flapping for LATE flapping. If you raise
                                 # DASHBOARD_RCLONE_TIMEOUT_S or PROBE_INTERVAL_S, redo this arithmetic.
 
+  - id: inbox-github-sync
+    name: Inbox GitHub mirror
+    # 24 h. The Inbox's value is being the ONE place everything pending shows up, and a
+    # dead mirror quietly costs that — the board keeps rendering the issues it last saw,
+    # so it looks right and is stale. A day is the right bar: the mirror runs every 15
+    # minutes, so a day is ~96 consecutive misses, and nothing here is urgent enough to
+    # wake anyone sooner (the issues themselves are still on GitHub).
+    # TIME-TO-PAGE: 24.5h  (LATE 30 min after a missed sync, then the 24 h threshold)
+    alert_after_s: 86400        # 24 h
+    machine: box
+    kind: worker                # a background loop, NOT a `probe` — a `kind: probe` job on
+                                # `box` would switch sibling-LATE suppression on for every
+                                # box job at once (services._machine_probe takes the first
+                                # probe job per machine). See registry.KINDS.
+    protects: The Inbox's view of every open GitHub issue across Graham's repos
+    method: in-container scheduler mirrors open issues (unauthenticated, ETag-conditional) into inbox.db
+    cadence_s: 900              # = INBOX_GITHUB_INTERVAL_S
+    grace_s: 900                # One missed sync is nothing: the anonymous API allows 60
+                                # requests/hour, so a rate limit sets a backoff that can
+                                # legitimately skip a cycle or two. 30 min of silence is
+                                # the loop being stopped, not GitHub pushing back.
+
   # ------------------------------------------------------------------ mac --
   - id: mac-probe
     name: Mac probe

@@ -114,7 +114,7 @@ def test_create_app_from_env_loads_example_jobs(monkeypatch, tmp_path):
     monkeypatch.setenv("JOBS_FILE", "jobs.example.yml")
     monkeypatch.setenv("DASHBOARD_NO_SCHEDULER", "1")
     app = create_app("ingest")
-    assert len(app.extensions["registry"]) == 13
+    assert len(app.extensions["registry"]) == 14
     assert app.extensions["scheduler"]._thread is None
 
 
