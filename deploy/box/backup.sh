@@ -26,8 +26,9 @@
 # ⚠️ THE AUDIO TREE IS THE EXCEPTION, AND IT IS DELIBERATE. Graham's decision 2026-09-19: the
 # recordings MIRROR the container, deletions included, because an additive audio backup
 # silently defeats the Inbox's own Delete control and its 180-day privacy ceiling — the point
-# of Delete is that a password read aloud stops existing. Guarded by a refuse-a-mass-deletion
-# brake; see push_audio. The two DATABASES are untouched by this and stay additive.
+# of Delete is that a password read aloud stops existing. Guarded by three independent
+# refuse-a-mass-deletion brakes (proportional, absolute, windowed) measured against what the
+# REMOTE actually holds; see push_audio. The two DATABASES are untouched and stay additive.
 #
 # RESTORING IS NOT A `cp`. The stale -wal/-shm sidecars must be deleted and the file re-owned
 # to 10001 first, or SQLite replays the old WAL over the restored image and silently hands
@@ -72,8 +73,25 @@ is_group_or_other_writable() {
 # defence: "0" and " " are both non-empty. Fail loudly instead.
 require_positive_int() {
   local name="$1" val="$2"
-  [[ "${val}" =~ ^[0-9]+$ ]] || die "${name}='${val}' is not an integer (must be >= 1)"
-  (( val >= 1 )) || die "${name}='${val}' must be >= 1"
+  [[ "${val}" =~ ^[0-9]{1,9}$ ]] || die "${name}='${val}' is not an integer (must be 1..999999999)"
+  (( 10#${val} >= 1 )) || die "${name}='${val}' must be >= 1"
+}
+
+# A PERCENTAGE is not "a positive integer". require_positive_int happily accepts 100 (which
+# makes the drop test `count * 100 < prev * 0` — never true, so the brake is silently OFF on
+# every run), 200 (which makes the right-hand side NEGATIVE — the brake is off AND inverted),
+# and a 20-digit number (which overflows the arithmetic). It also lets "050" through, and
+# bash reads a leading zero as OCTAL, so "050" would quietly become 40.
+#
+# So: 1..99 only, base 10 forced, and the value normalised in place by the caller. 100 is
+# refused loudly rather than treated as "no brake" — a config that disables the one guard
+# standing between this script and Graham's only copy of his voice must be a typo until
+# proven otherwise, and BACKUP_AUDIO=0 is the honest way to opt out of the mirror entirely.
+require_percent() {
+  local name="$1" val="$2" v
+  [[ "${val}" =~ ^[0-9]{1,3}$ ]] || die "${name}='${val}' is not a 1-3 digit percentage"
+  v=$((10#${val}))
+  (( v >= 1 && v <= 99 )) || die "${name}='${val}' must be between 1 and 99 (100 would disable the drop guard entirely — use BACKUP_AUDIO=0 if you really want no audio mirror; 0 would refuse every run)"
 }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -107,18 +125,44 @@ DAILY_RETENTION="${DAILY_RETENTION:-30}"
 DRIVE_PUSH_INTERVAL_MIN="${DRIVE_PUSH_INTERVAL_MIN:-15}"
 ALLOW_EMPTY_SNAPSHOT="${ALLOW_EMPTY_SNAPSHOT:-0}"
 BACKUP_AUDIO="${BACKUP_AUDIO:-1}"
-# The audio tree MIRRORS deletions (see push_audio). This is the brake: if the container's
-# recording count has fallen by more than this share since the last run, the deletion is not
-# propagated and the run says so loudly. Set AUDIO_ALLOW_MASS_DELETE=1 for a deliberate purge.
+# --- the audio brakes. THREE of them, and each can refuse on its own -------------------
+#
+# The audio tree MIRRORS deletions (see push_audio), so these are the only thing standing
+# between a bug and the sole copy of Graham's recordings. They are deliberately independent:
+#
+#   PROPORTIONAL (AUDIO_MAX_DROP_PCT) — refuse when the count falls by more than this share.
+#     Catches the wiped volume, the wrong container, the wrong path.
+#   ABSOLUTE (AUDIO_MAX_DROP_FILES) — refuse when more than this many files would be deleted
+#     in ONE run, whatever the proportion. A percentage alone cannot see a large tree losing
+#     a sub-threshold slice: 45% per run against a 50% brake never trips, and 1024 files walk
+#     down to 1 in ten runs — fifty minutes at the five-minute cadence.
+#   WINDOWED (AUDIO_DROP_WINDOW_MIN) — the percentage is measured not only against the
+#     PREVIOUS run but against the highest count seen in this window (a high-water mark), so
+#     cumulative loss is visible even when no single step is large enough to trip anything.
 AUDIO_MAX_DROP_PCT="${AUDIO_MAX_DROP_PCT:-50}"
-AUDIO_ALLOW_MASS_DELETE="${AUDIO_ALLOW_MASS_DELETE:-0}"
+AUDIO_MAX_DROP_FILES="${AUDIO_MAX_DROP_FILES:-25}"
+AUDIO_DROP_WINDOW_MIN="${AUDIO_DROP_WINDOW_MIN:-1440}"
+# The deliberate-purge override, and it is ONE-SHOT BY CONSTRUCTION. It is an ordinary env
+# var read from .env.backup, so "re-run once with it set" is advice a file cannot enforce —
+# left behind, a boolean would disable every brake for ever with nothing but a WARN line.
+# It therefore carries the EXACT number of recordings the purge should leave behind
+# (AUDIO_ALLOW_MASS_DELETE=<count>) and is honoured only when that number matches what this
+# run actually mirrored. A stale value authorises a state that has already happened, which
+# is to say: nothing. Empty (the default) is off.
+AUDIO_ALLOW_MASS_DELETE="${AUDIO_ALLOW_MASS_DELETE:-}"
 
 # BEFORE any mkdir or prune: a bad retention deletes data, and the prune slices below cannot
 # tell "0" from "unset".
 require_positive_int LOCAL_RETENTION "${LOCAL_RETENTION}"
 require_positive_int DRIVE_RETENTION "${DRIVE_RETENTION}"
 require_positive_int DAILY_RETENTION "${DAILY_RETENTION}"
-require_positive_int AUDIO_MAX_DROP_PCT "${AUDIO_MAX_DROP_PCT}"
+require_percent AUDIO_MAX_DROP_PCT "${AUDIO_MAX_DROP_PCT}"
+require_positive_int AUDIO_MAX_DROP_FILES "${AUDIO_MAX_DROP_FILES}"
+require_positive_int AUDIO_DROP_WINDOW_MIN "${AUDIO_DROP_WINDOW_MIN}"
+# Normalise to base 10 NOW, once, so no later `(( ))` can read a leading zero as octal.
+AUDIO_MAX_DROP_PCT=$((10#${AUDIO_MAX_DROP_PCT}))
+AUDIO_MAX_DROP_FILES=$((10#${AUDIO_MAX_DROP_FILES}))
+AUDIO_DROP_WINDOW_MIN=$((10#${AUDIO_DROP_WINDOW_MIN}))
 
 # 0700, not the deploy umask's 0755: these directories hold snapshots of inbox.db and copies
 # of Graham's voice recordings. The repo argues those deserve a stricter gate than the house
@@ -284,11 +328,60 @@ push_db() {  # <name> <snapshot path> <checksum>
 #      a later edit to point at the DB ring by accident. (tests/test_deploy_backup.py pins
 #      that absence.)
 #
-# THE GUARD, in the spirit of the refuse-an-empty-snapshot rule: a mass deletion is far more
+# THE GUARDS, in the spirit of the refuse-an-empty-snapshot rule: a mass deletion is far more
 # likely to be a wiped volume, a bad prune or a mis-set path than an intentional purge. If the
-# container's audio directory is missing entirely, or its file count has fallen by more than
-# AUDIO_MAX_DROP_PCT since the last run, NOTHING is deleted off-box: the sync is skipped and
-# the run says so. AUDIO_ALLOW_MASS_DELETE=1 is the deliberate override.
+# container's audio directory is missing entirely, or the count has fallen too far (see the
+# three brakes above), NOTHING is deleted off-box: the upload still happens, the deletion pass
+# is skipped, the remembered count is NOT advanced, and the run says so.
+#
+# ⚠️ WHAT THE BRAKE MEASURES AGAINST IS ITSELF SAFETY-CRITICAL. The baseline used to come from
+# a state file, falling back to the HOST mirror directory — a directory nothing ever created,
+# so the baseline was 0 on exactly the runs that needed one most: the first run after deploy,
+# any run after the state dir was cleared, after a BACKUP_ROOT/HOME change, and after a
+# rebuild-from-Drive. A baseline of 0 opens the brake completely (nothing is "a drop from 0").
+# Measured before the fix: a container holding 1 file against a remote holding 20 deleted 19
+# of them, silently, and logged "mirrored (deletions included)". The baseline now comes from
+# the REMOTE LISTING — what Drive actually holds, which is the thing being protected — and a
+# run that cannot obtain that listing does not delete at all. A run that does not know what
+# the remote holds has no business deleting from it.
+
+# Echo the number of files under <remote dir>. rc 0 means the number is TRUSTWORTHY; rc 1
+# means the listing could not be obtained and the caller must not infer anything from it.
+# `rclone mkdir` first so a not-yet-created directory reads as empty (rc 0, count 0) rather
+# than as an error — that is the one "missing" case that genuinely is "holds nothing".
+remote_audio_count() {  # <remote dir>
+  local out rc=0
+  rclone mkdir "$1" >/dev/null 2>&1 || true
+  out="$(rclone lsf "$1" --recursive --files-only 2>/dev/null)" || rc=$?
+  (( rc == 0 )) || return 1
+  printf '%s' "${out}" | awk 'END{print NR}'
+}
+
+# The deliberate-purge override. True only when AUDIO_ALLOW_MASS_DELETE names the EXACT count
+# this run would leave behind, so one value authorises one specific purge and can never
+# silently authorise a different, later one.
+purge_authorised() {  # <resulting count>
+  [[ "${AUDIO_ALLOW_MASS_DELETE}" =~ ^[0-9]{1,9}$ ]] || return 1
+  (( 10#${AUDIO_ALLOW_MASS_DELETE} == $1 ))
+}
+
+# rc 0 = this <from> -> <to> transition may be mirrored; rc 1 = refuse (and it has said why).
+# Both brakes are checked, and either can refuse on its own.
+audio_drop_allowed() {  # <from> <to> <what is being measured>
+  local from="$1" to="$2" what="$3" dropped=0
+  if (( from > to )); then dropped=$(( from - to )); fi
+  (( dropped > 0 )) || return 0
+  if (( to * 100 < from * (100 - AUDIO_MAX_DROP_PCT) )); then
+    log "ERROR: audio: ${what} holds ${to} recording(s), down from ${from} — a drop of more than ${AUDIO_MAX_DROP_PCT}% (AUDIO_MAX_DROP_PCT)"
+    return 1
+  fi
+  if (( dropped > AUDIO_MAX_DROP_FILES )); then
+    log "ERROR: audio: ${what} holds ${to} recording(s), down from ${from} — ${dropped} file(s) in a single run, more than AUDIO_MAX_DROP_FILES=${AUDIO_MAX_DROP_FILES}"
+    return 1
+  fi
+  return 0
+}
+
 push_audio() {
   [[ "${BACKUP_AUDIO}" == "1" ]] || return 0
   docker exec "${CONTAINER}" test -d "${CONTAINER_AUDIO_DIR}" 2>/dev/null || {
@@ -296,32 +389,76 @@ push_audio() {
     return 0
   }
 
-  local count prev=0 count_file="${STATE_DIR}/last_audio_count"
+  local remote="${RCLONE_DEST}/audio"
+  local count prev="" deletions_allowed=1 rc=0 count_file="${STATE_DIR}/last_audio_count"
   count="$(docker exec -e DIR="${CONTAINER_AUDIO_DIR}" "${CONTAINER}" python3 -c \
     'import os,sys; print(sum(len(f) for _,_,f in os.walk(os.environ["DIR"])))' 2>/dev/null)" \
     || { log "ERROR: could not count the audio files inside ${CONTAINER}"; return 1; }
-  [[ "${count}" =~ ^[0-9]+$ ]] || { log "ERROR: unreadable audio file count '${count}'"; return 1; }
-  if [[ -f "${count_file}" ]]; then
-    prev="$(cat "${count_file}")"
-  elif [[ -d "${AUDIO_MIRROR_DIR}" ]]; then
-    # No remembered count yet — the FIRST run after this script gained deletion propagation,
-    # or after the state dir was cleared. Fall back to what the host mirror already holds,
-    # which is what Drive holds: otherwise the one run most likely to face a large backlog of
-    # app-side prunes would be the one run with no brake on it.
-    prev="$(find "${AUDIO_MIRROR_DIR}" -type f | wc -l | tr -d ' ')"
-  fi
-  [[ "${prev}" =~ ^[0-9]+$ ]] || prev=0
+  [[ "${count}" =~ ^[0-9]{1,9}$ ]] || { log "ERROR: unreadable audio file count '${count}'"; return 1; }
+  count=$((10#${count}))
 
-  if (( prev > 0 && count * 100 < prev * (100 - AUDIO_MAX_DROP_PCT) )); then
-    if [[ "${AUDIO_ALLOW_MASS_DELETE}" != "1" ]]; then
-      log "ERROR: audio: the container holds ${count} recording(s), down from ${prev} — a drop of more than ${AUDIO_MAX_DROP_PCT}%. REFUSING to mirror that to Drive; the off-box copies are untouched. If the purge was deliberate, re-run once with AUDIO_ALLOW_MASS_DELETE=1"
+  # --- the baseline the brakes measure against ---------------------------------------
+  if [[ -f "${count_file}" ]]; then
+    prev="$(cat "${count_file}" 2>/dev/null || true)"
+    [[ "${prev}" =~ ^[0-9]{1,9}$ ]] || prev=""
+  fi
+  if [[ -z "${prev}" ]]; then
+    # No remembered count: first run after deploy, a cleared state dir, a changed
+    # BACKUP_ROOT/HOME, or a rebuild-from-Drive. Ask the REMOTE what it holds.
+    if prev="$(remote_audio_count "${remote}")" && [[ "${prev}" =~ ^[0-9]{1,9}$ ]]; then
+      log "audio: no remembered count — baseline taken from ${remote}, which holds ${prev} file(s)"
+    else
+      prev=""
+      deletions_allowed=0
+      # Loud, not quiet. A backup that cannot read its own destination is the exact failure
+      # this dashboard exists to surface; returning 0 here would leave the job green while
+      # the mirror silently stopped mirroring.
+      rc=1
+      # Note what is deliberately NOT done here: the count is not written either. Recording
+      # ${mirrored} as the baseline would claim the remote holds that many when this run just
+      # failed to find out — and if it actually held twenty more, the NEXT run would see no
+      # drop and delete them. So the state file stays empty, the next run asks the remote
+      # again, and deletion begins the first time that question gets an answer. If it never
+      # does, rclone is broken and nothing should be being deleted anyway.
+      log "WARN: audio: no remembered count AND ${remote} could not be listed — uploading only. NOTHING is deleted off-box this run and no baseline is recorded; deletion resumes on the first run that can read the remote."
+    fi
+  fi
+  prev=$((10#${prev:-0}))
+
+  # --- the windowed high-water mark ----------------------------------------------------
+  # Without this, only the single previous run is visible and a steady sub-threshold drip is
+  # invisible for ever. With it, the percentage is measured against the largest count seen in
+  # the last AUDIO_DROP_WINDOW_MIN minutes, so cumulative loss trips the same brake.
+  local hw=0 hw_epoch=0 hw_file="${STATE_DIR}/audio_high_water" now base
+  now="$(date +%s)"
+  if [[ -f "${hw_file}" ]]; then
+    read -r hw hw_epoch < "${hw_file}" 2>/dev/null || true
+  fi
+  [[ "${hw}" =~ ^[0-9]{1,9}$ ]] || hw=0
+  [[ "${hw_epoch}" =~ ^[0-9]{1,12}$ ]] || hw_epoch=0
+  if (( hw_epoch == 0 || now - hw_epoch > AUDIO_DROP_WINDOW_MIN * 60 )); then
+    hw=0; hw_epoch=0                       # the mark has aged out; this run sets a fresh one
+  fi
+  base="${prev}"
+  if (( hw > base )); then base="${hw}"; fi
+
+  # Pre-flight, before the copy out: the cheapest place to refuse.
+  if ! audio_drop_allowed "${base}" "${count}" "${CONTAINER}:${CONTAINER_AUDIO_DIR}"; then
+    if ! purge_authorised "${count}"; then
+      log "ERROR: audio: REFUSING to mirror that to ${remote}; the off-box copies are untouched. If the purge was deliberate, re-run ONCE with AUDIO_ALLOW_MASS_DELETE=${count} — the exact count it should leave behind, so the authorisation cannot outlive this one purge"
       return 1
     fi
-    log "WARN: audio: ${count} recording(s), down from ${prev} — mirroring the deletion anyway (AUDIO_ALLOW_MASS_DELETE=1)"
+    log "WARN: audio: mirroring the deletion anyway — AUDIO_ALLOW_MASS_DELETE=${count} matches what this run would leave behind"
   fi
 
-  local staged rc=0
-  staged="$(mktemp -d "${BACKUP_ROOT}/.audio.XXXXXX")"
+  local staged
+  staged="$(mktemp -d "${BACKUP_ROOT}/.audio.XXXXXX")" \
+    || { log "ERROR: audio: could not create a staging directory under ${BACKUP_ROOT}"; return 1; }
+  # Checked explicitly, NOT left to `set -e`: this function is invoked as `push_audio || ...`,
+  # which suppresses errexit for its whole body. An unchecked mktemp failure would leave
+  # staged="" and turn the docker cp below into a copy onto "/".
+  [[ -n "${staged}" && -d "${staged}" ]] \
+    || { log "ERROR: audio: staging directory is not usable"; return 1; }
   cleanup_audio() { [[ -z "${staged}" ]] || rm -rf "${staged}"; return 0; }
   trap cleanup_audio RETURN
 
@@ -330,50 +467,115 @@ push_audio() {
     || { log "ERROR: docker cp of the audio tree failed"; return 1; }
   # `docker cp` brings the container's modes with it (~0644). These are recordings of
   # Graham's voice; owner-only, like everything else under BACKUP_ROOT.
-  chmod -R go-rwx "${staged}"
+  chmod -R go-rwx "${staged}" || log "WARN: audio: could not tighten the staged tree's modes"
 
-  rclone copy "${staged}" "${RCLONE_DEST}/audio" \
+  # --- re-measure THE SET THAT IS ACTUALLY MIRRORED -----------------------------------
+  # The brake used to be applied to the in-container count while the delete list came from
+  # the staged host tree: two measurements of two different sets at two different moments,
+  # so the brake could pass on one set while the deletion ran against another. It needs no
+  # injected fault to diverge — `os.walk` counts symlinks and `find -type f` does not, so a
+  # container with 4 real files and 6 symlinks reported 10, the guard stayed silent, and 6 of
+  # 10 remote recordings were deleted under a log line that said "10 recording(s) mirrored".
+  # An interrupted `docker cp` that still exits 0 does the same thing with real files.
+  #
+  # From here on ${mirrored} — the staged tree, the exact set uploaded and diffed against the
+  # remote — is the ONLY number used: for the brakes, for the override, for the remembered
+  # count, and for the log line.
+  local mirrored
+  mirrored="$(find "${staged}" -type f 2>/dev/null | wc -l | tr -d ' ')"
+  [[ "${mirrored}" =~ ^[0-9]{1,9}$ ]] \
+    || { log "ERROR: audio: could not count the staged tree"; return 1; }
+  mirrored=$((10#${mirrored}))
+
+  if (( mirrored < count )); then
+    log "ERROR: audio: ${CONTAINER} reported ${count} recording(s) but only ${mirrored} landed in the staging tree — the two do not describe the same set, so the deletion list cannot be trusted. Uploading what staged; NOTHING is deleted off-box and the remembered count is not advanced."
+    deletions_allowed=0
+    rc=1
+  fi
+
+  if (( deletions_allowed )) && ! audio_drop_allowed "${base}" "${mirrored}" "the staged tree"; then
+    if purge_authorised "${mirrored}"; then
+      log "WARN: audio: mirroring the deletion anyway — AUDIO_ALLOW_MASS_DELETE=${mirrored} matches what this run mirrored"
+    else
+      log "ERROR: audio: REFUSING to delete anything from ${remote} this run; the off-box copies are untouched. If the purge was deliberate, re-run ONCE with AUDIO_ALLOW_MASS_DELETE=${mirrored}"
+      deletions_allowed=0
+      rc=1
+    fi
+  fi
+
+  rclone copy "${staged}" "${remote}" \
     || { log "ERROR: rclone copy of the audio tree failed"; return 1; }
-  delete_remote_extras "${staged}" "${RCLONE_DEST}/audio" || rc=1
+  if (( deletions_allowed )); then
+    delete_remote_extras "${staged}" "${remote}" "${mirrored}" || rc=1
+  else
+    log "WARN: audio: the deletion pass was SKIPPED this run — ${remote} may still hold recordings the container no longer has"
+  fi
 
-  # Swap the staged tree in as the host mirror, so it reflects deletions too.
+  # Swap the staged tree in as the host mirror, so it reflects deletions too. Both `mv`s are
+  # checked for the same reason the mktemp above is: errexit is off inside this function.
   rm -rf "${AUDIO_MIRROR_DIR}.old"
-  [[ -e "${AUDIO_MIRROR_DIR}" ]] && mv "${AUDIO_MIRROR_DIR}" "${AUDIO_MIRROR_DIR}.old"
-  mv "${staged}" "${AUDIO_MIRROR_DIR}"
+  if [[ -e "${AUDIO_MIRROR_DIR}" ]]; then
+    mv "${AUDIO_MIRROR_DIR}" "${AUDIO_MIRROR_DIR}.old" \
+      || { log "ERROR: audio: could not rotate the host mirror aside; leaving it as it was"; return 1; }
+  fi
+  mv "${staged}" "${AUDIO_MIRROR_DIR}" \
+    || { log "ERROR: audio: could not swap the staged tree in as the host mirror (Drive is unaffected)"; return 1; }
   staged=""                       # adopted; nothing left for the RETURN trap to remove
   rm -rf "${AUDIO_MIRROR_DIR}.old"
 
-  if (( rc == 0 )); then
+  if (( rc == 0 )) && (( deletions_allowed )); then
     # Only a CLEAN mirror advances the remembered count, so the drop guard above always
     # compares against the last state Drive actually reflects.
-    printf '%s\n' "${count}" > "${count_file}"
-    log "audio: ${count} recording(s) mirrored to ${RCLONE_DEST}/audio (deletions included)"
+    printf '%s\n' "${mirrored}" > "${count_file}"
+    if (( mirrored >= hw )) || purge_authorised "${mirrored}"; then
+      printf '%s %s\n' "${mirrored}" "${now}" > "${hw_file}"
+    fi
+    log "audio: ${mirrored} recording(s) mirrored to ${remote} (deletions included)"
   else
-    log "WARN: audio: ${count} recording(s) uploaded, but the deletion pass did not complete — ${RCLONE_DEST}/audio may still hold recordings the container no longer has"
+    log "WARN: audio: ${mirrored} recording(s) uploaded, but this run was not a clean mirror — ${remote} may still hold recordings the container no longer has, and the remembered count is unchanged"
   fi
   return "${rc}"
 }
 
 # Delete files under <remote dir> that <local dir> no longer has. The mirroring half of
 # push_audio, kept separate so the delete list is visible and logged one file at a time.
-delete_remote_extras() {  # <local dir> <remote dir>
-  local local_dir="$1" remote_dir="$2" rc=0 f
+delete_remote_extras() {  # <local dir> <remote dir> <mirrored count>
+  local local_dir="$1" remote_dir="$2" mirrored="$3" rc=0 f listing ls_rc=0
   local want=() have=() extras=()
   while IFS= read -r f; do [[ -n "$f" ]] && want+=("$f"); done \
     < <(cd "${local_dir}" && find . -type f 2>/dev/null | sed 's|^\./||' | sort || true)
+  # ⚠️ THE LISTING'S EXIT STATUS IS LOAD-BEARING. This used to be `$(rclone lsf … 2>/dev/null
+  # | sort || true)`, so a failed listing produced an EMPTY `have` and the function returned 0
+  # — "could not list the remote" was indistinguishable from "listed it, nothing to delete".
+  # Measured: the run logged "4 recording(s) mirrored … (deletions included)" while the remote
+  # still held 5 untouched, and advanced the remembered count to 4 — which is precisely the
+  # corrupted baseline that lets the NEXT run mirror a wipe.
+  rclone mkdir "${remote_dir}" >/dev/null 2>&1 || true
+  listing="$(rclone lsf "${remote_dir}" --recursive --files-only 2>/dev/null)" || ls_rc=$?
+  if (( ls_rc != 0 )); then
+    log "ERROR: audio: could not list ${remote_dir} (rclone exited ${ls_rc}) — what it holds is UNKNOWN, so nothing is deleted and the remembered count stays put. An unreadable remote is not an empty one."
+    return 1
+  fi
   while IFS= read -r f; do [[ -n "$f" ]] && have+=("$f"); done \
-    < <(rclone lsf "${remote_dir}" --recursive --files-only 2>/dev/null | sort || true)
+    < <(printf '%s\n' "${listing}" | sort)
   (( ${#have[@]} )) || return 0
   # "the container has NO recordings at all, the remote has some" is never propagated on its
-  # own say-so: it is the wiped-volume shape, and the count guard above only sees it when a
-  # previous count was recorded. Deleting everything always needs the explicit override.
-  if (( ${#want[@]} == 0 )) && [[ "${AUDIO_ALLOW_MASS_DELETE}" != "1" ]]; then
-    log "ERROR: audio: the container has no recordings while ${remote_dir} holds ${#have[@]} — REFUSING to delete them all (AUDIO_ALLOW_MASS_DELETE=1 if that is really intended)"
+  # own say-so: it is the wiped-volume shape. Deleting everything always needs the explicit
+  # override, naming 0 as the count it should leave behind.
+  if (( ${#want[@]} == 0 )) && ! purge_authorised 0; then
+    log "ERROR: audio: the container has no recordings while ${remote_dir} holds ${#have[@]} — REFUSING to delete them all (set AUDIO_ALLOW_MASS_DELETE=0 if that is really intended)"
     return 1
   fi
   while IFS= read -r f; do [[ -n "$f" ]] && extras+=("$f"); done \
     < <(comm -13 <(printf '%s\n' ${want[@]+"${want[@]}"}) <(printf '%s\n' "${have[@]}"))
   (( ${#extras[@]} )) || return 0
+  # The ABSOLUTE brake, applied to the real delete list rather than to a projection of it.
+  # This is the last gate before an irreversible `rclone deletefile`, and it is the one that
+  # sees a sub-threshold proportional drip for what it is: a lot of files going away at once.
+  if (( ${#extras[@]} > AUDIO_MAX_DROP_FILES )) && ! purge_authorised "${mirrored}"; then
+    log "ERROR: audio: ${#extras[@]} file(s) under ${remote_dir} are no longer in the container — more than AUDIO_MAX_DROP_FILES=${AUDIO_MAX_DROP_FILES} for a single run. REFUSING to delete ANY of them; the off-box copies are untouched. If it was deliberate, re-run ONCE with AUDIO_ALLOW_MASS_DELETE=${mirrored}"
+    return 1
+  fi
   for f in "${extras[@]}"; do
     if rclone deletefile "${remote_dir}/${f}"; then
       log "audio: deleted ${f} from ${remote_dir} (gone from the container)"
