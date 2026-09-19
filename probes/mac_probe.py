@@ -48,6 +48,7 @@ from probes.common import (  # noqa: E402
     ProbeError,
     build_ping,
     find_rclone,
+    flatten_for_log,
     join_nonempty,
     load_config,
     load_state,
@@ -318,9 +319,12 @@ def probe_inbox_backlog(cfg: Dict[str, str], log: Logger, dry_run: bool = False)
     path = cfg["INBOX_BACKLOG_FILE"]
     try:
         entries = backlog.read_backlog(path)
-    except ProbeError as e:
-        log.error("inbox-backlog: " + str(e))
-        return [("inbox-backlog", build_ping("fail", reason="error", note=str(e),
+    except Exception as e:
+        # Deliberately `Exception`, not `ProbeError`: see the containment note above. ANY
+        # failure here belongs to THIS job, and an unhandled one would propagate to main()
+        # and fail the whole mac-probe run instead.
+        log.error("inbox-backlog: " + flatten_for_log(e))
+        return [("inbox-backlog", build_ping("fail", reason="error", note=flatten_for_log(e),
                                              started_at=started, finished_at=now_iso()))]
     if dry_run:
         log.log("inbox-backlog: would POST %d entries to %s/api/v1/inbox/mirror/backlog"
@@ -332,10 +336,19 @@ def probe_inbox_backlog(cfg: Dict[str, str], log: Logger, dry_run: bool = False)
         result = api_json(url + "/api/v1/inbox/mirror/backlog", token, method="POST",
                           body=backlog.build_payload(entries),
                           timeout=float(cfg["PROBE_HTTP_TIMEOUT"]))
-    except ProbeError as e:
+    except Exception as e:
         # PARTIAL: logged and reported against THIS job, never against mac-probe.
-        log.error("inbox-backlog partial: " + str(e))
-        return [("inbox-backlog", build_ping("fail", reason="error", note=str(e),
+        #
+        # ⚠️ `Exception`, not `ProbeError`, and that width is the point. `api_request` only
+        # ever caught URLError/OSError, so a MALFORMED response — http.client.BadStatusLine
+        # or LineTooLong, which are HTTPException and NOT OSError — escaped it, reached
+        # main()'s generic handler and flipped mac-probe itself to `fail`. Per
+        # services._machine_probe that is the machine-offline signal, so a captive portal or
+        # a Cloudflare blip on the PUBLIC host read as "the Mac is down" AND suppressed the
+        # LATE alerts on pa-backup and minecraft-offload. api_request now retries those, and
+        # this is the backstop: nothing about the public host can be a mac-probe failure.
+        log.error("inbox-backlog partial: " + flatten_for_log(e))
+        return [("inbox-backlog", build_ping("fail", reason="error", note=flatten_for_log(e),
                                              started_at=started, finished_at=now_iso()))]
     synced = result.get("synced")
     archived = result.get("archived")
