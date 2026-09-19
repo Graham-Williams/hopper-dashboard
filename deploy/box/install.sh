@@ -11,6 +11,10 @@
 #      The token is read from --token-file (the compose .env: its INGEST_TOKEN= line) or, if that
 #      is omitted, prompted with a HIDDEN read. It is never accepted on the command line (shell
 #      history / `ps`). An existing env file is kept unless a token is supplied (then rewritten).
+#   1b. /etc/hopper-dashboard/ingest.curlrc (<user>:<user> 0600) — the same token as a curl
+#      `header = "Authorization: Bearer …"` line, so the backup heartbeat's ExecStopPost does
+#      NOT carry it in argv (i.e. in world-readable /proc/<pid>/cmdline). Readable by the
+#      service user on purpose; that user already owns the compose .env the token comes from.
 #   2. drop-ins  /etc/systemd/system/{km-backup,todoist-points-backup,hopper-dashboard-backup}.service.d/heartbeat.conf
 #   3. dashboard-containers.service + .timer AND hopper-dashboard-backup.service + .timer
 #      (templates: @@REPO@@ → this checkout, @@USER@@ → --user, default $SUDO_USER, i.e. whoever
@@ -44,7 +48,7 @@ while [[ $# -gt 0 ]]; do
     --token-file) TOKEN_FILE="$2"; shift 2 ;;
     --user)       RUN_USER="$2"; shift 2 ;;
     --token) echo "ERROR: --token is not accepted (it would leak into shell history / ps); use --token-file or the hidden prompt" >&2; exit 2 ;;
-    -h|--help) sed -n '2,23p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -88,6 +92,26 @@ else
 fi
 chown root:root "$ENV_FILE"; chmod 0600 "$ENV_FILE"
 
+# --- 1b. curl config for the backup heartbeat (the token OFF the command line) ---
+# systemd expands ${INGEST_TOKEN} into the ExecStopPost child's argv, which lands in
+# /proc/<pid>/cmdline — world-readable on default Ubuntu. hopper-dashboard-backup's drop-in
+# therefore has curl read the Authorization header from this file instead. It must be
+# readable by the SERVICE user (unlike root-only ingest.env); that costs nothing, since that
+# user already owns ~/hopper-dashboard/.env, which is where INGEST_TOKEN comes from.
+CURLRC="$ENV_DIR/ingest.curlrc"
+CURL_TOKEN="$TOKEN"
+[[ -n "$CURL_TOKEN" ]] || CURL_TOKEN="$(grep -m1 '^INGEST_TOKEN=' "$ENV_FILE" | cut -d= -f2- || true)"
+[[ -n "$CURL_TOKEN" ]] || { echo "ERROR: no INGEST_TOKEN in $ENV_FILE — cannot write $CURLRC"; exit 1; }
+# curl's config parser treats \ and " inside a quoted value as escapes, so a token containing
+# either would be sent WRONG (and silently: the ping would just 401 on every tick).
+[[ "$CURL_TOKEN" == *'"'* || "$CURL_TOKEN" == *'\'* ]] && { echo "ERROR: INGEST_TOKEN contains a quote or backslash, which curl's config syntax cannot carry — rotate it to an alphanumeric token"; exit 1; }
+umask 077
+printf '# hopper-dashboard: the Authorization header for the backup heartbeat, kept out of\n# the process command line. Written by deploy/box/install.sh. Mode 0600.\nheader = "Authorization: Bearer %s"\n' "$CURL_TOKEN" > "$CURLRC.tmp"
+mv "$CURLRC.tmp" "$CURLRC"
+umask 022
+chown "$RUN_USER" "$CURLRC"; chmod 0600 "$CURLRC"
+echo "wrote $CURLRC (owned by $RUN_USER, 0600)"
+
 # --- 2. drop-ins ----------------------------------------------------------------
 for u in "${UNITS[@]}"; do
   install -d -m 0755 "$SYSD/$u.service.d"
@@ -126,6 +150,10 @@ for u in "${OWN_UNITS[@]}"; do systemctl enable --now "$u.timer"; echo "enabled 
 # --- 5. verify ------------------------------------------------------------------
 echo; echo "=== systemd-analyze verify ==="
 systemd-analyze verify --man=no "$SYSD/dashboard-containers.service" "${OWN_UNITS[@]/%/.service}" "${UNITS[@]/%/.service}" && echo "ok"
+echo; echo "=== the heartbeat curl config (token off the command line) ==="
+ls -l "$CURLRC" && grep -c '^header = "Authorization: Bearer ' "$CURLRC" >/dev/null \
+  && echo "ok: $CURLRC has the Authorization header (value not printed)" \
+  || echo "!! $CURLRC is missing its header line — the backup heartbeat will 401"
 echo; echo "=== drop-ins as systemd sees them ==="
 for u in "${UNITS[@]}" "${OWN_UNITS[@]}"; do systemctl cat "$u.service" | grep -E 'heartbeat.conf|ExecStopPost' || echo "!! $u.service has no heartbeat drop-in"; done
 echo; echo "=== timers ==="
