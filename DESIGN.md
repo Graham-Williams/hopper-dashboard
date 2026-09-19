@@ -269,6 +269,23 @@ byte-unique and defeat the sha256 dedupe the whole backup design rests on, and t
 role's writes into long transactions. The price is that files need reconciliation rather than hope, so the
 scheduler sweeps for both directions of orphan: a row whose `audio_path` points at a file that is gone (the
 path is cleared; the row keeps its transcript and simply shows no player), and a file no row references.
+**The orphan sweep defers anything newer than the moment it snapshotted the known-paths set** — a live
+upload landing mid-sweep is not yet in that set, and deleting it would destroy a recording seconds after
+Graham made it.
+
+**`INBOX_AUDIO_MAX_BYTES` is load-bearing on the BROWSER side, not just at the door.** The server renders
+the configured value into the capture page, and the recorder ends a take just under it and KEEPS
+everything recorded up to that point — "Stopped at the 2 MB limit — saved what was recorded" — instead of
+letting the upload be rejected at submit time with the whole recording lost, which is the bug this
+replaced. So the knob now sets the maximum LENGTH of a voice note: lowering it shortens takes visibly,
+raising it allows longer ones; it no longer decides which recordings die. The page shows a measured
+minutes-remaining and a fill bar, and audio is requested at 48 kbps so the cap maps to a predictable
+number of minutes (~5 min at 2 MB) — but every size decision is made on MEASURED bytes, never on the
+bitrate assumption.
+
+The **aggregate** ceiling (`INBOX_AUDIO_MAX_TOTAL_BYTES`) is checked from an indexed row SUM with a 256 MB
+walk margin: near the cap it falls back to a real directory walk, so the cheap path can never admit an
+upload that the true on-disk total would refuse.
 
 Automatic deletion happens on **either** of two rules. The convenience prune needs **all three** of: the
 transcript is `whisper`-quality, the item has been reviewed, and it is older than
@@ -290,9 +307,27 @@ re-derivable and it had no off-box backup — verified on the box: only `km-back
 `todoist-points-backup.timer` existed. `inbox.db` and the audio tree changed that, so
 `deploy/box/backup.sh` + `hopper-dashboard-backup.{service,timer}` now snapshot BOTH DBs from inside the
 container (the WAL sidecars are owned by uid 10001; a host-side online backup fails "attempt to write a
-readonly database") and push to Drive with **`rclone copy`, never `sync`** — the audio tree in two hops,
-both additive, so the 90-day prune above cannot propagate a deletion off-box even if it has a bug. Details
-and the restore procedure in DEPLOY.md §2b.
+readonly database") and push them to Drive with **`rclone copy`** into a retention ring plus a `daily/`
+tier. The upload itself never deletes; the ring and the daily tier prune by COUNT, deliberately, so a
+snapshot leaves Drive only when enough newer ones have replaced it. Nothing that happens to the live DB
+can remove an off-box DB snapshot.
+
+**The audio tree is the deliberate exception: it MIRRORS the container, deletions included.** Graham's
+decision, 2026-09-19, after a reviewer pointed out that an additive audio backup quietly defeats both
+controls above — Delete is sold here as the way to retract "a password read aloud", and the privacy
+ceiling is sold as a maximum age, and neither is true if every recording lives on Drive forever. So both
+hops mirror: each run `docker cp`s the tree into a FRESH staging directory (an additive `docker cp` into a
+persistent one would itself resurrect deleted files) and the upload is `rclone copy` followed by an
+explicit delete pass for remote files the container no longer has. Delete now means deleted everywhere.
+The databases are untouched by this and stay additive.
+
+**The brake on that.** A mass deletion is far more likely to be a wiped volume, a mis-set path or a prune
+bug than an intentional purge, so `push_audio` refuses to propagate one: if the container's audio
+directory is missing entirely, or its file count has fallen by more than `AUDIO_MAX_DROP_PCT` (50%) since
+the last clean mirror, or the container has no recordings at all while Drive has some, the sync is skipped
+and the run FAILS loudly — Drive keeps what it has. `AUDIO_ALLOW_MASS_DELETE=1` is the deliberate
+override, and only a clean mirror updates the remembered count. Details and the restore procedure in
+DEPLOY.md §2b.
 
 ### What the Inbox adds to the board
 
@@ -301,7 +336,15 @@ Four jobs, all with a 24 h alert threshold because none of them is urgent and al
 - `inbox-github-sync` (box, `kind: worker`) — the in-container mirror. A dead mirror is the failure that
   looks fine: the board keeps rendering the issues it last saw.
 - `hopper-dashboard-backup` (box, `kind: db_snapshot`) — above.
-- `inbox-transcribe` (mac, `kind: worker`) — the only path from audio to text.
+- `inbox-transcribe` (mac, `kind: worker`) — the only path from audio to text. **One item can never
+  wedge the queue**: the queue is served oldest-first, so an item the server keeps rejecting (a 413 on an
+  over-long transcript, a 400, a persistent 429) would otherwise abort every run at the same row, burn no
+  attempt, and silently starve every newer voice note behind it. The download, the transcription AND the
+  success-path POST are all contained per item: a failure is reported as THAT item's (burning one of its
+  three attempts) and the run moves on. Only an `EnvironmentFault` (no ffmpeg, no mlx) or an auth-shaped
+  401/403 aborts a run — both of which would fail identically for every item, so burning attempts on them
+  would destroy transcripts rather than save them. Transcripts are also truncated to the server's
+  `MAX_TEXT` before posting, so length alone can never be the rejection.
 - `inbox-backlog` (mac, `kind: worker`) — a sub-probe of the hourly Mac probe.
 
 `kind: worker` is a correctness decision, not a label. `services._machine_probe` returns the FIRST
@@ -315,7 +358,12 @@ heartbeat rides the Tailscale ingest port — two completely different failure s
 "the Mac is awake and probing", and the machine-offline rule mutes every other Mac job's LATE alert while it
 is LATE, so letting a Cloudflare 502 mark the Mac as failing would mute the very jobs that say the backups
 stopped. The sub-probe therefore never raises: a delivery or parse failure comes back as `inbox-backlog`'s
-own `fail` ping.
+own `fail` ping. That guarantee was ONE EXCEPTION WIDE until the security gate found it — `api_request`
+caught `URLError`/`OSError`, but `http.client.BadStatusLine` and `LineTooLong` are `HTTPException` and
+neither, so a MALFORMED response (a captive portal, a truncated edge response) escaped the retry loop,
+reached mac_probe's generic handler and flipped `mac-probe` itself to `fail` — reading as "the Mac is
+down" and muting `pa-backup` and `minecraft-offload`. Fixed in both places: those are now retryable
+transport errors, and the sub-probe catches `Exception`, not just `ProbeError`.
 
 **Both Mac Inbox jobs carry `grace_s: 50520`**, like every other Mac job — 14 h + 2 min, so their deadline
 can never land before `mac-probe`'s. The cost is that plain SILENCE from the transcription worker only reads

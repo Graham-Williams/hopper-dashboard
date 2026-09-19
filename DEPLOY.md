@@ -82,8 +82,14 @@ sed -i "s|^INBOX_TOKEN=.*|INBOX_TOKEN=$(openssl rand -hex 32)|" .env
 # STARTUP, so a typo fails the container immediately rather than at the first sync.
 # .env.example already ships this exact line — check it rather than retyping it:
 grep -c 'Graham-Williams/' .env        # expect 1 line listing ten repos
-# INBOX_AUDIO_MAX_BYTES / INBOX_AUDIO_RETENTION_DAYS / INBOX_GITHUB_INTERVAL_S /
-# INBOX_PRUNE_INTERVAL_S all have compose defaults (8 MiB / 90 d / 900 s / 3600 s); leave them.
+# INBOX_AUDIO_MAX_BYTES / INBOX_AUDIO_MAX_TOTAL_BYTES / INBOX_AUDIO_RETENTION_DAYS /
+# INBOX_GITHUB_INTERVAL_S / INBOX_PRUNE_INTERVAL_S all have compose defaults (2 MiB per note /
+# 3 GB tree / 90 d / 900 s / 3600 s); leave them. One of them is not just a door policy:
+# INBOX_AUDIO_MAX_BYTES is rendered into the CAPTURE PAGE, where the recorder stops a take just
+# under it and keeps what it already recorded ("Stopped at the 2 MB limit — saved what was
+# recorded"). So changing it changes the maximum LENGTH of a voice note — ~5 min at 2 MB, since
+# audio is requested at 48 kbps — rather than deciding which uploads get a 413. Lowering it
+# shortens takes, with the user told on screen; it never loses a recording that was made.
 
 grep -E '^(APP_PASSWORD|SESSION_SECRET|INGEST_TOKEN|READ_TOKEN)=change-me' .env && echo "STOP: a secret is still the placeholder"
 
@@ -535,6 +541,17 @@ The token is read from the compose `.env`'s `INGEST_TOKEN=` line — it never ap
 What it does (idempotent; never restarts a container or the backup units):
 - writes `/etc/hopper-dashboard/ingest.env` (root:root **0600** — systemd reads `EnvironmentFile=` as PID 1
   even though the units run as the login user, so that user never needs to read it),
+- writes `/etc/hopper-dashboard/ingest.curlrc` (**owned by the service user, 0600**) holding one line —
+  `header = "Authorization: Bearer <token>"` — which is how the `hopper-dashboard-backup` heartbeat
+  authenticates. It exists because systemd expands `${INGEST_TOKEN}` into the ExecStopPost child's argv,
+  and argv is world-readable in `/proc/<pid>/cmdline` on a default Ubuntu; curl reading the header from a
+  0600 file keeps it off the command line. (The journal was never affected — systemd logs the argv
+  unexpanded.) It must be readable by the service user, unlike root-only `ingest.env`, which costs nothing:
+  that user already owns `~/hopper-dashboard/.env`, where the token comes from. **If you rotate
+  `INGEST_TOKEN`, re-run `install.sh` — this file does not update itself, and a stale one 401s every tick**
+  (`journalctl -u hopper-dashboard-backup.service | grep 401`). ⚠️ The two OLDER drop-ins
+  (`km-backup`, `todoist-points-backup`) still carry the token in argv — pre-existing, tracked separately;
+  do not "fix" them here, they belong to other repos' units.
 - installs `/etc/systemd/system/{km-backup,todoist-points-backup}.service.d/heartbeat.conf`
   (`ExecStopPost=-/usr/bin/curl … result=${SERVICE_RESULT} exit=${EXIT_STATUS}` → `/api/v1/ping/<unit>`;
   fires on success, failure **and** the 300 s timeout kill; `-` prefixes mean a dead dashboard can never
@@ -605,6 +622,8 @@ cd ~/hopper-dashboard
 # The backup pushes with the WRITER remote (`gdrive:`), not the read-only `gdrive-ro:` the probes use —
 # a backup that cannot write is not a backup. Same remote km-tracker and todoist-points already push with.
 rclone listremotes | grep -qx 'gdrive:' || echo "STOP: no writer remote; the local ring still works, Drive does not"
+# 0600 is REQUIRED, not tidiness: backup.sh `source`s this file — executing it as shell, as a user in
+# the docker group, every 5 minutes — and REFUSES to source it if it is group- or other-writable.
 ( umask 077; cat > deploy/box/.env.backup <<'EOF'
 # hopper-dashboard backup config (gitignored, 0600). Every key is optional; these are the ones
 # that differ from the defaults in deploy/box/backup.sh.
@@ -627,10 +646,35 @@ What it does, and the two things that are non-negotiable about how:
   with *"attempt to write a readonly database"* even when the source is opened `mode=ro`. The finished file
   is integrity-checked in the container, `docker cp`'d out, and **re-verified on the host** (a truncated copy
   would otherwise reach Drive undetected, since everything downstream only sha256s the host file).
-- **`rclone copy`, never `sync`.** Copy only adds to the remote, so nothing that happens on the box — the
-  Inbox's own 90-day audio prune, a bug in it, a wiped volume, a bad restore — can delete the off-box copy.
-  The audio tree gets the same treatment in two hops (`docker cp` of the directory *contents* into
-  `~/hopper-dashboard-backups/audio`, then `rclone copy` of that), and both hops are additive.
+- **The DB snapshots are additive; the AUDIO TREE IS A MIRROR.** The two databases go up with
+  `rclone copy` into a ring plus a `daily/` tier: the upload never deletes, and a snapshot leaves Drive
+  only when enough newer ones have pushed it out by retention count. Nothing that happens to the live DB
+  can remove an off-box DB snapshot.
+  The **audio tree is the deliberate exception** (Graham's decision, 2026-09-19): it mirrors the
+  container, deletions included, because an additive audio backup defeats both the Inbox's Delete control
+  — sold as the way to retract "a password read aloud" — and its 180-day privacy ceiling. Each run
+  `docker cp`s the tree into a **fresh** staging directory (copying into a persistent one would resurrect
+  deleted files, since `docker cp` only adds) and then `rclone copy`s it up and deletes the remote files
+  the container no longer has, one at a time, logged.
+- **The brake on that mirror.** A mass deletion is far likelier to be a wiped volume or a mis-set path
+  than an intentional purge, so the run REFUSES to propagate one and exits non-zero (the heartbeat goes
+  `fail`, the board pages after the job's threshold) when: the container's audio directory is missing
+  entirely; its file count has dropped by more than `AUDIO_MAX_DROP_PCT` (default 50) since the last
+  **clean** mirror; or the container has no recordings at all while Drive has some. Drive keeps what it
+  has in every one of those cases. For a deliberate purge, run once with `AUDIO_ALLOW_MASS_DELETE=1`:
+  ```bash
+  cd ~/hopper-dashboard && AUDIO_ALLOW_MASS_DELETE=1 deploy/box/backup.sh
+  ```
+- **Retention values are validated before anything is pruned.** `LOCAL_RETENTION`, `DRIVE_RETENTION`,
+  `DAILY_RETENTION` and `AUDIO_MAX_DROP_PCT` must each be an integer ≥ 1 or the run dies with a named
+  error. A value of `0` (or `" "`) is NOT caught by `${VAR:-60}` — it is non-empty — and would make every
+  prune slice cover the whole list, deleting every snapshot on the box AND in `gdrive:hopper-dashboard-backups`
+  on a single tick.
+- **`deploy/box/.env.backup` is refused if it is group- or other-writable.** It is `source`d — executed as
+  shell — every five minutes as a user in the `docker` group, so `chmod 600` it (the recipe above does).
+- **`~/hopper-dashboard-backups/` and everything under it is created 0700**, and audio files are tightened
+  to owner-only after the `docker cp` (which brings the container's ~0644 modes with it). These are
+  recordings of Graham's voice; the on-box mirror should not be readable by every account on the box.
 
 Also: sha256 dedupe (an unchanged DB does not create a new file), a 60-deep local ring, a Drive push
 throttled to ~15 minutes, a `daily/` tier keeping one snapshot per UTC day for 30 days, and a guard that
@@ -984,7 +1028,9 @@ script, but that is per-repo work).
       real value back.
 - [ ] `INVENTORY.md` in `~/personal-assistant` updated: new container, new public hostname, new box timer,
       new Mac launchd job, new credential locations (`/etc/hopper-dashboard/ingest.env`,
-      `~/.config/hopper-dashboard/env`, box `.env`, `~/.config/rclone/dashboard-ro.conf`).
+      **`/etc/hopper-dashboard/ingest.curlrc` — a second copy of the ingest token, owned by the service
+      user 0600, rewritten by `install.sh`**, `~/.config/hopper-dashboard/env`, box `.env`,
+      `~/.config/rclone/dashboard-ro.conf`).
 
 ## Rollback
 
@@ -1097,7 +1143,7 @@ restore data; the dashboard's own SQLite is derived state that repopulates withi
 | `inbox-backlog` missing from the box `jobs.yml` while the Mac posts it (§1d-ii) | Exactly the same shape as the row above, in a worse place: it is a sub-probe of the HOURLY Mac probe, so a 404 makes `mac-probe` itself report a failed sub-probe every hour — and `mac-probe` is the job whose alert mutes its siblings | Run §1d-ii (it is idempotent). Until `INBOX_URL`/`INBOX_TOKEN` are in the Mac env file the sub-probe skips silently and cannot cause this, which is why §1d-ii comes BEFORE §4b |
 | The Mac transcription agent is unloaded, crashed, or was never installed (§4b) | Voice notes stay on the board reading "transcribing…" for ever. **Nothing is lost** — the audio is kept and a later run picks it up — but it is the ONLY path from a recording to text, and the page looks the same on minute one as on day ten | `inbox-transcribe` goes LATE after ~14 h (the mandatory Mac grace). A CRASHED worker is much faster: it posts its own `fail` and is red immediately. `launchctl list \| grep inbox-transcribe`; `~/Library/Logs/hopper-inbox-transcribe.log` |
 | `ffmpeg` not on the launchd agent's PATH (the plist's `PATH` line lost, Homebrew moved) | **The nastiest one here.** mlx-whisper runs a bare `ffmpeg` from PATH inside `load_audio`, so it fails as though every recording were corrupt — and only under launchd; run the same command in your own shell and it works | The worker checks PATH first and aborts the RUN with a diagnostic naming ffmpeg, rather than reporting per-item failures (three of those would mark every queued note permanently un-transcribable). `inbox-transcribe` goes FAIL with that note; `deploy/mac/install.sh` also refuses to install a plist missing the line |
-| The Inbox's audio prune deletes a file the backup has not copied yet | A recording is gone from both the box and Drive with nothing to say so | Can't happen by construction: the prune needs the transcript to be Whisper-quality AND the item reviewed AND 90 days old, and the backup's audio push is `rclone copy` — additive in both hops (`docker cp` into the host mirror, `rclone copy` up), so a local delete can never propagate. `rclone lsf gdrive:hopper-dashboard-backups/audio` keeps everything it ever saw |
+| The Inbox's audio prune deletes a file the backup has not copied yet | A recording is gone from both the box and Drive with nothing to say so | Bounded, not impossible — and deliberately so since 2026-09-19, because Delete must mean deleted everywhere. The prune needs the transcript to be Whisper-quality AND the item reviewed AND 90 days old, so by then the text has been in the DB snapshots for months. What the mirror cannot do is propagate a WIPE: a missing audio dir, a >50% drop in file count, or an empty tree against a non-empty Drive all refuse the deletion pass and fail the run loudly (`AUDIO_ALLOW_MASS_DELETE=1` overrides). The DB snapshots remain additive |
 | `hopper-dashboard-backup` timer installed without its heartbeat drop-in | The backup runs (or stops running) and the board says nothing either way — an unbacked-up app with a green card, which is the exact failure this repo exists to catch | Can't happen via `deploy/box/install.sh`: the unit, timer and drop-in are installed in one loop iteration, a test asserts it, and `systemctl cat hopper-dashboard-backup.service` must show `heartbeat.conf` + its `ExecStopPost=` line |
 | The dashboard is left on the shared house password (§1c) | The word Graham gave friends for km-tracker opens a board that now holds recordings of his voice, and the apex page links straight to it | Try the house word at `/login` — it must be REFUSED. Nothing in the code enforces this; it is a value in the box `.env`, so the only check is the one you run |
 | Sibling Mac job pages "→ LATE" a tick before `mac-probe` does | Two alerts for one night's sleep | A sibling's `grace_s` dropped below `mac-probe`'s + 120 in `jobs.yml` (the probe posts siblings before itself). Restore the margin. |
