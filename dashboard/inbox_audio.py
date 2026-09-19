@@ -255,11 +255,22 @@ def sweep_orphans(audio_dir: str, known: set[str],
     collected only once it is older than :data:`PART_MAX_AGE_S`, so a sweep that
     happens to run during an upload cannot delete a file that is still being
     written.
+
+    ``now`` is ALSO the moment ``known`` was read, and that is load-bearing:
+    this runs in the scheduler thread of the very process that serves uploads,
+    so a note whose ``os.replace`` lands after the snapshot but before
+    ``os.walk`` reaches its directory is a perfectly valid file that is simply
+    not in ``known`` yet. Deleting it left the row pointing at nothing, the
+    next prune cleared ``audio_path``, and the note silently became text-only
+    with no error anywhere. So anything modified at or after ``now`` is treated
+    as IN FLIGHT and left for the next sweep, which will have a snapshot that
+    includes it.
     """
     removed: list[str] = []
     if not os.path.isdir(audio_dir):
         return removed
-    cutoff = (now if now is not None else _time.time()) - PART_MAX_AGE_S
+    snapshot_at = now if now is not None else _time.time()
+    cutoff = snapshot_at - PART_MAX_AGE_S
     for dirpath, _dirnames, filenames in os.walk(audio_dir):
         for name in filenames:
             full = os.path.join(dirpath, name)
@@ -269,7 +280,7 @@ def sweep_orphans(audio_dir: str, known: set[str],
             if not REL_PATH_RE.match(rel):
                 if not _is_stale_part(rel, full, cutoff):
                     continue
-            elif rel in known:
+            elif rel in known or _in_flight(full, snapshot_at):
                 continue
             try:
                 os.remove(full)
@@ -277,6 +288,24 @@ def sweep_orphans(audio_dir: str, known: set[str],
             except OSError:
                 continue
     return removed
+
+
+def _in_flight(full: str, snapshot_at: float) -> bool:
+    """True if the file appeared after ``known`` was read, so its row may
+    simply not have been committed yet.
+
+    The window is real: ``prune_audio`` snapshots the paths the DB believes in,
+    closes its connection, and only then walks the tree — while the request
+    workers of the same process keep accepting uploads. A file that lands in
+    that gap is indistinguishable from an orphan by name alone.
+
+    An unreadable mtime is treated as in flight too: refusing to delete is the
+    recoverable outcome (the next sweep gets it), deleting is not.
+    """
+    try:
+        return os.path.getmtime(full) >= snapshot_at
+    except OSError:
+        return True
 
 
 def _is_stale_part(rel: str, full: str, cutoff: float) -> bool:
@@ -357,6 +386,10 @@ def prune_audio(settings, now: float | None = None) -> dict:
         known = inbox_db.known_audio_paths(conn)
     finally:
         conn.close()
+    # `now` was taken BEFORE any of the above, so it is never later than the
+    # moment `known` was read — which is the direction that is safe. The sweep
+    # treats anything newer than it as an upload still in flight and leaves it
+    # alone; erring early just defers one more file to the next pass.
     orphans = sweep_orphans(audio_dir, known, now)
     return {"pruned": pruned, "cleared": cleared, "orphans": len(orphans),
             "tree_bytes": tree_bytes(audio_dir)}

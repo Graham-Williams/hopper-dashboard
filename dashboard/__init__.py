@@ -146,7 +146,8 @@ def create_app(role: str = "read", settings: Settings | None = None,
     from . import inbox
     app.extensions["inbox_machine_endpoints"] = inbox.MACHINE_ENDPOINTS
     # Two buckets because they are two different abuses. Creating a row can
-    # carry 8 MB; editing one is a checkbox that a fast finger hits repeatedly.
+    # carry a whole voice note (INBOX_AUDIO_MAX_BYTES, 2 MB by default);
+    # editing one is a checkbox that a fast finger hits repeatedly.
     app.extensions["inbox_create_limiter"] = SlidingWindowLimiter(30, 900)
     app.extensions["inbox_write_limiter"] = SlidingWindowLimiter(120, 60)
     if not settings.inbox_token:

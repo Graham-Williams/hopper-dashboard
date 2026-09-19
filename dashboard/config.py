@@ -165,10 +165,18 @@ class Settings:
     # still works. Deliberately NOT a `${VAR:?}` in compose — the board booting
     # matters more than the Inbox booting.
     inbox_token: str = ""
-    # Per-upload cap for one voice note. 2 MB is roughly ten minutes of Opus,
-    # which is far more than a spoken bug report and an order of magnitude less
-    # than the 8 MB this used to allow — the cap multiplies by the create
-    # limiter (30 per 15 min per IP) into how much disk one address can spend.
+    # Per-upload cap for one voice note. The page records speech at ~48 kbps,
+    # so 2 MB is roughly five minutes — plenty for a spoken bug report, and an
+    # order of magnitude less than the 8 MB this used to allow (the cap
+    # multiplies by the create limiter, 30 per 15 min per IP, into how much
+    # disk one address can spend).
+    #
+    # LOAD-BEARING on the browser side: `static/inbox.js` is handed this number
+    # (via a data- attribute on the capture form) and AUTO-STOPS the recorder
+    # just before it is reached. Lower it and long takes simply end sooner with
+    # a message; without that the recorder would run past the cap and the
+    # upload would 413 with the audio held nowhere but a dead page — the take
+    # would be gone. Raise it and nothing breaks.
     # Applied PER REQUEST on the create route only
     # (`request.max_content_length`); the global 64 KB body cap that protects
     # every other route is never raised.

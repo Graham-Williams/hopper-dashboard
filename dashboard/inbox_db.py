@@ -706,6 +706,21 @@ def mark_audio_pruned(conn: sqlite3.Connection, item_id: str,
                  "updated_at=? WHERE id=?", (now, now, item_id))
 
 
+def audio_bytes_total(conn: sqlite3.Connection) -> int:
+    """Bytes of audio the ROWS account for — the cheap read of the aggregate
+    cap, used on the upload path so it does not ``stat`` the whole tree.
+
+    It is not the same number as ``inbox_audio.tree_bytes``: a file with no row
+    (an interrupted upload, an orphan the sweep has not collected yet) is
+    invisible here, so this is a LOWER BOUND on what is really on disk. That is
+    exactly why the caller only trusts it while there is a wide margin left,
+    and walks the tree for real anywhere near the cap.
+    """
+    row = conn.execute("SELECT COALESCE(SUM(audio_bytes), 0) FROM inbox_items"
+                       " WHERE audio_path IS NOT NULL").fetchone()
+    return int(row[0] or 0)
+
+
 def known_audio_paths(conn: sqlite3.Connection) -> set[str]:
     """Every path the DB still believes in — the orphan sweep's allow-list."""
     return {r["audio_path"] for r in conn.execute(

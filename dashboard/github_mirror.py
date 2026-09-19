@@ -386,11 +386,15 @@ def sync(conn, repos, *, now: float | None = None, fetch=None,
             results.append(_sync_repo(conn, repo, now=now, fetch=fetch,
                                       token=token))
         except Exception as exc:                          # noqa: BLE001
-            log.exception("inbox github mirror: %s raised", repo)
-            # Redacted before it is stored or logged: an exception raised while
-            # building the request can carry the header value with it.
+            # Redacted BEFORE anything is logged: an exception raised while
+            # building the request can carry the header value with it, and
+            # `log.exception` would have written the raw message (the tail of
+            # the traceback) out before this line ever ran — the exact leak
+            # `_redact` exists to prevent. The traceback is given up on purpose;
+            # the redacted `type: message` is what identifies the fault anyway.
             reason = _redact(f"{type(exc).__name__}: {exc}",
                              {"Authorization": f"Bearer {token}"} if token else None)
+            log.error("inbox github mirror: %s raised: %s", repo, reason[:200])
             results.append({"repo": repo, "status": "error",
                             "error": reason[:200]})
     ok = sum(1 for r in results if r["status"] in ("ok", "unchanged"))

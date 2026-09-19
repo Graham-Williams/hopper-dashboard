@@ -138,6 +138,44 @@ def test_sweep_orphans_removes_only_what_it_recognises(audio_dir):
 # The sweep's one named exception
 # --------------------------------------------------------------------------- #
 
+def test_the_sweep_never_deletes_an_upload_that_landed_after_the_snapshot(
+        audio_dir):
+    """`prune_audio` reads the paths the DB believes in, CLOSES the connection,
+    and only then walks the tree — from the scheduler thread of the very process
+    that is still serving uploads. A note whose `os.replace` lands after that
+    snapshot but before `os.walk` reaches its directory is a perfectly valid
+    file that `known` has simply not heard of yet.
+
+    Deleting it was silent and unrecoverable: the row survived pointing at
+    nothing, the next prune cleared `audio_path`, and a voice note became
+    text-only with no error anywhere and no recording to re-transcribe. So
+    anything modified at or after the snapshot is left for the next pass, which
+    will have a snapshot that includes it.
+    """
+    snapshot_at = 1_800_000_000.0
+    before = audio.save(audio_dir, item_id="a" * 32, data=WEBM,
+                        declared_mime="audio/webm", max_bytes=10 ** 6,
+                        created_at=CREATED)
+    after = audio.save(audio_dir, item_id="b" * 32, data=WEBM,
+                       declared_mime="audio/webm", max_bytes=10 ** 6,
+                       created_at=CREATED)
+    os.utime(os.path.join(audio_dir, before.path),
+             (snapshot_at - 30, snapshot_at - 30))
+    os.utime(os.path.join(audio_dir, after.path),
+             (snapshot_at + 5, snapshot_at + 5))
+
+    # Neither is in `known`. Only the one that predates the snapshot is a
+    # genuine orphan; the other is an upload the snapshot simply missed.
+    removed = audio.sweep_orphans(audio_dir, known=set(), now=snapshot_at)
+    assert removed == [before.path]
+    assert audio.open_path(audio_dir, after.path) is not None
+
+    # It is a deferral, not an amnesty: once it is genuinely old and still
+    # unreferenced, the next sweep takes it.
+    later = audio.sweep_orphans(audio_dir, known=set(), now=snapshot_at + 600)
+    assert later == [after.path]
+
+
 def test_the_sweep_collects_stale_part_files_and_nothing_else(tmp_path):
     """`save` writes `<id>.<ext>.part` and then `os.replace`s it into place, so
     the real name is never half-written — but an interrupted write leaves the

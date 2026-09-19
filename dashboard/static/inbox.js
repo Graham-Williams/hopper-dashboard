@@ -31,6 +31,16 @@
       do on a phone. Hence: release before starting, release in the failure
       path, and refuse to start a second time while a permission prompt is
       already open.
+   4. A take is NEVER lost to the per-note size cap. The server caps one upload
+      at INBOX_AUDIO_MAX_BYTES (2 MB by default, a few minutes of speech), and
+      an unbounded MediaRecorder would sail past it: the user talks for six
+      minutes, presses “Add to inbox”, gets `body too large`, and the recording
+      is gone — it lives nowhere but this page. So the cap is rendered into the
+      form as `data-audio-max-bytes`, the recorder runs with a timeslice so the
+      bytes are counted as they arrive, and it AUTO-STOPS with a plain message
+      just before the cap is reached, keeping everything recorded so far. The
+      clock shows measured minutes-remaining and a progress bar shows the fill,
+      because “2 MB” tells nobody how long they may talk.
 
    And the page must degrade: with JavaScript off the table, the filters and
    the typed-note form all still work. Only the microphone needs this file. */
@@ -43,6 +53,7 @@
   var statusEl = document.getElementById('record-status');
   var errEl = document.getElementById('capture-error');
   var submitBtn = document.getElementById('capture-submit');
+  var levelEl = document.getElementById('record-level');
 
   function setText(el, message) {
     if (!el) { return; }
@@ -74,6 +85,30 @@
      stopped, so the microphone stays live for the life of the page. */
   var starting = false;
   var timerId = null;
+  /* Bytes accepted so far for THIS take, the biggest chunk seen (the reserve
+     for auto-stop is sized off it), whether the cap ended the take, and whether
+     the take has already been wrapped up. */
+  var recordedBytes = 0;
+  var maxChunkBytes = 0;
+  var autoStopped = false;
+  var finalised = true;
+
+  /* The server's per-note cap, rendered into the form by Jinja so it tracks the
+     setting instead of drifting from it. 0 = not available (an old cached page,
+     a template change) — in which case nothing auto-stops and the behaviour is
+     exactly what it was before. */
+  var MAX_BYTES = (function () {
+    var raw = form ? parseInt(form.getAttribute('data-audio-max-bytes'), 10) : NaN;
+    return (isFinite(raw) && raw > 0) ? raw : 0;
+  })();
+
+  /* Speech does not need more, and it makes the cap mean a predictable number
+     of minutes rather than whatever the UA felt like. Every size decision below
+     is still made on MEASURED bytes, so a UA that ignores this is handled. */
+  var AUDIO_BPS = 48000;
+  /* Chunk interval. The point is not the chunks, it is that `ondataavailable`
+     fires while recording so there is a running byte count to act on at all. */
+  var TIMESLICE_MS = 1000;
 
   /* Both formats the two devices Graham uses actually produce: Chrome/Android
      gives webm/opus, iOS Safari gives mp4/AAC. The server accepts both and the
@@ -124,6 +159,53 @@
     return startedAt ? (Date.now() - startedAt) / 1000 : 0;
   }
 
+  /* ---- the size budget ---------------------------------------------- */
+
+  /* What must be left unspent when the decision to stop is taken: the chunk
+     currently filling, plus the final one `stop()` flushes, plus a chunk of
+     slack. The first chunk carries the container header and is the largest, so
+     it is a sound unit to reserve three of. Never more than a quarter of the
+     cap, or a tiny cap would make every take stop instantly. */
+  function stopMargin() {
+    var margin = Math.max(maxChunkBytes * 3, 32768);
+    return Math.min(margin, Math.floor(MAX_BYTES / 4));
+  }
+
+  function limitLabel() {
+    if (!MAX_BYTES) { return 'the size limit'; }
+    if (MAX_BYTES < 1048576) { return Math.round(MAX_BYTES / 1024) + ' KB'; }
+    return (Math.round(MAX_BYTES / 1048576 * 10) / 10) + ' MB';
+  }
+
+  /* “About 4 min left”, from the rate this take is ACTUALLY encoding at —
+     never from an assumed bitrate, because iOS Safari's AAC and Chrome's Opus
+     are nothing like each other and the honest number is the measured one. */
+  function remainingLabel() {
+    if (!MAX_BYTES || recordedBytes <= 0) { return ''; }
+    var secs = elapsedSecs();
+    if (secs < 3) { return ''; }          // too early for the rate to mean much
+    var rate = recordedBytes / secs;
+    if (rate <= 0) { return ''; }
+    var left = (MAX_BYTES - stopMargin() - recordedBytes) / rate;
+    if (left <= 0) { return ''; }
+    if (left < 60) { return ' · under a minute left'; }
+    return ' · about ' + Math.floor(left / 60) + ' min left';
+  }
+
+  /* A fill bar, not a byte count: nobody is converting megabytes to minutes in
+     their head halfway through a sentence. `.value`/`.max` are properties, so
+     this needs no inline style and the CSP stays as strict as it is. */
+  function updateLevel() {
+    if (!levelEl) { return; }
+    if (!MAX_BYTES || recordedBytes <= 0) {
+      levelEl.hidden = true;
+      return;
+    }
+    levelEl.max = MAX_BYTES;
+    levelEl.value = Math.min(recordedBytes, MAX_BYTES);
+    levelEl.hidden = false;
+  }
+
   function stopTimer() {
     if (timerId !== null) {
       window.clearInterval(timerId);
@@ -135,35 +217,77 @@
     stopTimer();
     status('● Recording… 0:00');
     timerId = window.setInterval(function () {
-      status('● Recording… ' + clock(elapsedSecs()));
+      status('● Recording… ' + clock(elapsedSecs()) + remainingLabel());
     }, 250);
   }
 
-  function wireRecorder() {
-    recorder.ondataavailable = function (event) {
-      if (event.data && event.data.size) { chunks.push(event.data); }
-    };
-    recorder.onstop = function () {
-      stopTimer();
-      releaseStream();
-      var type = recorder.mimeType || (chunks[0] && chunks[0].type) || 'audio/webm';
-      recordedBlob = chunks.length ? new Blob(chunks, {type: type}) : null;
-      recordedSecs = Math.round(elapsedSecs() * 10) / 10;
-      setRecording(false);
-      if (recordedBlob) {
-        /* Deliberately no preview player here: that needs a blob: URL and the
-           CSP has no media-src blob:. It is playable from the row as soon as
-           it is saved. */
-        status('Recorded ' + clock(recordedSecs) + ' — press “Add to inbox” to save it.');
-      } else {
-        status('Nothing was recorded — try again, or type it instead.');
+  /* Wrap a take up: stop the clock, drop the microphone, build the blob and
+     say what happened. Called from `onstop` normally — and from the manual
+     teardown when `stop()` itself throws, because the chunks are already in
+     hand there and throwing them away would lose the take for the sake of a
+     UA quirk. Runs at most once per take. */
+  function finalise(instance) {
+    if (finalised) { return; }
+    finalised = true;
+    stopTimer();
+    releaseStream();
+    var type = 'audio/webm';
+    try {
+      type = (instance && instance.mimeType) || (chunks[0] && chunks[0].type) || type;
+    } catch (e) { /* a dead recorder can throw on property access */ }
+    recordedBlob = chunks.length ? new Blob(chunks, {type: type}) : null;
+    recordedSecs = Math.round(elapsedSecs() * 10) / 10;
+    setRecording(false);
+    updateLevel();
+    /* Deliberately no preview player here: that needs a blob: URL and the CSP
+       has no media-src blob:. It is playable from the row as soon as it is
+       saved. */
+    if (!recordedBlob) {
+      status('Nothing was recorded — try again, or type it instead.');
+    } else if (autoStopped) {
+      status('Stopped at the ' + limitLabel() + ' limit — saved what was ' +
+             'recorded (' + clock(recordedSecs) + '). Press “Add to inbox”.');
+    } else {
+      status('Recorded ' + clock(recordedSecs) + ' — press “Add to inbox” to save it.');
+    }
+  }
+
+  /* `instance` rather than the module-level `recorder`: a Stop click followed
+     quickly by a Record click whose getUserMedia resolves FIRST leaves the old
+     recorder's handlers still queued, and a stale one that ran would release
+     the brand-new stream (a dead microphone) and overwrite recordedBlob with
+     the previous take. A superseded recorder does nothing at all — the take it
+     belonged to has already been abandoned, and `startRecording` released its
+     stream before asking for the new one. */
+  function wireRecorder(instance) {
+    instance.ondataavailable = function (event) {
+      if (instance !== recorder) { return; }
+      if (!event.data || !event.data.size) { return; }
+      chunks.push(event.data);
+      recordedBytes += event.data.size;
+      if (event.data.size > maxChunkBytes) { maxChunkBytes = event.data.size; }
+      updateLevel();
+      /* The whole point of the timeslice: stop BEFORE the cap rather than
+         discovering it at upload time, when the only copy of the recording is
+         in a page that is about to show an error. */
+      if (MAX_BYTES && !autoStopped &&
+          recordedBytes + stopMargin() >= MAX_BYTES) {
+        autoStopped = true;
+        stopRecording();
       }
     };
-    recorder.onerror = function () {
+    instance.onstop = function () {
+      if (instance !== recorder) { return; }
+      finalise(instance);
+    };
+    instance.onerror = function () {
+      if (instance !== recorder) { return; }
+      finalised = true;                   // nothing usable to wrap up
       stopTimer();
       status('The recorder failed — type it instead.');
       setRecording(false);
       releaseStream();
+      updateLevel();
       if (textEl) { textEl.focus(); }
     };
   }
@@ -183,8 +307,21 @@
        that), it is stopped here rather than orphaned by the next assignment. */
     releaseStream();
     stopTimer();
+    /* Orphan the previous recorder HERE, not when the new one is constructed.
+       Between this click and getUserMedia resolving, the old recorder's
+       `onstop` can still fire; while it was still the current one it would
+       finalise the ABANDONED take — restoring the old recordedBlob over the
+       reset below and overwriting "Asking for the microphone…". With `recorder`
+       already null every stale handler bails, and the old stream was released
+       on the line above. */
+    recorder = null;
     recordedBlob = null;
     recordedSecs = 0;
+    recordedBytes = 0;
+    maxChunkBytes = 0;
+    autoStopped = false;
+    finalised = false;
+    updateLevel();
     starting = true;
     if (recBtn) { recBtn.disabled = true; }
     status('Asking for the microphone…');
@@ -194,16 +331,21 @@
       stream = granted;
       try {
         var mime = preferredMime();
+        var options = {audioBitsPerSecond: AUDIO_BPS};
+        if (mime) { options.mimeType = mime; }
         try {
-          recorder = mime ? new window.MediaRecorder(stream, {mimeType: mime})
-                          : new window.MediaRecorder(stream);
+          recorder = new window.MediaRecorder(stream, options);
         } catch (e) {
+          /* A UA that refuses the options at all still records — it just picks
+             its own bitrate, which the measured auto-stop handles anyway. */
           recorder = new window.MediaRecorder(stream);
         }
         chunks = [];
-        wireRecorder();
+        wireRecorder(recorder);
         startedAt = Date.now();
-        recorder.start();
+        /* WITH a timeslice: without one, `ondataavailable` fires exactly once,
+           at stop, and there is no running byte count to auto-stop on. */
+        recorder.start(TIMESLICE_MS);
       } catch (e) {
         /* The construct-or-start path can throw on its own (an unsupported
            mimeType, a track that died between grant and start). The stream is
@@ -211,7 +353,9 @@
            microphone stays live with no way to turn it off. */
         releaseStream();
         recorder = null;
+        finalised = true;               // there is no take to wrap up
         setRecording(false);
+        updateLevel();
         status('The recorder would not start (' + ((e && e.name) || 'error') +
                ') — type it instead.');
         if (textEl) { textEl.focus(); }
@@ -221,6 +365,7 @@
       startTimer();
     }).catch(function (err) {
       starting = false;
+      finalised = true;                 // nothing was ever recorded
       /* Release whatever may have been granted before the failure, always.
          Nothing should be open on this path, but "should" is how a hot
          microphone happens. */
@@ -242,14 +387,29 @@
     });
   }
 
+  /* `stop()` is not as safe as it looks: the state can race to `inactive`
+     between the check and the call, and UAs have their own quirks. An
+     exception escaping the click handler left the microphone live with the
+     button still reading “■ Stop”, and every later click threw identically —
+     the one failure this page must not have. So it is wrapped, and the fall
+     through still wraps the take up from the chunks already in hand. */
   function stopRecording() {
-    if (recorder && recorder.state !== 'inactive') {
-      recorder.stop();                    // onstop releases the stream + timer
-    } else {
-      stopTimer();
-      releaseStream();
-      setRecording(false);
+    var instance = recorder;
+    if (instance && instance.state !== 'inactive') {
+      try {
+        instance.stop();                  // onstop finalises the take
+        return;
+      } catch (e) { /* fall through to the manual teardown */ }
     }
+    if (!finalised) {
+      finalise(instance);
+      return;
+    }
+    /* Nothing to wrap up (the take is already finished, or never started) —
+       but never leave without checking the microphone is off. */
+    stopTimer();
+    releaseStream();
+    setRecording(false);
   }
 
   if (recBtn) {

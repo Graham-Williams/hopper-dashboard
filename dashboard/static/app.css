@@ -222,6 +222,13 @@ button.record {
 }
 button.record[disabled] { background: var(--unknown); cursor: not-allowed; }
 button.record.recording { background: var(--late); }
+/* How full this take is against the per-note cap — the recorder auto-stops at
+   the end of it, so this is a countdown, not a decoration. Deliberately small
+   and quiet: the clock next to it carries the minutes-remaining in words. */
+progress.record-level {
+  width: 6rem; height: .45rem; flex: 0 0 auto; align-self: center;
+  accent-color: var(--late); border: 0;
+}
 .filters button, .capture-actions button { min-height: 44px; }
 .filters .clear { align-self: center; padding: .6rem .2rem; }
 

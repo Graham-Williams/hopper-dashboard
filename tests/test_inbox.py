@@ -798,6 +798,59 @@ def test_the_page_never_plays_audio_from_a_blob_url(authed):
     assert "document.write" not in js
 
 
+def test_the_page_is_told_the_size_cap_instead_of_hardcoding_it(authed,
+                                                                settings):
+    """A take must never be lost to the per-note cap, and at 2 MB that is an
+    ordinary six-minute ramble, not a theoretical one: MediaRecorder would run
+    on unbounded, the upload would come back `body too large`, and the only
+    copy of the recording would be in a page showing an error.
+
+    So the server hands the page its own INBOX_AUDIO_MAX_BYTES and the recorder
+    auto-stops under it. Rendered, never hardcoded in the script — otherwise
+    changing the setting silently stops the two agreeing, which is the same bug
+    with extra steps."""
+    html = authed.get("/inbox").data.decode()
+    assert f'data-audio-max-bytes="{settings.inbox_audio_max_bytes}"' in html
+    # ...and the copy says what the cap MEANS. "Up to 2 MB" is not something a
+    # person can act on mid-sentence.
+    assert "minutes of speech" in html
+    assert "stops itself at the" in html
+
+    js = _code("dashboard/static/inbox.js")
+    assert "data-audio-max-bytes" in js
+    # A timeslice, or `ondataavailable` fires exactly once — at stop — and
+    # there is no running byte count to act on at all.
+    assert "recorder.start(TIMESLICE_MS)" in js and "recorder.start()" not in js
+    assert "autoStopped" in js and "Stopped at the " in js
+    # The size decisions are made on measured bytes, so a UA that ignores the
+    # requested bitrate is still stopped in time.
+    assert "recordedBytes + stopMargin()" in js
+    # Still no innerHTML, still no blob: preview.
+    assert "innerHTML" not in js and "createObjectURL" not in js
+
+
+def test_the_recorder_teardown_cannot_be_skipped_or_run_by_a_stale_take():
+    """Two microphone bugs that only show up on a phone, pinned in the source
+    because there is no browser in this suite (the behavioural half lives in
+    test_inbox_js.py, which skips without node).
+
+    1. `recorder.stop()` throwing let the exception escape the click handler:
+       the stream was never released, the button stayed "■ Stop" with the mic
+       live, and every later click threw identically.
+    2. A Stop click followed quickly by a Record click whose getUserMedia
+       resolved FIRST let the superseded recorder's handlers release the NEW
+       stream and overwrite the new take with the old one."""
+    import re
+    js = _code("dashboard/static/inbox.js")
+    assert re.search(r"try\s*\{\s*instance\.stop\(\);", js), \
+        "stop() is unguarded again"
+    # Every handler a superseded recorder still owns bails out.
+    assert js.count("if (instance !== recorder) { return; }") >= 3
+    # ...and the previous recorder is orphaned as the new take starts, not when
+    # the new recorder is constructed a turn of the event loop later.
+    assert re.search(r"recorder = null;\s*recordedBlob = null;", js)
+
+
 def test_the_page_keeps_mobile_input_sizes_and_tap_targets():
     """iOS Safari auto-zooms the viewport when a focused input is under 16px,
     which throws the page sideways mid-sentence. Load-bearing, not cosmetic."""
@@ -941,6 +994,51 @@ def test_the_audio_store_has_an_aggregate_cap_not_just_a_per_note_one(
     assert r.status_code == 507 and "full" in r.get_json()["error"]
     # A typed note still works — the cap is about audio, not about the Inbox.
     assert post_note(authed, text="typed still fine").status_code == 201
+
+
+def test_the_aggregate_cap_does_not_stat_the_whole_tree_on_every_upload(
+        authed, settings, monkeypatch):
+    """Measuring the cap used to mean `os.walk`-ing the audio tree on EVERY
+    upload — at the 3 GB cap that is tens of thousands of `stat` calls for a
+    number that moves by one file. The rows already know what they are holding,
+    so far from the cap the SUM answers it.
+
+    The margin is what keeps that honest, and it is asserted in both
+    directions: nowhere near the cap, no walk happens at all; anywhere near it,
+    the walk happens and the number it produces is the one that decides."""
+    from dashboard import inbox_audio
+
+    walks = []
+    real = inbox_audio.tree_bytes
+    monkeypatch.setattr(inbox_audio, "tree_bytes",
+                        lambda d: (walks.append(d), real(d))[1])
+
+    clip = b"\x1a\x45\xdf\xa3" + b"\x00" * 2000
+    assert authed.post("/api/v1/inbox/items",
+                       data={"text": "", "audio": (io_bytes(clip), "n",
+                                                   "audio/webm")},
+                       content_type="multipart/form-data",
+                       headers={"Accept": "application/json"}
+                       ).status_code == 201
+    assert walks == [], "the upload path walked the tree with gigabytes to spare"
+
+    # Now put the cap within the margin. The cheap number must stop being
+    # trusted — and it must be the WALK that decides, which is provable because
+    # a file no row knows about is invisible to the SUM and fatal to the walk.
+    settings.inbox_audio_max_total_bytes = 6000
+    import os
+    stray = os.path.join(settings.inbox_audio_dir, "2026", "09",
+                         "f" * 32 + ".webm")
+    os.makedirs(os.path.dirname(stray), exist_ok=True)
+    with open(stray, "wb") as fh:
+        fh.write(b"\x1a\x45\xdf\xa3" + b"\x00" * 5000)
+    r = authed.post("/api/v1/inbox/items",
+                    data={"text": "", "audio": (io_bytes(clip), "n",
+                                                "audio/webm")},
+                    content_type="multipart/form-data",
+                    headers={"Accept": "application/json"})
+    assert walks, "near the cap the real total must be measured, not guessed"
+    assert r.status_code == 507
 
 
 # --------------------------------------------------------------------------- #

@@ -80,6 +80,12 @@ MAX_URL = 300
 MAX_REPO = 140
 MAX_ISSUE_NUMBER = 10 ** 7
 MAX_BACKLOG_ITEMS = 2000
+#: Bytes per second the page's recorder is asked for (``audioBitsPerSecond``
+#: 48 kbps in ``static/inbox.js``, which is ample for speech). Used ONLY to turn
+#: ``INBOX_AUDIO_MAX_BYTES`` into the "roughly N minutes" the capture panel
+#: prints — a byte count tells nobody how long they may talk. The live
+#: minutes-remaining the page shows while recording is MEASURED, not this.
+AUDIO_BYTES_PER_SEC = 48000 // 8
 QUEUE_MAX = 50
 TRANSCRIBE_MAX_ATTEMPTS = 3
 
@@ -118,9 +124,9 @@ def _limited(name: str, key: str) -> bool:
 @bp.before_request
 def _lift_the_body_cap_for_the_create_route_only():
     """Flask 3.1 lets ``max_content_length`` be set PER REQUEST, and that is the
-    only reason an 8 MB voice note can reach a view at all: the app-wide
-    ``MAX_CONTENT_LENGTH`` is 64 KB for both roles, so every upload would 413
-    before any code of ours ran.
+    only reason a voice note (``INBOX_AUDIO_MAX_BYTES``, 2 MB by default) can
+    reach a view at all: the app-wide ``MAX_CONTENT_LENGTH`` is 64 KB for both
+    roles, so every upload would 413 before any code of ours ran.
 
     The global cap is deliberately NOT raised. It protects ``/api/v1/ping`` and
     every other route on both roles, and one route needing more is not a reason
@@ -308,6 +314,8 @@ def board():
     return render_template("inbox.html", page=page, now=time.time(),
                            filters=_list_args(request.args),
                            audio_max_bytes=_settings().inbox_audio_max_bytes,
+                           audio_max_secs=(_settings().inbox_audio_max_bytes
+                                           // AUDIO_BYTES_PER_SEC),
                            retention_days=_settings().inbox_audio_retention_days,
                            sources=inbox_db.SOURCES)
 
@@ -353,23 +361,13 @@ def create_item():
     data = upload.read() if upload is not None else b""
     if not data and not text:
         return _err("say something or type something — the row would be empty")
-    if data:
-        # The AGGREGATE cap, checked before the write. The per-note cap bounds
-        # one upload; the create limiter bounds the rate; neither bounds the
-        # total, and 30 notes per 15 minutes per IP at the per-note limit is
-        # still gigabytes a day from one address. `box-disk` would only report
-        # it once the disk was already gone.
-        #
+    if data and _store_is_full(settings, len(data)):
         # 507 Insufficient Storage, not 413: the request is a fine size, the
         # store is full. The text half is deliberately NOT accepted-without-
         # audio here — silently dropping the recording and keeping the note
         # would be the worst of both.
-        total = inbox_audio.tree_bytes(settings.inbox_audio_dir)
-        if total + len(data) > settings.inbox_audio_max_total_bytes:
-            log.warning("inbox audio store full: %d bytes held, cap %d",
-                        total, settings.inbox_audio_max_total_bytes)
-            return _err("the voice-note store is full — old audio is pruned "
-                        "automatically, or delete some notes", 507)
+        return _err("the voice-note store is full — old audio is pruned "
+                    "automatically, or delete some notes", 507)
 
     now = inbox_db.now_iso()
     item_id = inbox_db.new_id()
@@ -411,6 +409,52 @@ def create_item():
         # with no JS at all; only the microphone needs it.
         return redirect(url_for("inbox.board"), code=303)
     return jsonify(item_json(row)), 201
+
+
+#: How much room must be left under the aggregate cap before the cheap,
+#: row-derived total is trusted instead of a real walk of the audio tree.
+#: Generous on purpose — it is the whole error budget for "files exist that no
+#: row knows about yet". A quarter of a gigabyte is orders of magnitude more
+#: than the handful of in-flight or orphaned clips that can ever be outstanding
+#: between two prune passes, and with the shipped 3 GB cap it still means the
+#: walk is skipped for the entire realistic life of the store.
+AUDIO_WALK_MARGIN = 256 * 1024 ** 2
+
+
+def _store_is_full(settings, incoming: int) -> bool:
+    """The AGGREGATE cap, checked before the write. Logs when it refuses.
+
+    The per-note cap bounds ONE upload; the create limiter bounds the rate;
+    neither bounds the total, and 30 notes per 15 minutes per IP at the per-note
+    limit is still gigabytes a day from one address. `box-disk` would only
+    report it once the disk was already gone.
+
+    Measuring it used to mean ``os.walk``-ing the whole audio tree on every
+    single upload — at the 3 GB cap that is tens of thousands of ``stat`` calls
+    for a number that moves by one file. So the fast path asks the DB what the
+    ROWS account for (one indexed SUM), and that answer is trusted ONLY while
+    there is :data:`AUDIO_WALK_MARGIN` of headroom left.
+
+    The direction of the error is what makes that safe. The row total is a
+    LOWER bound on what is on disk — a file whose row has not been committed
+    yet, or an orphan the sweep has not collected, is invisible to it — so it
+    can only ever be too small, and being too small is only dangerous near the
+    cap. Anywhere near the cap this walks the tree for real, so the cheap path
+    can never admit an upload the true total would refuse.
+    """
+    cap = settings.inbox_audio_max_total_bytes
+    conn = _conn()
+    try:
+        accounted = inbox_db.audio_bytes_total(conn)
+    finally:
+        conn.close()
+    if accounted + incoming + AUDIO_WALK_MARGIN <= cap:
+        return False
+    total = inbox_audio.tree_bytes(settings.inbox_audio_dir)
+    if total + incoming > cap:
+        log.warning("inbox audio store full: %d bytes held, cap %d", total, cap)
+        return True
+    return False
 
 
 def _wants_html() -> bool:
