@@ -97,10 +97,14 @@ def load_env_file(path: str) -> Dict[str, str]:
 
 
 def load_config(env_path: str = DEFAULT_ENV_FILE) -> Dict[str, str]:
-    """Env file first, then real process environment overrides (handy for one-off runs)."""
+    """Env file first, then real process environment overrides (handy for one-off runs).
+
+    ``INBOX_*`` is in the overlay list alongside ``PROBE_*`` so the Inbox worker and the
+    backlog sub-probe can be driven from the environment in a one-off run without editing
+    the 0600 env file — same convenience the other probes already had."""
     cfg = load_env_file(env_path)
     for k, v in os.environ.items():
-        if k in ("DASHBOARD_URL", "INGEST_TOKEN") or k.startswith("PROBE_"):
+        if k in ("DASHBOARD_URL", "INGEST_TOKEN") or k.startswith(("PROBE_", "INBOX_")):
             cfg[k] = v
     return cfg
 
@@ -231,6 +235,110 @@ def send_ping(
         if attempt < retries:
             sleep(1.5 * (attempt + 1))
     raise ProbeError("ping %s failed after %d attempts: %s" % (job_id, retries + 1, last_err))
+
+
+# ---------------------------------------------------------------------------
+# Generic bearer-authenticated HTTP (the Inbox API on the PUBLIC host)
+#
+# ``send_ping`` above talks to the Tailscale-only ingest port with INGEST_TOKEN. The Inbox
+# machine endpoints are a DIFFERENT credential on a DIFFERENT host: INBOX_TOKEN against
+# https://<public host>. Two rules from that endpoint contract are structural here, not
+# incidental:
+#   * NO cookie jar. ``urllib.request.urlopen`` keeps no cookies unless an opener installs a
+#     HTTPCookieProcessor, and none is installed anywhere in this package. That matters because
+#     a session cookie OUTRANKS the bearer on the server — a request carrying both is refused.
+#   * NO Origin/Referer. The server's CSRF pin exempts bearer-authenticated calls precisely
+#     because a bearer is not an ambient credential; sending an Origin here would be a 403 on
+#     prod (where APP_HOST is set) that no test would catch.
+# Neither the token nor the Authorization header ever appears in a raised message.
+# ---------------------------------------------------------------------------
+API_USER_AGENT = "hopper-dashboard-probe/1"
+#: Refuse to buffer a response larger than this. A runaway or wrong endpoint must not be able
+#: to make the worker allocate unboundedly; audio is capped server-side well below it.
+MAX_RESPONSE_BYTES = 32 * 1024 * 1024
+
+
+def api_request(
+    url: str,
+    token: str,
+    method: str = "GET",
+    body: Optional[Dict[str, object]] = None,
+    timeout: float = HTTP_TIMEOUT_S,
+    retries: int = HTTP_RETRIES,
+    accept: str = "application/json",
+    max_bytes: int = MAX_RESPONSE_BYTES,
+    sleep=time.sleep,
+) -> Tuple[int, bytes]:
+    """Bearer-authenticated request returning ``(status, raw_body)``.
+
+    Retries the same cases ``send_ping`` does (network error, 5xx, 429) and raises
+    ``ProbeError`` on a non-retryable 4xx or once the retries are spent. A 404/410 is
+    *returned*, not raised, when ``method`` is GET — callers need to tell "this one item's
+    audio is gone" apart from "the API is broken", and only they know which is which.
+    """
+    if not url.startswith(("http://", "https://")):
+        raise ProbeError("refusing a non-http(s) URL")
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    headers = {"Authorization": "Bearer " + token, "Accept": accept,
+               "User-Agent": API_USER_AGENT}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    last_err = "unknown"
+    for attempt in range(retries + 1):
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read(max_bytes + 1)
+                if len(raw) > max_bytes:
+                    raise ProbeError("response larger than %d bytes" % max_bytes)
+                return resp.status, raw
+        except urllib.error.HTTPError as e:
+            text = ""
+            try:
+                text = e.read(2000).decode("utf-8", "replace")
+            except Exception:
+                pass
+            if e.code in (404, 410) and method == "GET":
+                return e.code, text.encode("utf-8")
+            if e.code == 429 or e.code >= 500:
+                last_err = "HTTP %d %s" % (e.code, text[:120])
+            else:
+                raise ProbeError("%s %s rejected: HTTP %d %s" % (
+                    method, _redact_url(url), e.code, text[:200]))
+        except (urllib.error.URLError, OSError) as e:
+            last_err = "%s" % (getattr(e, "reason", e),)
+        if attempt < retries:
+            sleep(1.5 * (attempt + 1))
+    raise ProbeError("%s %s failed after %d attempts: %s" % (
+        method, _redact_url(url), retries + 1, last_err))
+
+
+def _redact_url(url: str) -> str:
+    """Path only — never echo a query string or userinfo into a log line."""
+    return re.sub(r"\?.*$", "", url)
+
+
+def api_json(
+    url: str,
+    token: str,
+    method: str = "GET",
+    body: Optional[Dict[str, object]] = None,
+    timeout: float = HTTP_TIMEOUT_S,
+    retries: int = HTTP_RETRIES,
+    sleep=time.sleep,
+) -> Dict[str, object]:
+    """``api_request`` + a JSON object, or ``ProbeError`` if the body is not one."""
+    status, raw = api_request(url, token, method=method, body=body, timeout=timeout,
+                              retries=retries, sleep=sleep)
+    if status in (404, 410):
+        raise ProbeError("%s %s: HTTP %d" % (method, _redact_url(url), status))
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as e:
+        raise ProbeError("%s %s: response was not JSON (%s)" % (method, _redact_url(url), e))
+    if not isinstance(doc, dict):
+        raise ProbeError("%s %s: expected a JSON object" % (method, _redact_url(url)))
+    return doc
 
 
 # ---------------------------------------------------------------------------
