@@ -46,8 +46,8 @@ from __future__ import annotations
 import logging
 import time
 
-from flask import (Blueprint, Response, current_app, jsonify, redirect,
-                   render_template, request, url_for)
+from flask import (Blueprint, current_app, jsonify, redirect, render_template,
+                   request, send_file, url_for)
 
 from . import inbox_audio, inbox_db
 from .web import client_ip, require_session
@@ -540,16 +540,22 @@ def audio(item_id: str):
     full = inbox_audio.open_path(_settings().inbox_audio_dir, row["audio_path"])
     if full is None:
         return _err("audio file is missing", 410)
-    with open(full, "rb") as fh:
-        payload = fh.read()
-    resp = Response(payload, mimetype=inbox_audio.mime_for(row["audio_path"]))
-    resp.headers["Content-Length"] = str(len(payload))
-    # private + no-store: a voice note is not something to leave in a shared
-    # cache, and the tunnel sits in front of this.
+    ext = row["audio_path"].rsplit(".", 1)[-1]
+    # send_file, not fh.read(): it STREAMS the file instead of materialising the
+    # whole thing per request, and `conditional=True` adds Range support. The
+    # second half is the one with a user-visible payoff — scrubbing an <audio>
+    # element on a phone issues range requests, and without them Safari
+    # re-downloads from the start on every seek.
+    resp = send_file(full, mimetype=inbox_audio.mime_for(row["audio_path"]),
+                     conditional=True, max_age=0,
+                     download_name=f"{row['id']}.{ext}", as_attachment=False)
+    # These are re-asserted AFTER send_file, not before: send_file sets its own
+    # Cache-Control (from max_age) and its own Content-Disposition, so anything
+    # set first would be overwritten. A voice note is not something to leave in
+    # a shared cache, and the tunnel sits in front of this.
     resp.headers["Cache-Control"] = "private, no-store"
     resp.headers["X-Content-Type-Options"] = "nosniff"
-    resp.headers["Content-Disposition"] = f'inline; filename="{row["id"]}.' \
-                                          f'{row["audio_path"].rsplit(".", 1)[-1]}"'
+    resp.headers["Content-Disposition"] = f'inline; filename="{row["id"]}.{ext}"'
     return resp
 
 

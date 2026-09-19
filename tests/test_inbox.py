@@ -489,6 +489,36 @@ def test_audio_is_served_with_no_store_and_nosniff(authed):
     assert got.headers["X-Content-Type-Options"] == "nosniff"
     assert got.headers["Content-Type"].startswith("audio/webm")
     assert got.headers["Content-Disposition"].startswith("inline")
+    assert got.headers["Content-Disposition"].endswith(f'"{item}.webm"')
+    # send_file sets its OWN Cache-Control (from max_age) and its own
+    # Content-Disposition, so these headers only survive because they are
+    # re-asserted AFTER the call. Nothing about a voice note should reach a
+    # shared cache, and nosniff is what keeps an unknown container from being
+    # re-interpreted by the browser.
+    assert "public" not in got.headers["Cache-Control"]
+    assert "max-age" not in got.headers["Cache-Control"]
+
+
+def test_audio_is_streamed_with_range_support(authed):
+    """`fh.read()` materialised the whole file per request and, more usefully,
+    answered no Range requests — so scrubbing the <audio> element on a phone
+    re-downloaded from the start on every seek. `conditional=True` gives both."""
+    r = authed.post("/api/v1/inbox/items",
+                    data={"text": "", "audio": (io_bytes(WEBM), "n", "audio/webm")},
+                    content_type="multipart/form-data",
+                    headers={"Accept": "application/json"})
+    item = r.get_json()["id"]
+    full = authed.get(f"/inbox/audio/{item}")
+    assert full.headers.get("Accept-Ranges") == "bytes"
+
+    part = authed.get(f"/inbox/audio/{item}", headers={"Range": "bytes=10-19"})
+    assert part.status_code == 206
+    assert part.data == WEBM[10:20]
+    assert part.headers["Content-Range"] == f"bytes 10-19/{len(WEBM)}"
+    # The security headers are on the partial response too — a range request is
+    # the ordinary case for playback, not an edge case.
+    assert part.headers["Cache-Control"] == "private, no-store"
+    assert part.headers["X-Content-Type-Options"] == "nosniff"
 
 
 def test_audio_is_404_then_410_after_a_prune(authed, settings, read_app):
@@ -911,3 +941,42 @@ def test_the_audio_store_has_an_aggregate_cap_not_just_a_per_note_one(
     assert r.status_code == 507 and "full" in r.get_json()["error"]
     # A typed note still works — the cap is about audio, not about the Inbox.
     assert post_note(authed, text="typed still fine").status_code == 201
+
+
+# --------------------------------------------------------------------------- #
+# Log hygiene
+# --------------------------------------------------------------------------- #
+
+def test_a_failed_transcript_error_cannot_forge_a_log_line(bot, authed, caplog):
+    """`error` is caller-supplied. The caller is the Mac worker, which could
+    easily put a fragment of a TRANSCRIPT in it — untrusted text from a
+    microphone. Raw, it carries ANSI escapes, C0 control bytes and newlines
+    straight into the container log: forged log lines, and a terminal reading
+    them does as it is told."""
+    item = _voice_note(authed)["id"]
+    nasty = ("boom\n2026-09-19 00:00:00 ERROR dashboard.web forged line\r\n"
+             "\x1b[2J\x1b]0;pwned\x07\x00tail")
+    with caplog.at_level("WARNING"):
+        r = bot.post(f"/api/v1/inbox/items/{item}/transcript",
+                     json={"failed": True, "error": nasty}, headers=machine())
+    assert r.status_code == 200
+    logged = [rec.getMessage() for rec in caplog.records
+              if "transcription failed" in rec.getMessage()]
+    assert len(logged) == 1
+    line = logged[0]
+    assert "\n" not in line and "\r" not in line
+    assert "\x1b" not in line and "\x00" not in line and "\x07" not in line
+    # The readable words survive — it is a sanitiser, not a redactor.
+    assert "boom" in line and "tail" in line
+
+
+def test_a_repo_with_a_trailing_newline_is_not_a_valid_repo():
+    """Python's `$` also matches immediately BEFORE a trailing newline, so a
+    `$`-anchored check accepts "a/b\n" — and this string is interpolated into
+    an api.github.com path and stored as a mirror key."""
+    from dashboard.config import GITHUB_REPO_RE, GITHUB_TOKEN_RE
+    assert GITHUB_REPO_RE.match("Graham-Williams/km-tracker")
+    assert not GITHUB_REPO_RE.match("Graham-Williams/km-tracker\n")
+    assert not GITHUB_REPO_RE.match("a/b\nc/d")
+    assert GITHUB_TOKEN_RE.match("ghp_abc123")
+    assert not GITHUB_TOKEN_RE.match("ghp_abc123\n")

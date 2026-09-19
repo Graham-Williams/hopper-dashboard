@@ -484,6 +484,26 @@ def upsert_mirror_item(conn: sqlite3.Connection, *, mirror_key: str,
                        mirror_key=mirror_key, mirror_url=url)
 
 
+#: SQLite's compile-time SQLITE_MAX_VARIABLE_NUMBER is 999 on older builds and
+#: 32766 on newer ones, and which one a container gets is not ours to choose.
+#: `issues_for` has always chunked at 200 for exactly that reason; these three
+#: NOT IN clauses had not, and each can carry up to 2000 parameters (the backlog
+#: mirror's MAX_BACKLOG_ITEMS, or a repo's whole open-issue list). Chunking a
+#: NOT IN is sound because `x NOT IN A AND x NOT IN B` is `x NOT IN (A | B)`.
+PARAM_CHUNK = 200
+
+
+def _not_in_chunks(column: str, values: list) -> tuple[str, list]:
+    """``AND col NOT IN (…) AND col NOT IN (…)`` — one clause per chunk."""
+    clauses: list[str] = []
+    args: list[Any] = []
+    for start in range(0, len(values), PARAM_CHUNK):
+        chunk = values[start:start + PARAM_CHUNK]
+        clauses.append(f" AND {column} NOT IN ({','.join('?' * len(chunk))})")
+        args += chunk
+    return "".join(clauses), args
+
+
 def _like_prefix(prefix: str) -> str:
     """``prefix%`` with LIKE's own wildcards escaped — a repo named ``a_b`` must
     match itself, not ``axb``."""
@@ -505,9 +525,9 @@ def archive_missing(conn: sqlite3.Connection, *, prefix: str,
     sql = ("UPDATE inbox_items SET archived_at=?, updated_at=? "
            "WHERE mirror_key LIKE ? ESCAPE '\\' AND archived_at IS NULL")
     args: list[Any] = [now, now, _like_prefix(prefix)]
-    if seen:
-        sql += f" AND mirror_key NOT IN ({','.join('?' * len(seen))})"
-        args += seen
+    clause, extra = _not_in_chunks("mirror_key", seen)
+    sql += clause
+    args += extra
     return int(conn.execute(sql, args).rowcount or 0)
 
 
@@ -531,9 +551,9 @@ def close_missing_mirror_items(conn: sqlite3.Connection, *, prefix: str,
     sql = ("UPDATE inbox_items SET state='closed', closed_at=?, updated_at=? "
            "WHERE state='open' AND mirror_key LIKE ? ESCAPE '\\'")
     args: list[Any] = [now, now, _like_prefix(prefix)]
-    if seen:
-        sql += f" AND mirror_key NOT IN ({','.join('?' * len(seen))})"
-        args += seen
+    clause, extra = _not_in_chunks("mirror_key", seen)
+    sql += clause
+    args += extra
     return int(conn.execute(sql, args).rowcount or 0)
 
 
@@ -602,9 +622,9 @@ def mark_issues_closed(conn: sqlite3.Connection, repo: str,
     sql = ("UPDATE inbox_issues SET state='closed', closed_at=?, checked_at=? "
            "WHERE repo=? AND state!='closed'")
     args: list[Any] = [now, now, repo]
-    if numbers:
-        sql += f" AND number NOT IN ({','.join('?' * len(numbers))})"
-        args += numbers
+    clause, extra = _not_in_chunks("number", numbers)
+    sql += clause
+    args += extra
     return int(conn.execute(sql, args).rowcount or 0)
 
 
@@ -789,8 +809,8 @@ def issues_for(conn: sqlite3.Connection,
         return {}
     out: dict[str, list[dict]] = {}
     # Chunked so a 500-row page cannot blow SQLite's variable limit.
-    for start in range(0, len(ids), 200):
-        chunk = ids[start:start + 200]
+    for start in range(0, len(ids), PARAM_CHUNK):
+        chunk = ids[start:start + PARAM_CHUNK]
         for row in conn.execute(
                 f"SELECT * FROM inbox_issues WHERE item_id IN "
                 f"({','.join('?' * len(chunk))}) ORDER BY item_id, id", chunk):
