@@ -284,6 +284,14 @@ def test_redirect_runs_before_the_password_gate(settings, registry, notifier):
     assert r.status_code == 307 and r.headers["Location"] == f"{HTTPS_BASE}/"
 
 
+# The DNS maximum is 253 characters. Both sides of that boundary are pinned:
+# a 253-char host must still work, 254 must not. Built from valid 63-char
+# labels so ONLY the total length can be what rejects the long one.
+_MAX_LEN_HOST = ("a" * 63 + ".") * 3 + "b" * 61      # exactly 253
+_OVERLONG_HOST = ("a" * 63 + ".") * 3 + "b" * 62     # exactly 254
+assert (len(_MAX_LEN_HOST), len(_OVERLONG_HOST)) == (253, 254)
+
+
 # APP_HOST is spliced into a Location header, so it is validated as a bare
 # hostname. Operator-set, not attacker-set — hardening, not a live hole — but
 # every sibling app refuses these and an unvalidated one is either a silent
@@ -300,6 +308,7 @@ MALFORMED_APP_HOSTS = [
     "dash board.example.test",              # whitespace
     "dashboard-.example.test",              # trailing-hyphen label
     "dashboard..example.test",              # empty label
+    _OVERLONG_HOST,                         # 254: over the DNS max
 ]
 
 
@@ -359,6 +368,10 @@ def test_location_patterns_are_safe_only_under_fullmatch():
     assert _HOSTNAME_RE.fullmatch("dashboard.example.test")
     assert not _HOSTNAME_RE.fullmatch("dashboard.example.test\n")
     assert not _HOSTNAME_RE.fullmatch("dashboard.example.test@evil.example")
+    # 253 is the DNS maximum: the per-label pattern bounds each LABEL but not
+    # the total, so this pins the `(?=.{1,253}\Z)` lookahead specifically.
+    assert _HOSTNAME_RE.fullmatch(_MAX_LEN_HOST)
+    assert not _HOSTNAME_RE.fullmatch(_OVERLONG_HOST)
 
 
 def test_hsts_header_on_every_response(authed, settings, registry, notifier):

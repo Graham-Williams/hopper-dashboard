@@ -30,7 +30,7 @@ MAX_FAIL_THRESHOLD = 10
 # trailing hyphen) — byte-identical to the one in jjho-fan-almanac, so all
 # five sibling apps agree on exactly what a hostname is.
 _HOSTNAME_RE = re.compile(
-    r"\A[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"\A(?=.{1,253}\Z)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
     r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\Z")
 
 
