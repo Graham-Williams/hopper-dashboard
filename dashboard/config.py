@@ -25,8 +25,11 @@ MAX_FAIL_THRESHOLD = 10
 # string is interpolated into an api.github.com path — a repo of `..` walks up
 # out of `/repos/` and asks GitHub for something else entirely. ASCII classes
 # rather than `\w`, which is unicode-aware and would admit homoglyphs.
+# `\Z`, NOT `$`: in Python `$` also matches immediately BEFORE a trailing
+# newline, so "a/b\n" would pass a `$`-anchored check — and this string is
+# interpolated into an api.github.com path and stored as a mirror key.
 GITHUB_REPO_RE = re.compile(
-    r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 # A repo list long enough to blow the mirror's own cadence is a paste accident.
 MAX_GITHUB_REPOS = 50
 
@@ -43,7 +46,7 @@ MAX_GITHUB_REPOS = 50
 # the log and in the database. Refusing it here means the illegal header value
 # can never be constructed; `github_mirror._redact` is the second, independent
 # defence for the same leak.
-GITHUB_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
+GITHUB_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.\-]+\Z")   # \Z, not $ — see above
 MAX_GITHUB_TOKEN = 255
 
 

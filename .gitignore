@@ -17,6 +17,16 @@ data/
 *.sqlite*
 *.log
 
+# voice notes — belt and braces only. Everything the app actually writes lives
+# under data/ (settings.inbox_audio_dir = <data>/inbox/audio) and is already
+# covered by the line above; these catch a recording that ends up somewhere
+# else — a scratch copy pulled off the box for debugging, a test fixture saved
+# by hand. A recording of Graham's voice must never reach a public repo.
+*.webm
+*.m4a
+*.ogg
+*.wav
+
 # python
 __pycache__/
 *.pyc

@@ -604,8 +604,15 @@ def post_transcript(item_id: str):
                 row = inbox_db.note_transcribe_attempt(
                     conn, item_id, failed=True,
                     max_attempts=TRANSCRIBE_MAX_ATTEMPTS)
-            log.warning("transcription failed for %s: %s", item_id,
-                        str(doc.get("error"))[:200])
+            # Through clean_text and with newlines flattened before it is
+            # logged: `error` is caller-supplied, and the caller is a worker
+            # that could easily put a fragment of a TRANSCRIPT in here. Raw, it
+            # carries ANSI, C0 control bytes and newlines straight into the log
+            # — forged log lines, and a terminal reading them does as it is
+            # told. (`clean_text` keeps \n and \t, hence the second step.)
+            reason = inbox_db.clean_text(doc.get("error"), 200)
+            reason = reason.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+            log.warning("transcription failed for %s: %s", item_id, reason)
             return jsonify(item_json(row))
         text = doc.get("text")
         if not isinstance(text, str) or not text.strip():
