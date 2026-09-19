@@ -132,3 +132,44 @@ def test_sweep_orphans_removes_only_what_it_recognises(audio_dir):
     assert audio.open_path(audio_dir, keep.path)
     assert os.path.exists(stranger)          # a sweeper that eats the unfamiliar
     assert audio.sweep_orphans(str(audio_dir) + "-missing", known=set()) == []
+
+
+# --------------------------------------------------------------------------- #
+# The sweep's one named exception
+# --------------------------------------------------------------------------- #
+
+def test_the_sweep_collects_stale_part_files_and_nothing_else(tmp_path):
+    """`save` writes `<id>.<ext>.part` and then `os.replace`s it into place, so
+    the real name is never half-written — but an interrupted write leaves the
+    temp file behind. It can never match REL_PATH_RE, and the sweep deliberately
+    refuses to delete what it does not recognise, so before this they were
+    immortal.
+
+    The age clause is the load-bearing half: a sweep that happened to run during
+    an upload would otherwise delete a file that is still being written."""
+    import os
+    import time
+
+    from dashboard import inbox_audio
+    root = tmp_path / "audio" / "2026" / "09"
+    root.mkdir(parents=True)
+    ident = "a" * 32
+    stale = root / f"{ident}.webm.part"
+    fresh = root / f"{'b' * 32}.webm.part"
+    keeper = root / f"{'c' * 32}.webm"
+    stranger = root / "notes.txt"            # nothing this module ever wrote
+    odd = root / "not-an-id.part"            # `.part` but not our shape
+    for path in (stale, fresh, keeper, stranger, odd):
+        path.write_bytes(b"x")
+    old = time.time() - 2 * inbox_audio.PART_MAX_AGE_S
+    os.utime(stale, (old, old))
+    os.utime(odd, (old, old))
+
+    removed = inbox_audio.sweep_orphans(str(tmp_path / "audio"),
+                                        known={"2026/09/" + "c" * 32 + ".webm"})
+    assert removed == ["2026/09/" + ident + ".webm.part"]
+    assert not stale.exists()
+    # Everything else is left exactly alone: a sweeper that deletes what it does
+    # not recognise is a sweeper that will one day eat something else.
+    for path in (fresh, keeper, stranger, odd):
+        assert path.exists(), path

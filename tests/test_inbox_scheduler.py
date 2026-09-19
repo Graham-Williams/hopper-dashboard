@@ -340,3 +340,26 @@ def test_neither_inbox_job_writes_dashboard_db_rows_of_its_own(core, settings,
     core.sync_inbox_github(now=NOW)
     assert conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == before + 1
     conn.close()
+
+
+def test_the_audio_store_total_rides_the_mirror_heartbeat(core, settings,
+                                                          monkeypatch):
+    """The aggregate audio cap is enforced on the create route, so without a
+    metric it is a limit nobody can see approaching until an upload 507s. It
+    beats here rather than on its own job because the GitHub mirror is the
+    inbox job that already runs on a cadence."""
+    clip = b"\x1a\x45\xdf\xa3" + b"\x00" * 512
+    inbox_audio.save(settings.inbox_audio_dir, item_id="f" * 32, data=clip,
+                     declared_mime="audio/webm", max_bytes=10 ** 6,
+                     created_at=inbox_db.to_iso(NOW))
+    monkeypatch.setattr(github_mirror, "default_fetch",
+                        lambda url, headers: ok([]))
+    core.sync_inbox_github(now=NOW)
+    conn = core.connect()
+    try:
+        run = db.last_run(conn, INBOX_GITHUB_JOB_ID)
+    finally:
+        conn.close()
+    assert run["metrics"]["audio_bytes"] == len(clip)
+    assert (run["metrics"]["audio_max_bytes"]
+            == settings.inbox_audio_max_total_bytes)

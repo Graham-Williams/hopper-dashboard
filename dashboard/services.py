@@ -389,7 +389,6 @@ class Core:
         # Inbox jobs live in the gitignored jobs.yml, so a fresh deploy may not
         # declare them yet. Warn once each, never crash, never spam the log.
         self._warned_missing_inbox_jobs: set[str] = set()
-        self._warned_missing_inbox_jobs: set[str] = set()
         # Logical clock at the END of the last probe cycle (start + measured
         # wall time). The scheduler schedules the next cycle from this, never
         # from the pre-cycle clock.
@@ -467,7 +466,15 @@ class Core:
                     if summary["failed"] else
                     f"{summary['repos']} repo(s), {summary['issues']} open issue(s)"),
             metrics={"repos": summary["repos"], "repos_failed": summary["failed"],
-                     "issues": summary["issues"]},
+                     "issues": summary["issues"],
+                     # How much disk the voice notes are holding, and the cap
+                     # they are measured against. It rides the mirror's
+                     # heartbeat because that is the inbox job that already
+                     # beats on a cadence — otherwise the aggregate cap is a
+                     # limit nobody can see approaching until an upload 507s.
+                     "audio_bytes": inbox_audio.tree_bytes(
+                         self.settings.inbox_audio_dir),
+                     "audio_max_bytes": self.settings.inbox_audio_max_total_bytes},
             now=now)
         return summary
 

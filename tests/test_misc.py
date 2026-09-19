@@ -165,7 +165,14 @@ def test_inbox_settings_defaults_and_derived_paths(tmp_path):
     assert s.inbox_db_path != s.db_path          # a SEPARATE file, on purpose
     assert s.inbox_audio_dir == str(tmp_path / "inbox" / "audio")
     assert s.inbox_token == "" and s.inbox_github_repos == ()
-    assert s.inbox_audio_max_bytes == 8 * 1024 * 1024
+    # 2 MB per note (~10 minutes of Opus), not the 8 MB this started at: the
+    # per-note cap multiplies by the create limiter (30 per 15 min per IP) into
+    # how much disk one address can spend.
+    assert s.inbox_audio_max_bytes == 2 * 1024 * 1024
+    # ...and an AGGREGATE cap, because the per-note cap bounds nothing over
+    # time. Checked before every upload; `box-disk` would only notice once the
+    # disk was already gone.
+    assert s.inbox_audio_max_total_bytes == 3 * 1024 ** 3
     # The global body cap must stay where it is: the create route lifts its own
     # limit per request, it never raises this.
     assert s.max_body_bytes == 64 * 1024

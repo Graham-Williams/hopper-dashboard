@@ -16,6 +16,7 @@ route                                        auth    notes
 ``GET  /inbox``                              S       HTML; works with JS off
 ``POST /api/v1/inbox/items``                 S       + origin pin + limiter
 ``PATCH /api/v1/inbox/items/<id>``           S       + origin pin + limiter
+``DELETE /api/v1/inbox/items/<id>``          S       + origin pin + limiter
 ``GET  /api/v1/inbox/items``                 S | R   Hopper may read it
 ``GET  /inbox/audio/<id>``                   S | I
 ``GET  /api/v1/inbox/transcribe/queue``      I
@@ -352,6 +353,23 @@ def create_item():
     data = upload.read() if upload is not None else b""
     if not data and not text:
         return _err("say something or type something — the row would be empty")
+    if data:
+        # The AGGREGATE cap, checked before the write. The per-note cap bounds
+        # one upload; the create limiter bounds the rate; neither bounds the
+        # total, and 30 notes per 15 minutes per IP at the per-note limit is
+        # still gigabytes a day from one address. `box-disk` would only report
+        # it once the disk was already gone.
+        #
+        # 507 Insufficient Storage, not 413: the request is a fine size, the
+        # store is full. The text half is deliberately NOT accepted-without-
+        # audio here — silently dropping the recording and keeping the note
+        # would be the worst of both.
+        total = inbox_audio.tree_bytes(settings.inbox_audio_dir)
+        if total + len(data) > settings.inbox_audio_max_total_bytes:
+            log.warning("inbox audio store full: %d bytes held, cap %d",
+                        total, settings.inbox_audio_max_total_bytes)
+            return _err("the voice-note store is full — old audio is pruned "
+                        "automatically, or delete some notes", 507)
 
     now = inbox_db.now_iso()
     item_id = inbox_db.new_id()
@@ -452,6 +470,50 @@ def patch_item(item_id: str):
         return jsonify(item_json(row, issues))
     finally:
         conn.close()
+
+
+@bp.delete("/api/v1/inbox/items/<item_id>")
+def delete_item(item_id: str):
+    """S only, + the origin pin and the write limiter — exactly ``patch_item``.
+
+    The only destructive route in the Inbox, and it exists because a voice note
+    is a recording of Graham's voice: "there is no way to delete it" is not an
+    acceptable answer for personal data, and the automatic prune is a schedule,
+    not a control. This is the control.
+
+    Row first, file second. If the unlink fails (or the process dies between
+    the two) the file is an orphan, and the scheduler's existing sweep collects
+    orphans — whereas a file deleted before its row would leave a row pointing
+    at nothing until the reconcile noticed. Linked issues go with the row via
+    ``ON DELETE CASCADE``; the GitHub issues themselves are untouched, and a
+    mirrored row simply comes back on the next sync, which is correct — the
+    board mirrors GitHub, it does not own it.
+    """
+    denied = require_session()
+    if denied is not None:
+        return denied
+    if _limited("inbox_write_limiter", client_ip()):
+        return _err("too many writes — slow down", 429)
+    settings = _settings()
+    conn = _conn()
+    try:
+        with conn:
+            row = inbox_db.delete_item(conn, item_id)
+    finally:
+        conn.close()
+    if row is None:
+        return _err("no such item", 404)
+    audio_removed = False
+    if row["audio_path"]:
+        audio_removed = inbox_audio.delete(settings.inbox_audio_dir,
+                                           row["audio_path"])
+        if not audio_removed:
+            # Not an error to the caller: the row is gone, which is what was
+            # asked for, and the sweep will collect the file.
+            log.warning("inbox: deleted item %s but its audio file remains; "
+                        "the orphan sweep will collect it", row["id"])
+    return jsonify({"deleted": row["id"], "had_audio": bool(row["audio_path"]),
+                    "audio_removed": audio_removed})
 
 
 @bp.get("/inbox/audio/<item_id>")

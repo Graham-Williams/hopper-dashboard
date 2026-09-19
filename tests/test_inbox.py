@@ -664,3 +664,131 @@ def test_the_page_keeps_mobile_input_sizes_and_tap_targets():
 
 def test_the_inbox_is_reachable_from_the_board_nav(authed):
     assert 'href="/inbox"' in authed.get("/").data.decode()
+
+
+# --------------------------------------------------------------------------- #
+# Delete — the one control that destroys something
+# --------------------------------------------------------------------------- #
+#
+# A voice note is a recording of Graham's voice. The automatic prune is a
+# SCHEDULE, not a control, and "there is no way to delete it" is not an
+# acceptable answer for personal data. These pin the route's auth to exactly
+# what `patch_item` has: session only, origin-pinned, rate-limited.
+
+def _voice_note(client):
+    return client.post("/api/v1/inbox/items",
+                       data={"text": "", "audio": (io_bytes(WEBM), "note",
+                                                   "audio/webm")},
+                       content_type="multipart/form-data",
+                       headers={"Accept": "application/json"}).get_json()
+
+
+def test_delete_removes_the_row_and_the_recording(authed, settings):
+    from dashboard import inbox_audio
+    item = _voice_note(authed)
+    conn = inbox_db.connect(settings.inbox_db_path)
+    try:
+        path = inbox_db.get_item(conn, item["id"])["audio_path"]
+    finally:
+        conn.close()
+    assert inbox_audio.open_path(settings.inbox_audio_dir, path) is not None
+
+    r = authed.delete(f"/api/v1/inbox/items/{item['id']}")
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["deleted"] == item["id"] and body["had_audio"] is True
+    assert body["audio_removed"] is True
+    # Gone from both halves of the store.
+    assert inbox_audio.open_path(settings.inbox_audio_dir, path) is None
+    assert authed.get(f"/inbox/audio/{item['id']}").status_code == 404
+    conn = inbox_db.connect(settings.inbox_db_path)
+    try:
+        assert inbox_db.get_item(conn, item["id"]) is None
+    finally:
+        conn.close()
+    # Idempotent-ish: a second delete is an honest 404, not a 500.
+    assert authed.delete(f"/api/v1/inbox/items/{item['id']}").status_code == 404
+
+
+def test_delete_takes_linked_issues_with_it(bot, authed, settings):
+    """ON DELETE CASCADE, with foreign_keys=ON. A dangling inbox_issues row
+    would make the (repo, number) uniqueness index — the thing that stops the
+    GitHub mirror cloning a filed voice note — permanently un-reusable."""
+    item = post_note(authed).get_json()["id"]
+    r = bot.post(f"/api/v1/inbox/items/{item}/issues",
+                 json={"repo": "a/b", "number": 9,
+                       "url": "https://github.com/a/b/issues/9"},
+                 headers=machine())
+    assert r.status_code == 201
+    assert authed.delete(f"/api/v1/inbox/items/{item}").status_code == 200
+    conn = inbox_db.connect(settings.inbox_db_path)
+    try:
+        assert inbox_db.linked_issue(conn, "a/b", 9) is None
+    finally:
+        conn.close()
+
+
+def test_delete_is_session_only_and_origin_pinned(bot, authed, settings,
+                                                  registry, notifier):
+    """Same auth as PATCH, and for the same reasons: READ_TOKEN is a read
+    credential, INBOX_TOKEN is scoped to the machine endpoints, and a DELETE
+    driven by a session cookie is an ambient credential that needs the pin."""
+    item = post_note(authed).get_json()["id"]
+    assert bot.delete(f"/api/v1/inbox/items/{item}",
+                      headers=reader()).status_code == 401
+    assert bot.delete(f"/api/v1/inbox/items/{item}",
+                      headers=machine()).status_code == 401
+    assert bot.delete(f"/api/v1/inbox/items/{item}").status_code == 401
+    # ...and it survived all three.
+    assert authed.get(f"/api/v1/inbox/items").get_json()["counts"]["total"] == 1
+
+    client = _pinned_client(settings, registry, notifier)
+    base = "https://dash.example.com"
+    created = client.post("/api/v1/inbox/items", data={"text": "pin me"},
+                          content_type="multipart/form-data", base_url=base,
+                          headers={"Origin": base, "Accept": "application/json"})
+    pinned = created.get_json()["id"]
+    assert client.delete(f"/api/v1/inbox/items/{pinned}",
+                         base_url=base).status_code == 403
+    assert client.delete(f"/api/v1/inbox/items/{pinned}", base_url=base,
+                         headers={"Origin": "https://evil.example"}
+                         ).status_code == 403
+    assert client.delete(f"/api/v1/inbox/items/{pinned}", base_url=base,
+                         headers={"Origin": base}).status_code == 200
+
+
+def test_the_board_offers_a_delete_control_per_row(authed):
+    html = authed.get("/inbox").data.decode()
+    item = post_note(authed).get_json()["id"]
+    html = authed.get("/inbox").data.decode()
+    assert f'class="delete-item" data-id="{item}"' in html
+
+
+# --------------------------------------------------------------------------- #
+# Aggregate storage cap
+# --------------------------------------------------------------------------- #
+
+def test_the_audio_store_has_an_aggregate_cap_not_just_a_per_note_one(
+        authed, settings):
+    """The per-note cap bounds ONE upload. The create limiter bounds the rate.
+    Neither bounds the total — 30 notes per 15 min per IP at the per-note cap is
+    gigabytes a day from a single address, and `box-disk` only pages once the
+    disk is already gone."""
+    settings.inbox_audio_max_total_bytes = 6000
+    clip = b"\x1a\x45\xdf\xa3" + b"\x00" * 2000        # ~2 kB each
+    for _ in range(2):
+        r = authed.post("/api/v1/inbox/items",
+                        data={"text": "", "audio": (io_bytes(clip), "n",
+                                                    "audio/webm")},
+                        content_type="multipart/form-data",
+                        headers={"Accept": "application/json"})
+        assert r.status_code == 201
+    r = authed.post("/api/v1/inbox/items",
+                    data={"text": "", "audio": (io_bytes(clip), "n",
+                                                "audio/webm")},
+                    content_type="multipart/form-data",
+                    headers={"Accept": "application/json"})
+    # 507 Insufficient Storage: the REQUEST is a fine size, the STORE is full.
+    assert r.status_code == 507 and "full" in r.get_json()["error"]
+    # A typed note still works — the cap is about audio, not about the Inbox.
+    assert post_note(authed, text="typed still fine").status_code == 201
