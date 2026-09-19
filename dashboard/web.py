@@ -7,7 +7,7 @@ and ``/static/*`` requires the signed session cookie. Additionally
 the board without a browser session. ``APP_HOST`` (optional) pins Host and,
 for POSTs, Origin/Referer as a CSRF defence.
 
-This role also enforces HTTPS at the origin (``X-Forwarded-Proto: http`` → 301
+This role also enforces HTTPS at the origin (``X-Forwarded-Proto: http`` → 307
 to ``https://<APP_HOST>…``, plus HSTS). The INGEST role does not, and must not:
 see ``_https_redirect`` below.
 """
@@ -52,6 +52,14 @@ HSTS_VALUE = "max-age=31536000"
 # Printable ASCII, no spaces and no control bytes: what may be pasted into a
 # Location header. Makes CR/LF header injection structurally impossible rather
 # than merely unlikely (Werkzeug would also refuse, but not from here).
+#
+# ⚠️ THIS PATTERN IS SAFE ONLY UNDER `.fullmatch()`. EVERY call site MUST use
+# `fullmatch` — never `.match()`, never `.search()`. The pattern is unanchored,
+# so `_SAFE_TARGET_RE.match('/x\n')` SUCCEEDS (it matches the safe prefix and
+# stops), and a single `fullmatch`->`match` slip would therefore let a newline
+# through into a response header: header injection. Anchoring with `^...$`
+# would NOT save it either — in Python "$" also matches immediately before a
+# TRAILING newline. `tests/test_web.py` pins both facts.
 _SAFE_TARGET_RE = re.compile(r"[\x21-\x7e]*")
 _MAX_TARGET_LEN = 2000
 
@@ -125,7 +133,7 @@ def _request_target() -> str:
 def _https_redirect():
     """Enforce HTTPS at the origin — defence in depth behind the edge.
 
-    Cloudflare's zone-wide "Always Use HTTPS" already 301s http→https, but that
+    Cloudflare's zone-wide "Always Use HTTPS" already redirects http→https, but
     is one dashboard toggle away from regressing, so the origin enforces it too.
     Only the tunnel reaches this role, and cloudflared forwards the visitor's
     scheme in ``X-Forwarded-Proto``.
@@ -138,9 +146,27 @@ def _https_redirect():
       send none, and redirecting them would break monitoring, not protect it.
     - The target is built from the configured ``APP_HOST`` pin, never from the
       request's own Host/URL — host reflection here would be an open redirect.
-    - No ``APP_HOST`` → no redirect (fail open). That keeps local dev, the
-      documented local visual-QA path and the test suite working; in production
-      ``APP_HOST`` is always set (it is also what the Host pin needs).
+      It is used through ``Settings.https_redirect_host``, which only yields it
+      when it is a bare hostname: a value like ``host@evil.example`` would
+      otherwise emit a Location the browser resolves to ``evil.example``, and
+      one containing a CRLF would 500 every request instead of failing open.
+    - No (or malformed) ``APP_HOST`` → no redirect (fail open). That keeps
+      local dev, the documented local visual-QA path and the test suite
+      working; in production ``APP_HOST`` is always set (it is also what the
+      Host pin needs).
+
+    **307, and never cacheable.** The ``Location`` is byte-identical to the URL
+    that was requested, so a cacheable answer is self-referential: RFC 9111
+    makes a 301 with no ``Cache-Control`` heuristically cacheable
+    *indefinitely*, which would let one misdeployed ``APP_HOST`` stick in every
+    visitor's browser with no way to recall it, and would let a shared cache
+    hand an https visitor a redirect to itself. 307 also preserves the method,
+    so a plain-http POST is re-sent over https rather than silently downgraded
+    to a bodiless GET. HSTS is what provides the durable upgrade; the redirect
+    does not need to be permanent. ``Cache-Control: no-store`` comes from
+    ``_security_headers`` (every read-side response gets it) and
+    ``Vary: X-Forwarded-Proto`` is added here, since this answer depends
+    entirely on that header.
 
     This hook lives on the read blueprint, which is registered ONLY for the read
     role — so the Tailscale-only ingest listener on :8081 is structurally exempt
@@ -151,12 +177,14 @@ def _https_redirect():
     Runs before the password gate so an http request is upgraded rather than
     first answered with a redirect to a plain-http ``/login``.
     """
-    app_host = _settings().app_host
+    app_host = _settings().https_redirect_host
     if not app_host:
         return None
     if (request.headers.get("X-Forwarded-Proto") or "").strip().lower() != "http":
         return None
-    return redirect(f"https://{app_host}{_request_target()}", code=301)
+    resp = redirect(f"https://{app_host}{_request_target()}", code=307)
+    resp.vary.add("X-Forwarded-Proto")
+    return resp
 
 
 @bp.before_app_request
@@ -207,7 +235,7 @@ def _security_headers(resp: Response) -> Response:
     # same-origin, NOT no-referrer: under no-referrer browsers send Origin: null
     # on the app's own form POST and the CSRF pin would reject the login.
     resp.headers.setdefault("Referrer-Policy", "same-origin")
-    # Sent on every read-side response (including the 301 above). A browser
+    # Sent on every read-side response (including the 307 above). A browser
     # ignores it on a plain-http response per RFC 6797, so it costs nothing
     # there; over the tunnel it pins this hostname to https for a year.
     resp.headers.setdefault("Strict-Transport-Security", HSTS_VALUE)

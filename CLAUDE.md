@@ -351,6 +351,27 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   (`RAW_URI`/`REQUEST_URI`), because `request.path` is already URL-decoded and would silently rewrite
   `/a%2Fb` to `/a/b`. Unset `APP_HOST` → no redirect (fail open, which is what keeps the documented local
   visual-QA path and the test suite working).
+- **`APP_HOST` is validated as a BARE hostname before it can reach a `Location`** — read it through
+  `Settings.https_redirect_host`, never `settings.app_host`, on any path that emits it. It is operator-set,
+  not attacker-set, but an unvalidated value is still a live footgun: `host@evil.example` parses as WHATWG
+  *userinfo*, so the browser lands on `evil.example` while the URL still reads like this app;
+  `host/evil.net` smuggles a path; and an embedded CRLF makes Werkzeug raise on **every** request — a
+  whole-site 500, not just a broken redirect. A malformed value disables the **redirect only** (logged at
+  start-up: *"is not a bare hostname"*) and leaves the Host/Origin pin alone, which fails *closed* because
+  it compares rather than emits. Those are deliberately two different postures, which is why
+  `https_redirect_host` is a separate property.
+- **⚠️ `_HOSTNAME_RE` and `_SAFE_TARGET_RE` are safe ONLY under `.fullmatch()`.** `_SAFE_TARGET_RE` is
+  unanchored, so `.match('/x\n')` **succeeds** — one `fullmatch`→`match` slip is a header-injection hole.
+  `^…$` would not save it either: in Python `$` also matches immediately before a *trailing* newline.
+  Both patterns carry that warning at their definition and `tests/test_web.py` pins the newline rejection
+  (and asserts the `.match()` trap explicitly, so it can't be "tidied" away).
+- **The redirect is `307`, not `301`, and carries `Cache-Control: no-store` + `Vary: X-Forwarded-Proto`.**
+  The `Location` is byte-identical to the requested URL, so a cacheable answer is self-referential: under
+  RFC 9111 a 301 with no `Cache-Control` is heuristically cacheable *indefinitely*, which would make one
+  misdeployed `APP_HOST` stick in every visitor's browser with no way to recall it, and would let a shared
+  cache hand an https visitor a redirect to itself. 307 also preserves the method, so a plain-http POST is
+  re-sent over https rather than silently downgraded to a bodiless GET. HSTS is the durable upgrade; the
+  redirect does not need to be permanent.
 - **The ingest listener is deliberately exempt from the redirect and from HSTS, and must stay that way.**
   Both hooks live on `web.bp`, registered only for the read role — the exemption is structural, not a
   condition. `:8081` is Tailscale-only, serves no TLS, and every heartbeat (systemd `ExecStopPost` curls,

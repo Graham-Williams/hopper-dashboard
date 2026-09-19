@@ -164,7 +164,7 @@ Outputs:
   timestamp localizer in `base.html`); no `'self'`/`'unsafe-inline'` for scripts, no CDN.
 - **HTTPS enforced at the origin, not only at the edge** (`web._https_redirect`, `_security_headers`).
   Cloudflare's zone-wide "Always Use HTTPS" is one dashboard toggle away from regressing, so the READ role
-  enforces it itself: when cloudflared forwards `X-Forwarded-Proto: http` it answers `301` to
+  enforces it itself: when cloudflared forwards `X-Forwarded-Proto: http` it answers `307` to
   `https://<APP_HOST><path?query>`, and every read-side response carries
   `Strict-Transport-Security: max-age=31536000` (no `includeSubDomains`, no `preload` — each hostname owns
   its own policy and preload is effectively irreversible; matches the apex landing page, the reference
@@ -176,7 +176,18 @@ Outputs:
     open redirect), from the RAW request target (`RAW_URI`/`REQUEST_URI`) so percent-encoding round-trips
     byte-for-byte — `request.path` is already decoded, so `/a%2Fb` and `/a/b` are indistinguishable there.
     A forged/absolute-form/over-long/control-byte target falls back to a re-quoted path, so no header
-    injection. Unset `APP_HOST` → **no redirect** (fail open: local dev, the local visual-QA path, tests).
+    injection. `APP_HOST` itself is read through `Settings.https_redirect_host`, which yields it only when
+    it is a **bare hostname** — `host@evil.example` would otherwise emit a Location the browser resolves to
+    `evil.example` (WHATWG userinfo) and an embedded CRLF would 500 every request. Unset **or malformed**
+    `APP_HOST` → **no redirect** (fail open: local dev, the local visual-QA path, tests), logged at start-up.
+    ⚠️ Both `_SAFE_TARGET_RE` and `_HOSTNAME_RE` are safe only under `.fullmatch()`; `.match()` accepts a
+    trailing newline and so would `^…$`.
+  - **`307`, with `Cache-Control: no-store` and `Vary: X-Forwarded-Proto`** — not `301`. The `Location` is
+    byte-identical to the requested URL, so a cacheable answer is self-referential: RFC 9111 makes a 301
+    with no `Cache-Control` heuristically cacheable *indefinitely*, which would make a misdeployed
+    `APP_HOST` sticky in every visitor's browser with no recall, and would let a shared cache serve an
+    https visitor a redirect to itself. 307 also preserves the method, so a plain-http POST is not
+    downgraded to a bodiless GET. HSTS provides the durable upgrade.
   - **The INGEST role is deliberately exempt**, structurally: both hooks live on `web.bp`, which only the read
     role registers. `:8081` is reached directly over the tailnet, serves no TLS, and its heartbeats (systemd
     `ExecStopPost` curls, `dashboard-containers.timer`, the Mac launchd probe) are plain HTTP with no

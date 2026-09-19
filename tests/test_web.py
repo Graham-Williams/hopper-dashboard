@@ -182,11 +182,35 @@ def xfp(proto):
     return {"X-Forwarded-Proto": proto}
 
 
-def test_forwarded_http_redirects_301_to_pinned_https_host(settings, registry, notifier):
+def test_forwarded_http_redirects_307_to_pinned_https_host(settings, registry, notifier):
     c = _pinned(settings, registry, notifier)
     r = c.get("/jobs/snap?x=1&y=2", base_url=HTTP_BASE, headers=xfp("http"))
-    assert r.status_code == 301
+    assert r.status_code == 307
     assert r.headers["Location"] == f"{HTTPS_BASE}/jobs/snap?x=1&y=2"
+
+
+def test_redirect_is_307_and_never_cacheable(settings, registry, notifier):
+    """Not 301. The Location is byte-identical to the URL that was requested,
+    so a cacheable redirect is self-referential: RFC 9111 makes a 301 with no
+    Cache-Control heuristically cacheable INDEFINITELY, which would make one
+    misdeployed APP_HOST sticky in every visitor's browser with no way to
+    recall it. Vary: any cache between here and the visitor must key on the
+    header the answer depends on."""
+    c = _pinned(settings, registry, notifier)
+    r = c.get("/", base_url=HTTP_BASE, headers=xfp("http"))
+    assert r.status_code == 307
+    assert r.headers["Cache-Control"] == "no-store"
+    assert "X-Forwarded-Proto" in r.headers["Vary"]
+
+
+def test_redirect_preserves_the_request_method(settings, registry, notifier):
+    """307, so a plain-http POST is re-sent over https rather than silently
+    downgraded to a bodiless GET."""
+    c = _pinned(settings, registry, notifier)
+    r = c.post("/login", base_url=HTTP_BASE, headers=xfp("http"),
+               data={"password": "x"})
+    assert r.status_code == 307
+    assert r.headers["Location"] == f"{HTTPS_BASE}/login"
 
 
 def test_redirect_preserves_percent_encoding_byte_for_byte(settings, registry, notifier):
@@ -195,7 +219,7 @@ def test_redirect_preserves_percent_encoding_byte_for_byte(settings, registry, n
     c = _pinned(settings, registry, notifier)
     raw = "/jobs/a%2Fb%20c?q=1%262&e=%C3%A9"
     r = c.get(raw, base_url=HTTP_BASE, headers=xfp("http"))
-    assert r.status_code == 301
+    assert r.status_code == 307
     assert r.headers["Location"] == HTTPS_BASE + raw
 
 
@@ -204,7 +228,7 @@ def test_redirect_never_reflects_the_request_host(settings, registry, notifier):
     APP_HOST pin, whatever the attacker put in the Host header."""
     c = _pinned(settings, registry, notifier)
     r = c.get("/", base_url="http://evil.example", headers=xfp("http"))
-    assert r.status_code == 301
+    assert r.status_code == 307
     assert r.headers["Location"] == f"{HTTPS_BASE}/"
     assert "evil.example" not in r.headers["Location"]
 
@@ -216,7 +240,7 @@ def test_redirect_cannot_inject_headers_via_a_crafted_raw_target(settings, regis
     for forged in ("/x\r\nX-Evil: 1", "http://evil.example/x", "/" + "a" * 4000, ""):
         r = c.get("/healthz", base_url=HTTP_BASE, headers=xfp("http"),
                   environ_overrides={"RAW_URI": forged, "REQUEST_URI": forged})
-        assert r.status_code == 301, forged
+        assert r.status_code == 307, forged
         assert r.headers["Location"] == f"{HTTPS_BASE}/healthz", forged
 
 
@@ -241,7 +265,7 @@ def test_only_an_exactly_http_header_redirects(settings, registry, notifier):
     c = _pinned(settings, registry, notifier)
     for value in (" HTTP ", "http"):          # normalised: case + surrounding space
         r = c.get("/healthz", base_url=HTTP_BASE, headers=xfp(value))
-        assert r.status_code == 301, value
+        assert r.status_code == 307, value
     for value in ("https", "HTTPS", "http,https", "httpx", ""):
         r = c.get("/healthz", base_url=HTTPS_BASE, headers=xfp(value))
         assert r.status_code == 200, value
@@ -257,7 +281,82 @@ def test_redirect_runs_before_the_password_gate(settings, registry, notifier):
     """An http visitor is upgraded, not first bounced to a plain-http /login."""
     c = _pinned(settings, registry, notifier)
     r = c.get("/", base_url=HTTP_BASE, headers=xfp("http"))
-    assert r.status_code == 301 and r.headers["Location"] == f"{HTTPS_BASE}/"
+    assert r.status_code == 307 and r.headers["Location"] == f"{HTTPS_BASE}/"
+
+
+# APP_HOST is spliced into a Location header, so it is validated as a bare
+# hostname. Operator-set, not attacker-set — hardening, not a live hole — but
+# every sibling app refuses these and an unvalidated one is either a silent
+# phishing vector or (CRLF) a whole-site 500.
+MALFORMED_APP_HOSTS = [
+    # Everything before "@" is WHATWG userinfo: the browser lands on
+    # evil.example while the URL still reads like this app.
+    "dashboard.example.test@evil.example",
+    "dashboard.example.test/evil.net",      # path smuggled into the host
+    "https://dashboard.example.test",       # scheme
+    "dashboard.example.test\r\nX-Evil: 1",  # CRLF -> Werkzeug raises -> 500
+    "dashboard.example.test:8080",          # port
+    "dashboard.example.test?x=1",           # query
+    "dash board.example.test",              # whitespace
+]
+
+
+def test_malformed_app_host_disables_the_redirect(settings, registry, notifier):
+    """Fail OPEN and never emit a bad Location — and never 500 the whole site.
+
+    A CRLF in particular makes Werkzeug refuse to build the response, which
+    without this guard is an HTTP 500 on EVERY request, not just the redirect.
+    """
+    for bad in MALFORMED_APP_HOSTS:
+        c = _pinned(settings, registry, notifier, app_host=bad)
+        r = c.get("/healthz", base_url=HTTP_BASE, headers=xfp("http"))
+        assert r.status_code == 200, bad          # not 307, and not 500
+        assert "Location" not in r.headers, bad
+
+
+def test_malformed_app_host_is_logged(settings, registry, notifier, caplog):
+    """Fail open, but never silently: an operator who typos APP_HOST has lost
+    origin-side HTTPS enforcement and must be able to find out why."""
+    with caplog.at_level("WARNING"):
+        _pinned(settings, registry, notifier,
+                app_host="dashboard.example.test@evil.example")
+    assert any("not a bare hostname" in r.getMessage() for r in caplog.records)
+
+
+def test_malformed_app_host_still_pins_the_host(settings, registry, notifier):
+    """The redirect fails OPEN, but Host/Origin pinning must keep failing
+    CLOSED — it compares the value, it never emits it. Two different postures
+    on purpose, which is why `https_redirect_host` is a separate property."""
+    c = _pinned(settings, registry, notifier,
+                app_host="dashboard.example.test@evil.example")
+    assert c.get("/login", base_url=HTTPS_BASE).status_code == 403
+
+
+def test_wellformed_app_host_still_redirects(settings, registry, notifier):
+    """Control for the two tests above: a real hostname is not rejected."""
+    c = _pinned(settings, registry, notifier)
+    assert c.get("/healthz", base_url=HTTP_BASE,
+                 headers=xfp("http")).status_code == 307
+
+
+def test_location_patterns_are_safe_only_under_fullmatch():
+    """`_SAFE_TARGET_RE` is UNANCHORED: it is safe purely because every call
+    site uses `.fullmatch()`. One `fullmatch`->`match` slip is a header
+    injection hole, and `^...$` would not save it either — in Python "$" also
+    matches immediately before a TRAILING newline. Pinned here so a refactor
+    has to delete an explicit assertion to reintroduce it."""
+    from dashboard.config import _HOSTNAME_RE
+    from dashboard.web import _SAFE_TARGET_RE
+
+    assert _SAFE_TARGET_RE.fullmatch("/jobs/snap?x=1")
+    assert not _SAFE_TARGET_RE.fullmatch("/x\n")
+    assert not _SAFE_TARGET_RE.fullmatch("/x\r\nX-Evil: 1")
+    # The trap itself, asserted so it is impossible to miss:
+    assert _SAFE_TARGET_RE.match("/x\n"), "…but .match() ACCEPTS it"
+
+    assert _HOSTNAME_RE.fullmatch("dashboard.example.test")
+    assert not _HOSTNAME_RE.fullmatch("dashboard.example.test\n")
+    assert not _HOSTNAME_RE.fullmatch("dashboard.example.test@evil.example")
 
 
 def test_hsts_header_on_every_response(authed, settings, registry, notifier):
@@ -267,7 +366,7 @@ def test_hsts_header_on_every_response(authed, settings, registry, notifier):
     assert authed.get("/login").headers["Strict-Transport-Security"] == HSTS
     c = _pinned(settings, registry, notifier)
     r = c.get("/", base_url=HTTP_BASE, headers=xfp("http"))
-    assert r.status_code == 301 and r.headers["Strict-Transport-Security"] == HSTS
+    assert r.status_code == 307 and r.headers["Strict-Transport-Security"] == HSTS
 
 
 def test_session_cookie_is_secure_httponly_samesite(read_app):
