@@ -159,7 +159,7 @@ def test_transcribe_file_classifies_by_the_exit_code_and_the_stderr(tmp_path, mo
         (1, "", "something else"): ProbeError,
     }
     for (rc, out, err), want in cases.items():
-        monkeypatch.setattr(it, "run_cmd", lambda a, timeout: (rc, out, err))
+        monkeypatch.setattr(it, "run_cmd", lambda a, timeout, env=None: (rc, out, err))
         with pytest.raises(want):
             it.transcribe_file(cfg, "/tmp/x.webm")
 
@@ -293,7 +293,8 @@ def test_suffix_follows_the_mime_and_falls_back_safely():
 def test_the_whisper_argv_is_a_list_with_no_shell_and_no_user_text(tmp_path, monkeypatch):
     captured = {}
     monkeypatch.setattr(it, "run_cmd",
-                        lambda argv, timeout: captured.update(argv=argv, timeout=timeout)
+                        lambda argv, timeout, env=None: captured.update(
+                            argv=argv, timeout=timeout, env=env)
                         or (0, "\n" + it.SENTINEL + '{"text": "x"}\n', ""))
     cfg = {"INBOX_WHISPER_PYTHON": "/usr/bin/python3", "INBOX_WHISPER_MODEL": "m",
            "INBOX_TRANSCRIBE_TIMEOUT": "42"}
@@ -301,6 +302,11 @@ def test_the_whisper_argv_is_a_list_with_no_shell_and_no_user_text(tmp_path, mon
     assert captured["argv"] == ["/usr/bin/python3", "-c", it.WHISPER_SCRIPT,
                                 "/tmp/clip.webm", "m", it.SENTINEL]
     assert captured["timeout"] == 42.0
+    # An explicit, allowlisted child environment — never this process's, which can be
+    # carrying INBOX_TOKEN (load_config overlays INBOX_* for one-off runs).
+    assert captured["env"] is not None
+    assert "INBOX_TOKEN" not in captured["env"] and "INGEST_TOKEN" not in captured["env"]
+    assert "PATH" in captured["env"], "the child must still be able to find ffmpeg"
 
 
 def test_nothing_under_probes_imports_mlx():
@@ -329,3 +335,137 @@ def test_nothing_under_probes_imports_mlx():
                 assert not mod.split(".")[0].startswith("mlx"), "%s imports %s" % (name, mod)
     assert checked >= 8
     assert "import mlx_whisper" in it.WHISPER_SCRIPT      # it lives in the CHILD's source
+
+
+# --- the queue must never wedge on one bad item -----------------------------------
+# The queue is served OLDEST FIRST. Before this containment, a ProbeError raised anywhere
+# outside the narrow try around transcribe_file — the download, or the SUCCESS-path POST —
+# propagated to main(), aborted the run, and left the item at the head of the queue with its
+# attempt counter untouched. It then aborted every subsequent run at the same item, and every
+# newer voice note behind it silently stopped being transcribed. The board only notices after
+# 24 h, because the worker still posts a heartbeat (a failing one).
+
+class _FailingPost(FakeApi):
+    """Rejects the transcript POST for ONE item id, like a server 413/400 would."""
+
+    def __init__(self, queue_items, bad_id, status=413, detail="transcript too long"):
+        FakeApi.__init__(self, queue_items)
+        self.bad_id = bad_id
+        self.status = status
+        self.detail = detail
+
+    def api_json(self, url, token, method="GET", body=None, **kw):
+        if url.endswith("/transcript") and self.bad_id in url and not (body or {}).get("failed"):
+            # NOT recorded: the server rejected it, so no transcript was stored.
+            raise ProbeError("POST %s rejected: HTTP %d %s" % (url, self.status, self.detail))
+        return FakeApi.api_json(self, url, token, method=method, body=body, **kw)
+
+
+def test_an_item_the_server_rejects_burns_its_attempt_instead_of_wedging_the_queue(
+        tmp_path, monkeypatch):
+    api = _FailingPost(_queue(ID_A, ID_B), bad_id=ID_A)
+    sent = _wire(monkeypatch, api)
+    rc = it.main(["--env", _env(tmp_path), "--quiet"])
+
+    posts = api.transcripts()
+    # The rejected item gets a FAILED report (so transcribe_attempts advances)...
+    failed = [(i, b) for i, b in posts if b.get("failed")]
+    assert [i for i, _ in failed] == [ID_A]
+    assert "413" in failed[0][1]["error"]
+    # ...and the item BEHIND it is still transcribed in the same run.
+    done = [(i, b) for i, b in posts if not b.get("failed")]
+    assert [i for i, _ in done] == [ID_B]
+    (_url, _tok, _job, hb), = sent
+    assert hb["metrics"] == dict(hb["metrics"], failed=1, transcribed=1, queued=2)
+    assert rc == 0, "one bad item is not a failing RUN"
+
+
+def test_an_item_whose_audio_download_fails_does_not_abort_the_run(tmp_path, monkeypatch):
+    class _FailingDownload(FakeApi):
+        def api_request(self, url, token, method="GET", **kw):
+            self.raw_calls.append((method, url))
+            if ID_A in url:
+                raise ProbeError("GET %s rejected: HTTP 400 bad request" % url)
+            return 200, self.audio
+
+    api = _FailingDownload(_queue(ID_A, ID_B))
+    sent = _wire(monkeypatch, api)
+    rc = it.main(["--env", _env(tmp_path), "--quiet"])
+
+    posts = dict(api.transcripts())
+    assert posts[ID_A]["failed"] is True and "400" in posts[ID_A]["error"]
+    assert posts[ID_B].get("failed") is None
+    assert rc == 0
+    (_u, _t, _j, hb), = sent
+    assert hb["status"] == "ok" and hb["metrics"]["failed"] == 1
+
+
+def test_a_401_is_the_runs_problem_and_stops_it_before_it_eats_every_attempt(
+        tmp_path, monkeypatch):
+    """A revoked or mistyped INBOX_TOKEN fails identically for every item. Treating it as a
+    per-item failure would burn all three attempts on each queued voice note and mark them
+    permanently failed — the same data loss EnvironmentFault exists to prevent."""
+    class _Unauthorized(FakeApi):
+        def api_request(self, url, token, method="GET", **kw):
+            self.raw_calls.append((method, url))
+            raise ProbeError("GET %s rejected: HTTP 401 unauthorized" % url)
+
+    api = _Unauthorized(_queue(ID_A, ID_B))
+    sent = _wire(monkeypatch, api)
+    rc = it.main(["--env", _env(tmp_path), "--quiet"])
+
+    assert api.transcripts() == [], "no item may be marked failed over a bad credential"
+    assert len(api.raw_calls) == 1, "the run stops at the first item"
+    assert rc == 1
+    (_u, _t, _j, hb), = sent
+    assert hb["status"] == "fail" and "401" in hb["note"]
+
+
+def test_an_over_long_transcript_is_truncated_to_the_servers_limit(tmp_path, monkeypatch):
+    """The server REJECTS a transcript over MAX_TEXT rather than trimming it, and that
+    rejection on the success path is one of the ways the queue used to wedge. A very long
+    recording should cost a few characters, not the queue."""
+    api = FakeApi(_queue(ID_A))
+    _wire(monkeypatch, api,
+          transcribe=lambda cfg, path: ({"text": "word " * 9000, "language": "en"}, 40.0))
+    rc = it.main(["--env", _env(tmp_path), "--quiet"])
+    (_id, body), = api.transcripts()
+    assert rc == 0 and len(body["text"]) == it.MAX_TEXT
+
+
+def test_a_failure_report_that_itself_fails_still_lets_the_next_item_run(
+        tmp_path, monkeypatch):
+    """Belt and braces: if even the "this item failed" POST cannot be delivered, the attempt
+    counter simply does not advance this run — the following item must still get its turn."""
+    class _AllPostsRejected(FakeApi):
+        def api_json(self, url, token, method="GET", body=None, **kw):
+            if url.endswith("/transcript") and ID_A in url:
+                # NOT recorded: the server rejected it, so no transcript was stored.
+                raise ProbeError("POST %s rejected: HTTP 400 nope" % url)
+            return FakeApi.api_json(self, url, token, method=method, body=body, **kw)
+
+    api = _AllPostsRejected(_queue(ID_A, ID_B))
+    _wire(monkeypatch, api)
+    rc = it.main(["--env", _env(tmp_path), "--quiet"])
+    assert [i for i, b in api.transcripts() if not b.get("failed")] == [ID_B]
+    assert rc == 0
+
+
+def test_whisper_stderr_cannot_forge_a_line_in_the_mac_log(tmp_path, monkeypatch):
+    """Child output goes verbatim into a timestamped log file; a newline in it forges a whole
+    log line and an ESC sequence runs in whoever's terminal is tailing it."""
+    forged = "boom\n2026-09-19 03:00:00 run ok in 2s (0 failed)\x1b[2J"
+
+    def angry(cfg, path):
+        raise ProbeError("whisper exited 4: " + forged)
+
+    api = FakeApi(_queue(ID_A))
+    _wire(monkeypatch, api, transcribe=angry)
+    it.main(["--env", _env(tmp_path), "--quiet"])
+
+    log_text = (tmp_path / "worker.log").read_text()
+    assert "\x1b" not in log_text
+    for line in log_text.splitlines():
+        assert not line.startswith("2026-09-19 03:00:00 run ok"), "a forged log line got in"
+    (_id, body), = api.transcripts()
+    assert "\n" not in body["error"] and "\x1b" not in body["error"]
