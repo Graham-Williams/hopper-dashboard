@@ -39,6 +39,7 @@ import uuid
 from typing import Any, Iterable
 
 from .db import _add_column, now_iso, to_iso  # noqa: F401  (shared helpers)
+from .db import from_iso as from_iso_or_none  # noqa: F401  (never raises)
 
 # --------------------------------------------------------------------------- #
 # Vocabulary
@@ -471,6 +472,13 @@ def upsert_mirror_item(conn: sqlite3.Connection, *, mirror_key: str,
                        mirror_key=mirror_key, mirror_url=url)
 
 
+def _like_prefix(prefix: str) -> str:
+    """``prefix%`` with LIKE's own wildcards escaped — a repo named ``a_b`` must
+    match itself, not ``axb``."""
+    return (prefix.replace("\\", "\\\\").replace("%", "\\%")
+            .replace("_", "\\_") + "%")
+
+
 def archive_missing(conn: sqlite3.Connection, *, prefix: str,
                     seen_keys: Iterable[str], now: str | None = None) -> int:
     """Archive mirrored rows whose upstream key was NOT seen in a COMPLETE sync.
@@ -484,12 +492,72 @@ def archive_missing(conn: sqlite3.Connection, *, prefix: str,
     seen = list(dict.fromkeys(seen_keys))
     sql = ("UPDATE inbox_items SET archived_at=?, updated_at=? "
            "WHERE mirror_key LIKE ? ESCAPE '\\' AND archived_at IS NULL")
-    args: list[Any] = [now, now, prefix.replace("\\", "\\\\")
-                       .replace("%", "\\%").replace("_", "\\_") + "%"]
+    args: list[Any] = [now, now, _like_prefix(prefix)]
     if seen:
         sql += f" AND mirror_key NOT IN ({','.join('?' * len(seen))})"
         args += seen
     return int(conn.execute(sql, args).rowcount or 0)
+
+
+def close_missing_mirror_items(conn: sqlite3.Connection, *, prefix: str,
+                               seen_keys: Iterable[str],
+                               now: str | None = None) -> int:
+    """Close — not archive — mirrored rows absent from a COMPLETE open-issue
+    scan.
+
+    The GitHub mirror only ever asks for ``state=open``, so a key that is no
+    longer in the answer is closed, transferred or deleted; "closed" is the
+    useful rendering, and it keeps the row on the board with a badge. That is
+    the point of the feature: nothing disappears once it has been filed.
+
+    (backlog.txt is the other way round — see :func:`archive_missing` — because
+    a backlog entry that vanished from the file was *removed*, not completed.)
+    Callers must only reach here after an error-free full fetch.
+    """
+    now = now or now_iso()
+    seen = list(dict.fromkeys(seen_keys))
+    sql = ("UPDATE inbox_items SET state='closed', closed_at=?, updated_at=? "
+           "WHERE state='open' AND mirror_key LIKE ? ESCAPE '\\'")
+    args: list[Any] = [now, now, _like_prefix(prefix)]
+    if seen:
+        sql += f" AND mirror_key NOT IN ({','.join('?' * len(seen))})"
+        args += seen
+    return int(conn.execute(sql, args).rowcount or 0)
+
+
+def reopen_mirror_item(conn: sqlite3.Connection, mirror_key: str,
+                       now: str | None = None) -> None:
+    """An issue that is open upstream again is open here again."""
+    now = now or now_iso()
+    conn.execute("UPDATE inbox_items SET state='open', closed_at=NULL, "
+                 "updated_at=? WHERE mirror_key=? AND state='closed'",
+                 (now, mirror_key))
+
+
+def linked_issue(conn: sqlite3.Connection, repo: str,
+                 number: int) -> dict | None:
+    """The ``inbox_issues`` row for one issue, if this Inbox already knows it.
+
+    The repo scan calls this BEFORE creating a mirrored row: an issue Hopper
+    filed for a voice note is already represented on the board by that note, and
+    mirroring it again would put the same piece of work on the page twice.
+    """
+    return row_to_dict(conn.execute(
+        "SELECT * FROM inbox_issues WHERE repo=? AND number=?",
+        (repo, int(number))).fetchone())
+
+
+def refresh_issue(conn: sqlite3.Connection, repo: str, number: int, *,
+                  title: str | None = None, url: str | None = None,
+                  state: str = "open", now: str | None = None) -> None:
+    """Keep a linked issue's title/state current from a repo scan."""
+    now = now or now_iso()
+    conn.execute(
+        "UPDATE inbox_issues SET title=COALESCE(?, title), "
+        "url=COALESCE(?, url), state=?, checked_at=?, "
+        "closed_at=CASE WHEN ?='closed' THEN COALESCE(closed_at, ?) ELSE NULL END "
+        "WHERE repo=? AND number=?",
+        (title, url, state, now, state, now, repo, int(number)))
 
 
 def close_items_whose_issues_all_closed(conn: sqlite3.Connection,
