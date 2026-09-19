@@ -160,6 +160,124 @@ def test_host_pin_and_csrf(settings, registry, notifier):
 
 
 # --------------------------------------------------------------------------- #
+# HTTPS enforcement at the origin (issue #6)
+# --------------------------------------------------------------------------- #
+
+HTTPS_HOST = "dash.example.com"
+HTTPS_BASE = f"https://{HTTPS_HOST}"
+HTTP_BASE = f"http://{HTTPS_HOST}"
+HSTS = "max-age=31536000"
+
+
+def _pinned(settings, registry, notifier, **overrides):
+    """A read app with APP_HOST set — i.e. configured the way prod is."""
+    from dashboard import create_app
+    settings.app_host = HTTPS_HOST
+    for key, value in overrides.items():
+        setattr(settings, key, value)
+    return create_app("read", settings, registry, notifier).test_client()
+
+
+def xfp(proto):
+    return {"X-Forwarded-Proto": proto}
+
+
+def test_forwarded_http_redirects_301_to_pinned_https_host(settings, registry, notifier):
+    c = _pinned(settings, registry, notifier)
+    r = c.get("/jobs/snap?x=1&y=2", base_url=HTTP_BASE, headers=xfp("http"))
+    assert r.status_code == 301
+    assert r.headers["Location"] == f"{HTTPS_BASE}/jobs/snap?x=1&y=2"
+
+
+def test_redirect_preserves_percent_encoding_byte_for_byte(settings, registry, notifier):
+    """`request.path` is already decoded, so `/a%2Fb` and `/a/b` look the same
+    there. The redirect must re-issue what was actually asked for."""
+    c = _pinned(settings, registry, notifier)
+    raw = "/jobs/a%2Fb%20c?q=1%262&e=%C3%A9"
+    r = c.get(raw, base_url=HTTP_BASE, headers=xfp("http"))
+    assert r.status_code == 301
+    assert r.headers["Location"] == HTTPS_BASE + raw
+
+
+def test_redirect_never_reflects_the_request_host(settings, registry, notifier):
+    """Host reflection here would be an open redirect. The target comes from the
+    APP_HOST pin, whatever the attacker put in the Host header."""
+    c = _pinned(settings, registry, notifier)
+    r = c.get("/", base_url="http://evil.example", headers=xfp("http"))
+    assert r.status_code == 301
+    assert r.headers["Location"] == f"{HTTPS_BASE}/"
+    assert "evil.example" not in r.headers["Location"]
+
+
+def test_redirect_cannot_inject_headers_via_a_crafted_raw_target(settings, registry, notifier):
+    """A forged RAW_URI/REQUEST_URI (control bytes, absolute-form, absurd
+    length) is never pasted into Location — it falls back to the re-quoted path."""
+    c = _pinned(settings, registry, notifier)
+    for forged in ("/x\r\nX-Evil: 1", "http://evil.example/x", "/" + "a" * 4000, ""):
+        r = c.get("/healthz", base_url=HTTP_BASE, headers=xfp("http"),
+                  environ_overrides={"RAW_URI": forged, "REQUEST_URI": forged})
+        assert r.status_code == 301, forged
+        assert r.headers["Location"] == f"{HTTPS_BASE}/healthz", forged
+
+
+def test_forwarded_https_is_served_normally(settings, registry, notifier):
+    c = _pinned(settings, registry, notifier)
+    assert c.get("/healthz", base_url=HTTPS_BASE, headers=xfp("https")).status_code == 200
+    r = c.get("/api/v1/status", base_url=HTTPS_BASE, headers={**bearer(), **xfp("https")})
+    assert r.status_code == 200
+
+
+def test_absent_forwarded_proto_is_never_redirected(settings, registry, notifier):
+    """The container HEALTHCHECK and Hopper's in-network read
+    (`curl -H 'Host: <APP_HOST>' http://…/api/v1/status`) send no
+    X-Forwarded-Proto. Redirecting those would break monitoring, not protect it."""
+    c = _pinned(settings, registry, notifier)
+    assert c.get("/healthz", base_url=HTTP_BASE).status_code == 200
+    r = c.get("/api/v1/status", base_url=HTTP_BASE, headers=bearer())
+    assert r.status_code == 200 and "jobs" in r.get_json()
+
+
+def test_only_an_exactly_http_header_redirects(settings, registry, notifier):
+    c = _pinned(settings, registry, notifier)
+    for value in (" HTTP ", "http"):          # normalised: case + surrounding space
+        r = c.get("/healthz", base_url=HTTP_BASE, headers=xfp(value))
+        assert r.status_code == 301, value
+    for value in ("https", "HTTPS", "http,https", "httpx", ""):
+        r = c.get("/healthz", base_url=HTTPS_BASE, headers=xfp(value))
+        assert r.status_code == 200, value
+
+
+def test_no_app_host_means_no_redirect(read):
+    """Fail open: with APP_HOST unset there is no pin to build a target from
+    (local dev, the documented local visual-QA path, this suite)."""
+    assert read.get("/healthz", headers=xfp("http")).status_code == 200
+
+
+def test_redirect_runs_before_the_password_gate(settings, registry, notifier):
+    """An http visitor is upgraded, not first bounced to a plain-http /login."""
+    c = _pinned(settings, registry, notifier)
+    r = c.get("/", base_url=HTTP_BASE, headers=xfp("http"))
+    assert r.status_code == 301 and r.headers["Location"] == f"{HTTPS_BASE}/"
+
+
+def test_hsts_header_on_every_response(authed, settings, registry, notifier):
+    """One year, no includeSubDomains, no preload — each host owns its own
+    policy and preload is effectively irreversible."""
+    assert authed.get("/").headers["Strict-Transport-Security"] == HSTS
+    assert authed.get("/login").headers["Strict-Transport-Security"] == HSTS
+    c = _pinned(settings, registry, notifier)
+    r = c.get("/", base_url=HTTP_BASE, headers=xfp("http"))
+    assert r.status_code == 301 and r.headers["Strict-Transport-Security"] == HSTS
+
+
+def test_session_cookie_is_secure_httponly_samesite(read_app):
+    cfg = read_app.config
+    assert cfg["SESSION_COOKIE_SECURE"] is True
+    assert cfg["SESSION_COOKIE_HTTPONLY"] is True
+    assert cfg["SESSION_COOKIE_SAMESITE"] == "Lax"
+
+
+# --------------------------------------------------------------------------- #
 # JSON contract
 # --------------------------------------------------------------------------- #
 
