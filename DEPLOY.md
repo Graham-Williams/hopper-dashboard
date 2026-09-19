@@ -661,7 +661,11 @@ What it does, and the two things that are non-negotiable about how:
   `fail`, the board pages after the job's threshold) when: the container's audio directory is missing
   entirely; its file count has dropped by more than `AUDIO_MAX_DROP_PCT` (default 50) since the last
   **clean** mirror; or the container has no recordings at all while Drive has some. Drive keeps what it
-  has in every one of those cases. For a deliberate purge, run once with `AUDIO_ALLOW_MASS_DELETE=1`:
+  has in every one of those cases. **The very first run is guarded too**: with no remembered count yet
+  (fresh state dir, or the first run after this script learned to propagate deletions) the comparison
+  falls back to the file count already in `~/hopper-dashboard-backups/audio`, which is what Drive holds —
+  otherwise the one run most likely to meet a backlog of app-side prunes would be the one with no brake.
+  For a deliberate purge, run once with `AUDIO_ALLOW_MASS_DELETE=1`:
   ```bash
   cd ~/hopper-dashboard && AUDIO_ALLOW_MASS_DELETE=1 deploy/box/backup.sh
   ```

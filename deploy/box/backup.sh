@@ -301,7 +301,15 @@ push_audio() {
     'import os,sys; print(sum(len(f) for _,_,f in os.walk(os.environ["DIR"])))' 2>/dev/null)" \
     || { log "ERROR: could not count the audio files inside ${CONTAINER}"; return 1; }
   [[ "${count}" =~ ^[0-9]+$ ]] || { log "ERROR: unreadable audio file count '${count}'"; return 1; }
-  [[ -f "${count_file}" ]] && prev="$(cat "${count_file}")"
+  if [[ -f "${count_file}" ]]; then
+    prev="$(cat "${count_file}")"
+  elif [[ -d "${AUDIO_MIRROR_DIR}" ]]; then
+    # No remembered count yet — the FIRST run after this script gained deletion propagation,
+    # or after the state dir was cleared. Fall back to what the host mirror already holds,
+    # which is what Drive holds: otherwise the one run most likely to face a large backlog of
+    # app-side prunes would be the one run with no brake on it.
+    prev="$(find "${AUDIO_MIRROR_DIR}" -type f | wc -l | tr -d ' ')"
+  fi
   [[ "${prev}" =~ ^[0-9]+$ ]] || prev=0
 
   if (( prev > 0 && count * 100 < prev * (100 - AUDIO_MAX_DROP_PCT) )); then
