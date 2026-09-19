@@ -32,6 +32,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import time as _time
 from dataclasses import dataclass
 
 #: Extension → the mime types a browser may legitimately declare for it.
@@ -56,6 +57,20 @@ REL_PATH_RE = re.compile(r"^\d{4}/\d{2}/[0-9a-f]{32}\.(?:%s)$"
 #: Smallest plausible recording. A zero- or few-byte part is a recorder that
 #: never started, and storing it would put an unplayable row on the board.
 MIN_BYTES = 64
+
+#: The PRIVACY CEILING, as a multiple of ``INBOX_AUDIO_RETENTION_DAYS``: audio
+#: this old is deleted whatever its transcript status and whether or not it was
+#: reviewed. See :func:`prune_audio`.
+AUDIO_CEILING_MULTIPLE = 2
+
+#: An interrupted ``save`` leaves ``<id>.<ext>.part`` behind (the write is
+#: atomic via ``os.replace``, so the real name is never half-written — but the
+#: temp file survives a crash). ``sweep_orphans`` deliberately refuses to delete
+#: anything it does not recognise, and a ``.part`` file does not match
+#: :data:`REL_PATH_RE`, so without this they accumulate for ever. An hour is far
+#: longer than any upload and short enough to matter.
+PART_SUFFIX = ".part"
+PART_MAX_AGE_S = 3600
 
 
 class AudioRejected(ValueError):
@@ -224,7 +239,8 @@ def delete(audio_dir: str, rel_path: str) -> bool:
         return False
 
 
-def sweep_orphans(audio_dir: str, known: set[str]) -> list[str]:
+def sweep_orphans(audio_dir: str, known: set[str],
+                  now: float | None = None) -> list[str]:
     """Files on disk no row points at any more — the other half of the
     reconciliation that choosing files over BLOBs costs.
 
@@ -232,17 +248,28 @@ def sweep_orphans(audio_dir: str, known: set[str]) -> list[str]:
     shape this module writes is LEFT ALONE: this walks a directory inside the
     data volume, and a sweeper that deletes what it does not recognise is a
     sweeper that will one day eat something else.
+
+    The ONE named exception is ``<id>.<ext>.part``, which :func:`save` writes
+    and then ``os.replace``s into place. An interrupted write leaves one behind,
+    it can never match :data:`REL_PATH_RE`, and so it used to be immortal. It is
+    collected only once it is older than :data:`PART_MAX_AGE_S`, so a sweep that
+    happens to run during an upload cannot delete a file that is still being
+    written.
     """
     removed: list[str] = []
     if not os.path.isdir(audio_dir):
         return removed
+    cutoff = (now if now is not None else _time.time()) - PART_MAX_AGE_S
     for dirpath, _dirnames, filenames in os.walk(audio_dir):
         for name in filenames:
             full = os.path.join(dirpath, name)
             rel = os.path.relpath(full, audio_dir)
             if os.sep != "/":                       # pragma: no cover - posix only
                 rel = rel.replace(os.sep, "/")
-            if not REL_PATH_RE.match(rel) or rel in known:
+            if not REL_PATH_RE.match(rel):
+                if not _is_stale_part(rel, full, cutoff):
+                    continue
+            elif rel in known:
                 continue
             try:
                 os.remove(full)
@@ -250,6 +277,24 @@ def sweep_orphans(audio_dir: str, known: set[str]) -> list[str]:
             except OSError:
                 continue
     return removed
+
+
+def _is_stale_part(rel: str, full: str, cutoff: float) -> bool:
+    """A leftover temp file from an interrupted write, old enough to be dead.
+
+    Both halves matter: the name must be exactly what :func:`save` writes
+    (``<the real relative path>.part``), so nothing else in the tree can be
+    caught by this, and it must predate the cutoff, so an upload in flight is
+    never swept out from under itself.
+    """
+    if not rel.endswith(PART_SUFFIX):
+        return False
+    if not REL_PATH_RE.match(rel[:-len(PART_SUFFIX)]):
+        return False
+    try:
+        return os.path.getmtime(full) < cutoff
+    except OSError:
+        return False
 
 
 # --------------------------------------------------------------------------- #
@@ -264,11 +309,20 @@ def sweep_orphans(audio_dir: str, known: set[str]) -> list[str]:
 def prune_audio(settings, now: float | None = None) -> dict:
     """Delete audio whose transcript is safe, then reconcile files ↔ rows.
 
-    Three conditions for a delete, all required (see ``inbox_db.prunable_audio``):
-    the transcript is Whisper-quality, Graham has reviewed it, and it is past the
-    retention window. By then the words are in the database and therefore in the
-    database backup, which is what makes deleting the only recording of them
-    tolerable.
+    Two rules, and they answer two different questions (see
+    ``inbox_db.prunable_audio``):
+
+    * **"we no longer need it"** — all three of: the transcript is
+      Whisper-quality, Graham has reviewed it, and it is past
+      ``INBOX_AUDIO_RETENTION_DAYS``. By then the words are in the database and
+      therefore in the database backup, which is what makes deleting the only
+      recording of them tolerable.
+    * **"we may no longer keep it"** — the PRIVACY CEILING at twice the
+      retention window, regardless of transcript status or review state. All
+      three conditions above are things that can simply never happen (Graham
+      never ticks Reviewed; Whisper failed; the Mac worker never ran), and
+      without this backstop a retention setting that reads like a maximum
+      behaves like a minimum and a recording of his voice is kept for ever.
 
     The reconciliation is the price of storing audio as files rather than BLOBs,
     and it runs in BOTH directions: a row pointing at a file that is gone has its
@@ -277,17 +331,20 @@ def prune_audio(settings, now: float | None = None) -> dict:
     shaped like ``db.prune``, whose correlated DELETE was measured at 113 s; these
     are bounded, indexed statements over a few hundred rows.
     """
-    import time as _time
-
     from . import inbox_db
 
     now = _time.time() if now is None else now
-    cutoff = inbox_db.to_iso(now - settings.inbox_audio_retention_days * 86400)
+    retention_s = settings.inbox_audio_retention_days * 86400
+    cutoff = inbox_db.to_iso(now - retention_s)
+    # The ceiling. Twice the convenience window: long enough that a note
+    # waiting on a slow review is not snatched away, short enough that "for
+    # ever" is off the table.
+    hard_cutoff = inbox_db.to_iso(now - AUDIO_CEILING_MULTIPLE * retention_s)
     audio_dir = settings.inbox_audio_dir
     pruned = cleared = 0
     conn = inbox_db.connect(settings.inbox_db_path)
     try:
-        for row in inbox_db.prunable_audio(conn, cutoff):
+        for row in inbox_db.prunable_audio(conn, cutoff, hard_cutoff):
             delete(audio_dir, row["audio_path"])
             with conn:
                 inbox_db.mark_audio_pruned(conn, row["id"])
@@ -300,8 +357,9 @@ def prune_audio(settings, now: float | None = None) -> dict:
         known = inbox_db.known_audio_paths(conn)
     finally:
         conn.close()
-    orphans = sweep_orphans(audio_dir, known)
-    return {"pruned": pruned, "cleared": cleared, "orphans": len(orphans)}
+    orphans = sweep_orphans(audio_dir, known, now)
+    return {"pruned": pruned, "cleared": cleared, "orphans": len(orphans),
+            "tree_bytes": tree_bytes(audio_dir)}
 
 
 def tree_bytes(audio_dir: str) -> int:

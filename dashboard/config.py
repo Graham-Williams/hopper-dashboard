@@ -162,14 +162,24 @@ class Settings:
     # still works. Deliberately NOT a `${VAR:?}` in compose — the board booting
     # matters more than the Inbox booting.
     inbox_token: str = ""
-    # Per-upload cap for one voice note. 8 MB is ~40 minutes of 30 kbps Opus and
-    # comfortable against the container's 64 MB tmpfs /tmp, which multipart
-    # spools to above `max_form_memory_size`. Applied PER REQUEST on the create
-    # route only (`request.max_content_length`); the global 64 KB body cap that
-    # protects every other route is never raised.
-    inbox_audio_max_bytes: int = 8 * 1024 * 1024
-    # Audio is deleted only once its transcript is Whisper-quality AND the item
-    # has been reviewed AND it is older than this — see inbox_db.prunable_audio.
+    # Per-upload cap for one voice note. 2 MB is roughly ten minutes of Opus,
+    # which is far more than a spoken bug report and an order of magnitude less
+    # than the 8 MB this used to allow — the cap multiplies by the create
+    # limiter (30 per 15 min per IP) into how much disk one address can spend.
+    # Applied PER REQUEST on the create route only
+    # (`request.max_content_length`); the global 64 KB body cap that protects
+    # every other route is never raised.
+    inbox_audio_max_bytes: int = 2 * 1024 * 1024
+    # AGGREGATE cap on the whole audio tree, checked before each upload. The
+    # per-note cap alone bounds nothing over time: 30 notes / 15 min / IP at the
+    # per-note limit is still gigabytes a day, and `box-disk` only notices once
+    # the damage is done. 3 GB is years of real use — a 30 s note is ~60 KB.
+    inbox_audio_max_total_bytes: int = 3 * 1024 ** 3
+    # Audio is deleted once its transcript is Whisper-quality AND the item has
+    # been reviewed AND it is older than this — and UNCONDITIONALLY at twice
+    # this age, whatever its state. See inbox_db.prunable_audio: the second rule
+    # is the privacy ceiling, and without it this setting reads like a maximum
+    # and behaves like a minimum.
     inbox_audio_retention_days: int = 90
     # `owner/repo` list for the unauthenticated GitHub issue mirror. App config,
     # not per-job data, so it lives in .env rather than the gitignored jobs.yml.
@@ -260,7 +270,9 @@ class Settings:
             trusted_proxy_cidrs=_env_cidrs("TRUSTED_PROXY_CIDR"),
             inbox_token=os.environ.get("INBOX_TOKEN", ""),
             inbox_audio_max_bytes=_env_int("INBOX_AUDIO_MAX_BYTES",
-                                           8 * 1024 * 1024),
+                                           2 * 1024 * 1024),
+            inbox_audio_max_total_bytes=_env_int("INBOX_AUDIO_MAX_TOTAL_BYTES",
+                                                 3 * 1024 ** 3),
             inbox_audio_retention_days=_env_int("INBOX_AUDIO_RETENTION_DAYS", 90),
             inbox_github_repos=_env_github_repos("INBOX_GITHUB_REPOS"),
             inbox_github_token=_env_github_token("INBOX_GITHUB_TOKEN"),

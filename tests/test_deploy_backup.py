@@ -201,3 +201,54 @@ def test_an_unreadable_previous_snapshot_does_not_block_the_backup(tmp_path):
     prev = tmp_path / "prev.db"
     prev.write_bytes(b"corrupt")
     assert _verify(_db(tmp_path / "new.db", 0), str(prev)) == 0
+
+
+# --- the Mac transcription agent --------------------------------------------------
+MAC = os.path.join(REPO, "deploy", "mac")
+
+
+def _mac(*parts):
+    with open(os.path.join(MAC, *parts), encoding="utf-8") as fh:
+        return fh.read()
+
+
+def test_the_transcribe_agent_injects_path_for_ffmpeg():
+    """THE trap. mlx-whisper's load_audio shells out to a BARE `ffmpeg` resolved from PATH,
+    and launchd's PATH is /usr/bin:/bin:/usr/sbin:/sbin — no /opt/homebrew/bin. Without this
+    line every transcription fails deep inside load_audio looking like a corrupt recording,
+    and only under launchd: run the same command in a shell and it works."""
+    plist = _mac("com.hopper.inbox-transcribe.plist")
+    assert "<key>PATH</key>" in plist
+    assert "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" in plist
+    # install.sh refuses to install a plist that has lost it.
+    assert "/opt/homebrew/bin" in _mac("install.sh")
+
+
+def test_the_transcribe_agent_runs_often_enough_to_be_the_only_path_to_text():
+    """5 minutes, not the probe's hour: this worker is the ONLY thing that turns a recording
+    into readable text, so its interval IS how long Graham waits to read back what he said."""
+    plist = _mac("com.hopper.inbox-transcribe.plist")
+    interval = re.search(r"<key>StartInterval</key>\s*<integer>(\d+)</integer>", plist)
+    assert interval and int(interval.group(1)) == 300
+    assert "<key>RunAtLoad</key>" in plist and "<key>LowPriorityIO</key>" in plist
+    # The stock interpreter, with mlx reached by subprocess — probes/ stays stdlib-only.
+    assert "/usr/bin/python3" in plist
+    assert "probes/inbox_transcribe.py" in plist
+
+
+def test_the_mac_templates_are_rendered_and_never_take_a_token_on_the_cli():
+    install = _mac("install.sh")
+    for plist in ("com.hopper.dashboard-probe.plist", "com.hopper.inbox-transcribe.plist"):
+        for ph in set(re.findall(r"@@[A-Z_]+@@", _mac(plist))):
+            assert "s|%s|" % ph in install, "%s: install.sh never renders %s" % (plist, ph)
+    # A token on the command line lands in shell history and in `ps`. Both are refused, and
+    # both are prompted for with a hidden read instead.
+    assert "--token|--inbox-token)" in install
+    assert install.count("read -r -s -p") >= 2
+
+
+def test_the_mac_uninstaller_knows_about_both_agents():
+    uninstall = _mac("uninstall.sh")
+    assert "com.hopper.dashboard-probe" in uninstall
+    assert "com.hopper.inbox-transcribe" in uninstall
+    assert "--inbox-only" in uninstall

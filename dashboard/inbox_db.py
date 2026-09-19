@@ -612,24 +612,68 @@ def mark_issues_closed(conn: sqlite3.Connection, repo: str,
 # Audio lifecycle
 # --------------------------------------------------------------------------- #
 
-def prunable_audio(conn: sqlite3.Connection, cutoff_iso: str) -> list[dict]:
-    """Rows whose audio may be deleted. ALL THREE conditions, never two:
+def prunable_audio(conn: sqlite3.Connection, cutoff_iso: str,
+                   hard_cutoff_iso: str | None = None) -> list[dict]:
+    """Rows whose audio may be deleted. TWO independent rules, OR'd together.
+
+    **The convenience prune** needs all three of:
 
     1. ``transcript_status = 'whisper'`` — the text is as good as it will get,
     2. ``reviewed = 1`` — Graham has read it and confirmed the transcript,
-    3. older than the retention cutoff.
+    3. older than ``cutoff_iso``.
 
     Together they mean the words are safely in the DB (and so in the DB backup)
-    before the only recording of them is destroyed.
+    before the only recording of them is destroyed. That is the right rule for
+    "delete it once we no longer need it".
+
+    **The privacy ceiling** (``hard_cutoff_iso``) needs only age, and overrides
+    every one of the three above. It exists because those three conditions are
+    all things that can simply never happen: Graham never ticks Reviewed,
+    Whisper failed (``failed`` is deliberately outside
+    :data:`PRUNABLE_TRANSCRIPT_STATUSES`), or the Mac worker never ran. Without
+    a backstop, ``INBOX_AUDIO_RETENTION_DAYS`` reads like a maximum and behaves
+    like a minimum, and a recording of Graham's voice is kept for ever by
+    default. Past this date the audio goes, transcript or no transcript — the
+    row keeps its metadata and its ``audio_pruned_at`` stamp, so the board says
+    honestly that there WAS a recording and it is gone.
+
+    ``hard_cutoff_iso=None`` disables the ceiling; callers in the app always
+    pass one (see ``inbox_audio.prune_audio``).
     """
     placeholders = ",".join("?" * len(PRUNABLE_TRANSCRIPT_STATUSES))
+    soft = (f"(transcript_status IN ({placeholders})"
+            f" AND reviewed = 1 AND created_at < ?)")
+    args: list[Any] = [*PRUNABLE_TRANSCRIPT_STATUSES, cutoff_iso]
+    rule = soft
+    if hard_cutoff_iso is not None:
+        rule = f"({soft} OR created_at < ?)"
+        args.append(hard_cutoff_iso)
     return _rows(conn.execute(
         f"SELECT id, audio_path FROM inbox_items"
         f" WHERE audio_path IS NOT NULL AND audio_pruned_at IS NULL"
-        f"   AND transcript_status IN ({placeholders})"
-        f"   AND reviewed = 1 AND created_at < ?"
-        f" ORDER BY created_at LIMIT 500",
-        (*PRUNABLE_TRANSCRIPT_STATUSES, cutoff_iso)))
+        f"   AND {rule}"
+        f" ORDER BY created_at LIMIT 500", args))
+
+
+def delete_item(conn: sqlite3.Connection, item_id: str) -> dict | None:
+    """Delete one row outright, returning it (so the caller can delete its
+    audio file) or ``None`` if it was not there.
+
+    The ONLY destructive operation in this store, and it exists for one reason:
+    a voice note is a recording of Graham's voice, and "there is no way to
+    delete it" is not an acceptable answer for personal data. Everything else
+    here archives or closes.
+
+    ``inbox_issues`` goes with it via ``ON DELETE CASCADE`` (``connect`` sets
+    ``PRAGMA foreign_keys=ON``). The audio FILE is the caller's job — and if
+    that half fails, the scheduler's orphan sweep collects it, which is what
+    makes this ordering safe.
+    """
+    row = get_item(conn, item_id)
+    if row is None:
+        return None
+    conn.execute("DELETE FROM inbox_items WHERE id=?", (item_id,))
+    return row
 
 
 def mark_audio_pruned(conn: sqlite3.Connection, item_id: str,

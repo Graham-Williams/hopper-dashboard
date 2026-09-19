@@ -220,8 +220,14 @@ def test_the_prune_needs_all_three_conditions(core, settings):
     """All three, never two: the transcript is Whisper-quality, Graham has
     reviewed it, and it is past the retention window. Only then are the words
     safely in the DB (and so in the DB backup) before the only recording of
-    them is destroyed."""
-    old, new = "2020-01-01T00:00:00Z", inbox_db.to_iso(NOW)
+    them is destroyed.
+
+    Every age here sits BETWEEN the retention window and the privacy ceiling,
+    so this test measures the convenience prune alone — the ceiling is the next
+    test and it deliberately overrides all three of these conditions."""
+    days = settings.inbox_audio_retention_days
+    old = inbox_db.to_iso(NOW - (days + 5) * 86400)
+    new = inbox_db.to_iso(NOW)
     conn = inbox_db.connect(settings.inbox_db_path)
     audio_dir = settings.inbox_audio_dir
     try:
@@ -240,6 +246,45 @@ def test_the_prune_needs_all_three_conditions(core, settings):
     assert inbox_audio.open_path(audio_dir, good) is None
     for path in (not_whisper, not_reviewed, too_new):
         assert inbox_audio.open_path(audio_dir, path) is not None
+
+
+def test_the_privacy_ceiling_deletes_old_audio_whatever_its_state(core, settings):
+    """INBOX_AUDIO_RETENTION_DAYS reads like a maximum. Without a backstop it
+    behaves like a MINIMUM, because all three convenience conditions are things
+    that can simply never happen: Graham never ticks Reviewed, Whisper failed
+    (`failed` is deliberately outside PRUNABLE_TRANSCRIPT_STATUSES), or the Mac
+    worker never ran. Each of those keeps a recording of his voice for ever.
+
+    Past twice the retention window the audio goes regardless — and the row
+    keeps its metadata plus an `audio_pruned_at` stamp, so the board says
+    honestly that there WAS a recording and it is gone."""
+    days = settings.inbox_audio_retention_days
+    ancient = inbox_db.to_iso(NOW - (2 * days + 5) * 86400)
+    conn = inbox_db.connect(settings.inbox_db_path)
+    audio_dir = settings.inbox_audio_dir
+    try:
+        never_reviewed = _note(conn, audio_dir, status="whisper", reviewed=False,
+                               created=ancient, item_id="a" * 32)
+        gave_up = _note(conn, audio_dir, status="failed", reviewed=False,
+                        created=ancient, item_id="b" * 32)
+        never_transcribed = _note(conn, audio_dir, status="pending",
+                                  reviewed=False, created=ancient,
+                                  item_id="c" * 32)
+    finally:
+        conn.close()
+    out = core.prune_inbox_audio(now=NOW)
+    assert out["pruned"] == 3
+    for path in (never_reviewed, gave_up, never_transcribed):
+        assert inbox_audio.open_path(audio_dir, path) is None
+    conn = inbox_db.connect(settings.inbox_db_path)
+    try:
+        row = inbox_db.get_item(conn, "b" * 32)
+    finally:
+        conn.close()
+    # Honest about what happened: no path, a prune stamp, and the size/duration
+    # metadata kept so the row does not look as if it never had audio.
+    assert row["audio_path"] is None and row["audio_pruned_at"]
+    assert row["audio_bytes"] and row["transcript_status"] == "failed"
 
 
 def test_the_reconcile_clears_a_dangling_audio_path(core, settings):
