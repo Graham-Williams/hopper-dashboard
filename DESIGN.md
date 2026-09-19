@@ -160,9 +160,157 @@ Outputs:
   board).
 - ntfy (a third party) receives only `job_id: FROM → TO` — never the free-text reason (container names,
   client notes, rclone stderr stay on the board).
+- **A voice note never reaches a third party at all.** The browser uploads audio to the box and does
+  nothing else with it: there is deliberately no in-browser speech recognition, because the Web Speech API
+  streams the microphone to Google's or Apple's servers to do the work — inherent to it, not a setting.
+  Transcription instead happens on Graham's own Mac, by mlx-whisper running locally. So the full path of a
+  recording is browser → the box → that Mac, all of them his. The audio is stored as files under
+  `/app/data/inbox/audio`, served only over `/inbox/audio/<id>` behind the session or `INBOX_TOKEN` gate
+  with `Cache-Control: private, no-store`, and backed up only to his own Drive.
+  The cost of that choice, stated so it is not mistaken for a bug: **a voice note has no transcript at all
+  until the Mac worker runs.** Every one is created `transcript_status='pending'` and shows as
+  "transcribing…" until then. Nothing is lost while the worker is down — the audio is kept and the next run
+  picks it up — but the Mac worker is the ONLY path from audio to text, which is why it runs every 5
+  minutes and has a job of its own (`inbox-transcribe`) on the board.
 - CSP: `default-src 'self'`, `script-src 'nonce-<per-request>'` allowing exactly one inline script (the
   timestamp localizer in `base.html`); no `'self'`/`'unsafe-inline'` for scripts, no CDN.
-- One writer: the container owns the SQLite file; everything external arrives via the ingest API.
+- **Write paths, stated precisely (amended by the Inbox release — the old one-line claim is no longer
+  true, and quietly leaving it would be worse than the change it hides).** It used to read *"one writer:
+  the container owns the SQLite file; everything external arrives via the ingest API."* What is true now:
+  - `dashboard.db` has **one request-path writer, the ingest role.** Both roles run its additive schema
+    migration at start-up under `BEGIN IMMEDIATE`; after that the READ role's request-path connections are
+    `PRAGMA query_only=ON`, so a stray write to `jobs`/`runs`/`probes`/`state_changes` from a read worker
+    raises `SQLITE_READONLY` at runtime instead of being merely discouraged by a comment. The invariant is
+    now ENFORCED, where before it was a convention.
+  - `inbox.db` is a **separate file with two in-container writers** — the read role (the browser creates,
+    ticks and edits rows) and the ingest role's scheduler (the GitHub mirror, the audio prune) — coordinated
+    by WAL + `busy_timeout`. Concurrency is a non-issue at this scale: a handful of sub-millisecond writes a
+    day against a 60 s ticker.
+  - Everything external still arrives via an API. Nothing outside the container writes either file.
+  The reason for the split rather than proxying the browser's writes to ingest: ingest is a SINGLE worker
+  that also owns the scheduler and its serial, up-to-240 s blocking rclone probes, every proxied request
+  would arrive from 127.0.0.1 and collapse ingest's peer-keyed rate limiter into one bucket for the world,
+  and it would add a 60 s-timeout hop to a write Graham is watching on his phone.
+
+## The Inbox (`/inbox`) — added 2026-09-19
+
+A voice-first work queue on the same app: Graham talks a bug or an idea into his phone, and `/inbox` is then
+the ONE place everything pending shows up — his own notes, every open GitHub issue across his ten public
+repos, and `~/personal-assistant/backlog.txt`. Filed rows stay, with their issue links and live open/closed
+state; "reviewed" is his green light for Hopper to act, not a done-marker.
+
+It rides this app rather than being a new one because the dashboard already had every piece: the password
+gate, the tunnel hostname, the ingest port, the scheduler, the CSP, and a board Graham already opens. What it
+did NOT have was a backup, and that is the change with the longest tail — see "Audio lifecycle" below.
+
+### Store: a SECOND SQLite file
+
+```sql
+inbox_items(id TEXT PK,                     -- uuid4 hex; opaque, appears in URLs
+  source, title, title_source, body, project, created_at, updated_at,
+  reviewed, reviewed_at, state, closed_at, archived_at,
+  transcript_status, transcript_at, transcribe_attempts,
+  audio_path, audio_bytes, audio_mime, audio_sha256, audio_secs, audio_pruned_at,
+  mirror_key, mirror_url, mirror_seen_at)
+inbox_issues(id INTEGER PK, item_id → inbox_items(id), repo, number, url, title,
+  state, linked_at, checked_at, closed_at)
+inbox_mirror_state(key PK, etag, last_sync_at, last_status, last_error,
+  rate_remaining, rate_reset_at, backoff_until)
+```
+
+Two unique indexes carry most of the correctness:
+
+- `UNIQUE(mirror_key) WHERE mirror_key IS NOT NULL` — keys are `github:<owner>/<repo>#<n>` and
+  `backlog:<sha256 of the normalised What: line>[:16]`. It is the upsert key, so re-mirroring is idempotent.
+  **The backlog key is derived, because backlog.txt has no identifiers**: an entry is addressable only by its
+  `What:` text. Case and whitespace are normalised so a re-wrap does not orphan a row; any other edit IS a
+  different item, which archives the old row and creates a new one (honest and cheap for v1). That
+  derivation exists TWICE — `dashboard/inbox_db.normalise_backlog_key` and `probes/backlog.py`, because
+  `probes/` is stdlib-only and cannot import Flask — and `tests/test_backlog_mirror.py` imports both and
+  pins their agreement. Drift there is not cosmetic: it would archive every mirrored row on the next sync
+  and re-create it under a new key, losing its reviewed tick and its linked issues.
+- `UNIQUE(repo, number)` on `inbox_issues` — one GitHub issue belongs to exactly ONE row. This is what stops
+  the repo mirror cloning a voice note Hopper has already filed as an issue.
+
+`transcript_status` has **five** values, not two: `pending` (audio, nothing transcribed yet) · `whisper` ·
+`typed` · `failed` (Whisper gave up after 3 attempts) · `live` (legacy; no longer produced — see the privacy
+note under Security posture). Without `pending` and `failed` the board cannot tell "transcribing…" from
+"this will never transcribe", and the Mac worker has nothing to back off from.
+
+### Three credentials, and why it is three and not one
+
+| token | reaches | over | used by |
+|---|---|---|---|
+| `INGEST_TOKEN` | `POST /api/v1/ping/<job>` | Tailscale-only `:8081` | every heartbeat, incl. the Inbox's own jobs |
+| `READ_TOKEN` | `GET /api/v1/status`, `/api/v1/jobs/<id>` | the public host | Hopper's health watch. **Read-only, and it stays that way** |
+| `INBOX_TOKEN` | a fixed list of Inbox endpoints, nothing else | the public host | the Mac transcription worker + the backlog mirror |
+
+`READ_TOKEN` is explicitly REFUSED on the Inbox's mutating routes. It is the credential Hopper's watch
+carries around, and the moment it can write, a read credential has quietly become a write one. `INBOX_TOKEN`
+is scoped by endpoint name (`inbox.MACHINE_ENDPOINTS`, consulted by `web.auth_kind`) so it cannot become a
+second read token for the rest of the API either. Empty `INBOX_TOKEN` = fail closed, exactly like
+`INGEST_TOKEN`, and it is deliberately not a `${VAR:?}` in compose: the board booting matters more than the
+Inbox booting.
+
+Two consequences that surprise people:
+
+- **A session cookie OUTRANKS a bearer** in `auth_kind`, so a logged-in browser cannot call the
+  `INBOX_TOKEN`-only endpoints — they are not for humans. Testing one by pasting a URL into a browser tab
+  will always 401, and that is correct.
+- **The Origin/Referer CSRF pin exempts a bearer-authenticated call.** A bearer is not an ambient
+  credential, and `curl` sends neither header — without the exemption every Mac-worker POST would 403 on
+  prod (where `APP_HOST` is set) while passing every test (where it is not).
+
+### Audio lifecycle
+
+Audio is **files, never BLOBs**: `/app/data/inbox/audio/<yyyy>/<mm>/<id>.<ext>`, with the path built from the
+server-generated id only — the client's filename is never used. Blobs would make every backup snapshot
+byte-unique and defeat the sha256 dedupe the whole backup design rests on, and they would turn the read
+role's writes into long transactions. The price is that files need reconciliation rather than hope, so the
+scheduler sweeps for both directions of orphan: a row whose `audio_path` points at a file that is gone (the
+path is cleared; the row keeps its transcript and simply shows no player), and a file no row references.
+
+Deletion needs **all three** of: the transcript is `whisper`-quality, the item has been reviewed, and it is
+older than `INBOX_AUDIO_RETENTION_DAYS` (90). By the time all three hold, the text has been in the DB backup
+for months and the recording is no longer the only copy of the thought — which is what makes pruning
+tolerable at all.
+
+**Backup.** This is the part with the longest tail. Before the Inbox, this app's data was entirely
+re-derivable and it had no off-box backup — verified on the box: only `km-backup.timer` and
+`todoist-points-backup.timer` existed. `inbox.db` and the audio tree changed that, so
+`deploy/box/backup.sh` + `hopper-dashboard-backup.{service,timer}` now snapshot BOTH DBs from inside the
+container (the WAL sidecars are owned by uid 10001; a host-side online backup fails "attempt to write a
+readonly database") and push to Drive with **`rclone copy`, never `sync`** — the audio tree in two hops,
+both additive, so the 90-day prune above cannot propagate a deletion off-box even if it has a bug. Details
+and the restore procedure in DEPLOY.md §2b.
+
+### What the Inbox adds to the board
+
+Four jobs, all with a 24 h alert threshold because none of them is urgent and all of them fail INVISIBLY:
+
+- `inbox-github-sync` (box, `kind: worker`) — the in-container mirror. A dead mirror is the failure that
+  looks fine: the board keeps rendering the issues it last saw.
+- `hopper-dashboard-backup` (box, `kind: db_snapshot`) — above.
+- `inbox-transcribe` (mac, `kind: worker`) — the only path from audio to text.
+- `inbox-backlog` (mac, `kind: worker`) — a sub-probe of the hourly Mac probe.
+
+`kind: worker` is a correctness decision, not a label. `services._machine_probe` returns the FIRST
+`kind: probe` job for a machine, so a second probe job on `mac` would make the machine-offline rule depend
+on the ORDER of `jobs.yml`, and the first one ever on `box` would silently switch sibling-LATE suppression
+on for every box job at once. `worker` carries no kind-specific state and flows through the generic
+scheduled precedence — never-pinged → LATE → FAIL → OK — which is exactly what "did this loop run?" means.
+
+**`inbox-backlog`'s failures are its own, never `mac-probe`'s.** It posts to the PUBLIC host while every
+heartbeat rides the Tailscale ingest port — two completely different failure surfaces. `mac-probe` means
+"the Mac is awake and probing", and the machine-offline rule mutes every other Mac job's LATE alert while it
+is LATE, so letting a Cloudflare 502 mark the Mac as failing would mute the very jobs that say the backups
+stopped. The sub-probe therefore never raises: a delivery or parse failure comes back as `inbox-backlog`'s
+own `fail` ping.
+
+**Both Mac Inbox jobs carry `grace_s: 50520`**, like every other Mac job — 14 h + 2 min, so their deadline
+can never land before `mac-probe`'s. The cost is that plain SILENCE from the transcription worker only reads
+as LATE after ~14 h. A worker that CRASHED is a different story and is red immediately, because it posts its
+own `fail`; the slow half only covers "launchd never ran it at all".
 
 ## Box facts (recon 2026-09-04, read-only)
 Ubuntu 24.04, Python 3.12, Docker 29 + Compose v5, host rclone 1.60 (old), curl present, no sqlite3 CLI.
@@ -559,8 +707,12 @@ on the phone with no resolution — which reads as "still broken" and is a silen
 
 **That 12/day is PER JOB**, which is worth spelling out because the incident being fixed was ~11 pushes/day
 from *one* job. Fleet-wide the ceiling is `3 × 86400 / cooldown_s` summed over the jobs that alert: on the
-shipped file, **70 pushes/day** across 9 alerting jobs — five sit at the 6 h floor and contribute 12 each, and
-the four with day-or-longer thresholds contribute 3 + 3 + 3 + 1. That is the arithmetic worst case, with every
+shipped file, **82 pushes/day** across 13 alerting jobs — five sit at the 6 h floor and contribute 12 each
+(60), and the eight with day-or-longer thresholds contribute 22 between them (3 each, except `mac-probe`'s
+72 h threshold at 1). The Inbox release moved that figure from 70/9: it added four alerting jobs
+(`inbox-github-sync`, `hopper-dashboard-backup`, `inbox-transcribe`, `inbox-backlog`), every one of them at
+a 24 h threshold and therefore 3/day, precisely because none of them is urgent enough to earn a sub-6 h
+threshold. That is the arithmetic worst case, with every
 job simultaneously past its bar, worsening and recovering round the clock for a whole day; it is a bound, not a
 forecast (the measured single-job figure above is 8/day). Asserted over the shipped file by
 `test_the_fleet_wide_push_ceiling_is_the_sum_over_the_alerting_jobs`, so adding a fast-threshold job moves the
@@ -637,8 +789,13 @@ muted LATE, the episode closes silently, and a fresh LATE 15 h later pages **the
 (`test_muted_late_time_can_still_bring_a_later_late_page_forward`). The condition is
 `alert_after_s > the job's own LATE onset` — `cadence_s + grace_s`, or `DISK_METRIC_MAX_AGE_S` for a gauge —
 because otherwise the earlier badness has aged out of the 2× window before a new episode can even begin. On
-the shipped file exactly one job is over that line (`drive-mirror`: 24 h against a 15 h onset); `pa-backup`
-(6 h against 38 h) and `mac-disk` (1 h against 48 h) are not, box jobs cannot be muted at all because
+the shipped file **three** jobs are over that line: `drive-mirror` (24 h against a 15 h onset) and, since
+the Inbox release, `inbox-transcribe` (24 h against 14.1 h) and `inbox-backlog` (24 h against 15 h — in fact
+numerically identical to `drive-mirror`). The two new ones widen this residual in `drive-mirror`'s exact
+shape, and deliberately: a Mac job's ~14 h grace is mandatory (below it a missed run cannot be told apart
+from a sleeping Mac), so the only way to stay under the line would be a threshold shorter than 14 h, which
+would double each job's share of the fleet push ceiling to buy urgency neither of them has. `pa-backup`
+(6 h against 38 h) and `mac-disk` (1 h against 48 h) are not over it, box jobs cannot be muted at all because
 `_machine_probe("box")` is `None`, and the four `manual` Mac jobs never page.
 `test_which_shipped_jobs_can_have_muted_time_brought_forward` pins that set, so a `jobs.yml` edit that adds
 another one fails loudly instead of quietly widening this. **It is not silence** — the job really is in that
@@ -670,11 +827,12 @@ the alert policy at parse time rather than being a second, overlapping concept.
 a scheduled job is already `cadence_s + grace_s` after its last good run — and for the long-grace Mac jobs the
 deadline is the bigger half. End to end: `km-backup`/`todoist-points-backup` **24.3 h**, `box-containers`
 **35 m**, `box-disk`/`mac-disk` **1 h** (capacity breach; 49 h for a gauge nothing feeds),
-`dashboard-probes` **6.3 h**, `mac-probe` **87 h**, `pa-backup` **44 h**, `drive-mirror` **39 h**. Every job
-in `jobs.example.yml` states its own figure on a `# TIME-TO-PAGE:` line, and
-`test_every_alerting_job_states_its_real_time_to_page` recomputes all nine from that same file — four of
-those comments used to describe the threshold as if it were the wait, wrong by between 15 minutes and
-38 hours.
+`dashboard-probes` **6.3 h**, `mac-probe` **87 h**, `pa-backup` **44 h**, `drive-mirror` **39 h**,
+`inbox-github-sync` **24.5 h**, `hopper-dashboard-backup` **24.3 h**, `inbox-transcribe` **38.1 h**,
+`inbox-backlog` **39 h**. Every job in `jobs.example.yml` states its own figure on a `# TIME-TO-PAGE:` line,
+and `test_every_alerting_job_states_its_real_time_to_page` recomputes all thirteen from that same file —
+four of those comments used to describe the threshold as if it were the wait, wrong by between 15 minutes
+and 38 hours.
 
 **Shipped thresholds** (`jobs.example.yml` carries the per-job rationale):
 
@@ -687,6 +845,7 @@ those comments used to describe the threshold as if it were the wait, wrong by b
 | `drive-mirror` | 86400 (24 h) | pending uploads clear themselves once the Mac is awake |
 | `mac-probe` | 259200 (72 h) | with its 15 h LATE deadline ≈ 87 h: a weekend with the lid shut pages nobody, a dead Mac pages once. **Never `alert: never`** — see below |
 | `box-disk`, `mac-disk` | 3600 (1 h) | the gauge already has a 48 h fuse of its own (`DISK_METRIC_MAX_AGE_S`), so a day on top would mean hearing about a dead gauge at 72 h; and a capacity threshold is a *level*, not a flap — an hour only rides out a reading hovering at the boundary |
+| `inbox-github-sync`, `hopper-dashboard-backup`, `inbox-transcribe`, `inbox-backlog` | 86400 (24 h) | the Inbox's four. None is urgent, and all four fail INVISIBLY — a dead mirror keeps rendering the issues it last saw, a dead transcription worker leaves every voice note reading "transcribing…", and an unmonitored backup is the exact thing this app exists to catch. A day is the right bar for each. They are the reason the fleet ceiling moved 70 → 82 |
 | `minecraft-offload`, `taste-twin-publish`, `jjho-refresh`, `baby-pool-sync` | `never` | on-demand; "behind" is information, not an incident |
 
 - `UNKNOWN → OK` (first sighting) is never alerted.
