@@ -540,3 +540,96 @@ def test_the_board_page_never_embeds_item_json(authed):
         inner = chunk.split(">", 1)[1].split("</script>", 1)[0]
         assert "spoken note" not in inner
         assert "items" not in inner or "querySelectorAll" in inner
+
+
+# --------------------------------------------------------------------------- #
+# The page itself (step 6)
+# --------------------------------------------------------------------------- #
+
+def _code(path: str) -> str:
+    """The file with its comments stripped: these assertions are about what the
+    code DOES, and a doc comment that says "never innerHTML" must not be able to
+    satisfy a test looking for the absence of innerHTML."""
+    import pathlib
+    import re as _re
+    text = pathlib.Path(path).read_text()
+    text = _re.sub(r"/\*.*?\*/", "", text, flags=_re.S)
+    return _re.sub(r"^\s*//.*$", "", text, flags=_re.M)
+
+
+def test_the_board_still_has_exactly_one_script_and_the_inbox_has_two(authed):
+    """`{% block scripts %}` is filled by inbox.html and NOTHING else. Two
+    existing tests assert the board has exactly one <script>, and the CSP has no
+    'self' in script-src — so anything that lands in that block must carry the
+    same per-request nonce as the inline localizer."""
+    import re
+    board = authed.get("/")
+    assert board.data.decode().count("<script") == 1
+    r = authed.get("/inbox")
+    html = r.data.decode()
+    nonce = re.search(r"script-src 'nonce-([A-Za-z0-9_-]{16,})'",
+                      r.headers["Content-Security-Policy"]).group(1)
+    assert html.count("<script") == 2
+    for tag in re.findall(r"<script[^>]*>", html):
+        assert f'nonce="{nonce}"' in tag, tag
+    assert 'src="/static/inbox.js"' in html
+    # The CSP itself is untouched: no 'self', no unsafe-inline, no blob:.
+    csp = r.headers["Content-Security-Policy"]
+    assert "script-src 'self'" not in csp and "'unsafe-inline'" not in csp
+    assert "blob:" not in csp and "media-src" not in csp
+
+
+def test_the_table_renders_every_row_with_js_off(authed, bot):
+    """The page must be usable with JavaScript disabled — the script only shows
+    and hides rows that are already here."""
+    ids = [post_note(authed, text=f"note number {n}").get_json()["id"]
+           for n in range(5)]
+    bot.post("/api/v1/inbox/mirror/backlog",
+             json={"complete": True,
+                   "items": [{"key": inbox_db.normalise_backlog_key("mirrored"),
+                              "text": "mirrored backlog entry"}]},
+             headers=machine())
+    html = authed.get("/inbox").data.decode()
+    for item in ids:
+        assert f'id="item-{item}"' in html
+    assert "mirrored backlog entry" in html
+    assert html.count('<li class="item') == 6
+    # ...and the filters are a plain GET form, so each one is a real URL.
+    assert 'method="get"' in html
+    filtered = authed.get("/inbox?q=number+3").data.decode()
+    assert filtered.count('<li class="item') == 1
+
+
+def test_the_page_never_plays_audio_from_a_blob_url(authed):
+    """A blob: preview would need `media-src blob:` in the CSP. Playback comes
+    from /inbox/audio/<id> instead, which costs one round trip and leaves
+    `default-src 'self'` exactly as it is."""
+    authed.post("/api/v1/inbox/items",
+                data={"text": "", "audio": (io_bytes(WEBM), "n", "audio/webm")},
+                content_type="multipart/form-data",
+                headers={"Accept": "application/json"})
+    html = authed.get("/inbox").data.decode()
+    assert "/inbox/audio/" in html
+    assert "blob:" not in html
+    js = _code("dashboard/static/inbox.js")
+    assert "createObjectURL" not in js
+    # ...and it never builds markup from a string.
+    assert "innerHTML" not in js and "insertAdjacentHTML" not in js
+    assert "document.write" not in js
+
+
+def test_the_page_keeps_mobile_input_sizes_and_tap_targets():
+    """iOS Safari auto-zooms the viewport when a focused input is under 16px,
+    which throws the page sideways mid-sentence. Load-bearing, not cosmetic."""
+    block = _code("dashboard/static/app.css").split("inbox", 1)[1]
+    assert "font-size: 16px" in block
+    assert "min-height: 44px" in block
+    # Rows stack on a phone and go inline at 640px, never one cramped line.
+    assert "@media (min-width: 640px)" in block
+    assert "flex-direction: column" in block
+    assert "overflow-wrap: anywhere" in block
+    assert "truncate" not in block and "text-overflow: ellipsis" not in block
+
+
+def test_the_inbox_is_reachable_from_the_board_nav(authed):
+    assert 'href="/inbox"' in authed.get("/").data.decode()

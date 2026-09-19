@@ -176,3 +176,11 @@
   </ul>
 </section>
 {% endblock %}
+
+{# The ONLY page that fills this block. It carries the same per-request nonce as
+   base.html's inline localizer — `script-src 'nonce-…'` has no 'self', so an
+   external file without it would silently not run. The board keeps exactly one
+   <script>; this page has two, both nonce'd. #}
+{% block scripts %}
+<script nonce="{{ csp_nonce() }}" src="{{ url_for('static', filename='inbox.js') }}" defer></script>
+{% endblock %}
