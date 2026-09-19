@@ -92,18 +92,71 @@ def test_the_inbox_token_is_scoped_to_the_machine_endpoints(bot, authed):
                       headers=machine()).status_code == 401
 
 
-def test_an_empty_inbox_token_fails_closed(settings, registry, notifier):
+#: Every endpoint INBOX_TOKEN can authenticate, as (endpoint, method, path,
+#: body-kwargs). Kept in step with `inbox.MACHINE_ENDPOINTS` by
+#: `test_the_machine_endpoint_list_is_covered_here`, so adding a machine route
+#: without a fail-closed case fails the suite rather than shipping unguarded.
+MACHINE_CALLS = [
+    ("inbox.audio", "get", "/inbox/audio/{item}", {}),
+    ("inbox.transcribe_queue", "get", "/api/v1/inbox/transcribe/queue", {}),
+    ("inbox.post_transcript", "post", "/api/v1/inbox/items/{item}/transcript",
+     {"json": {"text": "hello", "engine": "whisper"}}),
+    ("inbox.post_issues", "post", "/api/v1/inbox/items/{item}/issues",
+     {"json": {"repo": "a/b", "number": 1,
+               "url": "https://github.com/a/b/issues/1"}}),
+    ("inbox.mirror_backlog", "post", "/api/v1/inbox/mirror/backlog",
+     {"json": {"complete": True, "items": [{"text": "a thing"}]}}),
+]
+
+
+def test_the_machine_endpoint_list_is_covered_here():
+    from dashboard.inbox import MACHINE_ENDPOINTS
+    assert {c[0] for c in MACHINE_CALLS} == set(MACHINE_ENDPOINTS)
+
+
+@pytest.mark.parametrize("endpoint,method,path,body",
+                         MACHINE_CALLS,
+                         ids=[c[0] for c in MACHINE_CALLS])
+@pytest.mark.parametrize("headers", [{}, {"Authorization": "Bearer "},
+                                     {"Authorization": "Bearer x"}],
+                         ids=["none", "empty", "wrong"])
+def test_an_empty_inbox_token_fails_closed(settings, registry, notifier,
+                                           endpoint, method, path, body,
+                                           headers):
     """Same rule INGEST_TOKEN follows: un-provisioned means every machine call
-    is 401, never that every machine call is allowed."""
+    is refused, never that every machine call is allowed.
+
+    Over ALL FIVE machine endpoints, not just the queue. "Un-provisioned fails
+    closed" is a property of the credential, so testing one route proved
+    nothing about the other four — and one of those four accepts audio, another
+    rewrites transcripts and a third can archive the entire backlog mirror.
+    """
+    from dashboard import create_app
+    settings.inbox_token = ""
+    app = create_app("read", settings, registry, notifier)
+    # A row with audio, made through the browser side, so the audio route has
+    # something real to refuse.
+    browser = app.test_client()
+    browser.post("/login", data={"password": PASSWORD})
+    item = _voice_note(browser)["id"]
+
+    bare = app.test_client()            # no session: the Mac worker's shape
+    r = getattr(bare, method)(path.format(item=item), headers=headers,
+                              **body)
+    # 401 for the JSON API. /inbox/audio/<id> is not under /api/v1/, so the
+    # password gate redirects it to the login page instead — different status,
+    # same outcome, and the bytes are what actually matter.
+    assert r.status_code in (401, 302), (endpoint, r.status_code)
+    assert WEBM[:4] not in r.get_data()
+
+
+def test_the_browser_side_works_with_no_inbox_token(settings, registry, notifier):
+    """Why INBOX_TOKEN is not a `${VAR:?}` in compose: the board booting
+    matters more than the Inbox booting."""
     from dashboard import create_app
     settings.inbox_token = ""
     client = create_app("read", settings, registry, notifier).test_client()
     client.post("/login", data={"password": PASSWORD})
-    for headers in ({}, {"Authorization": "Bearer "}, {"Authorization": "Bearer x"}):
-        assert client.get("/api/v1/inbox/transcribe/queue",
-                          headers=headers).status_code == 401
-    # ...and the browser side still works, which is why INBOX_TOKEN is not a
-    # `${VAR:?}` in compose: the board booting matters more than the Inbox does.
     assert client.get("/inbox").status_code == 200
 
 
@@ -152,6 +205,72 @@ def test_the_origin_pin_now_covers_patch(settings, registry, notifier):
     ok = client.patch(f"/api/v1/inbox/items/{item}", json={"reviewed": True},
                       base_url=base, headers={"Origin": base})
     assert ok.status_code == 200 and ok.get_json()["reviewed"] is True
+
+
+def test_a_session_plus_a_machine_token_is_still_csrf_pinned(
+        settings, registry, notifier):
+    """THE test this whole exemption rests on.
+
+    `_host_origin_pin` skips the Origin/Referer check when `auth_kind()` says
+    "inbox", and that is sound for exactly one reason: a bearer token is not an
+    ambient credential, so a cross-site form post cannot present one. But a
+    SESSION cookie is ambient, and the browser attaches it to a cross-site
+    request whether or not the page wanted it to.
+
+    So the exemption is only safe while `auth_kind()` resolves the session
+    FIRST — before the machine token — because a request carrying both is a
+    browser request and must be pinned. Nothing in the code pins that ordering;
+    swapping those two `if`s in web.auth_kind turns the exemption into a live
+    CSRF bypass, and every other test in this suite would still pass. This is
+    that pin.
+
+    The scenario is not theoretical: INBOX_TOKEN is a value Graham could
+    plausibly have in a browser extension, a bookmarklet or a devtools snippet
+    while logged in to the board.
+    """
+    app = _pinned_app(settings, registry, notifier)
+    client = _pinned_client(settings, registry, notifier, app)
+    base = "https://dash.example.com"
+    created = client.post("/api/v1/inbox/items", data={"text": "pin me"},
+                          content_type="multipart/form-data", base_url=base,
+                          headers={"Origin": base, "Accept": "application/json"})
+    item = created.get_json()["id"]
+
+    hostile = {"Origin": "https://evil.example", **machine()}
+    # A browser route: the session is what authenticates it, so the pin applies.
+    assert client.patch(f"/api/v1/inbox/items/{item}", json={"reviewed": True},
+                        base_url=base, headers=hostile).status_code == 403
+    assert client.delete(f"/api/v1/inbox/items/{item}", base_url=base,
+                         headers=hostile).status_code == 403
+    assert client.post("/api/v1/inbox/items", data={"text": "x"},
+                       content_type="multipart/form-data", base_url=base,
+                       headers=hostile).status_code == 403
+    # A MACHINE route reached with a session cookie attached is still a browser
+    # request, and is still pinned. The exemption may not be bought by adding a
+    # valid token to a cross-site post.
+    assert client.post(f"/api/v1/inbox/items/{item}/issues",
+                       json={"repo": "a/b", "number": 4,
+                             "url": "https://github.com/a/b/issues/4"},
+                       base_url=base, headers=hostile).status_code == 403
+    # ...and none of it landed.
+    assert client.get(f"/api/v1/inbox/items", base_url=base,
+                      headers={"Accept": "application/json"}
+                      ).get_json()["items"][0]["reviewed"] is False
+
+
+def test_the_two_browser_write_routes_are_not_machine_endpoints(settings):
+    """A structural guard, not a behavioural one: if create/patch/delete ever
+    appear in MACHINE_ENDPOINTS, `auth_kind` can answer "inbox" for them and
+    the origin pin above skips itself — CSRF bypass by one line in a set
+    literal, with every behavioural test still green."""
+    from dashboard.inbox import MACHINE_ENDPOINTS
+    assert "inbox.create_item" not in MACHINE_ENDPOINTS
+    assert "inbox.patch_item" not in MACHINE_ENDPOINTS
+    assert "inbox.delete_item" not in MACHINE_ENDPOINTS
+    # The pin must also cover every method that can change something — it used
+    # to fire on POST alone.
+    from dashboard.web import MUTATING_METHODS
+    assert set(MUTATING_METHODS) >= {"POST", "PUT", "PATCH", "DELETE"}
 
 
 def test_a_machine_post_needs_no_origin(settings, registry, notifier):
