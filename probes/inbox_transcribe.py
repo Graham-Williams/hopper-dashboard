@@ -74,18 +74,23 @@ from probes.common import (  # noqa: E402
 #: Item ids are uuid4 hex and go straight into a URL path. Validated before interpolation.
 ITEM_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
-#: The server's own ceiling (``dashboard.inbox_db.MAX_TEXT``). A transcript longer than this
-#: is REJECTED, not truncated, server-side — and a rejection on the success path used to abort
-#: the whole run at this item for ever, because the queue is oldest-first. Truncating here
-#: makes an hour-long recording a lossy transcript instead of a wedged queue. Keep in step
-#: with the server; a mismatch only costs a few characters.
+#: The server's own ceiling (``dashboard.inbox_db.MAX_TEXT``). Truncating to it here is about
+#: the TRANSPORT, not that ceiling: ``clean_text`` truncates rather than rejects, so an
+#: over-long transcript would be silently clipped server-side anyway. The real wall is the
+#: app-wide ``MAX_CONTENT_LENGTH`` of 64 KB (``dashboard.Settings.max_body_bytes``), which
+#: rejects the whole request with a 413 — and a rejection on the success path wedges the
+#: queue at this item for ever, because it is oldest-first. 20 000 characters of ASCII is
+#: 20 KB, but 20 000 characters of non-Latin script is ~60 KB of UTF-8 and lands close to
+#: that wall, so keep this comfortably under it rather than raising it to match the server.
 MAX_TEXT = 20000
 
 #: A 401/403 is never one item's problem: the token is wrong, revoked, or pointed at the
 #: wrong host, and every remaining item would fail the same way — burning all their attempts
-#: and marking Graham's voice notes permanently failed. Matched on the message ``api_request``
-#: raises ("… rejected: HTTP 401 …"), which never contains the token itself.
-AUTH_FAILURE_RE = re.compile(r"HTTP (?:401|403)\b")
+#: and marking Graham's voice notes permanently failed. Read off ``ProbeError.status``, NOT
+#: off the message: the message embeds up to 200 bytes of the server's own response body, so
+#: a 500 whose body merely CONTAINS "HTTP 401" would abort the run and re-create the wedge
+#: this abort exists to prevent.
+AUTH_FAILURE_STATUSES = frozenset((401, 403))
 
 #: mime → suffix for the temp file. ffmpeg sniffs the content, but a correct extension keeps
 #: the failure mode honest and makes a stray temp file identifiable.
@@ -327,8 +332,12 @@ def suffix_for(mime: object) -> str:
 
 
 def is_auth_failure(err: object) -> bool:
-    """True for the one class of API error that is the RUN's problem, not the item's."""
-    return bool(AUTH_FAILURE_RE.search(str(err)))
+    """True for the one class of API error that is the RUN's problem, not the item's.
+
+    Structural, not textual: only a ProbeError that CARRIES a 401/403 status counts. An error
+    whose message happens to quote one does not.
+    """
+    return getattr(err, "status", None) in AUTH_FAILURE_STATUSES
 
 
 def report_failure(cfg: Dict[str, str], item_id: str, error: object, log: Logger) -> str:

@@ -1,6 +1,7 @@
 """Ping payload builder, env-file parsing, HTTP retry logic (mocked — no network)."""
 import os
 import sys
+import time
 import urllib.error
 
 import pytest
@@ -478,6 +479,76 @@ def test_a_trickling_response_hits_the_total_deadline(monkeypatch):
         common.api_request("http://h/audio", "tok", retries=0, max_bytes=10 ** 9,
                            read_deadline_s=0.01, sleep=lambda s: None)
     assert "deadline" in str(ei.value)
+
+
+class _Trickle:
+    """A body that behaves like a real ``HTTPResponse``: ``read(n)`` is BUFFERED and does not
+    come back until it has n bytes, while ``read1(n)`` returns whatever one underlying read
+    got. A server dripping one byte at a time is the whole attack."""
+
+    status = 200
+
+    def __init__(self, per_read=1, delay=0.01):
+        self.per_read = per_read
+        self.delay = delay
+        self.read_calls = 0
+        self.read1_calls = 0
+
+    def read(self, n=None):
+        self.read_calls += 1
+        n = n or 1
+        time.sleep(self.delay * (n / float(self.per_read)))   # fills the WHOLE buffer first
+        return b"x" * n
+
+    def read1(self, n=None):
+        self.read1_calls += 1
+        time.sleep(self.delay)
+        return b"x" * self.per_read
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_the_read_deadline_fires_on_a_dripping_body_not_only_between_full_chunks(monkeypatch):
+    """The bug this pins: ``_read_bounded`` checked the clock BETWEEN chunks, but
+    ``resp.read(65536)`` on a ``BufferedReader`` blocks until it has a FULL 64 KiB. Against
+    the exact attack the deadline exists for — a server sending one byte at a time — the loop
+    never came back round and the clock was never consulted. Measured: a 2 s deadline was
+    still reading after 25 s at 1 byte/s, and in production (``timeout=10`` → a 300 s
+    deadline) the first check would land about 6.8 days in, with launchd refusing to start a
+    second transcription agent for the whole of it. ``read1`` is the fix."""
+    body = _Trickle(per_read=1, delay=0.01)
+    monkeypatch.setattr(common._OPENER, "open", lambda req, timeout: body)
+    started = time.monotonic()
+    with pytest.raises(common.ProbeError) as ei:
+        common.api_request("http://h/audio", "tok", retries=0, max_bytes=10 ** 9,
+                           read_deadline_s=0.2, sleep=lambda s: None)
+    elapsed = time.monotonic() - started
+    assert "deadline" in str(ei.value)
+    assert elapsed < 5, "the deadline did not fire while the body was still dripping"
+    assert body.read1_calls > 0, "the buffered read() was used; a trickle can outlast it"
+    assert body.read_calls == 0
+
+
+def test_send_ping_bounds_its_response_the_way_api_request_does(monkeypatch):
+    """``send_ping`` used to read its body unbounded. The ingest port is on the tailnet and
+    answers with a line of JSON, but "it is ours" is not a reason to let a wrong host, a
+    captive portal or a runaway hand the probe an unbounded allocation."""
+    monkeypatch.setattr(common, "PING_RESPONSE_BYTES", 4096)
+    monkeypatch.setattr(common._OPENER, "open", lambda req, timeout: _SlowBody())
+    with pytest.raises(common.ProbeError) as ei:
+        common.send_ping("http://h", "tok", "job", {}, retries=0, sleep=lambda s: None)
+    assert "larger than 4096" in str(ei.value)
+
+
+def test_a_body_object_without_read1_still_works(monkeypatch):
+    """Not every response-like object implements ``read1``; falling back must not break."""
+    monkeypatch.setattr(common._OPENER, "open", lambda req, timeout: _Resp(b"{}"))
+    status, raw = common.api_request("http://h/x", "tok", retries=0, sleep=lambda s: None)
+    assert (status, raw) == (200, b"{}")
 
 
 def test_an_oversized_body_is_refused_before_it_is_buffered(monkeypatch):

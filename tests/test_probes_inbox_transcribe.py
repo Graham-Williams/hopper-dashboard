@@ -408,7 +408,9 @@ def test_a_401_is_the_runs_problem_and_stops_it_before_it_eats_every_attempt(
     class _Unauthorized(FakeApi):
         def api_request(self, url, token, method="GET", **kw):
             self.raw_calls.append((method, url))
-            raise ProbeError("GET %s rejected: HTTP 401 unauthorized" % url)
+            # Exactly the shape common.api_request raises: the message for a human, and the
+            # STATUS as structured data. The status is what is acted on.
+            raise ProbeError("GET %s rejected: HTTP 401 unauthorized" % url, status=401)
 
     api = _Unauthorized(_queue(ID_A, ID_B))
     sent = _wire(monkeypatch, api)
@@ -419,6 +421,46 @@ def test_a_401_is_the_runs_problem_and_stops_it_before_it_eats_every_attempt(
     assert rc == 1
     (_u, _t, _j, hb), = sent
     assert hb["status"] == "fail" and "401" in hb["note"]
+
+
+def test_a_server_error_that_merely_mentions_401_is_this_items_problem_not_the_runs(
+        tmp_path, monkeypatch):
+    """The abort used to be decided by a regex over the error MESSAGE — and that message
+    carries up to 200 bytes of the server's own response body. So a 500 whose body happened
+    to contain the characters "HTTP 401" (a proxy error page quoting an upstream, say) read
+    as a revoked token and aborted the whole run: the exact queue wedge the abort exists to
+    prevent, re-created by the abort itself. The status code is carried on the exception now,
+    so the text is no longer load-bearing."""
+    class _MisleadingBody(FakeApi):
+        def api_request(self, url, token, method="GET", **kw):
+            self.raw_calls.append((method, url))
+            raise ProbeError(
+                "GET %s rejected: HTTP 500 upstream said: HTTP 401 unauthorized" % url,
+                status=500)
+
+    api = _MisleadingBody(_queue(ID_A, ID_B))
+    sent = _wire(monkeypatch, api)
+    rc = it.main(["--env", _env(tmp_path), "--quiet"])
+
+    # Both items were attempted — the run did NOT abort at the first one...
+    assert len(api.raw_calls) == 2
+    # ...and each burned one of its own attempts, which is the correct per-item treatment.
+    assert sorted(i for i, _ in api.transcripts()) == sorted([ID_A, ID_B])
+    assert all(body.get("failed") for _, body in api.transcripts())
+    # ...and the run itself completed, reporting the per-item failures rather than aborting.
+    assert rc == 0
+    (_u, _t, _j, hb), = sent
+    assert hb["metrics"]["failed"] == 2
+
+
+def test_a_locally_raised_error_quoting_a_401_never_aborts_the_run(tmp_path, monkeypatch):
+    """The same trap from the other direction: an error this module raises itself carries no
+    status at all, so it can never be mistaken for an auth failure however it reads."""
+    assert it.is_auth_failure(ProbeError("whisper said: HTTP 401")) is False
+    assert it.is_auth_failure(ProbeError("nope", status=401)) is True
+    assert it.is_auth_failure(ProbeError("nope", status=403)) is True
+    assert it.is_auth_failure(ProbeError("nope", status=500)) is False
+    assert it.is_auth_failure(RuntimeError("HTTP 401")) is False
 
 
 def test_an_over_long_transcript_is_truncated_to_the_servers_limit(tmp_path, monkeypatch):

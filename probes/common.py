@@ -39,10 +39,24 @@ RCLONE_CANDIDATES = ("/opt/homebrew/bin/rclone", "/usr/local/bin/rclone")
 HTTP_TIMEOUT_S = 10
 HTTP_RETRIES = 2
 RCLONE_TIMEOUT_S = 120
+#: Cap on a heartbeat-ingest response body. The endpoint answers with a line of JSON; anything
+#: approaching this is a wrong host or a captive portal, not the dashboard.
+PING_RESPONSE_BYTES = 256 * 1024
 
 
 class ProbeError(Exception):
-    """A sub-probe failed in a way that should be reported, not crash the run."""
+    """A sub-probe failed in a way that should be reported, not crash the run.
+
+    ``status`` carries the HTTP status code when the failure WAS an HTTP status — so a caller
+    can ask "was this a 401?" without pattern-matching the message. That distinction is
+    load-bearing: the message embeds up to 200 bytes of the server's own response body, so a
+    500 whose body happens to contain the string "HTTP 401" would otherwise be read as an
+    auth failure and abort a whole run (see probes/inbox_transcribe.is_auth_failure).
+    """
+
+    def __init__(self, *args, **kwargs):
+        self.status = kwargs.pop("status", None)
+        super().__init__(*args, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -288,7 +302,13 @@ def send_ping(
         )
         try:
             with _OPENER.open(req, timeout=timeout) as resp:
-                return resp.status, resp.read().decode("utf-8", "replace")
+                # Bounded exactly like api_request's: the ingest port is on the tailnet and
+                # answers with a few dozen bytes of JSON, but "it is ours" is not a reason to
+                # let an unbounded read allocate without limit or hold the run for ever.
+                return resp.status, _read_bounded(
+                    resp, PING_RESPONSE_BYTES,
+                    max(30.0, float(timeout) * READ_DEADLINE_FACTOR),
+                ).decode("utf-8", "replace")
         except urllib.error.HTTPError as e:
             text = ""
             try:
@@ -298,7 +318,8 @@ def send_ping(
             if e.code == 429 or e.code >= 500:
                 last_err = "HTTP %d %s" % (e.code, text[:120])
             else:
-                raise ProbeError("ping %s rejected: HTTP %d %s" % (job_id, e.code, text[:200]))
+                raise ProbeError("ping %s rejected: HTTP %d %s" % (job_id, e.code, text[:200]),
+                                 status=e.code)
         except _RETRYABLE_TRANSPORT as e:  # includes socket.timeout and a malformed response
             last_err = "%s" % (getattr(e, "reason", e) or e.__class__.__name__,)
         if attempt < retries:
@@ -381,7 +402,7 @@ def api_request(
                 last_err = "HTTP %d %s" % (e.code, text[:120])
             else:
                 raise ProbeError("%s %s rejected: HTTP %d %s" % (
-                    method, _redact_url(url), e.code, text[:200]))
+                    method, _redact_url(url), e.code, text[:200]), status=e.code)
         except _RETRYABLE_TRANSPORT as e:
             last_err = "%s" % (getattr(e, "reason", e) or e.__class__.__name__,)
         if attempt < retries:
@@ -398,12 +419,23 @@ def _read_bounded(resp, max_bytes: int, deadline_s: float) -> bytes:
     under it holds the reader indefinitely. Reading in chunks lets the total elapsed time be
     checked, and a breach raises ``ProbeError`` (not an ``OSError``), so it is reported rather
     than retried — a server that is slow on purpose would be slow on the retry too.
+
+    ⚠️ ``read1``, NOT ``read``, and that is the whole point. ``HTTPResponse`` is a
+    ``BufferedIOBase``: ``resp.read(65536)`` blocks until it has a FULL 65536 bytes (or EOF),
+    so against the exact attack this deadline exists for — a server dripping one byte at a
+    time — the loop never comes back around and the clock is never consulted. Measured: with
+    ``read``, a 2 s deadline was still reading after 25 s at 1 byte/s, and in production
+    (``timeout=10`` → a 300 s deadline) the FIRST check would land ~6.8 days in, with launchd
+    refusing to start a second transcription agent the whole time. ``read1`` issues at most
+    one underlying recv and returns what it got, so every trickled byte re-checks the clock.
+    (``or resp.read`` keeps hand-rolled test doubles, which only implement ``read``, working.)
     """
     end = time.monotonic() + deadline_s
     chunks: List[bytes] = []
     total = 0
+    read = getattr(resp, "read1", None) or resp.read
     while True:
-        chunk = resp.read(_READ_CHUNK)
+        chunk = read(_READ_CHUNK)
         if not chunk:
             break
         total += len(chunk)
@@ -434,7 +466,7 @@ def api_json(
     status, raw = api_request(url, token, method=method, body=body, timeout=timeout,
                               retries=retries, sleep=sleep)
     if status in (404, 410):
-        raise ProbeError("%s %s: HTTP %d" % (method, _redact_url(url), status))
+        raise ProbeError("%s %s: HTTP %d" % (method, _redact_url(url), status), status=status)
     try:
         doc = json.loads(raw.decode("utf-8"))
     except (ValueError, UnicodeDecodeError) as e:
