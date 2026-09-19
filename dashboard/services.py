@@ -63,7 +63,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 
-from . import db, probes
+from . import db, inbox_db, probes
 from .config import Settings
 from .notify import HIGH_PRIORITY_STATES, Notifier
 from .registry import Job, Registry
@@ -407,6 +407,24 @@ class Core:
             db.ensure_jobs(conn, (j.id for j in self.registry))
         finally:
             conn.close()
+        self.init_inbox_store()
+
+    def init_inbox_store(self) -> None:
+        """Create/migrate ``inbox.db`` — a SEPARATE file (see inbox_db).
+
+        Run for BOTH roles and from every gunicorn worker, which is exactly why
+        ``init_inbox_schema`` migrates under BEGIN IMMEDIATE with a
+        duplicate-column-tolerant ALTER: the loser of that race must not kill a
+        worker and restart-loop the container.
+        """
+        conn = inbox_db.connect(self.settings.inbox_db_path)
+        try:
+            inbox_db.init_inbox_schema(conn)
+        finally:
+            conn.close()
+
+    def inbox_connect(self):
+        return inbox_db.connect(self.settings.inbox_db_path)
 
     @staticmethod
     def gather_facts(conn, job: Job, row: dict | None = None) -> Facts:
