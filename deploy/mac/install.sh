@@ -111,6 +111,15 @@ fi
 # --- 2. plists ------------------------------------------------------------------
 mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
 sed -e "s|@@REPO@@|$REPO|g" -e "s|@@HOME@@|$HOME|g" "$PLIST_SRC" > "$PLIST_DST.tmp"
+# ⚠️ plutil is NOT this check. A literal @@FOO@@ is a perfectly VALID plist string, so
+# `plutil -lint` passes and launchd only fails later, at exec — silently, every hour. That is
+# exactly how the box container heartbeat died on 2026-09-12. Same guard as deploy/box/install.sh.
+# (Written as if/then, not `grep -q && {...}`, so a NON-match cannot trip `set -e`.)
+if grep -q '@@' "$PLIST_DST.tmp"; then
+  echo "ERROR: unrendered placeholder in $PLIST_DST.tmp — launchd would fail at exec, not at load"
+  grep -o '@@[A-Z_]*@@' "$PLIST_DST.tmp" | sort -u
+  rm -f "$PLIST_DST.tmp"; exit 1
+fi
 /usr/bin/plutil -lint "$PLIST_DST.tmp" >/dev/null
 mv "$PLIST_DST.tmp" "$PLIST_DST"
 echo "installed $PLIST_DST"
@@ -118,6 +127,11 @@ echo "installed $PLIST_DST"
 if [[ -n "$WANT_INBOX" ]]; then
   INBOX_PLIST_DST="$HOME/Library/LaunchAgents/$INBOX_LABEL.plist"
   sed -e "s|@@REPO@@|$REPO|g" -e "s|@@HOME@@|$HOME|g" "$HERE/$INBOX_LABEL.plist" > "$INBOX_PLIST_DST.tmp"
+  if grep -q '@@' "$INBOX_PLIST_DST.tmp"; then           # see the note above: plutil misses this
+    echo "ERROR: unrendered placeholder in $INBOX_PLIST_DST.tmp — the agent would load and then fail at exec"
+    grep -o '@@[A-Z_]*@@' "$INBOX_PLIST_DST.tmp" | sort -u
+    rm -f "$INBOX_PLIST_DST.tmp"; exit 1
+  fi
   /usr/bin/plutil -lint "$INBOX_PLIST_DST.tmp" >/dev/null
   # The PATH injection is what makes mlx-whisper able to find ffmpeg under launchd. Without
   # it every transcription fails inside load_audio in a way that reads like bad audio.
