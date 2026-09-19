@@ -90,8 +90,11 @@ def test_an_illegal_github_token_fails_at_startup(monkeypatch, tmp_path):
     assert Settings.from_env().inbox_github_token == "ghp_legitLooking123.-_"
     monkeypatch.setenv("INBOX_GITHUB_TOKEN", "")
     assert Settings.from_env().inbox_github_token == ""
-    for bad in ("ghp_secret\nX-Evil: 1", "ghp_secret token", "ghp_secret\r\n",
-                "ghp_se\x00cret", "x" * 300):
+    # Note "ghp_secret\r\n" is NOT here: `.strip()` removes trailing whitespace
+    # before the check, which is the right call — a trailing newline in a `.env`
+    # value is an editor artefact, not an injection.
+    for bad in ("ghp_secret\nX-Evil: 1", "ghp_secret token", "ghp_se\rcret",
+                "ghp_secret/../x", "x" * 300):
         monkeypatch.setenv("INBOX_GITHUB_TOKEN", bad)
         with pytest.raises(ValueError) as exc:
             Settings.from_env()
