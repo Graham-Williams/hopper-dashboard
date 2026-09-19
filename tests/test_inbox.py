@@ -1,0 +1,542 @@
+"""The Inbox blueprint: auth per endpoint, the per-request body cap, the CSRF
+pin on PATCH, the limiters, and the fact that untrusted text never becomes
+markup."""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from dashboard import inbox_db
+from tests.conftest import PASSWORD, READ_TOKEN
+
+INBOX_TOKEN = "test-inbox-token"
+WEBM = b"\x1a\x45\xdf\xa3" + b"\x00" * 4096
+M4A = b"\x00\x00\x00\x20" + b"ftyp" + b"M4A " + b"\x00" * 4096
+
+
+@pytest.fixture
+def settings(settings):
+    settings.inbox_token = INBOX_TOKEN
+    return settings
+
+
+@pytest.fixture
+def bot(read_app):
+    """A client with NO session cookie — the shape the Mac worker's curl has.
+
+    It matters that this is a second client: `authed` logs the shared `read`
+    client in, and a request carrying a session is authenticated AS a session
+    (web.auth_kind resolves the session first), so the machine endpoints would
+    refuse it. Which is correct — they are not for humans — but it means a test
+    of the machine token cannot reuse the browser's client.
+    """
+    return read_app.test_client()
+
+
+def machine(token: str = INBOX_TOKEN) -> dict:
+    return {"Authorization": f"Bearer {token}"}
+
+
+def reader() -> dict:
+    return {"Authorization": f"Bearer {READ_TOKEN}"}
+
+
+def post_note(client, text="a spoken bug report", **extra):
+    data = {"text": text}
+    data.update(extra)
+    return client.post("/api/v1/inbox/items", data=data,
+                       content_type="multipart/form-data",
+                       headers={"Accept": "application/json"})
+
+
+# --------------------------------------------------------------------------- #
+# Auth
+# --------------------------------------------------------------------------- #
+
+def test_unauthenticated_api_gets_json_401_not_a_redirect(read):
+    r = read.get("/api/v1/inbox/items")
+    assert r.status_code == 401 and r.is_json
+    r = read.post("/api/v1/inbox/items", data={"text": "x"})
+    assert r.status_code == 401 and r.is_json
+    # The HTML board still redirects a signed-out browser to the login page.
+    r = read.get("/inbox")
+    assert r.status_code == 302 and "/login" in r.headers["Location"]
+
+
+def test_the_read_token_can_read_the_inbox_but_never_write_it(bot, authed):
+    """READ_TOKEN is the credential Hopper's watch carries. It must not become
+    a write credential just because the Inbox lives under /api/v1/."""
+    created = post_note(authed).get_json()
+    assert bot.get("/api/v1/inbox/items", headers=reader()).status_code == 200
+    denied = bot.post("/api/v1/inbox/items", data={"text": "written by a token"},
+                      content_type="multipart/form-data", headers=reader())
+    assert denied.status_code == 401
+    denied = bot.patch(f"/api/v1/inbox/items/{created['id']}",
+                       json={"reviewed": True}, headers=reader())
+    assert denied.status_code == 401
+
+
+def test_the_inbox_token_is_scoped_to_the_machine_endpoints(bot, authed):
+    """INBOX_TOKEN must not act as a second read token for the whole API."""
+    item = post_note(authed).get_json()["id"]
+    assert bot.get("/api/v1/inbox/transcribe/queue",
+                    headers=machine()).status_code == 200
+    assert bot.get("/api/v1/inbox/items", headers=machine()).status_code == 401
+    assert bot.get("/api/v1/status", headers=machine()).status_code == 401
+    assert bot.post("/api/v1/inbox/items", data={"text": "x"},
+                     content_type="multipart/form-data",
+                     headers=machine()).status_code == 401
+    assert bot.patch(f"/api/v1/inbox/items/{item}", json={"reviewed": True},
+                      headers=machine()).status_code == 401
+
+
+def test_an_empty_inbox_token_fails_closed(settings, registry, notifier):
+    """Same rule INGEST_TOKEN follows: un-provisioned means every machine call
+    is 401, never that every machine call is allowed."""
+    from dashboard import create_app
+    settings.inbox_token = ""
+    client = create_app("read", settings, registry, notifier).test_client()
+    client.post("/login", data={"password": PASSWORD})
+    for headers in ({}, {"Authorization": "Bearer "}, {"Authorization": "Bearer x"}):
+        assert client.get("/api/v1/inbox/transcribe/queue",
+                          headers=headers).status_code == 401
+    # ...and the browser side still works, which is why INBOX_TOKEN is not a
+    # `${VAR:?}` in compose: the board booting matters more than the Inbox does.
+    assert client.get("/inbox").status_code == 200
+
+
+def test_a_wrong_machine_token_is_401(bot):
+    assert bot.get("/api/v1/inbox/transcribe/queue",
+                    headers=machine("nope")).status_code == 401
+
+
+# --------------------------------------------------------------------------- #
+# CSRF pin
+# --------------------------------------------------------------------------- #
+
+def _pinned_app(settings, registry, notifier):
+    from dashboard import create_app
+    settings.app_host = "dash.example.com"
+    return create_app("read", settings, registry, notifier)
+
+
+def _pinned_client(settings, registry, notifier, app=None):
+    app = app or _pinned_app(settings, registry, notifier)
+    client = app.test_client()
+    client.post("/login", data={"password": PASSWORD},
+                base_url="https://dash.example.com",
+                headers={"Origin": "https://dash.example.com"})
+    return client
+
+
+def test_the_origin_pin_now_covers_patch(settings, registry, notifier):
+    """It used to fire on POST alone, so a PATCH route would have arrived with
+    no CSRF pin at all. Widened BEFORE the route existed, not after."""
+    client = _pinned_client(settings, registry, notifier)
+    base = "https://dash.example.com"
+    created = client.post("/api/v1/inbox/items", data={"text": "hello"},
+                          content_type="multipart/form-data", base_url=base,
+                          headers={"Origin": base, "Accept": "application/json"})
+    assert created.status_code == 201
+    item = created.get_json()["id"]
+    # No Origin, no Referer → refused.
+    assert client.patch(f"/api/v1/inbox/items/{item}", json={"reviewed": True},
+                        base_url=base).status_code == 403
+    # A foreign Origin → refused.
+    assert client.patch(f"/api/v1/inbox/items/{item}", json={"reviewed": True},
+                        base_url=base,
+                        headers={"Origin": "https://evil.example"}).status_code == 403
+    # The app's own Origin → allowed.
+    ok = client.patch(f"/api/v1/inbox/items/{item}", json={"reviewed": True},
+                      base_url=base, headers={"Origin": base})
+    assert ok.status_code == 200 and ok.get_json()["reviewed"] is True
+
+
+def test_a_machine_post_needs_no_origin(settings, registry, notifier):
+    """A bearer token is not an ambient credential — a cross-site form cannot
+    set an Authorization header — and the Mac worker's curl sends neither Origin
+    nor Referer. Requiring one would make the machine endpoints unreachable."""
+    app = _pinned_app(settings, registry, notifier)
+    client = _pinned_client(settings, registry, notifier, app)
+    base = "https://dash.example.com"
+    created = client.post("/api/v1/inbox/items", data={"text": "spoken"},
+                          content_type="multipart/form-data", base_url=base,
+                          headers={"Origin": base, "Accept": "application/json"})
+    item = created.get_json()["id"]
+    worker = app.test_client()          # no session, exactly like the Mac's curl
+    r = worker.post(f"/api/v1/inbox/items/{item}/issues",
+                    json={"repo": "a/b", "number": 3,
+                          "url": "https://github.com/a/b/issues/3"},
+                    base_url=base, headers=machine())
+    assert r.status_code == 201
+
+
+# --------------------------------------------------------------------------- #
+# Body size
+# --------------------------------------------------------------------------- #
+
+def test_audio_upload_is_capped_per_request_and_the_global_cap_is_untouched(
+        settings, read_app, ingest, authed, read):
+    """The create route lifts `request.max_content_length` for itself only. The
+    64 KB global cap protects every other route on BOTH roles and is never
+    raised — including /api/v1/ping, which is what a compromised heartbeat
+    sender would aim at."""
+    from dashboard import inbox as inbox_mod
+    assert read_app.config["MAX_CONTENT_LENGTH"] == 64 * 1024
+    # A 1 MB note sails through the create route...
+    big = b"\x1a\x45\xdf\xa3" + b"\x00" * (1024 * 1024)
+    r = authed.post("/api/v1/inbox/items",
+                    data={"text": "big one", "audio": (io_bytes(big), "x.webm",
+                                                       "audio/webm")},
+                    content_type="multipart/form-data",
+                    headers={"Accept": "application/json"})
+    assert r.status_code == 201, r.get_json()
+    # ...and one over the cap is 413 from the route, not a truncated write.
+    too_big = b"\x1a\x45\xdf\xa3" + b"\x00" * (settings.inbox_audio_max_bytes + 10)
+    r = authed.post("/api/v1/inbox/items",
+                    data={"text": "huge", "audio": (io_bytes(too_big), "x.webm",
+                                                    "audio/webm")},
+                    content_type="multipart/form-data",
+                    headers={"Accept": "application/json"})
+    assert r.status_code == 413
+    # The ingest ping is still 64 KB-capped.
+    from tests.conftest import auth
+    r = ingest.post("/api/v1/ping/snap", data=b"x" * (70 * 1024),
+                    content_type="application/json", headers=auth())
+    assert r.status_code == 413
+    # ...and so is every other read-side route.
+    r = read.post("/login", data={"password": "x" * (70 * 1024)})
+    assert r.status_code == 413
+    assert inbox_mod.MULTIPART_OVERHEAD == 64 * 1024
+
+
+def io_bytes(data: bytes):
+    import io
+    return io.BytesIO(data)
+
+
+def test_a_wrong_audio_type_is_415(authed):
+    r = authed.post("/api/v1/inbox/items",
+                    data={"text": "not audio",
+                          "audio": (io_bytes(b"%PDF-1.4" + b"\x00" * 300),
+                                    "x.pdf", "application/pdf")},
+                    content_type="multipart/form-data",
+                    headers={"Accept": "application/json"})
+    assert r.status_code == 415
+
+
+# --------------------------------------------------------------------------- #
+# Create / patch behaviour
+# --------------------------------------------------------------------------- #
+
+def test_typed_note_is_typed_and_never_queued_for_transcription(authed):
+    item = post_note(authed, text="Remember to bump the rclone client id").get_json()
+    assert item["source"] == "typed" and item["transcript_status"] == "typed"
+    assert item["has_audio"] is False and item["awaiting_transcription"] is False
+    assert item["title"] == "Remember to bump the rclone client id"
+
+
+@pytest.mark.parametrize("data,mime", [(WEBM, "audio/webm;codecs=opus"),
+                                       (M4A, "audio/mp4")])
+def test_a_voice_note_with_no_live_transcript_is_pending(authed, data, mime):
+    """iOS Safari emits mp4 and Chrome/Android webm — both land as `pending`
+    when speech recognition produced nothing, and Whisper fills them in."""
+    r = authed.post("/api/v1/inbox/items",
+                    data={"text": "", "audio": (io_bytes(data), "note", mime)},
+                    content_type="multipart/form-data",
+                    headers={"Accept": "application/json"})
+    item = r.get_json()
+    assert r.status_code == 201
+    assert item["source"] == "voice" and item["transcript_status"] == "pending"
+    assert item["has_audio"] and item["awaiting_transcription"] is True
+
+
+def test_a_voice_note_with_a_live_transcript_is_live(authed):
+    r = authed.post("/api/v1/inbox/items",
+                    data={"text": "the wheel spins twice", "audio_secs": "12.5",
+                          "audio": (io_bytes(WEBM), "note", "audio/webm")},
+                    content_type="multipart/form-data",
+                    headers={"Accept": "application/json"})
+    item = r.get_json()
+    assert item["transcript_status"] == "live" and item["audio_secs"] == 12.5
+
+
+def test_an_empty_submission_is_refused(authed):
+    r = post_note(authed, text="")
+    assert r.status_code == 400 and "empty" in r.get_json()["error"]
+
+
+def test_a_bad_project_is_refused(authed):
+    # Note the shape that is NOT rejected: `.` and `/` are legal in a project
+    # label (it is a label, never a path, and every query is parameterised).
+    assert post_note(authed, project="a/b.c-d_e").status_code == 201
+    for bad in ("a b", "drop table", "x" * 65, "kmtracker!"):
+        r = post_note(authed, project=bad)
+        assert r.status_code == 400 and "project" in r.get_json()["error"], bad
+
+
+def test_patch_validates_and_rejects_unknown_fields(authed):
+    item = post_note(authed).get_json()["id"]
+    assert authed.patch(f"/api/v1/inbox/items/{item}",
+                        json={"nope": 1}).status_code == 400
+    assert authed.patch(f"/api/v1/inbox/items/{item}",
+                        json={"reviewed": "yes"}).status_code == 400
+    assert authed.patch(f"/api/v1/inbox/items/{item}",
+                        json={"state": "deleted"}).status_code == 400
+    assert authed.patch(f"/api/v1/inbox/items/{item}",
+                        json={"title": "   "}).status_code == 400
+    assert authed.patch("/api/v1/inbox/items/" + "0" * 32,
+                        json={"reviewed": True}).status_code == 404
+    ok = authed.patch(f"/api/v1/inbox/items/{item}",
+                      json={"reviewed": True, "project": "km-tracker",
+                            "state": "closed"})
+    body = ok.get_json()
+    assert body["reviewed"] and body["project"] == "km-tracker"
+    assert body["state"] == "closed" and body["closed_at"]
+
+
+def test_a_form_post_without_js_redirects_back_to_the_board(authed):
+    """Capture has to work with JavaScript off; only the microphone needs it."""
+    r = authed.post("/api/v1/inbox/items", data={"text": "typed with no JS"},
+                    content_type="multipart/form-data",
+                    headers={"Accept": "text/html,application/xhtml+xml"})
+    assert r.status_code == 303 and r.headers["Location"].endswith("/inbox")
+
+
+# --------------------------------------------------------------------------- #
+# Rate limits
+# --------------------------------------------------------------------------- #
+
+def test_the_create_limiter_returns_429(authed, read_app):
+    read_app.extensions["inbox_create_limiter"].max_events = 3
+    for _ in range(3):
+        assert post_note(authed).status_code == 201
+    r = post_note(authed)
+    assert r.status_code == 429 and "try again" in r.get_json()["error"]
+
+
+def test_the_write_limiter_returns_429(authed, read_app):
+    item = post_note(authed).get_json()["id"]
+    read_app.extensions["inbox_write_limiter"].max_events = 2
+    for _ in range(2):
+        assert authed.patch(f"/api/v1/inbox/items/{item}",
+                            json={"reviewed": True}).status_code == 200
+    assert authed.patch(f"/api/v1/inbox/items/{item}",
+                        json={"reviewed": False}).status_code == 429
+
+
+# --------------------------------------------------------------------------- #
+# Audio serving
+# --------------------------------------------------------------------------- #
+
+def test_audio_is_served_with_no_store_and_nosniff(authed):
+    r = authed.post("/api/v1/inbox/items",
+                    data={"text": "", "audio": (io_bytes(WEBM), "n", "audio/webm")},
+                    content_type="multipart/form-data",
+                    headers={"Accept": "application/json"})
+    item = r.get_json()["id"]
+    got = authed.get(f"/inbox/audio/{item}")
+    assert got.status_code == 200 and got.data == WEBM
+    assert got.headers["Cache-Control"] == "private, no-store"
+    assert got.headers["X-Content-Type-Options"] == "nosniff"
+    assert got.headers["Content-Type"].startswith("audio/webm")
+    assert got.headers["Content-Disposition"].startswith("inline")
+
+
+def test_audio_is_404_then_410_after_a_prune(authed, settings, read_app):
+    from dashboard import inbox as inbox_mod
+    r = authed.post("/api/v1/inbox/items",
+                    data={"text": "", "audio": (io_bytes(WEBM), "n", "audio/webm")},
+                    content_type="multipart/form-data",
+                    headers={"Accept": "application/json"})
+    item = r.get_json()["id"]
+    assert authed.get("/inbox/audio/" + "0" * 32).status_code == 404
+    typed = post_note(authed).get_json()["id"]
+    assert authed.get(f"/inbox/audio/{typed}").status_code == 404
+    # Make it prunable: whisper transcript + reviewed + old enough.
+    conn = inbox_db.connect(settings.inbox_db_path)
+    with conn:
+        inbox_db.set_transcript(conn, item, text="the wheel spins twice")
+        inbox_db.update_item(conn, item, {"reviewed": True})
+        conn.execute("UPDATE inbox_items SET created_at='2020-01-01T00:00:00Z'"
+                     " WHERE id=?", (item,))
+    conn.close()
+    assert inbox_mod.prune_audio(settings)["pruned"] == 1
+    gone = authed.get(f"/inbox/audio/{item}")
+    assert gone.status_code == 410 and "pruned" in gone.get_json()["error"]
+
+
+def test_the_machine_token_can_fetch_audio_but_not_the_board(bot, authed):
+    r = authed.post("/api/v1/inbox/items",
+                    data={"text": "", "audio": (io_bytes(WEBM), "n", "audio/webm")},
+                    content_type="multipart/form-data",
+                    headers={"Accept": "application/json"})
+    item = r.get_json()["id"]
+    assert bot.get(f"/inbox/audio/{item}", headers=machine()).status_code == 200
+    assert bot.get("/inbox", headers=machine()).status_code == 302
+
+
+# --------------------------------------------------------------------------- #
+# Machine endpoints
+# --------------------------------------------------------------------------- #
+
+def test_the_transcript_endpoint_fills_a_pending_row(bot, authed):
+    r = authed.post("/api/v1/inbox/items",
+                    data={"text": "", "audio": (io_bytes(WEBM), "n", "audio/webm")},
+                    content_type="multipart/form-data",
+                    headers={"Accept": "application/json"})
+    item = r.get_json()["id"]
+    assert [i["id"] for i in bot.get("/api/v1/inbox/transcribe/queue",
+                                      headers=machine()).get_json()["items"]] == [item]
+    done = bot.post(f"/api/v1/inbox/items/{item}/transcript",
+                     json={"text": "The km wheel spins twice on iOS.",
+                           "engine": "whisper", "model": "large-v3-turbo",
+                           "duration_s": 9.5}, headers=machine())
+    body = done.get_json()
+    assert done.status_code == 200 and body["transcript_status"] == "whisper"
+    assert body["title"] == "The km wheel spins twice on iOS."
+    assert body["audio_secs"] == 9.5
+    assert bot.get("/api/v1/inbox/transcribe/queue",
+                    headers=machine()).get_json()["items"] == []
+
+
+def test_the_transcript_endpoint_records_a_failure_and_gives_up(bot, authed):
+    r = authed.post("/api/v1/inbox/items",
+                    data={"text": "", "audio": (io_bytes(WEBM), "n", "audio/webm")},
+                    content_type="multipart/form-data",
+                    headers={"Accept": "application/json"})
+    item = r.get_json()["id"]
+    for _ in range(3):
+        out = bot.post(f"/api/v1/inbox/items/{item}/transcript",
+                        json={"failed": True, "error": "ffmpeg could not decode"},
+                        headers=machine())
+        assert out.status_code == 200
+    assert out.get_json()["transcript_status"] == "failed"
+    assert bot.get("/api/v1/inbox/transcribe/queue",
+                    headers=machine()).get_json()["items"] == []
+    # The audio is still there — a failed transcript is not a reason to lose it.
+    assert authed.get(f"/inbox/audio/{item}").status_code == 200
+
+
+def test_the_transcript_endpoint_validates(bot, authed):
+    item = post_note(authed).get_json()["id"]
+    assert bot.post(f"/api/v1/inbox/items/{item}/transcript", json={},
+                     headers=machine()).status_code == 400
+    assert bot.post(f"/api/v1/inbox/items/{item}/transcript",
+                     json={"text": "x", "engine": "gpt"},
+                     headers=machine()).status_code == 400
+    assert bot.post("/api/v1/inbox/items/" + "0" * 32 + "/transcript",
+                    json={"text": "x"}, headers=machine()).status_code == 404
+
+
+def test_the_issues_endpoint_is_idempotent_and_validates_the_url(bot, authed):
+    item = post_note(authed).get_json()["id"]
+    good = {"repo": "Graham-Williams/km-tracker", "number": 95,
+            "url": "https://github.com/Graham-Williams/km-tracker/issues/95",
+            "title": "Wheel spins twice"}
+    first = bot.post(f"/api/v1/inbox/items/{item}/issues", json=good,
+                      headers=machine())
+    assert first.status_code == 201
+    again = bot.post(f"/api/v1/inbox/items/{item}/issues", json=good,
+                      headers=machine())
+    assert again.status_code == 201
+    assert len(again.get_json()["item"]["issues"]) == 1
+    # A javascript: href would survive Jinja's escaping and still navigate.
+    for bad_url in ("javascript:alert(1)", "http://github.com/a/b/issues/1",
+                    "https://evil.example/a/b", "https://github.com/a b"):
+        r = bot.post(f"/api/v1/inbox/items/{item}/issues",
+                      json={**good, "url": bad_url}, headers=machine())
+        assert r.status_code == 400, bad_url
+    for bad_repo in ("a", "a/b/c", "../x"):
+        r = bot.post(f"/api/v1/inbox/items/{item}/issues",
+                      json={**good, "repo": bad_repo}, headers=machine())
+        assert r.status_code == 400, bad_repo
+
+
+def test_filing_an_issue_clears_awaiting_filing(bot, authed):
+    item = post_note(authed).get_json()["id"]
+    authed.patch(f"/api/v1/inbox/items/{item}", json={"reviewed": True})
+    page = authed.get("/api/v1/inbox/items?awaiting=filing").get_json()
+    assert [i["id"] for i in page["items"]] == [item]
+    bot.post(f"/api/v1/inbox/items/{item}/issues",
+              json={"repo": "a/b", "number": 1,
+                    "url": "https://github.com/a/b/issues/1"}, headers=machine())
+    page = authed.get("/api/v1/inbox/items?awaiting=filing").get_json()
+    assert page["items"] == []
+
+
+def test_the_backlog_mirror_refuses_to_archive_on_an_empty_list(bot, authed):
+    payload = {"complete": True, "items": [
+        {"key": inbox_db.normalise_backlog_key("Build the thing"),
+         "text": "Build the thing\nWhy: because"},
+        {"key": inbox_db.normalise_backlog_key("Other thing"),
+         "text": "Other thing"}]}
+    r = bot.post("/api/v1/inbox/mirror/backlog", json=payload, headers=machine())
+    assert r.status_code == 200 and r.get_json() == {
+        "synced": 2, "archived": 0, "complete": True}
+    # An unreadable file and an emptied backlog look identical here.
+    r = bot.post("/api/v1/inbox/mirror/backlog",
+                  json={"complete": True, "items": []}, headers=machine())
+    assert r.status_code == 400 and "allow_empty" in r.get_json()["error"]
+    page = authed.get("/api/v1/inbox/items?source=backlog").get_json()
+    assert len(page["items"]) == 2
+    # One entry disappears from a COMPLETE sync → archived, never deleted.
+    r = bot.post("/api/v1/inbox/mirror/backlog",
+                  json={"complete": True, "items": [payload["items"][0]]},
+                  headers=machine())
+    assert r.get_json() == {"synced": 1, "archived": 1, "complete": True}
+    page = authed.get("/api/v1/inbox/items?source=backlog").get_json()
+    assert len(page["items"]) == 1
+    # A PARTIAL sync archives nothing.
+    r = bot.post("/api/v1/inbox/mirror/backlog",
+                  json={"complete": False, "items": [payload["items"][0]]},
+                  headers=machine())
+    assert r.get_json()["archived"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# Untrusted text
+# --------------------------------------------------------------------------- #
+
+def test_a_script_tag_in_a_transcript_is_escaped_in_html_and_json(bot, authed):
+    """A transcript is untrusted text from a browser speech API, and a GitHub
+    title is untrusted text from a stranger's repo. Neither may become markup,
+    an attribute, or a Jinja expression."""
+    nasty = '</script><img src=x onerror="alert(1)">{{ 7*7 }}'
+    item = post_note(authed, text=nasty).get_json()
+    assert item["title"].startswith("</script>")          # stored verbatim
+    html = authed.get("/inbox").data.decode()
+    # No tag of theirs survives, and no quote of theirs can close an attribute.
+    assert "<img" not in html
+    assert 'onerror="alert(1)"' not in html
+    assert "&lt;/script&gt;" in html and "&lt;img" in html
+    # The only </script> in the document is our own single inline script's.
+    assert html.count("</script>") == html.count("<script")
+    # Jinja renders, it does not re-evaluate: {{ 7*7 }} stays four characters.
+    body = html.split('<ul class="items"', 1)[1]
+    assert "{{ 7*7 }}" in body and "49" not in body
+    api = bot.get("/api/v1/inbox/items", headers=reader())
+    raw = api.data.decode()
+    # Flask 3 no longer HTML-escapes `</script>` inside a JSON body, so the
+    # sequence IS present here — and it is harmless for exactly one reason,
+    # which is a rule this feature must keep: the JSON is only ever served as
+    # `application/json` with nosniff and is NEVER embedded in a <script> tag.
+    # (`test_the_board_page_never_embeds_item_json` pins the other half.)
+    assert api.headers["Content-Type"].startswith("application/json")
+    assert api.headers["X-Content-Type-Options"] == "nosniff"
+    assert json.loads(raw)["items"][0]["title"] == item["title"]
+
+
+def test_the_board_page_never_embeds_item_json(authed):
+    """The other half of the rule above: no transcript ever reaches the page
+    inside a <script>. Rows are server-rendered; inbox.js only shows and hides
+    what is already in the DOM."""
+    post_note(authed, text="</script> a spoken note")
+    html = authed.get("/inbox").data.decode()
+    scripts = html.split("<script")[1:]
+    for chunk in scripts:
+        inner = chunk.split(">", 1)[1].split("</script>", 1)[0]
+        assert "spoken note" not in inner
+        assert "items" not in inner or "querySelectorAll" in inner

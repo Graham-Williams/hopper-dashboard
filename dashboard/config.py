@@ -20,7 +20,13 @@ MAX_FAIL_THRESHOLD = 10
 # that quietly syncs nothing for ever — the same rule registry.py applies to
 # jobs.yml. It also means nothing interpolated into a GitHub URL has ever been
 # unvalidated.
-GITHUB_REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
+# Each half must START with an alphanumeric, which is both GitHub's own rule and
+# the thing that matters here: `[\w.-]+/[\w.-]+` happily matches `../x`, and this
+# string is interpolated into an api.github.com path — a repo of `..` walks up
+# out of `/repos/` and asks GitHub for something else entirely. ASCII classes
+# rather than `\w`, which is unicode-aware and would admit homoglyphs.
+GITHUB_REPO_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 # A repo list long enough to blow the mirror's own cadence is a paste accident.
 MAX_GITHUB_REPOS = 50
 

@@ -38,6 +38,8 @@ _CSP_TEMPLATE = ("default-src 'self'; img-src 'self' data:; style-src 'self'; "
                  "script-src 'nonce-{nonce}'; object-src 'none'; base-uri 'self'; "
                  "form-action 'self'; frame-ancestors 'none'")
 GLOBAL_LOGIN_KEY = "*"
+#: Methods the Origin/Referer CSRF pin applies to.
+MUTATING_METHODS = ("POST", "PUT", "PATCH", "DELETE")
 
 
 def _settings():
@@ -59,22 +61,69 @@ def _gate_enabled() -> bool:
     return bool(_settings().app_password)
 
 
-def _bearer_ok() -> bool:
-    expected = _settings().read_token
+def _presented_bearer() -> str:
     header = request.headers.get("Authorization", "")
     scheme, _, token = header.partition(" ")
-    token = token.strip()
-    if scheme.lower() != "bearer" or not token or not expected:
+    return token.strip() if scheme.lower() == "bearer" else ""
+
+
+def _token_ok(expected: str) -> bool:
+    """Constant-time bearer compare. An empty expected token fails CLOSED —
+    the same rule INGEST_TOKEN follows, so an un-provisioned INBOX_TOKEN means
+    "every machine call is 401", never "every machine call is allowed"."""
+    supplied = _presented_bearer()
+    if not expected or not supplied:
+        # Burn a comparison anyway so timing does not distinguish the cases.
+        hmac.compare_digest(supplied or "x", expected or "y")
         return False
-    return hmac.compare_digest(token.encode(), expected.encode())
+    return hmac.compare_digest(supplied.encode(), expected.encode())
+
+
+def _bearer_ok() -> bool:
+    return _token_ok(_settings().read_token)
+
+
+def _machine_endpoints() -> frozenset:
+    """Endpoints the Inbox's MACHINE token may authenticate (registered by
+    ``create_app``). Scoped to an endpoint set, not a path prefix: INBOX_TOKEN
+    must never become a second read token for the whole API."""
+    return current_app.extensions.get("inbox_machine_endpoints", frozenset())
+
+
+def auth_kind() -> str:
+    """Which credential this request actually presented.
+
+    Three are distinguishable and the difference matters downstream: a session
+    cookie is AMBIENT (so it needs the CSRF origin pin), while both bearer
+    tokens have to be attached deliberately by a non-browser client and
+    therefore cannot be replayed by a cross-site form post.
+    """
+    if session.get(SESSION_KEY) is True:
+        return "session"
+    if request.endpoint in _machine_endpoints() and _token_ok(_settings().inbox_token):
+        return "inbox"
+    if request.path.startswith("/api/v1/") and _bearer_ok():
+        return "read"
+    return "none"
 
 
 def is_authed() -> bool:
+    return auth_kind() != "none"
+
+
+def require_session():
+    """Guard for a MUTATING browser route: a READ_TOKEN bearer must never write.
+
+    ``READ_TOKEN`` is Hopper's read credential, handed to a watch that polls
+    ``/api/v1/status``; it is deliberately not a write credential, and the
+    generic gate above would otherwise let it through on any ``/api/v1/`` path.
+    Returns a 401 response to return from the view, or None to carry on.
+    """
+    if not _gate_enabled():
+        return None            # local dev with no gate at all
     if session.get(SESSION_KEY) is True:
-        return True
-    if request.path.startswith("/api/v1/") and _bearer_ok():
-        return True
-    return False
+        return None
+    return jsonify({"error": "this endpoint needs a browser session"}), 401
 
 
 @bp.before_app_request
@@ -104,7 +153,18 @@ def _host_origin_pin():
         return None
     if request.host.split(":", 1)[0].lower() != app_host:
         abort(403)
-    if request.method == "POST":
+    # EVERY mutating method, not just POST. This used to fire on POST alone,
+    # which was fine while POST was the only way to change anything — the
+    # Inbox's PATCH would have arrived with no CSRF pin at all, so the check is
+    # widened BEFORE the route exists rather than after.
+    if request.method in MUTATING_METHODS:
+        # A bearer token is not an ambient credential: a cross-site form post
+        # cannot set an Authorization header, so there is nothing for an origin
+        # pin to defend on the Inbox's machine endpoints — and requiring one
+        # would make them unreachable from the Mac worker's curl, which sends
+        # neither Origin nor Referer.
+        if auth_kind() == "inbox":
+            return None
         origin = request.headers.get("Origin", "")
         referer = request.headers.get("Referer", "")
         if origin:

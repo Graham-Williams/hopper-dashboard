@@ -138,4 +138,19 @@ def create_app(role: str = "read", settings: Settings | None = None,
     app.jinja_env.globals["app_env"] = settings.app_env
     app.jinja_env.globals["csp_nonce"] = web.csp_nonce
     app.register_blueprint(web.bp)
+
+    # -- the Inbox -------------------------------------------------------- #
+    # Registered on the READ role: it is browser-driven, and the Mac
+    # transcription worker reaches it through the public hostname (the ingest
+    # port is Tailscale-only and its ping API cannot carry audio anyway).
+    from . import inbox
+    app.extensions["inbox_machine_endpoints"] = inbox.MACHINE_ENDPOINTS
+    # Two buckets because they are two different abuses. Creating a row can
+    # carry 8 MB; editing one is a checkbox that a fast finger hits repeatedly.
+    app.extensions["inbox_create_limiter"] = SlidingWindowLimiter(30, 900)
+    app.extensions["inbox_write_limiter"] = SlidingWindowLimiter(120, 60)
+    if not settings.inbox_token:
+        log.warning("INBOX_TOKEN unset — the Inbox's machine endpoints will "
+                    "reject every call (401); the browser side still works.")
+    app.register_blueprint(inbox.bp)
     return app
