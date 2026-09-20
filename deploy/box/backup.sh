@@ -105,8 +105,10 @@ if [[ -f "${ENV_FILE}" ]]; then
   elif (( $? == 2 )); then
     log "WARN: could not determine the permissions of ${ENV_FILE}; sourcing anyway"
   fi
-  # shellcheck disable=SC1090
-  set -a; source "${ENV_FILE}"; set +a
+  set -a
+  # shellcheck source=/dev/null  (the path is runtime config, not knowable statically)
+  source "${ENV_FILE}"
+  set +a
 fi
 
 CONTAINER="${BACKUP_CONTAINER:-hopper-dashboard}"
@@ -176,7 +178,7 @@ command -v docker >/dev/null 2>&1 || die "docker not on PATH (the snapshot runs 
 sha256_of() { sha256sum "$1" | cut -d' ' -f1; }
 
 # --- one DB: snapshot inside the container, verify, dedupe, keep ---------------------
-# Sets SNAPSHOT_PATH / SNAPSHOT_CKSUM / SNAPSHOT_CHANGED for the caller.
+# Sets SNAPSHOT_PATH / SNAPSHOT_CKSUM for the caller.
 snapshot_db() {
   local name="$1" src="$2" tmp ctmp prev rc=0
   tmp="$(mktemp "${LOCAL_BACKUP_DIR}/.snapshot.XXXXXX.db")"
@@ -238,7 +240,7 @@ PY
   [[ -f "${ck_file}" ]] && last="$(cat "${ck_file}")"
   if [[ "${SNAPSHOT_CKSUM}" == "${last}" && -n "${prev}" && -f "${prev}" ]]; then
     log "${name}: unchanged since ${prev##*/} (sha ${SNAPSHOT_CKSUM:0:12}); keeping one copy"
-    SNAPSHOT_PATH="${prev}"; SNAPSHOT_CHANGED=0
+    SNAPSHOT_PATH="${prev}"
   else
     local ts dest n=1
     ts="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -248,7 +250,7 @@ PY
     while [[ -e "${dest}" ]]; do dest="${LOCAL_BACKUP_DIR}/${name}_${ts}_${n}.db"; n=$((n+1)); done
     mv "${tmp}" "${dest}"
     printf '%s\n' "${SNAPSHOT_CKSUM}" > "${ck_file}"
-    SNAPSHOT_PATH="${dest}"; SNAPSHOT_CHANGED=1
+    SNAPSHOT_PATH="${dest}"
     log "${name}: saved ${dest##*/} (sha ${SNAPSHOT_CKSUM:0:12})"
   fi
 
@@ -592,7 +594,7 @@ declare -a PUSHABLE=()
 SNAPSHOTS=0
 for pair in ${CONTAINER_DBS}; do
   name="${pair%%:*}"; src="${pair#*:}"
-  SNAPSHOT_PATH=""; SNAPSHOT_CKSUM=""; SNAPSHOT_CHANGED=0
+  SNAPSHOT_PATH=""; SNAPSHOT_CKSUM=""
   rc=0; snapshot_db "${name}" "${src}" || rc=$?
   if (( rc == 2 )); then
     # A DB that is not there yet (the Inbox has never been opened on a fresh volume) must not
