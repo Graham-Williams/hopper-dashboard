@@ -269,7 +269,8 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   the `Priority` header and `services.alert_severity` — keep it that way. No reason text ever leaves the box;
   never raises; returns False on a failed POST, which `Core` acts on (see below).
 - `ingest.py` — blueprint + pure payload parsers (`parse_json_payload`, `parse_form_payload`, `parse_metrics`).
-- `web.py` — read blueprint: gate, host pin, security headers (per-request CSP nonce), HTML + JSON routes.
+- `web.py` — read blueprint: http→https redirect, gate, host pin, security headers (per-request CSP nonce +
+  HSTS), HTML + JSON routes.
 - `views.py` — builds the `/api/v1/status` contract and job detail from the store.
 - `password_gate.py`, `ratelimit.py` — gate helpers (`client_ip(trusted_cidrs)` vs `remote_ip()`) +
   sliding-window limiters (hard key cap with stalest-eviction, keys truncated to 64 chars).
@@ -388,6 +389,44 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
 - Hopper's bearer reads go through the public hostname (`https://dashboard.graham-williams.com/api/v1/status`
   with `Authorization: Bearer $READ_TOKEN`) — that is the intended path. An in-container read against
   `127.0.0.1:8080` must also send `Host: <APP_HOST>` or the Host pin returns 403 (only `/healthz` is exempt).
+- **HTTPS at the origin (`web._https_redirect`) redirects ONLY when `X-Forwarded-Proto` is exactly `http`.**
+  An absent header must never redirect: the container HEALTHCHECK and that in-container/in-network read send
+  none, and a redirect there would break monitoring instead of protecting it. The target is built from the
+  `APP_HOST` pin (never the request's Host — reflection = open redirect) and from the RAW request target
+  (`RAW_URI`/`REQUEST_URI`), because `request.path` is already URL-decoded and would silently rewrite
+  `/a%2Fb` to `/a/b`. Unset `APP_HOST` → no redirect (fail open, which is what keeps the documented local
+  visual-QA path and the test suite working). **Because that failure is silent-by-design, `docker-compose.yml`
+  defaults `APP_HOST` to `dashboard.graham-williams.com` rather than to empty** — the value normally comes
+  from the gitignored `.env`, which no PR can edit, so an empty default would let a box with an older `.env`
+  bring the redirect up disabled (the same shape as the `jobs.yml` deploy trap). The app-level fail-open is
+  unchanged; only the container's default differs.
+- **`APP_HOST` is validated as a BARE hostname before it can reach a `Location`** — read it through
+  `Settings.https_redirect_host`, never `settings.app_host`, on any path that emits it. It is operator-set,
+  not attacker-set, but an unvalidated value is still a live footgun: `host@evil.example` parses as WHATWG
+  *userinfo*, so the browser lands on `evil.example` while the URL still reads like this app;
+  `host/evil.net` smuggles a path; and an embedded CRLF makes Werkzeug raise on **every** request — a
+  whole-site 500, not just a broken redirect. A malformed value disables the **redirect only** (logged at
+  start-up: *"is not a bare hostname"*) and leaves the Host/Origin pin alone, which fails *closed* because
+  it compares rather than emits. Those are deliberately two different postures, which is why
+  `https_redirect_host` is a separate property.
+- **⚠️ `_HOSTNAME_RE` and `_SAFE_TARGET_RE` are safe ONLY under `.fullmatch()`.** `_SAFE_TARGET_RE` is
+  unanchored, so `.match('/x\n')` **succeeds** — one `fullmatch`→`match` slip is a header-injection hole.
+  `^…$` would not save it either: in Python `$` also matches immediately before a *trailing* newline.
+  Both patterns carry that warning at their definition and `tests/test_web.py` pins the newline rejection
+  (and asserts the `.match()` trap explicitly, so it can't be "tidied" away).
+- **The redirect is `307`, not `301`, and carries `Cache-Control: no-store` + `Vary: X-Forwarded-Proto`.**
+  The `Location` is byte-identical to the requested URL, so a cacheable answer is self-referential: under
+  RFC 9111 a 301 with no `Cache-Control` is heuristically cacheable *indefinitely*, which would make one
+  misdeployed `APP_HOST` stick in every visitor's browser with no way to recall it, and would let a shared
+  cache hand an https visitor a redirect to itself. 307 also preserves the method, so a plain-http POST is
+  re-sent over https rather than silently downgraded to a bodiless GET. HSTS is the durable upgrade; the
+  redirect does not need to be permanent.
+- **The ingest listener is deliberately exempt from the redirect and from HSTS, and must stay that way.**
+  Both hooks live on `web.bp`, registered only for the read role — the exemption is structural, not a
+  condition. `:8081` is Tailscale-only, serves no TLS, and every heartbeat (systemd `ExecStopPost` curls,
+  `dashboard-containers.timer`, the Mac launchd probe) is plain HTTP with no `X-Forwarded-Proto`. Moving
+  those hooks onto the app factory would stop every heartbeat *quietly* — the board would keep rendering,
+  just with everything drifting to LATE. `tests/test_ingest.py` pins this in three tests.
 
 ## Git workflow
 Feature branches only; `main` is protected and only Graham merges (via PR). Commit/push freely on branches.

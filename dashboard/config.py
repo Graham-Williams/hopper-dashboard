@@ -49,6 +49,25 @@ MAX_GITHUB_REPOS = 50
 GITHUB_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.\-]+\Z")   # \Z, not $ — see above
 MAX_GITHUB_TOKEN = 255
 
+# `app_host` is operator-configured, but the read role splices it straight into
+# a `Location` header for the http->https upgrade, so it must be a BARE
+# hostname first — no scheme, no port, no path, no userinfo, no whitespace.
+# Without this, `APP_HOST=dashboard.example.test@evil.example` emits a Location
+# the browser resolves to `evil.example` (everything before `@` is WHATWG
+# userinfo) while the URL still *reads* like this app, `host/evil.net` smuggles
+# a path, and an embedded CRLF makes Werkzeug raise on EVERY request — a
+# whole-site 500 rather than a logged fail-open.
+#
+# NOTE \A/\Z with `.fullmatch()`, NEVER ^...$ with `.match()`: in Python "$"
+# also matches immediately before a TRAILING NEWLINE, so "evil.net\n" would
+# sail through a "^...$" check and reach a response header.
+# Per-LABEL pattern (each dot-separated label 1-63 chars, no leading or
+# trailing hyphen) — byte-identical to the one in jjho-fan-almanac, so all
+# five sibling apps agree on exactly what a hostname is.
+_HOSTNAME_RE = re.compile(
+    r"\A(?=.{1,253}\Z)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\Z")
+
 
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name, "")
@@ -225,6 +244,17 @@ class Settings:
         sha256-deduped on every change, and megabytes of per-note audio would
         make every snapshot byte-unique and defeat that dedup entirely."""
         return os.path.join(self.data_dir, "inbox", "audio")
+
+    def https_redirect_host(self) -> str:
+        """`app_host`, but only when it is safe to paste into a Location header.
+
+        Empty = the http->https redirect is OFF (fail open). Deliberately
+        SEPARATE from `app_host` itself: the Host/Origin pin *compares* the
+        value and never emits it, so a malformed host must keep failing CLOSED
+        there while the redirect fails OPEN here. See `_HOSTNAME_RE`.
+        """
+        host = (self.app_host or "").strip().lower()
+        return host if _HOSTNAME_RE.fullmatch(host) else ""
 
     @property
     def effective_rclone_timeout_s(self) -> int:

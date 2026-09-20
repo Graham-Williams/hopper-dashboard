@@ -53,6 +53,44 @@ def test_read_routes_not_on_ingest(ingest):
     assert ingest.get("/api/v1/status").get_json()["ok"] is False
 
 
+def _pinned_ingest(settings, registry, notifier):
+    """An ingest app configured exactly as prod is — APP_HOST set — to prove the
+    read role's HTTPS enforcement cannot leak onto this listener."""
+    from dashboard import create_app
+    settings.app_host = "dash.example.com"
+    return create_app("ingest", settings, registry, notifier).test_client()
+
+
+def test_ingest_ping_without_forwarded_proto_still_succeeds(settings, registry, notifier):
+    """The real heartbeats: systemd ExecStopPost curls, dashboard-containers.timer
+    and the Mac launchd probe all POST plain HTTP over the tailnet with no
+    X-Forwarded-Proto. They must never meet a redirect."""
+    c = _pinned_ingest(settings, registry, notifier)
+    r = c.post("/api/v1/ping/snap", json={"status": "ok"}, headers=auth())
+    assert r.status_code == 200 and r.get_json()["ok"] is True
+    assert c.get("/healthz").status_code == 200
+
+
+def test_ingest_is_never_redirected_even_with_a_forwarded_proto_header(
+        settings, registry, notifier):
+    """:8081 is reached directly over the tailnet, so X-Forwarded-Proto there is
+    attacker-supplied. The read role's http→https hook lives on web.bp, which
+    this role never registers — the exemption is structural, not a condition."""
+    c = _pinned_ingest(settings, registry, notifier)
+    r = c.post("/api/v1/ping/snap", json={"status": "ok"}, headers={
+        **auth(), "X-Forwarded-Proto": "http"})
+    assert r.status_code == 200 and r.get_json()["ok"] is True
+    assert c.get("/healthz", headers={"X-Forwarded-Proto": "http"}).status_code == 200
+
+
+def test_ingest_sends_no_hsts(settings, registry, notifier):
+    """It serves no TLS and is not a browser surface; pinning a tailnet host to
+    https would only break the heartbeats."""
+    c = _pinned_ingest(settings, registry, notifier)
+    r = c.post("/api/v1/ping/snap", json={"status": "ok"}, headers=auth())
+    assert "Strict-Transport-Security" not in r.headers
+
+
 def test_empty_ingest_token_fails_closed(settings, registry, notifier):
     from dashboard import create_app
     settings.ingest_token = ""

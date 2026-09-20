@@ -6,15 +6,20 @@ and ``/static/*`` requires the signed session cookie. Additionally
 ``/api/v1/*`` accepts ``Authorization: Bearer <READ_TOKEN>`` so Hopper can read
 the board without a browser session. ``APP_HOST`` (optional) pins Host and,
 for POSTs, Origin/Referer as a CSRF defence.
+
+This role also enforces HTTPS at the origin (``X-Forwarded-Proto: http`` → 307
+to ``https://<APP_HOST>…``, plus HSTS). The INGEST role does not, and must not:
+see ``_https_redirect`` below.
 """
 
 from __future__ import annotations
 
 import hmac
 import logging
+import re
 import secrets
 import time
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from flask import (Blueprint, Response, abort, current_app, g, jsonify,
                    redirect, render_template, request, session, url_for)
@@ -40,6 +45,25 @@ _CSP_TEMPLATE = ("default-src 'self'; img-src 'self' data:; style-src 'self'; "
 GLOBAL_LOGIN_KEY = "*"
 #: Methods the Origin/Referer CSRF pin applies to.
 MUTATING_METHODS = ("POST", "PUT", "PATCH", "DELETE")
+
+# One year, and deliberately NO includeSubDomains / preload: every hostname on
+# graham-williams.com owns its own policy, and a preload entry is effectively
+# irreversible. Matches the apex landing page's snippets/security-headers.conf,
+# which is the reference implementation for all six apps.
+HSTS_VALUE = "max-age=31536000"
+# Printable ASCII, no spaces and no control bytes: what may be pasted into a
+# Location header. Makes CR/LF header injection structurally impossible rather
+# than merely unlikely (Werkzeug would also refuse, but not from here).
+#
+# ⚠️ THIS PATTERN IS SAFE ONLY UNDER `.fullmatch()`. EVERY call site MUST use
+# `fullmatch` — never `.match()`, never `.search()`. The pattern is unanchored,
+# so `_SAFE_TARGET_RE.match('/x\n')` SUCCEEDS (it matches the safe prefix and
+# stops), and a single `fullmatch`->`match` slip would therefore let a newline
+# through into a response header: header injection. Anchoring with `^...$`
+# would NOT save it either — in Python "$" also matches immediately before a
+# TRAILING newline. `tests/test_web.py` pins both facts.
+_SAFE_TARGET_RE = re.compile(r"[\x21-\x7e]*")
+_MAX_TARGET_LEN = 2000
 
 
 def _settings():
@@ -126,6 +150,92 @@ def require_session():
     return jsonify({"error": "this endpoint needs a browser session"}), 401
 
 
+def _request_target() -> str:
+    """The path+query to re-issue over https, preserving percent-encoding.
+
+    ``request.path`` is already URL-decoded, so ``/a%2Fb`` and ``/a/b`` are
+    indistinguishable there — rebuilding from it would silently rewrite the URL
+    the visitor asked for. The raw request target is in ``RAW_URI`` (gunicorn,
+    and Werkzeug's test client) or ``REQUEST_URI``; both are used verbatim when
+    they are an origin-form target that is safe to emit. Otherwise fall back to
+    a conservatively re-quoted path plus the byte-exact query string, and to
+    ``/`` if even that would not be safe.
+
+    Only origin-form (``/…``) is accepted: an absolute-form request target
+    carries its own host, and trusting that would be host reflection.
+    """
+    for key in ("RAW_URI", "REQUEST_URI"):
+        raw = request.environ.get(key) or ""
+        if (raw.startswith("/") and len(raw) <= _MAX_TARGET_LEN
+                and _SAFE_TARGET_RE.fullmatch(raw)):
+            return raw
+    target = quote(request.path, safe="/")
+    qs = request.query_string.decode("latin-1")
+    if qs and _SAFE_TARGET_RE.fullmatch(qs):
+        target = f"{target}?{qs}"
+    if len(target) > _MAX_TARGET_LEN or not _SAFE_TARGET_RE.fullmatch(target):
+        return "/"
+    return target
+
+
+@bp.before_app_request
+def _https_redirect():
+    """Enforce HTTPS at the origin — defence in depth behind the edge.
+
+    Cloudflare's zone-wide "Always Use HTTPS" already redirects http→https, but
+    is one dashboard toggle away from regressing, so the origin enforces it too.
+    Only the tunnel reaches this role, and cloudflared forwards the visitor's
+    scheme in ``X-Forwarded-Proto``.
+
+    Three rules, all load-bearing:
+
+    - Redirect ONLY when the header is present and exactly ``http``. An ABSENT
+      header is never redirected: the container HEALTHCHECK and Hopper's
+      in-network ``/api/v1/status`` read (``curl -H 'Host: <APP_HOST>' http://…``)
+      send none, and redirecting them would break monitoring, not protect it.
+    - The target is built from the configured ``APP_HOST`` pin, never from the
+      request's own Host/URL — host reflection here would be an open redirect.
+      It is used through ``Settings.https_redirect_host``, which only yields it
+      when it is a bare hostname: a value like ``host@evil.example`` would
+      otherwise emit a Location the browser resolves to ``evil.example``, and
+      one containing a CRLF would 500 every request instead of failing open.
+    - No (or malformed) ``APP_HOST`` → no redirect (fail open). That keeps
+      local dev, the documented local visual-QA path and the test suite
+      working; in production ``APP_HOST`` is always set (it is also what the
+      Host pin needs).
+
+    **307, and never cacheable.** The ``Location`` is byte-identical to the URL
+    that was requested, so a cacheable answer is self-referential: RFC 9111
+    makes a 301 with no ``Cache-Control`` heuristically cacheable
+    *indefinitely*, which would let one misdeployed ``APP_HOST`` stick in every
+    visitor's browser with no way to recall it, and would let a shared cache
+    hand an https visitor a redirect to itself. 307 also preserves the method,
+    so a plain-http POST is re-sent over https rather than silently downgraded
+    to a bodiless GET. HSTS is what provides the durable upgrade; the redirect
+    does not need to be permanent. ``Cache-Control: no-store`` comes from
+    ``_security_headers`` (every read-side response gets it) and
+    ``Vary: X-Forwarded-Proto`` is added here, since this answer depends
+    entirely on that header.
+
+    This hook lives on the read blueprint, which is registered ONLY for the read
+    role — so the Tailscale-only ingest listener on :8081 is structurally exempt
+    and its plain-HTTP heartbeat POSTs are untouched. That is deliberate: those
+    pings never traverse the tunnel and have no TLS to upgrade to; redirecting
+    them would silently stop every heartbeat and make the board lie.
+
+    Runs before the password gate so an http request is upgraded rather than
+    first answered with a redirect to a plain-http ``/login``.
+    """
+    app_host = _settings().https_redirect_host
+    if not app_host:
+        return None
+    if (request.headers.get("X-Forwarded-Proto") or "").strip().lower() != "http":
+        return None
+    resp = redirect(f"https://{app_host}{_request_target()}", code=307)
+    resp.vary.add("X-Forwarded-Proto")
+    return resp
+
+
 @bp.before_app_request
 def _password_gate():
     if not _gate_enabled():
@@ -185,6 +295,10 @@ def _security_headers(resp: Response) -> Response:
     # same-origin, NOT no-referrer: under no-referrer browsers send Origin: null
     # on the app's own form POST and the CSRF pin would reject the login.
     resp.headers.setdefault("Referrer-Policy", "same-origin")
+    # Sent on every read-side response (including the 307 above). A browser
+    # ignores it on a plain-http response per RFC 6797, so it costs nothing
+    # there; over the tunnel it pins this hostname to https for a year.
+    resp.headers.setdefault("Strict-Transport-Security", HSTS_VALUE)
     resp.headers.setdefault("Content-Security-Policy",
                             _CSP_TEMPLATE.format(nonce=csp_nonce()))
     resp.headers.setdefault("Cache-Control", "no-store")
