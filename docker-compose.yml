@@ -38,7 +38,13 @@ services:
       READ_TOKEN: ${READ_TOKEN:?set READ_TOKEN in .env (openssl rand -hex 32)}
       NTFY_URL: ${NTFY_URL:-}
       NTFY_TOPIC: ${NTFY_TOPIC:-}
-      APP_HOST: ${APP_HOST:-}
+      # Defaults to the real public hostname ON PURPOSE. The Host/Origin pin and
+      # the http->https 307 are both built from this value, and it lives in a
+      # file the repo cannot ship (`.env`, gitignored) — an empty default meant a
+      # box whose .env predates APP_HOST would bring the redirect up SILENTLY
+      # DISABLED, with only a start-up log line to say so. Same shape as the
+      # jobs.yml deploy trap. Override in .env for any other deployment.
+      APP_HOST: ${APP_HOST:-dashboard.graham-williams.com}
       APP_ENV: ${APP_ENV:-prod}
       TRUSTED_PROXY_CIDR: ${TRUSTED_PROXY_CIDR:-}
       PROBE_INTERVAL_S: ${PROBE_INTERVAL_S:-300}

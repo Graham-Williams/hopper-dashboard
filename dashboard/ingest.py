@@ -6,6 +6,15 @@ closed (every ping → 401). Undeclared job ids → 404 so a typo cannot create 
 phantom job. Bodies are capped at 64 KB, ``note`` at 500 chars, metrics to flat
 scalars. Form-encoded ``result=`` / ``exit=`` is accepted for systemd
 ``ExecStopPost`` curls.
+
+⚠️ This role is DELIBERATELY exempt from the read role's http→https redirect and
+HSTS header (:mod:`.web`). It is reached directly over the tailnet, never through
+the Cloudflare tunnel, and serves no TLS — its clients are the box's systemd
+``ExecStopPost`` curls, ``dashboard-containers.timer`` and the Mac's hourly
+launchd probe, all posting plain HTTP with no ``X-Forwarded-Proto``. Adding a
+redirect here would silently stop every heartbeat and leave the board lying. The
+exemption is structural: those hooks live on ``web.bp``, which is registered only
+for the read role — do not move them onto the app factory.
 """
 
 from __future__ import annotations

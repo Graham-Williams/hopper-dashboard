@@ -128,6 +128,14 @@ def create_app(role: str = "read", settings: Settings | None = None,
                  "login rate-limits key on the TCP peer (the tunnel container).")
     if not settings.app_host:
         log.warning("APP_HOST unset — Host/Origin pinning disabled (local dev).")
+    elif not settings.https_redirect_host:
+        # It would be spliced into a Location header, so a value that is not a
+        # bare hostname disables the http->https redirect (fail open) rather
+        # than emit an attacker-friendly Location or 500 every request. Host /
+        # Origin pinning is unaffected: it compares, it never emits.
+        log.warning("APP_HOST=%r is not a bare hostname — the http->https "
+                    "redirect is DISABLED (Host pinning is unaffected).",
+                    settings.app_host)
 
     app.jinja_env.filters["human_bytes"] = human_bytes
     app.jinja_env.filters["human_duration"] = human_duration
