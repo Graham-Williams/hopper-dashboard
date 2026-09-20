@@ -245,6 +245,7 @@ class Settings:
         make every snapshot byte-unique and defeat that dedup entirely."""
         return os.path.join(self.data_dir, "inbox", "audio")
 
+    @property
     def https_redirect_host(self) -> str:
         """`app_host`, but only when it is safe to paste into a Location header.
 
