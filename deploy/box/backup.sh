@@ -106,7 +106,8 @@ if [[ -f "${ENV_FILE}" ]]; then
     log "WARN: could not determine the permissions of ${ENV_FILE}; sourcing anyway"
   fi
   set -a
-  # shellcheck source=/dev/null  (the path is runtime config, not knowable statically)
+  # ENV_FILE is runtime config, so its contents are not knowable statically.
+  # shellcheck source=/dev/null
   source "${ENV_FILE}"
   set +a
 fi
