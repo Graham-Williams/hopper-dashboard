@@ -242,6 +242,16 @@ def _security_headers(resp: Response) -> Response:
     resp.headers.setdefault("Content-Security-Policy",
                             _CSP_TEMPLATE.format(nonce=csp_nonce()))
     resp.headers.setdefault("Cache-Control", "no-store")
+    # Vary on EVERY response, not just the 307. The redirect decision keys
+    # entirely off X-Forwarded-Proto, so the 200/302 bodies it gates are
+    # equally scheme-dependent: without this a shared cache could store an
+    # https-served 200 and later hand it to a plain-http request. Theoretical
+    # behind Cloudflare today, but "the edge is one dashboard toggle from
+    # regressing" is this whole feature's threat model, so the
+    # cache-correctness argument is carried through.
+    # .vary.add() APPENDS — Flask adds "Cookie" to Vary when the session is
+    # touched, and ``headers["Vary"] = ...`` would silently clobber it.
+    resp.vary.add("X-Forwarded-Proto")
     return resp
 
 

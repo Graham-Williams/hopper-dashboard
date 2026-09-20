@@ -309,6 +309,16 @@ MALFORMED_APP_HOSTS = [
     "dashboard-.example.test",              # trailing-hyphen label
     "dashboard..example.test",              # empty label
     _OVERLONG_HOST,                         # 254: over the DNS max
+    # --- B1: a public origin pin always has a dot -----------------------
+    # These USED TO VALIDATE, which is why the bug was silent: APP_HOST=localhost
+    # emitted a live `Location: https://localhost/...` to every plain-http
+    # visitor instead of tripping the fail-open warning below.
+    "localhost",                            # single label
+    "hopper-dashboard",                     # a compose service name
+    "127.0.0.1",                            # bare IPv4 literal
+    "192.168.1.1",
+    "100.101.1.28",                         # the box's own tailnet address
+    "::1",                                  # IPv6 (':' not in the class)
 ]
 
 
@@ -372,6 +382,14 @@ def test_location_patterns_are_safe_only_under_fullmatch():
     # the total, so this pins the `(?=.{1,253}\Z)` lookahead specifically.
     assert _HOSTNAME_RE.fullmatch(_MAX_LEN_HOST)
     assert not _HOSTNAME_RE.fullmatch(_OVERLONG_HOST)
+    # B1: a PUBLIC origin pin always has a dot, and is never a bare IP literal.
+    # Strictly a TIGHTENING — every host these apps actually use still passes.
+    for good in ("dashboard.graham-williams.com", "graham-williams.com",
+                 "dashboard.ci.example", "a.b"):
+        assert _HOSTNAME_RE.fullmatch(good), good
+    for bad in ("localhost", "x", "hopper-dashboard", "127.0.0.1",
+                "0.0.0.0", "100.101.1.28", "255.255.255.255"):
+        assert not _HOSTNAME_RE.fullmatch(bad), bad
 
 
 def test_hsts_header_on_every_response(authed, settings, registry, notifier):
@@ -824,3 +842,52 @@ def test_a_threshold_less_disk_gauge_that_pages_says_so(settings, notifier):
     assert "no capacity thresholds set" in card
     assert "pages after 1h not OK" in card
     assert "never alerts" not in card
+
+
+# --- B2: Vary is two-sided ---------------------------------------------------
+#
+# `Vary: X-Forwarded-Proto` used to be on the 307 ONLY. The 200s/302s whose
+# content the redirect gates are equally scheme-dependent, so a shared cache
+# could store an https-served 200 and later hand it to a plain-http request.
+
+
+def _vary_tokens(resp):
+    return {t.strip().lower()
+            for t in resp.headers.get("Vary", "").split(",") if t.strip()}
+
+
+def test_vary_is_on_non_redirect_responses_too(settings, registry, notifier):
+    c = _pinned(settings, registry, notifier)
+    for headers in ({}, xfp("https")):
+        r = c.get("/healthz", base_url=HTTPS_BASE, headers=headers)
+        assert r.status_code == 200
+        assert "x-forwarded-proto" in _vary_tokens(r), headers
+
+
+def test_vary_append_does_not_clobber_an_existing_value(
+        settings, registry, notifier):
+    """⚠️ `headers["Vary"] = ...` DROPS a Vary already on the response.
+
+    Flask adds "Cookie" itself whenever the session is touched, so assignment
+    would break session caching. `.vary.add()` appends; both must survive.
+    """
+    from flask import Response
+    from dashboard import create_app
+    settings.app_host = HTTPS_HOST
+    app = create_app("read", settings, registry, notifier)
+    resp = Response("x")
+    resp.headers["Vary"] = "Cookie"
+    with app.test_request_context("/"):
+        resp = app.process_response(resp)
+    assert _vary_tokens(resp) == {"cookie", "x-forwarded-proto"}
+
+
+def test_ingest_listener_is_untouched_by_vary(settings, registry, notifier):
+    """The Tailscale-only ingest role never registers the read blueprint, so
+    the heartbeat POSTs keep their existing headers exactly as before."""
+    from dashboard import create_app
+    settings.app_host = HTTPS_HOST
+    c = create_app("ingest", settings, registry, notifier).test_client()
+    r = c.get("/healthz", base_url=HTTP_BASE, headers=xfp("http"))
+    assert r.status_code == 200
+    assert "x-forwarded-proto" not in _vary_tokens(r)
