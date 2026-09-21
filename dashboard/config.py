@@ -29,9 +29,21 @@ MAX_FAIL_THRESHOLD = 10
 # Per-LABEL pattern (each dot-separated label 1-63 chars, no leading or
 # trailing hyphen) — byte-identical to the one in jjho-fan-almanac, so all
 # five sibling apps agree on exactly what a hostname is.
+#
+# ⚠️ At least ONE DOT is required (>=2 labels) and the final label may not be
+# all-digits. These are PUBLIC origin pins, and a public hostname always has a
+# dot. Without that rule `APP_HOST=localhost` — or a bare IPv4 literal like
+# 127.0.0.1 — VALIDATED, so every plain-http visitor was handed a live
+# `Location: https://localhost/…`: a redirect broken for everyone, and silent
+# precisely BECAUSE the value passed validation, so the loud fail-open branch
+# below never fired. Such a value now lands in that fail-open + warn branch
+# instead, which is the safe, diagnosable outcome. (IPv6 literals were never
+# accepted: ':' and '[' ']' are outside the character class already.)
+# Measured on staging by the break-staging sweep, 2026-09-19.
 _HOSTNAME_RE = re.compile(
     r"\A(?=.{1,253}\Z)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
-    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\Z")
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*"
+    r"\.(?![0-9]+\Z)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
 
 
 def _env_int(name: str, default: int) -> int:

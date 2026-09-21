@@ -363,7 +363,14 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   whole-site 500, not just a broken redirect. A malformed value disables the **redirect only** (logged at
   start-up: *"is not a bare hostname"*) and leaves the Host/Origin pin alone, which fails *closed* because
   it compares rather than emits. Those are deliberately two different postures, which is why
-  `https_redirect_host` is a separate property.
+  `https_redirect_host` is a separate property. **A bare hostname must also contain at least one DOT, and
+  its final label may not be all-digits** (B1, from the 2026-09-19 break-staging sweep) — a public origin
+  pin always has a dot, and without that rule `APP_HOST=localhost` (or a bare IPv4 literal, or
+  `100.101.1.28`, or the compose service name `hopper-dashboard`) *validated*, so every plain-http visitor
+  got a live `Location: https://localhost/…`: broken for everyone, and silent precisely BECAUSE the value
+  passed validation, so the loud fail-open branch never fired. Those values now fail open + warn. Strictly
+  a tightening — `dashboard.graham-williams.com`, the CI fixture `dashboard.ci.example`, the apex and the
+  253-char boundary host all still pass.
 - **⚠️ `_HOSTNAME_RE` and `_SAFE_TARGET_RE` are safe ONLY under `.fullmatch()`.** `_SAFE_TARGET_RE` is
   unanchored, so `.match('/x\n')` **succeeds** — one `fullmatch`→`match` slip is a header-injection hole.
   `^…$` would not save it either: in Python `$` also matches immediately before a *trailing* newline.
@@ -375,7 +382,13 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   misdeployed `APP_HOST` stick in every visitor's browser with no way to recall it, and would let a shared
   cache hand an https visitor a redirect to itself. 307 also preserves the method, so a plain-http POST is
   re-sent over https rather than silently downgraded to a bodiless GET. HSTS is the durable upgrade; the
-  redirect does not need to be permanent.
+  redirect does not need to be permanent. **`Vary: X-Forwarded-Proto` goes on EVERY read-side response,
+  not just the 307** (B2, same sweep): the 200s/302s the redirect gates are equally scheme-dependent, so a
+  shared cache could otherwise store an https-served 200 and later hand it to a plain-http request. It is
+  stamped in `_security_headers` with **`resp.vary.add()`, never `headers["Vary"] = …`** — Flask appends
+  `Cookie` to `Vary` itself when the session is touched, and assignment would silently clobber it;
+  `.vary.add()` is idempotent, so the 307's own value is not doubled. The **ingest** role is untouched
+  (see below) — `_security_headers` lives on `web.bp`, so the exemption stays structural.
 - **The ingest listener is deliberately exempt from the redirect and from HSTS, and must stay that way.**
   Both hooks live on `web.bp`, registered only for the read role — the exemption is structural, not a
   condition. `:8081` is Tailscale-only, serves no TLS, and every heartbeat (systemd `ExecStopPost` curls,
