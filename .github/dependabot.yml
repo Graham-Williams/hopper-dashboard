@@ -1,0 +1,22 @@
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    ignore:
+      # The base image is pinned by tag AND digest, so digest refreshes for the
+      # 3.12 line (the security rebuilds) do come through as PRs — that is the
+      # stream we want. What we do not want automatically is the next CPython
+      # feature release (3.13/3.14): that is an interpreter migration to be
+      # decided and tested deliberately.
+      - dependency-name: python
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
