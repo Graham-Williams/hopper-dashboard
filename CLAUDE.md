@@ -466,6 +466,55 @@ and rclone is checksum-verified. `.github/dependabot.yml` asks for weekly pip / 
 github-actions version updates (the digest refreshes of `python:3.12-slim` come through; a CPython
 feature-release bump is deliberately ignored).
 
+
+### Dependabot auto-merge — what merges itself, what stops for Graham
+
+`ci.yml` has a `dependabot-auto-merge` job. **Merges itself**, with no review,
+only when ALL of these hold:
+
+1. The PR author is `dependabot[bot]`, and `dependabot/fetch-metadata` confirms
+   the head commit was authored by Dependabot **and carries a verified
+   signature**. Nobody can hand-craft a PR into this path.
+2. **Every other job in the same workflow run succeeded** — that is literally
+   the `needs:` list, which names every sibling job.
+3. The update is **semver-minor**, **semver-patch**, or a **Docker digest
+   refresh** (same image tag, rebuilt digest).
+
+**Always stops for Graham:**
+
+- Any **major** version bump — *including a security update*. A security fix
+  that crosses a major still waits for him.
+- Any PR where no semver level could be derived and it is not a digest refresh.
+  An unknown update type is an absence of signal, never a pass.
+- Anything whose tests failed, errored, or did not run. **A run with no checks
+  can never merge**, because the merge step is unreachable unless the jobs it
+  needs actually reported success.
+
+**The gate is `needs:`, not branch protection — do not "simplify" it to
+`gh pr merge --auto`.** GitHub's native auto-merge only waits for checks that
+branch protection marks as *required*, and none of these repos define required
+status checks (baby-pool is private, where the plan offers no branch protection
+or rulesets at all). On such a repo `--auto` silently degrades to "merge now",
+which would merge a PR whose tests never ran. Depending on the sibling jobs
+behaves identically on every repo, protected or not. For the same reason
+`allow_auto_merge` is deliberately left **off** — the design does not use it.
+
+The trigger is `pull_request`, **not** `pull_request_target`. The auto-merge
+job checks out nothing and runs no PR code; the only job that runs repository
+code is `test`, which holds a read-only token. A `pull_request` run from a fork
+gets a read-only token regardless of the `permissions:` block, so the write
+scopes are unreachable from a fork.
+
+Each run writes its decision and reasoning to the job summary, so the reason a
+particular PR did or did not merge is always on the run page.
+
+**Known false negative (safe):** for a bounded requirement range —
+`Update X requirement from <4.0,>=3.0 to >=3.1.3,<4.0` — `fetch-metadata`'s
+regex reads the bounds as the versions and reports **semver-major**, so these
+stop for Graham even though they are minor floor bumps. That is the fail-closed
+direction, and it is left alone on purpose: overriding a "major" verdict with
+home-grown parsing would turn a safe stop into a possible unsafe merge.
+
 ## Self-maintenance
 When you add or change a capability, job kind, endpoint, dependency, deploy step, or architectural decision,
 update this file, `DESIGN.md` and `DEPLOY.md` before the task is done. This is how context persists for the

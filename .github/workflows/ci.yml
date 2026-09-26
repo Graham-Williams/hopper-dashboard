@@ -176,3 +176,110 @@ jobs:
           test "$(docker inspect -f '{{.State.Running}}' hd2)" = "false"
           docker logs hd2 2>&1 | grep -q "APP_PASSWORD is empty"
           docker rm -f hd2
+
+  # ---------------------------------------------------------------------------
+  # Dependabot auto-merge.
+  #
+  # THE GATE IS `needs:`, NOT BRANCH PROTECTION. GitHub's native auto-merge
+  # (`gh pr merge --auto`) only waits for checks that branch protection marks
+  # as *required* — and none of Graham's repos define required checks (one is
+  # private, where the plan offers no branch protection or rulesets at all). On
+  # such a repo `--auto` degrades to "merge immediately", which would merge a
+  # PR whose tests never ran. Depending on the test job in this same workflow
+  # run instead behaves identically everywhere: this job is simply unreachable
+  # unless every job it needs has already succeeded.
+  #
+  # Consequences worth keeping:
+  #   * A repo (or a run) with no tests produces no successful `needs:`, so
+  #     nothing merges. An absent check can never read as a pass.
+  #   * A major version bump always stops for Graham, security advisory or not.
+  #   * An empty `update-type` is an ABSENCE of signal, not a pass. The single
+  #     exception is a positively-identified Docker digest refresh.
+  #
+  # Trigger is `pull_request`, NOT `pull_request_target`. `pull_request_target`
+  # would run with a write token against a ref the PR author controls; this
+  # runs against the PR ref, and GitHub's documented Dependabot recipe grants
+  # the write scopes it needs via `permissions:` on `pull_request`. Note also
+  # that this job checks out nothing and executes no PR code — the only job
+  # that runs repository code is the test job above, which holds a read-only
+  # token. A pull_request run from a fork gets a read-only token regardless of
+  # the block below, so the write scopes are unreachable from a fork.
+  dependabot-auto-merge:
+    needs: [test, probes-py39, docker-build, read-role-fails-fast]
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      # Also the authenticity check: this action refuses to emit metadata
+      # unless the PR author AND the head commit's author are dependabot[bot]
+      # and Dependabot's commit signature verifies. If it refuses, it sets no
+      # outputs, so the decision below falls through to "leave for Graham".
+      - name: Read Dependabot metadata
+        id: meta
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decide whether this update may merge itself
+        id: decide
+        env:
+          UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
+          ECOSYSTEM: ${{ steps.meta.outputs.package-ecosystem }}
+          DEP_NAMES: ${{ steps.meta.outputs.dependency-names }}
+          # Read through the environment, never interpolated into the script.
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          merge=false
+          case "$UPDATE_TYPE" in
+            version-update:semver-minor|version-update:semver-patch)
+              merge=true
+              why="$UPDATE_TYPE, and every check in this run passed"
+              ;;
+            version-update:semver-major)
+              why="a MAJOR version bump — always left for Graham, security advisory or not"
+              ;;
+            "")
+              # No semver level could be derived. Treated as unknown, with one
+              # positively-identified exception: a Docker digest refresh, where
+              # the tag is unchanged and only the rebuilt image digest moves.
+              # That is the upstream security-rebuild stream these repos pin
+              # for, and it is recognised by its own shape rather than by the
+              # mere absence of a version.
+              if [ "$ECOSYSTEM" = "docker" ] && printf '%s' "$PR_TITLE" \
+                   | grep -qE 'from `[0-9a-f]{7,40}` to `[0-9a-f]{7,40}`$'; then
+                merge=true
+                why="Docker digest refresh (same tag, rebuilt image)"
+              else
+                why="no semver level could be derived, and this is not a digest refresh"
+              fi
+              ;;
+            *)
+              why="unrecognised update-type '$UPDATE_TYPE'"
+              ;;
+          esac
+          echo "merge=$merge" >> "$GITHUB_OUTPUT"
+          if [ "$merge" = true ]; then decision="merging"; else decision="left for Graham"; fi
+          {
+            echo "### Dependabot auto-merge"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Dependencies | \`${DEP_NAMES:-unknown}\` |"
+            echo "| Ecosystem | \`${ECOSYSTEM:-unknown}\` |"
+            echo "| update-type | \`${UPDATE_TYPE:-<none>}\` |"
+            echo "| Decision | **$decision** |"
+            echo "| Because | $why |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Squash-merge
+        if: steps.decide.outputs.merge == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: gh pr merge --squash "$PR_URL"
