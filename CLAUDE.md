@@ -462,7 +462,9 @@ Inbox's mutating routes: it is the credential Hopper's watch carries around, and
 a write one. Note a session cookie OUTRANKS a bearer in `web.auth_kind`, so a logged-in browser cannot call
 the `INBOX_TOKEN` endpoints at all — tests of them need a session-free client. Supply chain: `python:3.12-slim`
 is digest-pinned in the Dockerfile, GitHub Actions are SHA-pinned in `ci.yml` (`permissions: contents: read`),
-and rclone is checksum-verified.
+and rclone is checksum-verified. `.github/dependabot.yml` asks for weekly pip / docker /
+github-actions version updates (the digest refreshes of `python:3.12-slim` come through; a CPython
+feature-release bump is deliberately ignored).
 
 ## Self-maintenance
 When you add or change a capability, job kind, endpoint, dependency, deploy step, or architectural decision,
