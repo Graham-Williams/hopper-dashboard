@@ -2110,9 +2110,19 @@ def test_which_shipped_jobs_can_have_muted_time_brought_forward(settings, notifi
     mutable = [j for j in core.registry
                if j.machine in machines and not j.alert_never
                and j.kind != "probe" and late_onset_s(j) is not None]
-    assert {j.id for j in mutable} == {"pa-backup", "drive-mirror", "mac-disk"}
+    assert {j.id for j in mutable} == {"pa-backup", "drive-mirror", "mac-disk",
+                                       "inbox-transcribe", "inbox-backlog"}
     exposed = {j.id for j in mutable if j.alert_after_s > late_onset_s(j)}
-    assert exposed == {"drive-mirror"}
+    # READ THIS BEFORE ADDING A FOURTH. The two Inbox jobs widen this set deliberately,
+    # and they widen it in the SAME shape `drive-mirror` already has: a Mac job whose
+    # grace is the mandatory ~14 h (below it, a missed run cannot be told apart from a
+    # sleeping Mac) and whose threshold is a day. 86400 > 50820 / 54120, so muted LATE
+    # time from a sleep can in principle be laundered into a later episode and bring a
+    # page forward. The residual is one-directional — it can only make a page EARLIER,
+    # never cancel one — and the alternative (a threshold under 14 h) would double each
+    # job's share of the fleet push ceiling to buy nothing: neither job is urgent.
+    # `inbox-backlog` is in fact numerically identical to `drive-mirror` (3600/50520/86400).
+    assert exposed == {"drive-mirror", "inbox-transcribe", "inbox-backlog"}
     # Not vacuous: the other two mutable Mac jobs are inside the bound, with the
     # margins that keep them there.
     assert late_onset_s(core.registry.get("pa-backup")) == 86400 + 50520
@@ -2528,15 +2538,18 @@ def test_the_fleet_wide_push_ceiling_is_the_sum_over_the_alerting_jobs():
     reg = load_registry(EXAMPLE_JOBS)
     alerting = [j for j in reg if not j.alert_never]
     per_job = {j.id: 3 * DAY / cooldown_s(j) for j in alerting}
-    assert len(alerting) == 9
-    assert sum(per_job.values()) == 70.0
+    assert len(alerting) == 13
+    assert sum(per_job.values()) == 82.0
     # The floor is what dominates it: the five jobs whose threshold is under 6 h
-    # each contribute the full 12/day (60), and the four day-or-longer ones
-    # contribute 10 between them (3 + 3 + 3 + 1).
+    # each contribute the full 12/day (60), and the eight day-or-longer ones
+    # contribute 22 between them (3 × 7 + 1 for mac-probe's 72 h). The Inbox added
+    # four of those eight — inbox-github-sync, hopper-dashboard-backup,
+    # inbox-transcribe, inbox-backlog — and each adds 3, not 12, precisely because
+    # none of them is urgent enough for a sub-6 h threshold.
     at_floor = {i for i, n in per_job.items() if n == 12}
     assert at_floor == {"box-containers", "box-disk", "dashboard-probes",
                         "mac-disk", "pa-backup"}
-    assert sum(n for i, n in per_job.items() if i not in at_floor) == 10.0
+    assert sum(n for i, n in per_job.items() if i not in at_floor) == 22.0
 
 
 def test_the_recovery_names_the_state_that_was_paged_not_the_latest_one(settings, notifier):

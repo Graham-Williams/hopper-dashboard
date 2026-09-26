@@ -76,6 +76,32 @@ def test_settings_from_env(monkeypatch, tmp_path):
         Settings.from_env()
 
 
+def test_an_illegal_github_token_fails_at_startup(monkeypatch, tmp_path):
+    """`http.client.putheader` embeds the WHOLE header value in its ValueError,
+    and the mirror logs that string AND stores it in
+    inbox_mirror_state.last_error. A token with a newline in it (the realistic
+    copy-paste accident) would therefore put the secret in both. Refusing at
+    startup means the illegal header value can never be constructed.
+
+    The error message must name the variable and the rule, never the value —
+    it is itself going to be logged."""
+    monkeypatch.setenv("DASHBOARD_DATA", str(tmp_path))
+    monkeypatch.setenv("INBOX_GITHUB_TOKEN", "ghp_legitLooking123.-_")
+    assert Settings.from_env().inbox_github_token == "ghp_legitLooking123.-_"
+    monkeypatch.setenv("INBOX_GITHUB_TOKEN", "")
+    assert Settings.from_env().inbox_github_token == ""
+    # Note "ghp_secret\r\n" is NOT here: `.strip()` removes trailing whitespace
+    # before the check, which is the right call — a trailing newline in a `.env`
+    # value is an editor artefact, not an injection.
+    for bad in ("ghp_secret\nX-Evil: 1", "ghp_secret token", "ghp_se\rcret",
+                "ghp_secret/../x", "x" * 300):
+        monkeypatch.setenv("INBOX_GITHUB_TOKEN", bad)
+        with pytest.raises(ValueError) as exc:
+            Settings.from_env()
+        assert "INBOX_GITHUB_TOKEN" in str(exc.value)
+        assert "ghp_secret" not in str(exc.value), "the token leaked into the error"
+
+
 def test_probe_damping_knobs_from_env(monkeypatch, tmp_path):
     monkeypatch.setenv("DASHBOARD_DATA", str(tmp_path))
     s = Settings.from_env()
@@ -114,7 +140,7 @@ def test_create_app_from_env_loads_example_jobs(monkeypatch, tmp_path):
     monkeypatch.setenv("JOBS_FILE", "jobs.example.yml")
     monkeypatch.setenv("DASHBOARD_NO_SCHEDULER", "1")
     app = create_app("ingest")
-    assert len(app.extensions["registry"]) == 13
+    assert len(app.extensions["registry"]) == 17
     assert app.extensions["scheduler"]._thread is None
 
 
@@ -126,3 +152,49 @@ def test_scheduler_thread_starts_and_stops(settings, registry, notifier, monkeyp
     sched.stop()
     sched._thread.join(timeout=5)
     assert not sched._thread.is_alive()
+
+
+# --------------------------------------------------------------------------- #
+# Inbox settings (step 1)
+# --------------------------------------------------------------------------- #
+
+def test_inbox_settings_defaults_and_derived_paths(tmp_path):
+    from dashboard.config import Settings
+    s = Settings(data_dir=str(tmp_path))
+    assert s.inbox_db_path == str(tmp_path / "inbox.db")
+    assert s.inbox_db_path != s.db_path          # a SEPARATE file, on purpose
+    assert s.inbox_audio_dir == str(tmp_path / "inbox" / "audio")
+    assert s.inbox_token == "" and s.inbox_github_repos == ()
+    # 2 MB per note (~10 minutes of Opus), not the 8 MB this started at: the
+    # per-note cap multiplies by the create limiter (30 per 15 min per IP) into
+    # how much disk one address can spend.
+    assert s.inbox_audio_max_bytes == 2 * 1024 * 1024
+    # ...and an AGGREGATE cap, because the per-note cap bounds nothing over
+    # time. Checked before every upload; `box-disk` would only notice once the
+    # disk was already gone.
+    assert s.inbox_audio_max_total_bytes == 3 * 1024 ** 3
+    # The global body cap must stay where it is: the create route lifts its own
+    # limit per request, it never raises this.
+    assert s.max_body_bytes == 64 * 1024
+    assert s.inbox_audio_retention_days == 90
+    assert s.inbox_github_interval_s == 900
+
+
+def test_inbox_github_repos_are_validated_at_startup(monkeypatch):
+    """A typo'd repo must fail the container at boot, not sync nothing for ever.
+    It is also the only user-supplied text interpolated into a GitHub URL."""
+    from dashboard.config import Settings
+    monkeypatch.setenv("INBOX_GITHUB_REPOS", "Graham-Williams/km-tracker, a/b\nc/d")
+    assert Settings.from_env().inbox_github_repos == (
+        "Graham-Williams/km-tracker", "a/b", "c/d")
+    monkeypatch.setenv("INBOX_GITHUB_REPOS", "Graham-Williams/km-tracker, a/b, a/b")
+    assert Settings.from_env().inbox_github_repos == (
+        "Graham-Williams/km-tracker", "a/b")            # de-duped
+    for bad in ("not-a-repo", "a/b/c", "a/../b", "a/b?x=1", "https://x/a/b",
+                "a b/c", "a/"):
+        monkeypatch.setenv("INBOX_GITHUB_REPOS", bad)
+        with pytest.raises(ValueError, match="not a valid owner/repo"):
+            Settings.from_env()
+    monkeypatch.setenv("INBOX_GITHUB_REPOS", ",".join(f"a/r{i}" for i in range(51)))
+    with pytest.raises(ValueError, match="over the 50 maximum"):
+        Settings.from_env()

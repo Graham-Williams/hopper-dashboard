@@ -15,7 +15,15 @@
 #   privileges, so nothing is written back and nothing runs as root afterwards.
 # - Root filesystem is read-only; only the data volume and /tmp are writable.
 # - `${VAR:?}` makes compose refuse to start without the four secrets rather
-#   than bringing up an unprotected read side or a fail-closed ingest.
+#   than bringing up an unprotected read side or a fail-closed ingest. The
+#   Inbox's own variables are deliberately NOT in that group — see below.
+# - APP_PASSWORD here is this app's OWN password, not the shared house word the
+#   other self-hosted apps use. The board is linked from the public apex page
+#   and now stores recordings of Graham's voice, so it does not share a gate
+#   with anything he has handed to friends.
+# - The data volume now holds ORIGINAL data (inbox.db + /app/data/inbox/audio),
+#   not just re-derivable history. deploy/box/backup.sh backs it up; see
+#   DEPLOY.md §2b.
 services:
   hopper-dashboard:
     build: .
@@ -28,11 +36,16 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    # Bounds a runaway (a hostile issue body, a pathological rclone listing) so it cannot
+    # take the box down with the other ten containers. Deliberately GENEROUS, not tight:
+    # measured steady state is ~116 MiB and the box has 30 GiB, so the only thing this can
+    # realistically stop is a genuine leak. Too low would OOM-kill the monitoring itself.
+    mem_limit: 768m
     read_only: true
     tmpfs:
       - /tmp:mode=1777,size=64m
     environment:
-      APP_PASSWORD: ${APP_PASSWORD:?set APP_PASSWORD in .env (shared house password)}
+      APP_PASSWORD: ${APP_PASSWORD:?set APP_PASSWORD in .env — THIS APP'S OWN password, not the shared house word}
       SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET in .env (openssl rand -hex 32)}
       INGEST_TOKEN: ${INGEST_TOKEN:?set INGEST_TOKEN in .env (openssl rand -hex 32)}
       READ_TOKEN: ${READ_TOKEN:?set READ_TOKEN in .env (openssl rand -hex 32)}
@@ -52,6 +65,18 @@ services:
       DASHBOARD_RCLONE_TIMEOUT_S: ${DASHBOARD_RCLONE_TIMEOUT_S:-240}
       PROBE_FAIL_THRESHOLD: ${PROBE_FAIL_THRESHOLD:-2}
       PROBE_NO_SUCCESS_S: ${PROBE_NO_SUCCESS_S:-3600}
+      # --- the Inbox. Every one is `:-`, never `:?`: with INBOX_TOKEN empty the board still
+      # boots and /inbox still works in a browser; only the MACHINE endpoints fail closed
+      # (401). The board being up matters more than the Inbox being up, and a compose that
+      # refuses to start over an optional feature would invert that.
+      INBOX_TOKEN: ${INBOX_TOKEN:-}
+      INBOX_AUDIO_MAX_BYTES: ${INBOX_AUDIO_MAX_BYTES:-2097152}
+      INBOX_AUDIO_MAX_TOTAL_BYTES: ${INBOX_AUDIO_MAX_TOTAL_BYTES:-3221225472}
+      INBOX_AUDIO_RETENTION_DAYS: ${INBOX_AUDIO_RETENTION_DAYS:-90}
+      INBOX_GITHUB_REPOS: ${INBOX_GITHUB_REPOS:-}
+      INBOX_GITHUB_TOKEN: ${INBOX_GITHUB_TOKEN:-}
+      INBOX_GITHUB_INTERVAL_S: ${INBOX_GITHUB_INTERVAL_S:-900}
+      INBOX_PRUNE_INTERVAL_S: ${INBOX_PRUNE_INTERVAL_S:-3600}
       JOBS_FILE: /app/jobs.yml
       DASHBOARD_DATA: /app/data
     ports:

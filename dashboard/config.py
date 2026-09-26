@@ -14,6 +14,41 @@ from dataclasses import dataclass, field
 
 MAX_FAIL_THRESHOLD = 10
 
+# `owner/repo`, the only shape the unauthenticated GitHub issue mirror can use.
+# Validated at STARTUP (not at fetch time) so a typo in the box `.env` is a
+# container that refuses to come up naming the bad value, rather than a mirror
+# that quietly syncs nothing for ever — the same rule registry.py applies to
+# jobs.yml. It also means nothing interpolated into a GitHub URL has ever been
+# unvalidated.
+# Each half must START with an alphanumeric, which is both GitHub's own rule and
+# the thing that matters here: `[\w.-]+/[\w.-]+` happily matches `../x`, and this
+# string is interpolated into an api.github.com path — a repo of `..` walks up
+# out of `/repos/` and asks GitHub for something else entirely. ASCII classes
+# rather than `\w`, which is unicode-aware and would admit homoglyphs.
+# `\Z`, NOT `$`: in Python `$` also matches immediately BEFORE a trailing
+# newline, so "a/b\n" would pass a `$`-anchored check — and this string is
+# interpolated into an api.github.com path and stored as a mirror key.
+GITHUB_REPO_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+# A repo list long enough to blow the mirror's own cadence is a paste accident.
+MAX_GITHUB_REPOS = 50
+
+# The characters a GitHub token may contain. Every shape GitHub issues (`ghp_`,
+# `github_pat_`, the older 40-hex PATs, an installation token) fits inside this.
+#
+# Validated at STARTUP, and the reason is not typo-catching: the token goes into
+# an `Authorization: Bearer …` header, and `http.client.putheader` rejects an
+# illegal header value by raising `ValueError('Invalid header value %r' % value)`
+# — with the WHOLE header, token included, inside the message. That message
+# becomes `MirrorResponse.error`, which the mirror then both `log.warning`s and
+# writes to `inbox_mirror_state.last_error`. So a token with a stray newline or
+# space (trivially produced by a copy-paste into `.env`) would put the secret in
+# the log and in the database. Refusing it here means the illegal header value
+# can never be constructed; `github_mirror._redact` is the second, independent
+# defence for the same leak.
+GITHUB_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.\-]+\Z")   # \Z, not $ — see above
+MAX_GITHUB_TOKEN = 255
+
 # `app_host` is operator-configured, but the read role splices it straight into
 # a `Location` header for the http->https upgrade, so it must be a BARE
 # hostname first — no scheme, no port, no path, no userinfo, no whitespace.
@@ -73,6 +108,43 @@ def _env_cidrs(name: str) -> tuple[str, ...]:
     return tuple(out)
 
 
+def _env_github_repos(name: str) -> tuple[str, ...]:
+    """Comma/whitespace-separated ``owner/repo`` list, validated here so a bad
+    value fails the container at startup instead of at the first sync."""
+    raw = os.environ.get(name, "")
+    out: list[str] = []
+    for part in re.split(r"[,\s]+", raw):
+        part = part.strip()
+        if not part:
+            continue
+        if not GITHUB_REPO_RE.match(part):
+            raise ValueError(f"{name}: {part!r} is not a valid owner/repo")
+        if part not in out:
+            out.append(part)
+    if len(out) > MAX_GITHUB_REPOS:
+        raise ValueError(f"{name}: {len(out)} repos is over the "
+                         f"{MAX_GITHUB_REPOS} maximum")
+    return tuple(out)
+
+
+def _env_github_token(name: str) -> str:
+    """The token, validated so it can never become an illegal header value.
+
+    The error message names the variable and the RULE, never the value — the
+    whole point of this function is that the token does not end up in a string
+    that gets logged.
+    """
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return ""
+    if len(raw) > MAX_GITHUB_TOKEN:
+        raise ValueError(f"{name} is longer than {MAX_GITHUB_TOKEN} characters")
+    if not GITHUB_TOKEN_RE.match(raw):
+        raise ValueError(f"{name} may only contain letters, digits, '_', '.' "
+                         f"and '-' (it becomes an HTTP header value)")
+    return raw
+
+
 @dataclass
 class Settings:
     data_dir: str = "/app/data"
@@ -117,11 +189,73 @@ class Settings:
     # container's network). Empty = never trust the header.
     trusted_proxy_cidrs: tuple[str, ...] = ()
     max_body_bytes: int = 64 * 1024
+    # -- Inbox (/inbox) ---------------------------------------------------- #
+    # Bearer token for the MACHINE side of the Inbox (the Mac transcription
+    # worker and the backlog mirror). Empty = fail closed, exactly like
+    # INGEST_TOKEN: every machine endpoint answers 401 and the browser side
+    # still works. Deliberately NOT a `${VAR:?}` in compose — the board booting
+    # matters more than the Inbox booting.
+    inbox_token: str = ""
+    # Per-upload cap for one voice note. The page records speech at ~48 kbps,
+    # so 2 MB is roughly five minutes — plenty for a spoken bug report, and an
+    # order of magnitude less than the 8 MB this used to allow (the cap
+    # multiplies by the create limiter, 30 per 15 min per IP, into how much
+    # disk one address can spend).
+    #
+    # LOAD-BEARING on the browser side: `static/inbox.js` is handed this number
+    # (via a data- attribute on the capture form) and AUTO-STOPS the recorder
+    # just before it is reached. Lower it and long takes simply end sooner with
+    # a message; without that the recorder would run past the cap and the
+    # upload would 413 with the audio held nowhere but a dead page — the take
+    # would be gone. Raise it and nothing breaks.
+    # Applied PER REQUEST on the create route only
+    # (`request.max_content_length`); the global 64 KB body cap that protects
+    # every other route is never raised.
+    inbox_audio_max_bytes: int = 2 * 1024 * 1024
+    # AGGREGATE cap on the whole audio tree, checked before each upload. The
+    # per-note cap alone bounds nothing over time: 30 notes / 15 min / IP at the
+    # per-note limit is still gigabytes a day, and `box-disk` only notices once
+    # the damage is done. 3 GB is years of real use — a 30 s note is ~60 KB.
+    inbox_audio_max_total_bytes: int = 3 * 1024 ** 3
+    # Audio is deleted once its transcript is Whisper-quality AND the item has
+    # been reviewed AND it is older than this — and UNCONDITIONALLY at twice
+    # this age, whatever its state. See inbox_db.prunable_audio: the second rule
+    # is the privacy ceiling, and without it this setting reads like a maximum
+    # and behaves like a minimum.
+    inbox_audio_retention_days: int = 90
+    # `owner/repo` list for the unauthenticated GitHub issue mirror. App config,
+    # not per-job data, so it lives in .env rather than the gitignored jobs.yml.
+    inbox_github_repos: tuple[str, ...] = ()
+    # Optional: lifts the unauthenticated 60 req/h rate limit (and would allow
+    # private repos). Empty = unauthenticated, which is the supported default.
+    inbox_github_token: str = ""
+    inbox_github_interval_s: int = 900
+    # How often the scheduler sweeps prunable audio + reconciles the file tree
+    # against the DB. Hourly: the work is a bounded DELETE plus a directory walk.
+    inbox_prune_interval_s: int = 3600
     extra: dict = field(default_factory=dict)
 
     @property
     def db_path(self) -> str:
         return os.path.join(self.data_dir, "dashboard.db")
+
+    @property
+    def inbox_db_path(self) -> str:
+        """A SEPARATE file from dashboard.db on purpose.
+
+        ``dashboard.db`` keeps exactly one request-path writer (ingest), now
+        enforced by ``db.connect_query_only``. The Inbox needs browser-driven
+        writes from the multi-worker read role, so those go to their own file,
+        coordinated with the scheduler's mirror/prune writes by WAL +
+        ``busy_timeout``."""
+        return os.path.join(self.data_dir, "inbox.db")
+
+    @property
+    def inbox_audio_dir(self) -> str:
+        """Voice notes are FILES, never BLOBs: the DB is snapshotted and
+        sha256-deduped on every change, and megabytes of per-note audio would
+        make every snapshot byte-unique and defeat that dedup entirely."""
+        return os.path.join(self.data_dir, "inbox", "audio")
 
     @property
     def https_redirect_host(self) -> str:
@@ -188,4 +322,14 @@ class Settings:
             probe_no_success_s=_env_int("PROBE_NO_SUCCESS_S", 3600),
             start_scheduler=os.environ.get("DASHBOARD_NO_SCHEDULER", "") == "",
             trusted_proxy_cidrs=_env_cidrs("TRUSTED_PROXY_CIDR"),
+            inbox_token=os.environ.get("INBOX_TOKEN", ""),
+            inbox_audio_max_bytes=_env_int("INBOX_AUDIO_MAX_BYTES",
+                                           2 * 1024 * 1024),
+            inbox_audio_max_total_bytes=_env_int("INBOX_AUDIO_MAX_TOTAL_BYTES",
+                                                 3 * 1024 ** 3),
+            inbox_audio_retention_days=_env_int("INBOX_AUDIO_RETENTION_DAYS", 90),
+            inbox_github_repos=_env_github_repos("INBOX_GITHUB_REPOS"),
+            inbox_github_token=_env_github_token("INBOX_GITHUB_TOKEN"),
+            inbox_github_interval_s=_env_int("INBOX_GITHUB_INTERVAL_S", 900),
+            inbox_prune_interval_s=_env_int("INBOX_PRUNE_INTERVAL_S", 3600),
         )

@@ -63,7 +63,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 
-from . import db, probes
+from . import db, github_mirror, inbox_audio, inbox_db, probes
 from .config import Settings
 from .notify import HIGH_PRIORITY_STATES, Notifier
 from .registry import Job, Registry
@@ -72,6 +72,10 @@ from .state import ALERTABLE_STATES, Facts, compute_state, is_alertable, ok_is_u
 log = logging.getLogger(__name__)
 
 SELF_JOB_ID = "dashboard-probes"
+# The Inbox's background loop, heartbeated from the scheduler thread. `kind:
+# worker`, deliberately NOT `kind: probe` — see registry.KINDS for why a second
+# probe job would rewire the machine-offline rule.
+INBOX_GITHUB_JOB_ID = "inbox-github-sync"
 NOTE_MAX = 500
 
 # How long a job must hold a VERIFIED OK before its episode counts as over,
@@ -382,6 +386,9 @@ class Core:
         self.notifier = notifier or Notifier(settings.ntfy_url,
                                              settings.ntfy_topic)
         self._warned_no_self_job = False
+        # Inbox jobs live in the gitignored jobs.yml, so a fresh deploy may not
+        # declare them yet. Warn once each, never crash, never spam the log.
+        self._warned_missing_inbox_jobs: set[str] = set()
         # Logical clock at the END of the last probe cycle (start + measured
         # wall time). The scheduler schedules the next cycle from this, never
         # from the pre-cycle clock.
@@ -407,6 +414,98 @@ class Core:
             db.ensure_jobs(conn, (j.id for j in self.registry))
         finally:
             conn.close()
+        self.init_inbox_store()
+
+    def init_inbox_store(self) -> None:
+        """Create/migrate ``inbox.db`` — a SEPARATE file (see inbox_db).
+
+        Run for BOTH roles and from every gunicorn worker, which is exactly why
+        ``init_inbox_schema`` migrates under BEGIN IMMEDIATE with a
+        duplicate-column-tolerant ALTER: the loser of that race must not kill a
+        worker and restart-loop the container.
+        """
+        conn = inbox_db.connect(self.settings.inbox_db_path)
+        try:
+            inbox_db.init_inbox_schema(conn)
+        finally:
+            conn.close()
+
+    def inbox_connect(self):
+        return inbox_db.connect(self.settings.inbox_db_path)
+
+    # -- inbox maintenance (scheduler thread only) -------------------------- #
+
+    def sync_inbox_github(self, now: float | None = None) -> dict:
+        """Mirror every configured repo's open issues, then heartbeat.
+
+        Writes ``inbox.db`` only — and is deliberately NOT called from inside
+        ``run_probe_cycle``: that cycle is serial, has a wall-clock budget and
+        can spend minutes blocked on rclone, and a GitHub sync sharing it would
+        either be starved by the budget or would spend the budget itself. Two
+        independent cadences on one thread, each re-armed from its own end
+        clock (see ``Scheduler.step``).
+        """
+        now = time.time() if now is None else now
+        repos = self.settings.inbox_github_repos
+        summary: dict
+        if not repos:
+            summary = {"repos": 0, "ok": 0, "failed": 0, "issues": 0,
+                       "results": []}
+        else:
+            conn = self.inbox_connect()
+            try:
+                summary = github_mirror.sync(
+                    conn, repos, now=now,
+                    token=self.settings.inbox_github_token)
+            finally:
+                conn.close()
+        self._inbox_heartbeat(
+            INBOX_GITHUB_JOB_ID,
+            status="fail" if summary["failed"] else "ok",
+            reason=(f"{summary['failed']} of {summary['repos']} repo(s) failed"
+                    if summary["failed"] else
+                    f"{summary['repos']} repo(s), {summary['issues']} open issue(s)"),
+            metrics={"repos": summary["repos"], "repos_failed": summary["failed"],
+                     "issues": summary["issues"],
+                     # How much disk the voice notes are holding, and the cap
+                     # they are measured against. It rides the mirror's
+                     # heartbeat because that is the inbox job that already
+                     # beats on a cadence — otherwise the aggregate cap is a
+                     # limit nobody can see approaching until an upload 507s.
+                     "audio_bytes": inbox_audio.tree_bytes(
+                         self.settings.inbox_audio_dir),
+                     "audio_max_bytes": self.settings.inbox_audio_max_total_bytes},
+            now=now)
+        return summary
+
+    def prune_inbox_audio(self, now: float | None = None) -> dict:
+        """Delete audio whose transcript is safe and reconcile files ↔ rows.
+        See ``inbox_audio.prune_audio`` for why all three prune conditions are
+        required."""
+        return inbox_audio.prune_audio(self.settings, now)
+
+    def _inbox_heartbeat(self, job_id: str, *, status: str, reason: str,
+                         metrics: dict, now: float) -> None:
+        """Record a run for an inbox job, if jobs.yml declares it.
+
+        It may well NOT: ``jobs.yml`` is gitignored, so merging this feature
+        ships the schema but never the values, and the box file has to be edited
+        by hand (DEPLOY.md §1d). A missing job is warned about ONCE and then
+        ignored — the sync itself still works, it is just unmonitored, which is
+        exactly what the operator needs to be told rather than crashed over.
+        """
+        job = self.registry.get(job_id)
+        if job is None:
+            if job_id not in self._warned_missing_inbox_jobs:
+                self._warned_missing_inbox_jobs.add(job_id)
+                log.warning("no %r job in jobs.yml — the Inbox's %s is running "
+                            "UNMONITORED (add it per DEPLOY.md)", job_id, job_id)
+            return
+        self.record_ping(job, {"status": status, "started_at": None,
+                               "finished_at": None, "reason": reason[:100],
+                               "exit_code": None, "note": None,
+                               "metrics": metrics},
+                         source="scheduler", now=now)
 
     @staticmethod
     def gather_facts(conn, job: Job, row: dict | None = None) -> Facts:

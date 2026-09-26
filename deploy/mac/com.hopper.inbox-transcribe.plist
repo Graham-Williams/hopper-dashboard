@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  hopper-dashboard Inbox transcription worker. TEMPLATE: deploy/mac/install.sh replaces
+  @@REPO@@ and @@HOME@@ with absolute paths and writes the result to ~/Library/LaunchAgents/.
+
+  Every 5 minutes, not hourly like the probe: this is the ONLY path from a recorded voice note
+  to readable text, so the interval IS how long Graham waits to be able to read back what he
+  said. A run with an empty queue costs one HTTPS GET.
+
+  ⚠️ THE PATH LINE BELOW IS LOAD-BEARING — DO NOT REMOVE IT.
+  mlx-whisper's load_audio() shells out to a BARE `ffmpeg` resolved from PATH, and launchd
+  gives a job the minimal PATH /usr/bin:/bin:/usr/sbin:/sbin, which does NOT include
+  /opt/homebrew/bin where ffmpeg lives. Without this, every transcription fails deep inside
+  load_audio with something that reads like a corrupt recording — not like a PATH problem —
+  and it fails only under launchd, never when the same command is run by hand in a shell that
+  has Homebrew on its PATH. (The absolute-path trick common.find_rclone uses cannot help here:
+  mlx-whisper offers no way to name the ffmpeg binary.) The worker also checks PATH itself and
+  aborts with a diagnostic naming ffmpeg rather than burning the queued items' retry budget.
+
+  The interpreter is NOT /usr/bin/python3: mlx-whisper cannot be installed there. It is the
+  venv named by INBOX_WHISPER_PYTHON in ~/.config/hopper-dashboard/env, invoked as a
+  subprocess — probes/ itself stays stdlib-only and 3.9-clean, and this agent runs it under
+  the stock interpreter like every other probe.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.hopper.inbox-transcribe</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>@@REPO@@/probes/inbox_transcribe.py</string>
+        <string>--quiet</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>300</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOPPER_DASHBOARD_ENV</key>
+        <string>@@HOME@@/.config/hopper-dashboard/env</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>@@HOME@@/Library/Logs/hopper-inbox-transcribe.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>@@HOME@@/Library/Logs/hopper-inbox-transcribe.err.log</string>
+</dict>
+</plist>

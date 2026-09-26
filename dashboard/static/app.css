@@ -187,3 +187,89 @@ button:hover { filter: brightness(1.08); }
   .card dl { grid-template-columns: 1fr; gap: .05rem; }
   .card dt { font-size: .76rem; text-transform: uppercase; letter-spacing: .05em; margin-top: .35rem; }
 }
+
+/* ------------------------------------------------------------------ inbox -- */
+/* Mobile-first, because this page is used on a phone first and a desktop
+   second. Three rules are load-bearing rather than cosmetic:
+   - every form control is font-size 16px on mobile. iOS Safari auto-zooms the
+     viewport when a focused input is under 16px, which throws the page sideways
+     mid-sentence. Do NOT "tidy" these to a smaller size.
+   - item rows STACK on a phone and go inline at 640px. A `min-w-0` title beside
+     a `shrink-0` control cluster on one line is what collapsed km-tracker's
+     titles to "Cl…" on a 390px screen.
+   - titles and transcripts `overflow-wrap: anywhere` (inherited from body) and
+     are never truncated: a wrapped sentence is readable, a clipped one is not.
+   Tap targets are >= 44px. */
+
+.inbox-summary { grid-template-columns: repeat(3, 1fr); }
+@media (min-width: 640px) { .inbox-summary { grid-template-columns: repeat(3, 1fr) 2fr; } }
+
+.capture-form { display: flex; flex-direction: column; gap: .6rem; }
+.field { display: flex; flex-direction: column; gap: .25rem; font-size: .9rem; color: var(--muted); }
+.field.grow { flex: 1 1 12rem; min-width: 0; }
+.capture-row, .filters { display: flex; flex-wrap: wrap; gap: .6rem; align-items: flex-end; }
+.capture-actions { display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; }
+.capture-actions .spacer { flex: 1; }
+
+textarea, input[type=text], input[type=search], select {
+  font: inherit; font-size: 16px; padding: .6rem .7rem; border-radius: 6px;
+  border: 1px solid var(--rule); background: var(--ground); color: var(--ink);
+  width: 100%; min-width: 0; color-scheme: light dark;
+}
+textarea { resize: vertical; min-height: 4.5rem; }
+button.record {
+  background: var(--fail); color: #fff; min-height: 44px; min-width: 7rem;
+}
+button.record[disabled] { background: var(--unknown); cursor: not-allowed; }
+button.record.recording { background: var(--late); }
+/* How full this take is against the per-note cap — the recorder auto-stops at
+   the end of it, so this is a countdown, not a decoration. Deliberately small
+   and quiet: the clock next to it carries the minutes-remaining in words. */
+progress.record-level {
+  width: 6rem; height: .45rem; flex: 0 0 auto; align-self: center;
+  accent-color: var(--late); border: 0;
+}
+.filters button, .capture-actions button { min-height: 44px; }
+.filters .clear { align-self: center; padding: .6rem .2rem; }
+
+.items { list-style: none; margin: .6rem 0 0; padding: 0; display: flex;
+         flex-direction: column; gap: .6rem; }
+.item {
+  background: var(--panel); border: 1px solid var(--rule); border-radius: 10px;
+  border-left: 5px solid var(--unknown); box-shadow: var(--shadow);
+  padding: .8rem .9rem; display: flex; flex-direction: column; gap: .6rem;
+  min-width: 0;
+}
+@media (min-width: 640px) {
+  .item { flex-direction: row; align-items: flex-start; justify-content: space-between; gap: 1rem; }
+  .item-controls { flex: 0 0 auto; align-items: flex-end; }
+}
+.item-filing { border-left-color: var(--behind); }
+.item.state-closed { border-left-color: var(--ok); opacity: .75; }
+.item-main { min-width: 0; flex: 1 1 auto; }
+.item-head { display: flex; flex-wrap: wrap; gap: .3rem; margin-bottom: .35rem; }
+.item-title { font-size: 1rem; font-weight: 650; overflow-wrap: anywhere; }
+.item-body { margin: .3rem 0 0; font-size: .92rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.item-meta { margin: .35rem 0 0; }
+.item-issues { margin: .35rem 0 0; }
+.item-controls { display: flex; flex-direction: column; gap: .5rem; min-width: 0; }
+.item-controls .review { display: flex; align-items: center; gap: .45rem;
+  font-size: .9rem; min-height: 44px; cursor: pointer; white-space: nowrap; }
+.item-controls .review input { width: 1.2rem; height: 1.2rem; }
+.item-controls .player { width: 100%; max-width: 16rem; height: 34px; }
+
+.badge { display: inline-block; padding: .05rem .45rem; border-radius: 999px;
+         font-size: .72rem; font-weight: 600; background: var(--panel-2);
+         color: var(--ink); white-space: nowrap; }
+.badge-voice { background: var(--behind); color: var(--on-state); }
+.badge-typed { background: var(--unknown); color: var(--on-state); }
+.badge-github { background: var(--stale); color: var(--on-state); }
+.badge-backlog { background: var(--skipped); color: var(--on-state); }
+.badge-filing { background: var(--late); color: var(--on-state); }
+.badge-closed, .badge-archived { background: var(--panel-2); color: var(--muted); }
+.ts { font-weight: 600; }
+.ts-pending, .ts-live { color: var(--late); }
+.ts-whisper, .ts-typed { color: var(--ok); }
+.ts-failed { color: var(--fail); }
+.issue { font-weight: 600; }
+.issue-closed { color: var(--muted); text-decoration: line-through; }

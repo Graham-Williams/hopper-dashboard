@@ -24,7 +24,11 @@ def test_example_file_loads_and_has_required_jobs():
     assert {"km-backup", "todoist-points-backup", "box-containers", "mac-probe",
             "pa-backup", "drive-mirror", "minecraft-offload", "taste-twin-publish",
             "jjho-refresh", "baby-pool-sync", "dashboard-probes", "mac-disk",
-            "box-disk"} <= ids
+            "box-disk", "inbox-github-sync"} <= ids
+    # The Inbox's mirror is a `worker`, not a `probe`: a probe job on `box`
+    # would switch sibling-LATE suppression on for every box job.
+    assert reg.get("inbox-github-sync").kind == "worker"
+    assert reg.get("inbox-github-sync").deadline_s == 1800
     assert "km-tracker-cloudflared-1" in reg.get("box-containers").expect
     assert reg.get("minecraft-offload").max_lag_bytes == 21474836480
     assert reg.get("taste-twin-publish").informational
@@ -40,7 +44,7 @@ def test_example_file_loads_and_has_required_jobs():
 
 def test_test_doc_parses():
     reg = parse_registry(JOBS_DOC)
-    assert len(reg) == 9
+    assert len(reg) == 10
     assert reg.get("snap").has_probe and reg.get("snap").deadline_s == 600
     assert reg.by_machine()["box"][0].id == "snap"
     assert [j.id for j in reg.probed()] == ["snap"]
@@ -198,6 +202,11 @@ def test_example_file_alert_policy_matches_the_documented_thresholds():
     # it is what mutes its siblings, so `never` there is silence for the whole machine.
     assert {j.id for j in reg if j.alert_never} == {
         "minecraft-offload", "taste-twin-publish", "jjho-refresh", "baby-pool-sync"}
+    # The Inbox's three jobs all page after a day: none of them is an emergency, and none of
+    # them is allowed to be silent either (a dead mirror or a dead worker LOOKS fine).
+    assert all(reg.get(i).alert_after_s == 86400
+               for i in ("hopper-dashboard-backup", "inbox-transcribe", "inbox-backlog",
+                         "inbox-github-sync"))
     assert all(not j.alert_never for j in reg if j.kind == "probe")
     # 72 h on top of a 15 h LATE deadline: a weekend with the lid shut is silent, a Mac
     # that is gone for ~3.6 days is not.
@@ -264,7 +273,7 @@ def test_every_alerting_job_states_its_real_time_to_page():
             f"{job.id}: comment says {found.group(1)}, arithmetic says {want} "
             f"(deadline {job.deadline_s} + threshold {job.alert_after_s})")
         checked += 1
-    assert checked == 9                                  # every job that can page
+    assert checked == 13                                 # every job that can page
 
 
 def test_the_time_to_page_figures_are_the_ones_graham_was_quoted():
@@ -278,7 +287,13 @@ def test_the_time_to_page_figures_are_the_ones_graham_was_quoted():
         "km-backup": "24.3h", "todoist-points-backup": "24.3h",
         "box-containers": "35m", "box-disk": "1h", "dashboard-probes": "6.3h",
         "mac-probe": "87h", "mac-disk": "1h", "pa-backup": "44h",
-        "drive-mirror": "39h"}
+        "drive-mirror": "39h", "inbox-github-sync": "24.5h",
+        "hopper-dashboard-backup": "24.3h",
+        # The two Mac Inbox jobs pay the same 14 h grace every Mac job pays (below it, a
+        # missed run is indistinguishable from a sleeping Mac), so a day-long threshold
+        # lands just under 40 h. A worker that CRASHED posts `fail` and is red at once —
+        # these figures cover silence, i.e. launchd never running it at all.
+        "inbox-transcribe": "38.1h", "inbox-backlog": "39h"}
     # The bar Graham set was "backups missed more than 24 hours". Both DB
     # snapshots clear it; pa-backup cannot (its 38 h deadline is a hard floor —
     # below it a missed backup is indistinguishable from a sleeping Mac) but it
@@ -430,7 +445,8 @@ def test_example_file_probe_intervals_are_documented_for_the_big_trees():
     reg = load_registry(EXAMPLE_JOBS)
     assert not reg.get("pa-backup").has_probe
     assert not reg.get("minecraft-offload").has_probe
-    assert [j.id for j in reg.probed()] == ["km-backup", "todoist-points-backup"]
+    assert [j.id for j in reg.probed()] == ["km-backup", "todoist-points-backup",
+                                            "hopper-dashboard-backup"]
     assert all(j.probe_interval_s is None for j in reg.probed())
     with open(EXAMPLE_JOBS, encoding="utf-8") as fh:
         text = fh.read()
@@ -506,3 +522,63 @@ def test_disk_job_has_no_schedule_or_probe():
     doc["jobs"][DISK_IDX]["probe"] = {"rclone_path": "g:x"}
     with pytest.raises(RegistryError, match="cannot have a 'probe' block"):
         parse_registry(doc)
+
+
+# --------------------------------------------------------------------------- #
+# kind: worker  (the Inbox's background loops)
+# --------------------------------------------------------------------------- #
+
+WORKER_IDX = 9
+
+
+def test_worker_is_a_scheduled_kind_with_no_extras():
+    """A `worker` is "did this background loop run?" and nothing else: it needs a
+    cadence + grace (so silence is LATE), and it may carry none of the blocks
+    that belong to a kind with a destination."""
+    from dashboard.registry import PROBEABLE_KINDS, SCHEDULED_KINDS
+    assert "worker" in SCHEDULED_KINDS and "worker" not in PROBEABLE_KINDS
+    job = parse_registry(JOBS_DOC).get("worker")
+    assert job.kind == "worker" and job.scheduled
+    assert job.deadline_s == 1800 and not job.has_probe
+    assert not job.informational and job.max_age_s is None
+
+
+@pytest.mark.parametrize("overrides,msg", [
+    ({"cadence_s": None}, "'cadence_s' is required"),
+    ({"grace_s": None}, "'grace_s' is required"),
+    ({"probe": {"rclone_path": "gdrive:x"}}, "cannot have a 'probe' block"),
+    ({"manual": {"max_age_s": 60}}, "'manual' block is only valid"),
+    ({"disk": {"max_used_pct": 90}}, "'disk' block is only valid"),
+    ({"expect": ["a"]}, "'expect' is only valid"),
+])
+def test_worker_rejects_blocks_that_are_not_its_own(overrides, msg):
+    doc = copy.deepcopy(JOBS_DOC)
+    for key, value in overrides.items():
+        if value is None:
+            doc["jobs"][WORKER_IDX].pop(key, None)
+        else:
+            doc["jobs"][WORKER_IDX][key] = value
+    with pytest.raises(RegistryError, match=msg):
+        parse_registry(doc)
+
+
+def test_exactly_one_non_self_probe_job_per_machine():
+    """PERMANENT GUARD. `services._machine_probe` returns the FIRST `kind: probe`
+    job for a machine, and the whole machine-offline rule hangs off it:
+
+    - a SECOND probe job on `mac` makes which job stands for "the Mac is
+      reachable" depend on the ORDER of jobs.yml, silently;
+    - the FIRST probe job on `box` switches sibling-LATE suppression on for every
+      box job at once — box jobs are currently never suppressed, which is why a
+      box outage pages per job.
+
+    Both are one-line edits with fleet-wide alerting consequences and neither
+    would fail anything else. That is why the Inbox's loops are `kind: worker`.
+    """
+    from dashboard.services import SELF_JOB_ID
+    reg = load_registry(EXAMPLE_JOBS)
+    per_machine = {}
+    for job in reg:
+        if job.kind == "probe" and job.id != SELF_JOB_ID:
+            per_machine.setdefault(job.machine, []).append(job.id)
+    assert per_machine == {"mac": ["mac-probe"]}, per_machine

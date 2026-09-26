@@ -127,13 +127,72 @@ def now_iso() -> str:
 # Connection
 # --------------------------------------------------------------------------- #
 
+WAL_SWITCH_ATTEMPTS = 8
+WAL_SWITCH_DELAY_S = 0.05
+
+
+def enable_wal(conn: sqlite3.Connection,
+               attempts: int = WAL_SWITCH_ATTEMPTS) -> None:
+    """Put the database in WAL mode, tolerating a simultaneous open.
+
+    ``PRAGMA journal_mode=WAL`` takes an EXCLUSIVE lock and does **not** go
+    through the busy handler on every path, so setting ``busy_timeout`` first is
+    not enough: a second process opening the same file at the same instant gets
+    ``database is locked`` outright. Measured intermittently (roughly 1 run in
+    10) at an 8-way concurrent open, which is not a contrived number —
+    ``entrypoint.sh`` starts the ingest worker and every read gunicorn worker
+    together, and each of them opens both stores.
+
+    Two mitigations, in order of how often they matter: read the current mode
+    first, because after the very first boot the answer is already ``wal`` and
+    no lock is needed at all; and retry the switch a few times with a short
+    backoff for the genuine first-boot race. Failing after all of that still
+    raises — a store that cannot get into WAL is a real problem.
+    """
+    for attempt in range(attempts):
+        try:
+            row = conn.execute("PRAGMA journal_mode").fetchone()
+            if row is not None and str(row[0]).lower() == "wal":
+                return
+            conn.execute("PRAGMA journal_mode=WAL")
+            return
+        except sqlite3.OperationalError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(WAL_SWITCH_DELAY_S * (attempt + 1))
+
+
+def connect_query_only(db_path: str) -> sqlite3.Connection:
+    """A connection that CANNOT write, enforced by SQLite rather than by comment.
+
+    "Only the ingest process writes" was a convention this whole file rests on,
+    and conventions are how a stray ``INSERT`` in a view ends up racing the
+    scheduler's transactions at 3 a.m. The Inbox makes the read role a writer
+    for the first time — of ``inbox.db``, never of this one — so the rule is now
+    enforced where it matters: every request-path connection the read role opens
+    to ``dashboard.db`` issues ``PRAGMA query_only=ON`` and any write raises
+    ``SQLITE_READONLY`` at once.
+
+    ``PRAGMA query_only``, deliberately NOT a ``file:…?mode=ro`` URI: a
+    read-only connection to a WAL database fails with ``SQLITE_CANTOPEN`` when
+    the ``-shm`` file does not exist yet (a cold start, or the very first
+    request after the data volume is created), which would take the board down
+    for the one case where it has nothing to say anyway. ``query_only`` is a
+    per-connection flag on an ordinary read-write handle, so WAL recovery still
+    works and only *writes* are refused.
+    """
+    conn = connect(db_path)
+    conn.execute("PRAGMA query_only=ON")
+    return conn
+
+
 def connect(db_path: str) -> sqlite3.Connection:
     os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
     conn = sqlite3.connect(db_path, timeout=10, isolation_level=None,
                            check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=10000")
+    enable_wal(conn)
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn

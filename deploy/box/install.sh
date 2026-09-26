@@ -11,11 +11,20 @@
 #      The token is read from --token-file (the compose .env: its INGEST_TOKEN= line) or, if that
 #      is omitted, prompted with a HIDDEN read. It is never accepted on the command line (shell
 #      history / `ps`). An existing env file is kept unless a token is supplied (then rewritten).
-#   2. drop-ins  /etc/systemd/system/{km-backup,todoist-points-backup}.service.d/heartbeat.conf
-#   3. dashboard-containers.service + .timer (template: @@REPO@@ → this checkout, @@USER@@ → --user,
-#      default $SUDO_USER, i.e. whoever ran sudo; must be in the docker group)
-#   4. systemctl daemon-reload; enable --now dashboard-containers.timer
+#   1b. /etc/hopper-dashboard/ingest.curlrc (<user>:<user> 0600) — the same token as a curl
+#      `header = "Authorization: Bearer …"` line, so the backup heartbeat's ExecStopPost does
+#      NOT carry it in argv (i.e. in world-readable /proc/<pid>/cmdline). Readable by the
+#      service user on purpose; that user already owns the compose .env the token comes from.
+#   2. drop-ins  /etc/systemd/system/{km-backup,todoist-points-backup,hopper-dashboard-backup}.service.d/heartbeat.conf
+#   3. dashboard-containers.service + .timer AND hopper-dashboard-backup.service + .timer
+#      (templates: @@REPO@@ → this checkout, @@USER@@ → --user, default $SUDO_USER, i.e. whoever
+#      ran sudo; must be in the docker group)
+#   4. systemctl daemon-reload; enable --now both timers
 #   5. prints verification: systemctl cat of each unit, list-timers, and a dry-run of the container probe
+#
+# The backup timer and its heartbeat drop-in are installed TOGETHER, always. An unmonitored
+# backup fails silently and the board keeps showing the job as it last was — the exact failure
+# this repo exists to catch.
 #
 # Does NOT: restart or touch any container, restart the backup units, or modify ~/km-tracker or
 # ~/todoist-points. daemon-reload only re-reads unit files; the oneshot backup units simply pick
@@ -30,7 +39,8 @@ ENV_FILE="$ENV_DIR/ingest.env"
 SYSD=/etc/systemd/system
 URL=""; TOKEN=""; TOKEN_FILE=""
 RUN_USER="${SUDO_USER:-$(id -un)}"
-UNITS=(km-backup todoist-points-backup)
+UNITS=(km-backup todoist-points-backup)          # foreign units we only drop a heartbeat into
+OWN_UNITS=(hopper-dashboard-backup)              # units this repo ships AND heartbeats
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -38,7 +48,7 @@ while [[ $# -gt 0 ]]; do
     --token-file) TOKEN_FILE="$2"; shift 2 ;;
     --user)       RUN_USER="$2"; shift 2 ;;
     --token) echo "ERROR: --token is not accepted (it would leak into shell history / ps); use --token-file or the hidden prompt" >&2; exit 2 ;;
-    -h|--help) sed -n '2,23p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -82,6 +92,26 @@ else
 fi
 chown root:root "$ENV_FILE"; chmod 0600 "$ENV_FILE"
 
+# --- 1b. curl config for the backup heartbeat (the token OFF the command line) ---
+# systemd expands ${INGEST_TOKEN} into the ExecStopPost child's argv, which lands in
+# /proc/<pid>/cmdline — world-readable on default Ubuntu. hopper-dashboard-backup's drop-in
+# therefore has curl read the Authorization header from this file instead. It must be
+# readable by the SERVICE user (unlike root-only ingest.env); that costs nothing, since that
+# user already owns ~/hopper-dashboard/.env, which is where INGEST_TOKEN comes from.
+CURLRC="$ENV_DIR/ingest.curlrc"
+CURL_TOKEN="$TOKEN"
+[[ -n "$CURL_TOKEN" ]] || CURL_TOKEN="$(grep -m1 '^INGEST_TOKEN=' "$ENV_FILE" | cut -d= -f2- || true)"
+[[ -n "$CURL_TOKEN" ]] || { echo "ERROR: no INGEST_TOKEN in $ENV_FILE — cannot write $CURLRC"; exit 1; }
+# curl's config parser treats \ and " inside a quoted value as escapes, so a token containing
+# either would be sent WRONG (and silently: the ping would just 401 on every tick).
+[[ "$CURL_TOKEN" == *'"'* || "$CURL_TOKEN" == *'\'* ]] && { echo "ERROR: INGEST_TOKEN contains a quote or backslash, which curl's config syntax cannot carry — rotate it to an alphanumeric token"; exit 1; }
+umask 077
+printf '# hopper-dashboard: the Authorization header for the backup heartbeat, kept out of\n# the process command line. Written by deploy/box/install.sh. Mode 0600.\nheader = "Authorization: Bearer %s"\n' "$CURL_TOKEN" > "$CURLRC.tmp"
+mv "$CURLRC.tmp" "$CURLRC"
+umask 022
+chown "$RUN_USER" "$CURLRC"; chmod 0600 "$CURLRC"
+echo "wrote $CURLRC (owned by $RUN_USER, 0600)"
+
 # --- 2. drop-ins ----------------------------------------------------------------
 for u in "${UNITS[@]}"; do
   install -d -m 0755 "$SYSD/$u.service.d"
@@ -98,23 +128,42 @@ install -m 0644 "$HERE/dashboard-containers.timer" "$SYSD/dashboard-containers.t
 chmod +x "$HERE/containers_probe.sh" "$REPO/probes/containers_probe.py" "$REPO/probes/disk_probe.py" 2>/dev/null || true
 echo "installed dashboard-containers.{service,timer}"
 
+# --- 3b. backup timer + its heartbeat drop-in (installed together, never apart) ---
+for u in "${OWN_UNITS[@]}"; do
+  sed -e "s|@@REPO@@|$REPO|g" -e "s|@@USER@@|$RUN_USER|g" "$HERE/$u.service" > "$SYSD/$u.service.tmp"
+  grep -q '@@' "$SYSD/$u.service.tmp" && { echo "ERROR: unrendered placeholder in $u.service"; rm -f "$SYSD/$u.service.tmp"; exit 1; }
+  mv "$SYSD/$u.service.tmp" "$SYSD/$u.service"
+  chmod 0644 "$SYSD/$u.service"
+  install -m 0644 "$HERE/$u.timer" "$SYSD/$u.timer"
+  install -d -m 0755 "$SYSD/$u.service.d"
+  install -m 0644 "$HERE/$u.service.d/heartbeat.conf" "$SYSD/$u.service.d/heartbeat.conf"
+  echo "installed $u.{service,timer} + its heartbeat drop-in"
+done
+chmod +x "$HERE/backup.sh" "$HERE/verify_snapshot.py" 2>/dev/null || true
+
 # --- 4. reload + enable ---------------------------------------------------------
 systemctl daemon-reload
 systemctl enable --now dashboard-containers.timer
 echo "enabled dashboard-containers.timer"
+for u in "${OWN_UNITS[@]}"; do systemctl enable --now "$u.timer"; echo "enabled $u.timer"; done
 
 # --- 5. verify ------------------------------------------------------------------
 echo; echo "=== systemd-analyze verify ==="
-systemd-analyze verify --man=no "$SYSD/dashboard-containers.service" "${UNITS[@]/%/.service}" && echo "ok"
+systemd-analyze verify --man=no "$SYSD/dashboard-containers.service" "${OWN_UNITS[@]/%/.service}" "${UNITS[@]/%/.service}" && echo "ok"
+echo; echo "=== the heartbeat curl config (token off the command line) ==="
+ls -l "$CURLRC" && grep -c '^header = "Authorization: Bearer ' "$CURLRC" >/dev/null \
+  && echo "ok: $CURLRC has the Authorization header (value not printed)" \
+  || echo "!! $CURLRC is missing its header line — the backup heartbeat will 401"
 echo; echo "=== drop-ins as systemd sees them ==="
-for u in "${UNITS[@]}"; do systemctl cat "$u.service" | grep -E 'heartbeat.conf|ExecStopPost' || echo "!! $u.service has no heartbeat drop-in"; done
+for u in "${UNITS[@]}" "${OWN_UNITS[@]}"; do systemctl cat "$u.service" | grep -E 'heartbeat.conf|ExecStopPost' || echo "!! $u.service has no heartbeat drop-in"; done
 echo; echo "=== timers ==="
-systemctl list-timers --no-pager | grep -E 'NEXT|km-backup|todoist-points-backup|dashboard-containers' || true
+systemctl list-timers --no-pager | grep -E 'NEXT|km-backup|todoist-points-backup|dashboard-containers|hopper-dashboard-backup' || true
 echo; echo "=== box probe dry run (as $RUN_USER): box-containers + box-disk ==="
 sudo -u "$RUN_USER" env "$(grep '^DASHBOARD_URL=' "$ENV_FILE")" "$REPO/deploy/box/containers_probe.sh" --dry-run || echo "dry run failed (rc=$?)"
 echo
 echo "First heartbeats: box-containers + box-disk within 5 min (or now: systemctl start dashboard-containers.service);"
-echo "km-backup / todoist-points-backup on their next timer tick (≤5 min). Check with:"
+echo "km-backup / todoist-points-backup / hopper-dashboard-backup on their next timer tick (≤5 min). Check with:"
+echo "  journalctl -u hopper-dashboard-backup.service -n 20 --no-pager   # the backup's own log lines"
 echo "  journalctl -u dashboard-containers.service -n 5 --no-pager"
 echo "  # read side (curl is not in the image; use python inside the container). Host MUST equal APP_HOST —"
 echo "  # the read role pins Host on everything but /healthz, so without the header this is a 403:"

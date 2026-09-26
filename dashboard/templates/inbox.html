@@ -1,0 +1,216 @@
+{% extends "base.html" %}
+{% from "_macros.html" import when %}
+{% block title %}Inbox · Hopper Dashboard{% endblock %}
+{#
+  EVERY row is rendered here, server-side. static/inbox.js only shows and hides
+  rows that already exist in this DOM — it never builds one, never assigns
+  innerHTML, and is never handed a JSON blob of transcripts inside a <script>
+  tag. With JavaScript off the table, the filters and the typed-note form all
+  still work; only the microphone needs it.
+#}
+{% block content %}
+{% set c = page.counts %}
+<section class="summary inbox-summary" aria-label="Inbox summary">
+  <div class="tile tile-behind {% if not c.awaiting_filing %}zero{% endif %}">
+    <span class="n">{{ c.awaiting_filing }}</span><span class="l">Awaiting filing</span>
+  </div>
+  <div class="tile tile-late {% if not c.awaiting_transcription %}zero{% endif %}">
+    <span class="n">{{ c.awaiting_transcription }}</span><span class="l">Transcribing</span>
+  </div>
+  <div class="tile tile-ok {% if not c.open %}zero{% endif %}">
+    <span class="n">{{ c.open }}</span><span class="l">Open</span>
+  </div>
+  <div class="tile meta">
+    <span class="l">{{ c.total }} item{{ '' if c.total == 1 else 's' }} · generated {{ when(page.generated_at, now) }}</span>
+  </div>
+</section>
+
+<section class="panel capture" aria-labelledby="capture-h">
+  <h2 id="capture-h">Capture</h2>
+  {# A plain multipart form: submitting it with JS off posts a typed note and
+     redirects back here. inbox.js upgrades it in place — it attaches the
+     recorded audio and submits via fetch — but never replaces it. #}
+  {# data-audio-max-bytes is the SERVER's INBOX_AUDIO_MAX_BYTES, handed to
+     inbox.js so the recorder auto-stops just under it instead of letting a long
+     take grow past the cap and die as a 413 with the audio held nowhere. It is
+     rendered here rather than hardcoded in the script so it tracks the setting.
+     A number, not content: nothing untrusted goes near this attribute. #}
+  <form id="capture-form" class="capture-form" method="post"
+        action="{{ url_for('inbox.create_item') }}"
+        data-audio-max-bytes="{{ audio_max_bytes }}"
+        enctype="multipart/form-data">
+    <label class="field">
+      <span>What happened?</span>
+      <textarea id="capture-text" name="text" rows="3"
+                maxlength="20000" placeholder="Describe the bug or idea…"></textarea>
+    </label>
+    <div class="capture-row">
+      <label class="field grow">
+        <span>Project <span class="muted">(optional)</span></span>
+        <input type="text" name="project" maxlength="64" list="project-list"
+               pattern="[A-Za-z0-9._/-]+" placeholder="km-tracker">
+      </label>
+      <datalist id="project-list">
+        {% for p in page.projects %}<option value="{{ p }}"></option>{% endfor %}
+      </datalist>
+      <label class="field grow">
+        <span>Title <span class="muted">(optional — never overwritten)</span></span>
+        <input type="text" name="title" maxlength="200" placeholder="derived from what you say">
+      </label>
+    </div>
+    <div class="capture-actions">
+      {# Hidden until inbox.js proves a recorder is actually usable: a dead
+         record button is worse than no record button. #}
+      <button type="button" id="record-btn" class="record" hidden
+              aria-pressed="false">● Record</button>
+      <span id="record-status" class="muted small" role="status" aria-live="polite"></span>
+      {# How full this take is against the per-note cap. Shown only while there
+         is something to show; inbox.js sets .value/.max, never a style. #}
+      <progress id="record-level" class="record-level" max="100" value="0"
+                hidden aria-label="Recording size against the limit"></progress>
+      <span class="spacer"></span>
+      <button type="submit" id="capture-submit">Add to inbox</button>
+    </div>
+    <p id="capture-error" class="hint bad" hidden></p>
+    <p class="muted small">
+      Recordings never leave this box: the audio is uploaded here and
+      transcribed on the Mac by Whisper, which runs every few minutes — so a
+      new voice note shows <span class="ts ts-pending">pending</span> until it
+      does. Nothing is sent to Google or Apple.
+    </p>
+    <p class="muted small">
+      Up to {{ (audio_max_bytes // 1048576) }} MB per note — roughly
+      {{ audio_max_secs // 60 }} minutes of speech. Recording stops itself at the
+      limit and keeps everything up to that point, so a take is never lost to it.
+      Audio is deleted once
+      its transcript is Whisper-quality <em>and</em> you have ticked Reviewed
+      <em>and</em> it is more than {{ retention_days }} days old — and in any
+      case after {{ retention_days * 2 }} days, whatever state it is in. Delete
+      removes a row and its recording immediately — everywhere, including the
+      off-box backup, within a few minutes. The transcript <em>text</em> is a
+      different matter: database backups already taken still contain it, and
+      those age out after about 30 days.
+    </p>
+  </form>
+</section>
+
+<section class="panel" aria-labelledby="filters-h">
+  <h2 id="filters-h">Filter</h2>
+  {# A GET form, so every filter is a real URL that works without JS and can be
+     bookmarked. inbox.js additionally filters the rendered rows as you type. #}
+  <form class="filters" method="get" action="{{ url_for('inbox.board') }}">
+    <label class="field grow">
+      <span>Search</span>
+      <input type="search" id="filter-q" name="q" value="{{ filters.q or '' }}"
+             maxlength="200" placeholder="wheel, backup, iOS…">
+    </label>
+    <label class="field">
+      <span>Source</span>
+      <select name="source" id="filter-source">
+        <option value="">any</option>
+        {% for s in sources %}
+        <option value="{{ s }}" {% if filters.source == s %}selected{% endif %}>{{ s }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label class="field">
+      <span>State</span>
+      <select name="state" id="filter-state">
+        <option value="">any</option>
+        <option value="open" {% if filters.state == 'open' %}selected{% endif %}>open</option>
+        <option value="closed" {% if filters.state == 'closed' %}selected{% endif %}>closed</option>
+      </select>
+    </label>
+    <label class="field">
+      <span>Waiting on</span>
+      <select name="awaiting" id="filter-awaiting">
+        <option value="">anything</option>
+        <option value="filing" {% if filters.awaiting == 'filing' %}selected{% endif %}>filing</option>
+        <option value="transcription" {% if filters.awaiting == 'transcription' %}selected{% endif %}>transcription</option>
+      </select>
+    </label>
+    <button type="submit">Apply</button>
+    <a class="clear" href="{{ url_for('inbox.board') }}">Clear</a>
+  </form>
+  <p id="filter-count" class="muted small" hidden></p>
+</section>
+
+<section class="group" aria-labelledby="items-h">
+  <h2 id="items-h">Items <span class="muted">{{ page["items"]|length }} shown</span></h2>
+  {% if not page["items"] %}
+  <p class="muted">Nothing here yet. Record a note or type one above.</p>
+  {% endif %}
+  <ul class="items" id="items">
+    {% for it in page["items"] %}
+    <li class="item {% if it.awaiting_filing %}item-filing{% endif %} state-{{ it.state }}"
+        id="item-{{ it.id }}" data-id="{{ it.id }}"
+        data-source="{{ it.source }}" data-state="{{ it.state }}"
+        data-reviewed="{{ 1 if it.reviewed else 0 }}"
+        data-awaiting-filing="{{ 1 if it.awaiting_filing else 0 }}"
+        data-awaiting-transcription="{{ 1 if it.awaiting_transcription else 0 }}"
+        data-project="{{ it.project or '' }}"
+        data-text="{{ (it.title ~ ' ' ~ it.body ~ ' ' ~ (it.project or ''))|lower }}">
+      <div class="item-main">
+        <div class="item-head">
+          <span class="badge badge-{{ it.source }}">{{ it.source }}</span>
+          {% if it.project %}<span class="badge badge-project">{{ it.project }}</span>{% endif %}
+          {% if it.awaiting_filing %}<span class="badge badge-filing">awaiting filing</span>{% endif %}
+          {% if it.state == 'closed' %}<span class="badge badge-closed">closed</span>{% endif %}
+          {% if it.archived_at %}<span class="badge badge-archived">archived upstream</span>{% endif %}
+        </div>
+        {# Autoescaped, like everything else here: a transcript containing
+           </script> or {{ }} is text, and stays text. #}
+        <h3 class="item-title">{{ it.title }}</h3>
+        {% if it.body and it.body != it.title %}
+        <p class="item-body">{{ it.body }}</p>
+        {% endif %}
+        <p class="item-meta muted small">
+          {{ when(it.created_at, now) }}
+          {% if it.transcript_status %} · transcript: <span class="ts ts-{{ it.transcript_status }}">{{ it.transcript_status }}</span>{% endif %}
+          {% if it.transcript_status == 'failed' %} <span class="muted">(Whisper gave up after {{ it.transcribe_attempts }} attempt{{ '' if it.transcribe_attempts == 1 else 's' }} — the audio is still here)</span>{% endif %}
+          {% if it.audio_pruned_at %} · audio pruned {{ when(it.audio_pruned_at, now) }}{% endif %}
+        </p>
+        {% if it.issues %}
+        <p class="item-issues small">
+          {% for i in it.issues %}
+          <a class="issue issue-{{ i.state }}" href="{{ i.url }}" rel="noopener noreferrer" target="_blank">{{ i.repo }}#{{ i.number }}</a>{% if i.state == 'closed' %}<span class="muted"> closed</span>{% endif %}{% if not loop.last %} · {% endif %}
+          {% endfor %}
+        </p>
+        {% elif it.mirror_url %}
+        <p class="item-issues small">
+          <a class="issue" href="{{ it.mirror_url }}" rel="noopener noreferrer" target="_blank">{{ it.mirror_key }}</a>
+        </p>
+        {% endif %}
+      </div>
+      <div class="item-controls">
+        <label class="review">
+          <input type="checkbox" class="review-box" data-id="{{ it.id }}"
+                 {% if it.reviewed %}checked{% endif %}>
+          <span>Reviewed</span>
+        </label>
+        {% if it.has_audio %}
+        {# Played back from the SERVER URL, never a blob: — a blob would need
+           media-src blob: in the CSP and the CSP is not being loosened. #}
+        <audio class="player" controls preload="none"
+               src="{{ url_for('inbox.audio', item_id=it.id) }}"></audio>
+        {% endif %}
+        {# The one control that destroys something. Needs JS (it is a DELETE),
+           which is acceptable for a deliberate destructive action in a way it
+           would not be for capture — and it is hidden until inbox.js wires it,
+           so it is never a button that does nothing. #}
+        <button type="button" class="delete-item" data-id="{{ it.id }}" hidden
+                title="Delete this item and its recording">Delete</button>
+      </div>
+    </li>
+    {% endfor %}
+  </ul>
+</section>
+{% endblock %}
+
+{# The ONLY page that fills this block. It carries the same per-request nonce as
+   base.html's inline localizer — `script-src 'nonce-…'` has no 'self', so an
+   external file without it would silently not run. The board keeps exactly one
+   <script>; this page has two, both nonce'd. #}
+{% block scripts %}
+<script nonce="{{ csp_nonce() }}" src="{{ url_for('static', filename='inbox.js') }}" defer></script>
+{% endblock %}

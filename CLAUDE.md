@@ -6,15 +6,27 @@ fresh bytes, and how far behind manual jobs are. Read `DESIGN.md` first — it i
 contract (the "State precedence (as implemented)" section there is the authoritative state-machine spec).
 
 ## Stack
-Python 3.12, Flask 3.1.3, SQLite (WAL; the ingest process is the only writer), PyYAML for `jobs.yml`, gunicorn,
-rclone inside the container for destination probes, ntfy for alerts. No CDN assets, no webfonts, and exactly
-ONE inline script (the `<time datetime>` localizer in `base.html`) allowed by a per-request CSP nonce —
-`default-src 'self'; script-src 'nonce-…'`. Docker + compose on the box behind the existing `km-tracker`
-Cloudflare tunnel; shared `APP_PASSWORD` gate (same pattern as km-tracker / todoist-points / taste-twin /
-jjho / baby-pool).
+Python 3.12, Flask 3.1.3, SQLite (WAL), PyYAML for `jobs.yml`, gunicorn, rclone inside the container for
+destination probes, ntfy for alerts. No CDN assets, no webfonts, and one inline script per page (the
+`<time datetime>` localizer in `base.html`; `/inbox` adds an external `static/inbox.js`) allowed by a
+per-request CSP nonce — `default-src 'self'; script-src 'nonce-…'`. Docker + compose on the box behind the
+existing `km-tracker` Cloudflare tunnel.
+
+**TWO SQLite files, with different rules.** `dashboard.db` has ONE request-path writer, the ingest role; the
+read role's request-path connections are `PRAGMA query_only=ON`, so a stray write raises `SQLITE_READONLY`
+rather than being discouraged by a comment. `inbox.db` (added with `/inbox`) is a separate file with two
+in-container writers — the read role for browser writes, the ingest scheduler for the GitHub mirror and the
+audio prune — coordinated by WAL. Do not "unify" them; DESIGN.md records why.
+
+**`APP_PASSWORD` is THIS APP'S OWN password, not the shared house word** (changed 2026-09-19). It used to be
+the same word as km-tracker / todoist-points / taste-twin / jjho / baby-pool, copied verbatim from
+`~/km-tracker/.env`. It is not any more: that word has been given to friends and the board is linked from
+the public apex page, which stopped being acceptable when `/inbox` began storing recordings of Graham's
+voice. The gate CODE is unchanged — this is a value in the box `.env` only (DEPLOY.md §1c), so nothing
+enforces it and the only check is trying the house word at `/login` and seeing it refused.
 
 ## Two roles, one container
-`create_app(role)` builds either app; both load the same `jobs.yml` and share `data/dashboard.db`.
+`create_app(role)` builds either app; both load the same `jobs.yml`, share `data/dashboard.db`, and both run the additive schema migration for `data/inbox.db` at start-up (under `BEGIN IMMEDIATE`, duplicate-column-tolerant — `entrypoint.sh` starts both gunicorns together, so they race).
 
 | role     | port | routes | extras |
 |----------|------|--------|--------|
@@ -43,6 +55,11 @@ export APP_PASSWORD=devpass SESSION_SECRET=devsecret INGEST_TOKEN=devtoken READ_
 #            INGEST_PORT, DASHBOARD_BIND, PROBE_INTERVAL_S, TICK_INTERVAL_S, DASHBOARD_NO_SCHEDULER=1,
 #            DASHBOARD_RCLONE_TIMEOUT_S (240 — NOT RCLONE_TIMEOUT*, that namespace is rclone's own),
 #            PROBE_FAIL_THRESHOLD (2), PROBE_NO_SUCCESS_S (3600)
+# Inbox knobs (all optional; empty INBOX_TOKEN = the machine endpoints fail closed, browser side still works):
+#            INBOX_TOKEN, INBOX_AUDIO_MAX_BYTES (2 MiB/note), INBOX_AUDIO_MAX_TOTAL_BYTES (3 GB tree),
+#            INBOX_AUDIO_RETENTION_DAYS (90; audio also goes unconditionally at 2x that age),
+#            INBOX_GITHUB_REPOS (validated at startup), INBOX_GITHUB_TOKEN, INBOX_GITHUB_INTERVAL_S (900),
+#            INBOX_PRUNE_INTERVAL_S (3600)
 
 curl -X POST -H 'Authorization: Bearer devtoken' -d result=success -d exit=0 localhost:8081/api/v1/ping/km-backup
 curl -X POST -H 'Authorization: Bearer devtoken' -H 'Content-Type: application/json' \
@@ -262,6 +279,29 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
 - `templates/`, `static/app.css`, `static/favicon.svg` — theme-aware (light/dark tokens), mobile-first,
   Okabe–Ito state colours always paired with a text label + glyph.
 
+### The Inbox (`/inbox`, added 2026-09-19)
+- `inbox_db.py` — the `inbox.db` store: `INBOX_SCHEMA` + an additive `INBOX_COLUMNS` migration in the same
+  shape as `db.py`, the queries, and the mirror bookkeeping. `normalise_backlog_key` lives here and is
+  DUPLICATED in `probes/backlog.py` (stdlib-only, cannot import Flask); `tests/test_backlog_mirror.py` pins
+  the two together — change both or neither.
+- `inbox_audio.py` — the audio file store (mime allow-list + a MAGIC-BYTE check, sha256, path built from the
+  server-generated id only, never the client filename) and the scheduler's prune + orphan reconcile. The
+  prune needs ALL THREE of `transcript_status='whisper'`, `reviewed=1`, and older than the retention. It
+  lives here rather than in `inbox.py` because `inbox.py` imports `web` → `views` → `services`, and the
+  scheduler importing that would close a cycle.
+- `inbox.py` — the blueprint. `MACHINE_ENDPOINTS` is what scopes `INBOX_TOKEN`; the create route raises
+  `request.max_content_length` PER REQUEST (the global 64 KB cap in `__init__.py` protects every other
+  route and must stay); the Origin/Referer CSRF pin covers POST/PUT/PATCH/DELETE but EXEMPTS a
+  bearer-authenticated call, because `curl` sends neither header and every Mac-worker POST would 403 on
+  prod while passing every test.
+- `github_mirror.py` — `sync(conn, repos, now, fetch)` with `fetch` injected for tests. ETag-conditional,
+  skips anything with a `pull_request` key, honours `X-RateLimit-Reset`/`Retry-After` into `backoff_until`,
+  and closes items ONLY after a complete, error-free repo fetch (a partial page must never close anything).
+- `templates/inbox.html`, `static/inbox.js` — see the JS convention above.
+- Scheduler: `Scheduler.step()` carries `last_github` and `last_prune`, each re-armed from its own END clock
+  and each in its own try/except, both writing `inbox.db` only and NEVER inside `run_probe_cycle`. A failing
+  GitHub sync must not kill the probe cycle or the tick.
+
 ## Conventions
 - Timestamps in the DB are ISO-8601 UTC strings with `Z`; heartbeat "when" is **server receive time**
   (`received_at`), never the client's `started_at`/`finished_at`, so clock skew can't fake liveness.
@@ -279,8 +319,13 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   data-driven width must be an SVG attribute (see the `disk_gauge` / `history_strip` macros), not a style.
   A styled bar would render empty in a browser while passing every server-side test.
 - JS is limited to the one nonce'd inline script in `base.html` (timestamp localization; the page must
-  work identically without it). Don't add a second `<script>` — the CSP nonce is generated once per request
-  via `csp_nonce()`, and anything else that needs interactivity should be reconsidered.
+  work identically without it), PLUS the external `static/inbox.js` that only `/inbox` loads, via a
+  `{% block scripts %}` no other template fills. Don't add a third — the CSP nonce is generated once per
+  request via `csp_nonce()`, and `tests/test_web.py` asserts the board page still has exactly ONE
+  `<script>` while `/inbox` has exactly two, both nonce'd. Note `script-src` is `'nonce-…'` with NO
+  `'self'`, so an external `<script src>` works ONLY if it also carries the nonce; do not add `'self'`.
+  `inbox.js` uses `textContent`, never `innerHTML`, and the rows are rendered server-side — it only
+  shows/hides/reorders DOM that is already there, so the table works with JS off.
 - Tests must stay network-free: mock `probes.probe_job` / `subprocess.run` and use `RecordingNotifier`.
   `run_probe_cycle` passes `timeout=` to `probe_job`, so a stub must accept it (`lambda job, **kw: …`).
 - Test fixtures pin `jobs.created_at` to 2030 (`conftest.pin_created_at`) so the never-pinged → LATE rule
@@ -405,9 +450,17 @@ of both roles.
 ## Secret safety
 `.env`, `jobs.yml` (it lists real Drive paths/ids and machine topology), `rclone.conf`, `ingest.env`,
 `*.sqlite*` and `data/` are gitignored. Only `.env.example` and `jobs.example.yml` are committed, with
-placeholders. Never log tokens; failed logins log the IP only. `INGEST_TOKEN`/`READ_TOKEN` empty = fail
-closed (every bearer request 401); `APP_PASSWORD` empty in prod = refuse to start. Install scripts never
-accept a token on the command line (`--token-file` / hidden prompt only). Supply chain: `python:3.12-slim`
+placeholders. Never log tokens; failed logins log the IP only. `INGEST_TOKEN`/`READ_TOKEN`/`INBOX_TOKEN`
+empty = fail closed (every bearer request 401); `APP_PASSWORD` empty in prod = refuse to start. Install
+scripts never accept a token on the command line (`--token-file` / hidden prompt only) — `deploy/mac/install.sh
+--inbox` follows the same rule for `INBOX_TOKEN`, and DEPLOY.md §1c follows it for the password itself.
+
+**Three credentials, deliberately not one.** `INGEST_TOKEN` (heartbeats, Tailscale-only `:8081`),
+`READ_TOKEN` (Hopper's read-only `GET /api/v1/status`) and `INBOX_TOKEN` (the Mac worker + the backlog
+mirror, scoped by endpoint name to `inbox.MACHINE_ENDPOINTS`). `READ_TOKEN` is explicitly REFUSED on the
+Inbox's mutating routes: it is the credential Hopper's watch carries around, and it must not quietly become
+a write one. Note a session cookie OUTRANKS a bearer in `web.auth_kind`, so a logged-in browser cannot call
+the `INBOX_TOKEN` endpoints at all — tests of them need a session-free client. Supply chain: `python:3.12-slim`
 is digest-pinned in the Dockerfile, GitHub Actions are SHA-pinned in `ci.yml` (`permissions: contents: read`),
 and rclone is checksum-verified.
 
@@ -415,6 +468,15 @@ and rclone is checksum-verified.
 When you add or change a capability, job kind, endpoint, dependency, deploy step, or architectural decision,
 update this file, `DESIGN.md` and `DEPLOY.md` before the task is done. This is how context persists for the
 next agent that enters the repo.
+
+**⚠️ `jobs.yml` AND `.env` ARE GITIGNORED, so merging a PR whose value lives in either of them changes
+NOTHING in production.** This has already bitten once for real: PR #8's per-job probe intervals merged and
+were never enabled, so the two big Drive trees kept being listed every 5 minutes — the very thing causing
+the rate-limiting it was meant to fix — until someone edited the box by hand. **Verify the box, not the
+diff.** Every new key needs an explicit DEPLOY.md recipe (§1 for `.env`, §1d/§1d-ii for `jobs.yml`), and
+the Inbox release adds four job ids plus six `.env` keys that ship nothing on merge. Rollback order matters
+for the same reason: restore the `jobs.yml` backup BEFORE rolling the image back, or an older registry
+rejects `kind: worker` (or `alert_after_s`) and the container restart-loops.
 
 ## Probes (`probes/`, `deploy/`, `tests/test_probes_*.py`)
 The push side. **Stdlib only, Python 3.9-compatible** — `probes/mac_probe.py` runs under macOS's stock
@@ -450,6 +512,61 @@ there is no default URL in the code, by design.
   `probes/common.py` (re-exported from `rclone_check` for the Mac probe's existing call site) so the box
   probe doesn't import an rclone module to call `statvfs`. Credentials in `/etc/hopper-dashboard/ingest.env` (root 0600,
   read by systemd); `install.sh --token-file <compose .env>` reads the token, never from argv.
+- Mac, the Inbox (added 2026-09-19): a SECOND launchd agent `com.hopper.inbox-transcribe`
+  (`deploy/mac/`, `StartInterval 300`) runs `probes/inbox_transcribe.py` — pull the transcription queue,
+  download each clip, run Whisper, post the transcript back — plus an `inbox-backlog` sub-probe inside
+  `mac_probe.py` that mirrors `~/personal-assistant/backlog.txt` via `probes/backlog.py`. Both are inert
+  until `INBOX_URL` + `INBOX_TOKEN` are in `~/.config/hopper-dashboard/env`, which is what keeps this
+  branch safe on the live hourly clone. `deploy/mac/install.sh --inbox` sets them up; `uninstall.sh
+  --inbox-only` removes just the worker. Healthy hourly log line is now `(5 sub-probes, …, 5 pings)`.
+  - **⚠️ NEVER `import mlx_whisper` anywhere under `probes/`.** CI compiles and runs this package under
+    3.9 with no third-party packages; mlx exists only in a venv. It is subprocessed, with the interpreter
+    from `INBOX_WHISPER_PYTHON` (today it borrows `~/code/jjho-fan-almanac/.venv` — a dedicated venv is the
+    clean fix and needs no code change). A test asserts this with `ast` over every module in the package.
+  - **⚠️ THE ffmpeg/PATH TRAP.** `mlx_whisper.load_audio()` runs a BARE `ffmpeg` from PATH, and launchd's
+    PATH omits `/opt/homebrew/bin`. The plist injects PATH and `install.sh` refuses to install one that has
+    lost the line. It presents as a corrupt recording, not a config error, and only under launchd — so the
+    worker checks PATH itself and aborts the RUN (`EnvironmentFault`) rather than reporting a per-item
+    failure, because three of those mark every queued voice note permanently un-transcribable.
+  - **An environment fault and an item failure are different things** and the distinction is load-bearing.
+    Keep it if you touch `handle_item` / `transcribe_file`.
+  - `probes/backlog.py` DUPLICATES `dashboard/inbox_db.normalise_backlog_key` (stdlib-only, cannot import
+    Flask). `tests/test_backlog_mirror.py` imports both and pins the agreement — drift archives every
+    mirrored row and re-creates it, losing its reviewed tick and its linked issues. Change both together.
+  - `inbox-backlog` NEVER raises: it posts to the PUBLIC host, while `mac-probe` rides Tailscale. A
+    Cloudflare blip must not mark the Mac offline, because that mutes every other Mac job's alert.
+- Box, the Inbox: `deploy/box/backup.sh` + `hopper-dashboard-backup.{service,timer}` +
+  `hopper-dashboard-backup.service.d/heartbeat.conf`, all installed together by `deploy/box/install.sh`
+  (there is no flag to install the timer without the heartbeat — an unmonitored backup is the exact failure
+  this repo exists to catch). Snapshots `dashboard.db` AND `inbox.db` from INSIDE the container via
+  `docker exec` (WAL sidecars are uid 10001; a host-side online backup fails "attempt to write a readonly
+  database"), sha256-dedupes, keeps a local ring + a `daily/` tier, and pushes with **`rclone copy`, never
+  `sync`** for the two DBs. The audio tree is the deliberate EXCEPTION: it MIRRORS deletions (copy, then an
+  explicit logged delete pass for remote extras) so that Delete and the unconditional privacy ceiling
+  actually reach the off-box copy — Graham's call 2026-09-19, because DESIGN.md sells Delete as the way to
+  retract a recording that caught something private, and an additive backup silently broke that promise.
+  Guarded against mirroring a wipe by THREE independent brakes, any one of which refuses and fails the run
+  loudly: proportional (`AUDIO_MAX_DROP_PCT`, default 50, **validated 1–99** — `require_positive_int` was
+  the wrong validator, since 100 makes the comparison never true and silently disables the brake, 200
+  inverts it, and a leading zero would be read as octal), absolute (`AUDIO_MAX_DROP_FILES`, default 25 —
+  a percentage alone cannot see a large tree losing a sub-threshold slice every five minutes), and
+  windowed (`AUDIO_DROP_WINDOW_MIN`, default 24 h — the percentage is measured against the highest count
+  in the window, so a cumulative drip is visible). It also refuses when a missing audio dir is found (skip,
+  never a deletion), when the STAGED tree disagrees with the in-container count, when `rclone lsf` cannot
+  list the remote, and when the container is empty while Drive is not. **The baseline is the REMOTE
+  LISTING, not a file on the box** — falling back to a host directory made the brake fully open on exactly
+  the runs that need it (first deploy, cleared state dir, changed `BACKUP_ROOT`, rebuild-from-Drive), and a
+  run that cannot list the remote deletes nothing and records no baseline. `AUDIO_ALLOW_MASS_DELETE` is
+  **one-shot by construction**: it carries the exact resulting count (`AUDIO_ALLOW_MASS_DELETE=7`), so a
+  value left in `.env.backup` cannot authorise a later, different purge. Only a clean mirror advances the
+  stored count. ⚠️ **Delete removes the row and the recording everywhere (Drive included, within one
+  5-minute cycle), but the transcript TEXT stays in the `inbox_*.db` snapshots already on Drive for up to
+  30 days (`DAILY_RETENTION`)** — rewriting historical snapshots would not be a backup, so the claim is
+  documented honestly instead. All of this is pinned by a real behavioural harness in
+  `tests/test_deploy_backup.py` (fake `docker`/`rclone` on PATH, the real script, assertions on the
+  resulting fake remote) — the string-matching tests it replaced caught none of these.
+  `deploy/box/verify_snapshot.py` holds the all-empty-snapshot guard (rc 3) so it is testable in
+  Python rather than only in bash.
 - Manual jobs: `probes/ping.sh <job_id> <ok|fail|skipped> [note]`. `minecraft-offload` needs one seed ping
   after the first offload or its `max_age_s` stays inert (card says "Never run").
 - Metrics-only updates use `status: "metric"` (not a run); `ok|fail|skipped` are real runs.

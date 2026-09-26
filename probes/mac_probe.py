@@ -10,6 +10,8 @@ ingest port:
   minecraft-offload  bytes/files under ~/minecraft-channel not yet on Drive, per pair + disk free
   mac-disk           free/total bytes of the data volume (the dashboard's disk gauge + thresholds)
   drive-mirror       DriveFS mirror queue/mismatch counts (copied sqlite)
+  inbox-backlog      backlog.txt parsed and mirrored into the Inbox (only when INBOX_URL +
+                     INBOX_TOKEN are configured; silently skipped otherwise)
   mac-probe          the probe's own heartbeat: ok, or fail + which sub-probes errored
 
 Each sub-probe is isolated — one failure never blocks the others — and a line is ALWAYS written
@@ -34,9 +36,10 @@ from typing import Callable, Dict, List, Optional, Tuple
 # Allow `/usr/bin/python3 probes/mac_probe.py` (script mode) as well as `python -m probes.mac_probe`.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from probes import backup_log, drivefs, rclone_check  # noqa: E402
+from probes import backlog, backup_log, drivefs, rclone_check  # noqa: E402
 from probes.common import (  # noqa: E402
     DEFAULT_ENV_FILE,
+    api_json,
     DEFAULT_LOG_FILE,
     DEFAULT_STATE_FILE,
     HTTP_TIMEOUT_S,
@@ -45,6 +48,7 @@ from probes.common import (  # noqa: E402
     ProbeError,
     build_ping,
     find_rclone,
+    flatten_for_log,
     join_nonempty,
     load_config,
     load_state,
@@ -84,6 +88,11 @@ def load_settings(env_path: str) -> Dict[str, str]:
         "PROBE_DISK_PATH": "/System/Volumes/Data",
         # drive-mirror
         "PROBE_DRIVEFS_DIR": drivefs.DEFAULT_DRIVEFS_DIR,
+        # inbox-backlog. INBOX_* rather than PROBE_* because the same three keys are read by
+        # probes/inbox_transcribe.py out of the same env file — one Inbox config, two readers.
+        "INBOX_URL": "",
+        "INBOX_TOKEN": "",
+        "INBOX_BACKLOG_FILE": backlog.DEFAULT_BACKLOG_FILE,
     }
     for k, v in defaults.items():
         cfg.setdefault(k, v)
@@ -274,10 +283,88 @@ def probe_drive_mirror(cfg: Dict[str, str], log: Logger) -> List[Ping]:
     return [("drive-mirror", build_ping("ok", reason="probed", note=note, started_at=started, finished_at=now_iso(), metrics=st.metrics()))]
 
 
+def probe_inbox_backlog(cfg: Dict[str, str], log: Logger, dry_run: bool = False) -> List[Ping]:
+    """Mirror backlog.txt into the Inbox, and report THAT as its own job.
+
+    The Inbox's whole value is being the one place everything pending shows up, and
+    backlog.txt is the half of it that lives on this Mac — the box has no copy and no way to
+    read one.
+
+    ⚠️ DELIVERY FAILURE HERE IS **NOT** A mac-probe FAILURE, and the distinction is the point
+    of this function's shape. ``mac-probe`` answers exactly one question — "is the Mac awake
+    and running its probe?" — and the dashboard's machine-offline rule hangs off that answer,
+    suppressing every other Mac job's LATE alert while it is LATE. This sync posts to the
+    PUBLIC host (Cloudflare, the app password gate, the read role), which is a completely
+    different failure surface from the Tailscale ingest port the heartbeat uses. Letting a
+    502 from Cloudflare mark the Mac as failing would mute the very jobs that tell Graham his
+    backups stopped. So this NEVER raises: a failure comes back as this job's own ``fail``
+    ping (which does reach the ingest port), the run logs it, and mac-probe stays honest.
+
+    Not configured is not broken either: with no INBOX_URL/INBOX_TOKEN there is no Inbox on
+    this Mac, so nothing is posted at all — including no heartbeat. A job that is genuinely
+    not running must go LATE on the board rather than report a healthy run. (This also keeps
+    the sub-probe inert on a Mac whose jobs.yml has never heard of ``inbox-backlog``: posting
+    to an unregistered job id is a 404, which WOULD count as a delivery failure.)
+
+    ``dry_run`` is honoured HERE as well as in ``deliver``: this is the only sub-probe that
+    WRITES anything anywhere, so the usual "compute everything, print the pings" contract
+    would otherwise mutate the real Inbox on a --dry-run.
+    """
+    url = (cfg.get("INBOX_URL") or "").strip().rstrip("/")
+    token = (cfg.get("INBOX_TOKEN") or "").strip()
+    if not url or not token:
+        log.log("inbox-backlog: INBOX_URL/INBOX_TOKEN not configured — skipping")
+        return []
+    started = now_iso()
+    path = cfg["INBOX_BACKLOG_FILE"]
+    try:
+        entries = backlog.read_backlog(path)
+    except Exception as e:
+        # Deliberately `Exception`, not `ProbeError`: see the containment note above. ANY
+        # failure here belongs to THIS job, and an unhandled one would propagate to main()
+        # and fail the whole mac-probe run instead.
+        log.error("inbox-backlog: " + flatten_for_log(e))
+        return [("inbox-backlog", build_ping("fail", reason="error", note=flatten_for_log(e),
+                                             started_at=started, finished_at=now_iso()))]
+    if dry_run:
+        log.log("inbox-backlog: would POST %d entries to %s/api/v1/inbox/mirror/backlog"
+                % (len(entries), url))
+        return [("inbox-backlog", build_ping(
+            "ok", reason="pushed", started_at=started, finished_at=now_iso(),
+            metrics={"entries": len(entries), "synced": 0, "archived": 0}))]
+    try:
+        result = api_json(url + "/api/v1/inbox/mirror/backlog", token, method="POST",
+                          body=backlog.build_payload(entries),
+                          timeout=float(cfg["PROBE_HTTP_TIMEOUT"]))
+    except Exception as e:
+        # PARTIAL: logged and reported against THIS job, never against mac-probe.
+        #
+        # ⚠️ `Exception`, not `ProbeError`, and that width is the point. `api_request` only
+        # ever caught URLError/OSError, so a MALFORMED response — http.client.BadStatusLine
+        # or LineTooLong, which are HTTPException and NOT OSError — escaped it, reached
+        # main()'s generic handler and flipped mac-probe itself to `fail`. Per
+        # services._machine_probe that is the machine-offline signal, so a captive portal or
+        # a Cloudflare blip on the PUBLIC host read as "the Mac is down" AND suppressed the
+        # LATE alerts on pa-backup and minecraft-offload. api_request now retries those, and
+        # this is the backstop: nothing about the public host can be a mac-probe failure.
+        log.error("inbox-backlog partial: " + flatten_for_log(e))
+        return [("inbox-backlog", build_ping("fail", reason="error", note=flatten_for_log(e),
+                                             started_at=started, finished_at=now_iso()))]
+    synced = result.get("synced")
+    archived = result.get("archived")
+    log.log("inbox-backlog: %s entries parsed, synced=%s archived=%s"
+            % (len(entries), synced, archived))
+    return [("inbox-backlog", build_ping(
+        "ok", reason="pushed", started_at=started, finished_at=now_iso(),
+        metrics={"entries": len(entries),
+                 "synced": synced if isinstance(synced, int) else 0,
+                 "archived": archived if isinstance(archived, int) else 0}))]
+
+
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
-SUBPROBES = ("pa-backup", "minecraft-offload", "mac-disk", "drive-mirror")
+SUBPROBES = ("pa-backup", "minecraft-offload", "mac-disk", "drive-mirror", "inbox-backlog")
 
 
 def deliver(pings: List[Ping], cfg: Dict[str, str], dry_run: bool, log: Logger) -> List[str]:
@@ -336,6 +423,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 pings = probe_mac_disk(cfg, log)
             elif name == "drive-mirror":
                 pings = probe_drive_mirror(cfg, log)
+            elif name == "inbox-backlog":
+                pings = probe_inbox_backlog(cfg, log, args.dry_run)
         except ProbeError as e:
             failures.append("%s: %s" % (name, e))
             log.error("%s: %s" % (name, e))

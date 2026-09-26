@@ -18,6 +18,7 @@
   <span class="spacer"></span>
   {# login.html overrides this block to empty: a signed-out visitor has nothing to sign out of. #}
   {% block nav %}
+  <a href="{{ url_for('inbox.board') }}">Inbox</a>
   <a href="{{ url_for('web.api_status') }}">JSON</a>
   <a href="{{ url_for('web.logout') }}">Sign out</a>
   {% endblock %}
@@ -49,5 +50,9 @@
   }
 })();
 </script>
+{# Filled ONLY by inbox.html. The board must keep exactly ONE <script> — two
+   tests assert that, and the CSP has no 'self' in script-src, so anything that
+   lands here must carry the same per-request nonce. #}
+{% block scripts %}{% endblock %}
 </body>
 </html>

@@ -18,15 +18,27 @@ import yaml
 ID_RE = re.compile(r"^[a-z0-9-]+$")
 MACHINES = ("box", "mac")
 KINDS = ("db_snapshot", "rclone_copy_tree", "drive_mirror", "container",
-         "manual", "probe", "disk")
+         "manual", "probe", "disk", "worker")
 # Kinds that run on a schedule and therefore have a dead-man's switch.
 # ``disk`` is deliberately NOT here: it is a gauge, not a job, and the machine's
 # own ``probe`` job (mac-probe / box-containers) is already the liveness signal
 # that the disk metrics ride in on — a second dead-man's switch for the same
 # silence would only double the alerts.
 SCHEDULED_KINDS = ("db_snapshot", "rclone_copy_tree", "drive_mirror",
-                   "container", "probe")
+                   "container", "probe", "worker")
 STATES = ("OK", "LATE", "FAIL", "STALE_DEST", "BEHIND", "UNKNOWN")
+# ``worker`` is a plain heartbeat-on-a-cadence kind: a background loop that
+# reports it ran (the Inbox's GitHub mirror, the Mac transcription worker). It
+# is deliberately NOT ``probe``, and that is a correctness decision, not a
+# labelling one: ``services._machine_probe`` returns the FIRST ``kind: probe``
+# job for a machine, so a second probe job on `mac` would make the
+# machine-offline rule depend on jobs.yml ORDER, and the first one ever on `box`
+# would silently switch sibling-LATE suppression on for every box job.
+# ``worker`` carries no kind-specific state: it flows through the generic
+# scheduled precedence in ``state.compute_state`` — never-pinged → LATE → FAIL →
+# OK — which is exactly what "did this loop run?" means. Nothing to probe, so it
+# is not in PROBEABLE_KINDS either.
+#
 # Kinds that may carry a ``probe`` block (the container lists the destination
 # itself). Required for db_snapshot; optional for copy trees and manual jobs
 # whose destination the box's read-only remote can see — when present, the

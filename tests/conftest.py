@@ -93,6 +93,16 @@ JOBS_DOC = {
         {"id": "disk", "name": "Mac disk", "machine": "mac", "kind": "disk",
          "protects": "headroom", "method": "statvfs", **ALERT_NOW,
          "disk": {"min_free_bytes": 25 * 1024 ** 3, "max_used_pct": 90}},
+        # APPENDED (never inserted — several suites address this list by index).
+        # `worker`: a background loop that heartbeats on a cadence. On `box`
+        # deliberately, because `box` has no machine `probe` job and must keep
+        # having none — `services._machine_probe` takes the FIRST `kind: probe`
+        # job for a machine, so anything probe-shaped here would switch sibling
+        # LATE-suppression on for every box job in these suites.
+        {"id": "worker", "name": "Background worker", "machine": "box",
+         "kind": "worker", "protects": "the inbox github mirror",
+         "method": "in-container scheduler loop", "cadence_s": 900,
+         "grace_s": 900, **ALERT_NOW},
     ]
 }
 

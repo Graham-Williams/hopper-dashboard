@@ -188,6 +188,53 @@ jobs:
                                 # listings would trade FAIL flapping for LATE flapping. If you raise
                                 # DASHBOARD_RCLONE_TIMEOUT_S or PROBE_INTERVAL_S, redo this arithmetic.
 
+  - id: inbox-github-sync
+    name: Inbox GitHub mirror
+    # 24 h. The Inbox's value is being the ONE place everything pending shows up, and a
+    # dead mirror quietly costs that — the board keeps rendering the issues it last saw,
+    # so it looks right and is stale. A day is the right bar: the mirror runs every 15
+    # minutes, so a day is ~96 consecutive misses, and nothing here is urgent enough to
+    # wake anyone sooner (the issues themselves are still on GitHub).
+    # TIME-TO-PAGE: 24.5h  (LATE 30 min after a missed sync, then the 24 h threshold)
+    alert_after_s: 86400        # 24 h
+    machine: box
+    kind: worker                # a background loop, NOT a `probe` — a `kind: probe` job on
+                                # `box` would switch sibling-LATE suppression on for every
+                                # box job at once (services._machine_probe takes the first
+                                # probe job per machine). See registry.KINDS.
+    protects: The Inbox's view of every open GitHub issue across Graham's repos
+    method: in-container scheduler mirrors open issues (unauthenticated, ETag-conditional) into inbox.db
+    cadence_s: 900              # = INBOX_GITHUB_INTERVAL_S
+    grace_s: 900                # One missed sync is nothing: the anonymous API allows 60
+                                # requests/hour, so a rate limit sets a backoff that can
+                                # legitimately skip a cycle or two. 30 min of silence is
+                                # the loop being stopped, not GitHub pushing back.
+
+  - id: hopper-dashboard-backup
+    name: hopper-dashboard DBs + voice audio → Drive
+    # 24 h, the same bar as its two siblings: at a 5-min cadence one missed run is nothing,
+    # a day of them is a real gap. This one matters MORE than the other two, though, and the
+    # comment is here so nobody "tidies" it later: km-tracker and todoist-points hold data
+    # that could be reconstructed with effort; inbox.db holds the transcripts of Graham's
+    # voice notes and his triage state, and the audio tree holds the recordings. There is no
+    # other copy of either.
+    # TIME-TO-PAGE: 24.3h  (LATE 20 min after a missed run, then the 24 h threshold)
+    alert_after_s: 86400        # 24 h
+    machine: box
+    kind: db_snapshot
+    protects: dashboard.db (board history) + inbox.db (voice-note transcripts, triage state) + the audio tree
+    method: systemd timer every 5 min → sqlite backup API INSIDE the container → sha256 dedup → rclone copy (additive) → Drive
+    destination: gdrive:hopper-dashboard-backups
+    cadence_s: 300
+    grace_s: 900
+    probe:
+      rclone_path: gdrive-ro:hopper-dashboard-backups
+      # No state_dir: unlike km/todoist this app's backup state lives in
+      # ~/hopper-dashboard-backups/state, which is not bind-mounted into the container. The
+      # destination listing alone answers "is there a recent snapshot on Drive", which is the
+      # question that matters. Bind-mount it and add the path here if the extra
+      # last-push-checksum detail is ever wanted.
+
   # ------------------------------------------------------------------ mac --
   - id: mac-probe
     name: Mac probe
@@ -355,3 +402,44 @@ jobs:
     protects: Baby pool entries served at baby-pool.graham-williams.com
     method: on-demand via Hopper — Sheet Raw tab → build_entries.py → scp entries.json to the box
     destination: box ~/baby-pool/data/entries.json
+
+  - id: inbox-transcribe
+    name: Inbox transcription worker
+    # 24 h. Nothing is LOST while this is down — the audio is kept and the item simply stays
+    # "transcribing…" — but it is the ONLY path from a recording to text, so a worker that has
+    # been dead for a day means a day of voice notes nobody can search or read.
+    # TIME-TO-PAGE: 38.1h  (LATE 14 h after the last run, then the 24 h threshold)
+    alert_after_s: 86400        # 24 h
+    machine: mac
+    kind: worker                # NOT `probe`: mac-probe is this machine's probe job and must
+                                # stay the only one — services._machine_probe takes the FIRST
+                                # one per machine, so a second would make the machine-offline
+                                # rule depend on the order of this file.
+    protects: Turning Graham's recorded voice notes into searchable text (mlx-whisper, locally)
+    method: launchd com.hopper.inbox-transcribe every 5 min → pulls the queue over the public host, runs Whisper on the Mac, posts the transcript back
+    cadence_s: 300
+    grace_s: 50520              # 14 h + 2 min — NOT 900. Every Mac job needs grace_s >= mac-probe's
+                                # (50400) + 120, or its deadline lands BEFORE the probe's and it goes
+                                # LATE, and pages, for a Mac that is merely asleep overnight. The cost
+                                # is that plain SILENCE from this worker only reads as LATE after ~14 h.
+                                # A worker that CRASHED is a different story: it posts `fail` itself and
+                                # is red immediately, so the slow half only covers "launchd never ran it".
+
+  - id: inbox-backlog
+    name: backlog.txt → Inbox
+    # 24 h. The mirror is a convenience — backlog.txt is still there and still readable — but a
+    # stale mirror is the failure that LOOKS fine: the Inbox keeps rendering the entries it last
+    # saw, so the one-stop-shop quietly stops being one.
+    # TIME-TO-PAGE: 39h  (LATE 14 h after the last hourly run, then the 24 h threshold)
+    alert_after_s: 86400        # 24 h
+    machine: mac
+    kind: worker
+    protects: The Inbox's view of ~/personal-assistant/backlog.txt (the box has no copy and no way to read one)
+    method: sub-probe of the hourly Mac probe — parses backlog.txt, posts the whole file with complete:true so vanished entries archive
+    cadence_s: 3600
+    grace_s: 50520              # 14 h + 2 min, same reasoning as every other Mac job (see pa-backup).
+                                # Note this job going FAIL means the Mac could not PARSE or DELIVER the
+                                # file; it deliberately does NOT fail mac-probe, because delivery here
+                                # goes to the PUBLIC host while mac-probe rides the Tailscale ingest
+                                # port — letting a Cloudflare blip mark the Mac offline would mute
+                                # every other Mac job's alert, backups included.
