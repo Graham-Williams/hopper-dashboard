@@ -11,8 +11,20 @@ transcript on the Mac, where an Apple-silicon Whisper runs ~20x realtime, and po
                                      ...or  {"failed": true, "error": …} to burn one attempt
   POST /api/v1/ping/inbox-transcribe    → this worker's own heartbeat (the INGEST port)
 
+PHASE TWO — drafting (probes/inbox_draft.py), a no-op unless INBOX_CLAUDE_BIN is set. After
+transcription it drafts up to INBOX_DRAFT_LIMIT (5) notes with `claude -p`:
+
+  GET  /api/v1/inbox/draft/queue        → transcribed notes to draft + known_projects
+  POST /api/v1/inbox/items/<id>/draft   → {"title","body","project","src_sha","model"}
+                                   ...or  {"failed": true, "error", "src_sha"}
+
+The TRANSCRIPT TEXT goes to Anthropic in that phase; the audio never leaves the box and this Mac.
+A systemic drafting failure (claude missing, not logged in, limit, 5xx, timeout) fails the
+heartbeat and burns no note's attempt; see inbox_draft's docstring.
+
 TWO CREDENTIALS, TWO HOSTS, and mixing them up is the most likely mistake here:
-  * INBOX_URL  + INBOX_TOKEN   → the PUBLIC host (dashboard.graham-williams.com), Inbox API.
+  * INBOX_URL  + INBOX_TOKEN   → the PUBLIC host (hub.graham-williams.com), Inbox API. NOT the
+    legacy dashboard.* name: it 307s to the Hub, and the client refuses cross-host redirects.
   * DASHBOARD_URL + INGEST_TOKEN → the TAILSCALE-ONLY ingest port (:8081), heartbeat only.
 The heartbeat deliberately does NOT ride the public host: "is the Mac running this loop?" must
 stay answerable when Cloudflare or the public gate is the thing that is broken.
@@ -199,7 +211,7 @@ def _int(cfg: Dict[str, str], key: str, fallback: int) -> int:
 def inbox_base(cfg: Dict[str, str]) -> str:
     url = (cfg.get("INBOX_URL") or "").strip().rstrip("/")
     if not url:
-        raise ProbeError("INBOX_URL is not set — e.g. INBOX_URL=https://dashboard.example.com")
+        raise ProbeError("INBOX_URL is not set — e.g. INBOX_URL=https://hub.example.com")
     if not url.startswith(("http://", "https://")):
         raise ProbeError("INBOX_URL must start with http:// or https:// (got %r)" % url)
     return url

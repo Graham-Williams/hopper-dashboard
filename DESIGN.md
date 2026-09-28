@@ -160,7 +160,10 @@ Outputs:
   board).
 - ntfy (a third party) receives only `job_id: FROM → TO` — never the free-text reason (container names,
   client notes, rclone stderr stay on the board).
-- **A voice note never reaches a third party at all.** The browser uploads audio to the box and does
+- **A voice note's AUDIO never reaches a third party; its TRANSCRIPT TEXT goes to Anthropic.** (Changed
+  2026-09-28 with drafting — see "Drafts, Needs review and the Hub".) The page says: "Audio stays on this box
+  and your Mac. The transcript text — not the audio — is sent from the Mac to Anthropic (Claude) to draft
+  the item." The browser still talks to nothing but this origin. The browser uploads audio to the box and does
   nothing else with it: there is deliberately no in-browser speech recognition, because the Web Speech API
   streams the microphone to Google's or Apple's servers to do the work — inherent to it, not a setting.
   Transcription instead happens on Graham's own Mac, by mlx-whisper running locally. So the full path of a
@@ -211,7 +214,10 @@ inbox_items(id TEXT PK,                     -- uuid4 hex; opaque, appears in URL
   reviewed, reviewed_at, state, closed_at, archived_at,
   transcript_status, transcript_at, transcribe_attempts,
   audio_path, audio_bytes, audio_mime, audio_sha256, audio_secs, audio_pruned_at,
-  mirror_key, mirror_url, mirror_seen_at)
+  mirror_key, mirror_url, mirror_seen_at,
+  -- added 2026-09-28 through INBOX_COLUMNS (the additive migration's first real use):
+  draft_title, draft_body, draft_project, draft_status, draft_at, draft_attempts,
+  draft_model, draft_src_sha, draft_edited_at)
 inbox_issues(id INTEGER PK, item_id → inbox_items(id), repo, number, url, title,
   state, linked_at, checked_at, closed_at)
 inbox_mirror_state(key PK, etag, last_sync_at, last_status, last_error,
@@ -430,6 +436,72 @@ own `fail`; the slow half only covers "launchd never ran it at all".
     Never move these hooks onto the app factory. Session cookies are `Secure` + `HttpOnly` + `SameSite=Lax`.
 - One writer: the container owns the SQLite file; everything external arrives via the ingest API.
 
+## Drafts, Needs review and the Hub — added 2026-09-28
+
+**The product is called Hub** (`hub.graham-williams.com`; the repo keeps its name). `/` is a landing page
+with two equal cards — the Inbox first (Needs-review count, a big Record link to `/inbox#capture`, open
+count), then a one-row health strip of the board (OK · behind · failing, glyph + label, and the
+stale-scheduler warning). The board moved to `/dashboard`; `/jobs/<id>` is unchanged. The Hub has exactly
+one `<script>` like the board, and the Record button is a plain link so it works with JS off.
+
+**Old hostname.** `APP_LEGACY_HOSTS` (validated like `APP_HOST`, never equal to it) are answered by
+`web._legacy_host_redirect` with a **307 for every method** to `https://<APP_HOST><raw target>`,
+`Cache-Control: no-store`, before the gate and the Host pin; `/healthz` is exempt; a malformed `APP_HOST`
+fails closed (403). 307 and not 301 for the same reason as the http→https redirect: a permanent redirect
+built from a wrong `APP_HOST` would stick in every browser. It is done in the app because the Cloudflare
+token cannot write redirect rules; the old hostname keeps its tunnel rule and CNAME.
+
+**Drafts.** After Whisper, the Mac worker (`probes/inbox_draft.py`, phase two of `inbox-transcribe`) asks
+`claude -p` for a title, a short description and a project, and posts it back. The draft lives in the
+`draft_*` columns ALONGSIDE the note — the Mac never writes `title`/`body`/`project`, because `body` is the
+transcript and the audio prune depends on it being Whisper's. Rules:
+
+- `draft_status`: NULL (no transcript yet, or a pre-drafting row) → `pending` (a transcript landed) →
+  `ready` | `failed` (three bad results). A new transcript, or Graham editing `body`, resets a machine draft
+  to `pending` with zero attempts; `draft_src_sha` (sha256 of the transcript it was made from) makes a draft
+  of an older transcript stale — the POST is a 409 and burns nothing.
+- Graham editing any draft field stamps `draft_edited_at`: from then on no machine draft may overwrite it
+  (409), and the draft is `ready`. A manual title typed at capture is forced into `draft_title`, and the
+  capture form's project seeds `draft_project`.
+- **Ticking Reviewed on a voice note copies the draft**: `title := draft_title` (made `manual`; only over a
+  still-derived title, or a draft edited in the same request, so a re-tick never takes back a rename) and
+  `project := COALESCE(draft_project, project)`. Hopper's filing loop keeps reading `title`/`project`, and
+  gains `draft.body` as the issue description.
+- **Needs review** = voice, open, not archived, `reviewed=0`, `draft_status IN ('ready','failed')` —
+  failed too, so nothing strands; the row says "Couldn't draft — edit to write one". It sorts first, then
+  awaiting-filing, then newest.
+- **Reviewed is a voice-note control.** The checkbox renders only on voice rows and a PATCH of
+  `reviewed:true` on anything else is a 400 (unticking stays allowed). Typed notes are created with
+  `reviewed=1` — typing one is the deliberate act — so the filing loop still picks them up. Rows created
+  before this change are untouched.
+
+**Contract addendum** (additive; `/api/v1/status` is unchanged):
+
+- Every item gains `needs_review` (bool) and `draft: {title, body, project, status, at, attempts, model,
+  edited_at}`. `counts` gains `needs_review`; `?awaiting=review` filters to it. `awaiting_filing`,
+  `?awaiting=filing|transcription` and the other counts are unchanged (the filing loop uses them). Search
+  also matches the draft title and body.
+- `PATCH /api/v1/inbox/items/<id>` accepts `draft_title`, `draft_body`, `draft_project` (voice only; same
+  session / Origin / limiter rules).
+- `GET /api/v1/inbox/draft/queue` (INBOX_TOKEN) → `{items: [{id, transcript, manual_title, project, sha}],
+  known_projects, max_attempts, max_title, max_body}`. Oldest first; includes the backfill (transcribed
+  notes with no draft) and notes whose draft is stale. `known_projects` = the repo names of
+  `INBOX_GITHUB_REPOS` plus the board's projects.
+- `POST /api/v1/inbox/items/<id>/draft` (INBOX_TOKEN) with `{title, body, project, src_sha, model}` or
+  `{failed: true, error, src_sha}`. Title one line ≤ 120, body ≤ 2000, both through `clean_text`; an unknown
+  project becomes NULL; stale sha / reviewed / edited → 409, no attempt burned. The caps are pinned between
+  `inbox_db` and `probes/inbox_draft.py` by a test.
+
+**The `claude -p` call** is locked down: `--safe-mode --tools "" --strict-mcp-config
+--no-session-persistence --disable-slash-commands --output-format json --json-schema … --model sonnet
+--system-prompt …`, the transcript as JSON on stdin framed as data, an empty temp cwd, an allowlisted env
+plus `CLAUDE_CODE_OAUTH_TOKEN` from a 0600 file. Never `--bare` (it ignores OAuth). The result envelope was
+recorded from the real CLI: success is `is_error:false` with the object in `structured_output`; every API
+problem is `is_error:true`, `terminal_reason:"api_error"`, `api_error_status` = HTTP status or null, and
+`subtype` still reads "success". Systemic failures (not logged in, expired, limit, 5xx, timeout, missing
+binary) stop drafting and fail the heartbeat without burning attempts; only a bad structured result, or a
+400/413 about that request, burns one.
+
 ## Box facts (recon 2026-09-04, read-only)
 Ubuntu 24.04, Python 3.12, Docker 29 + Compose v5, host rclone 1.60 (old), curl present, no sqlite3 CLI.
 the login user (uid 1000) in the `docker` group, `Linger=no` → system units only. Timers: `km-backup.timer`,
@@ -444,7 +516,9 @@ read by a root staging step (see Security posture) and a separate read-only-scop
 
 ## Hosting
 Box: `~/hopper-dashboard`, compose service `hopper-dashboard` → `http://hopper-dashboard:8080` on
-`km-tracker_default`; tunnel ingress + proxied CNAME `dashboard.graham-williams.com` (single-label host).
+`km-tracker_default`; tunnel ingress + proxied CNAME `hub.graham-williams.com` (single-label host). The
+legacy `dashboard.graham-williams.com` keeps its ingress rule and CNAME and is answered by the app with a
+307 to the Hub (`APP_LEGACY_HOSTS`).
 Ingest port published on `<tailscale-ip>:8081` only. Backups of its own SQLite: it's derived state — no
 off-box backup needed (re-populates within one probe cycle). It appears in INVENTORY.md and watches itself
 (its own probe heartbeat is a job).
@@ -486,7 +560,7 @@ Ingest (Tailscale-only port, default 8081):
 - `GET /healthz` → 200 on both ports.
 
 Read side (behind the tunnel + password gate; also accepts `Authorization: Bearer <READ_TOKEN>` for Hopper —
-whose reads go through the public hostname, `https://dashboard.graham-williams.com/api/v1/status`; a loopback
+whose reads go through the public hostname, `https://hub.graham-williams.com/api/v1/status`; a loopback
 read from inside the container must send `Host: <APP_HOST>` or the Host pin answers 403):
 - `GET /api/v1/status` → `{"generated_at": …, "summary": {"ok": n, "late": n, …},
   "jobs": [{"id", "name", "machine", "kind", "state", "since", "last_run", "last_success",

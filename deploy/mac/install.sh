@@ -7,8 +7,11 @@
 #   com.hopper.dashboard-probe     hourly  — the metrics probe (always installed)
 #   com.hopper.inbox-transcribe    5 min   — the Inbox transcription worker (--inbox only)
 #
-# --inbox additionally prompts for INBOX_URL (the PUBLIC dashboard host) and INBOX_TOKEN
+# --inbox additionally prompts for INBOX_URL (the PUBLIC Hub host) and INBOX_TOKEN
 # (hidden, same rule as every other token here) and appends them to the env file if absent.
+# It also prompts for INBOX_CLAUDE_BIN (the `claude` CLI that drafts each voice note; '-' =
+# drafting off) and checks the OAuth token file INBOX_CLAUDE_TOKEN_FILE is 0600 — it WARNS,
+# never fails, when the file is missing: make it once with `claude setup-token`.
 # It is opt-in because the transcription worker needs mlx-whisper in a venv on this Mac; the
 # probe needs nothing but the stock python3.
 #
@@ -78,7 +81,7 @@ chmod 600 "$ENV_FILE"
 # config. Existing keys are left alone, so a re-run with --inbox is a no-op.
 if [[ -n "$WANT_INBOX" ]] && ! grep -q '^INBOX_TOKEN=' "$ENV_FILE"; then
   if [[ -z "$INBOX_URL" ]]; then
-    read -r -p "INBOX_URL (the PUBLIC dashboard host, e.g. https://dashboard.example.com): " INBOX_URL
+    read -r -p "INBOX_URL (the PUBLIC Hub host, e.g. https://hub.example.com): " INBOX_URL
   fi
   [[ "$INBOX_URL" =~ ^https?:// ]] || { echo "ERROR: INBOX_URL must start with http:// or https://"; exit 2; }
   # Hidden read, same rule as INGEST_TOKEN: a token on the command line lands in shell
@@ -106,6 +109,52 @@ EOF
   echo "appended the Inbox keys to $ENV_FILE"
 elif [[ -n "$WANT_INBOX" ]]; then
   echo "Inbox keys already present in $ENV_FILE, leaving them alone"
+fi
+
+# --- 1c. Drafting keys (opt-in, with --inbox) ------------------------------------
+# The worker's second phase runs `claude -p` on each new transcript. The TRANSCRIPT TEXT is
+# sent to Anthropic; the audio never is. Empty INBOX_CLAUDE_BIN = drafting stays off.
+# The credential is an OAuth token from `claude setup-token`, in a 0600 FILE — never in the
+# env file and never on a command line. (Not `claude --bare`: it ignores OAuth.)
+if [[ -n "$WANT_INBOX" ]] && ! grep -q '^INBOX_CLAUDE_BIN=' "$ENV_FILE"; then
+  DEFAULT_CLAUDE="$(command -v claude || true)"
+  [[ -n "$DEFAULT_CLAUDE" ]] || DEFAULT_CLAUDE="$HOME/.local/bin/claude"
+  read -r -p "INBOX_CLAUDE_BIN (the claude CLI for drafting; '-' leaves drafting off) [$DEFAULT_CLAUDE]: " CLAUDE_BIN
+  CLAUDE_BIN="${CLAUDE_BIN:-$DEFAULT_CLAUDE}"
+  if [[ "$CLAUDE_BIN" == "-" ]]; then CLAUDE_BIN=""; fi
+  if [[ -n "$CLAUDE_BIN" && ! -x "$CLAUDE_BIN" ]]; then
+    echo "WARN: $CLAUDE_BIN is not executable — drafting will fail the heartbeat until it is"
+  fi
+  umask 077
+  {
+    echo
+    echo "# --- Inbox drafting (phase two of com.hopper.inbox-transcribe) ---"
+    echo "# The transcript TEXT (not the audio) goes to Anthropic (Claude) to draft each note."
+    echo "# Empty INBOX_CLAUDE_BIN = drafting off. The token file is made once with"
+    echo "# 'claude setup-token' and must be chmod 600."
+    echo "INBOX_CLAUDE_BIN=$CLAUDE_BIN"
+    echo "INBOX_CLAUDE_TOKEN_FILE=$CONF_DIR/claude-token"
+    echo "INBOX_DRAFT_MODEL=sonnet"
+    echo "INBOX_DRAFT_LIMIT=5"
+  } >> "$ENV_FILE"
+  umask 022
+  chmod 600 "$ENV_FILE"
+  echo "appended the drafting keys to $ENV_FILE"
+fi
+if [[ -n "$WANT_INBOX" ]]; then
+  CB="$(grep -m1 '^INBOX_CLAUDE_BIN=' "$ENV_FILE" | cut -d= -f2- || true)"
+  TF="$(grep -m1 '^INBOX_CLAUDE_TOKEN_FILE=' "$ENV_FILE" | cut -d= -f2- || true)"
+  if [[ -n "$CB" ]]; then
+    if [[ -z "$TF" || ! -f "$TF" ]]; then
+      echo "WARN: no claude token file at ${TF:-<INBOX_CLAUDE_TOKEN_FILE unset>}. Run 'claude setup-token',"
+      echo "      save the printed token in that file and chmod 600 it. Until then drafting fails the"
+      echo "      inbox-transcribe heartbeat (transcription itself is unaffected)."
+    elif [[ "$(stat -f '%Lp' "$TF")" != "600" ]]; then
+      echo "WARN: $TF is mode $(stat -f '%Lp' "$TF"), not 600 — the worker refuses it: chmod 600 '$TF'"
+    else
+      echo "claude token file OK ($TF, mode 600)"
+    fi
+  fi
 fi
 
 # --- 2. plists ------------------------------------------------------------------

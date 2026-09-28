@@ -1,5 +1,8 @@
 # CLAUDE.md — hopper-dashboard
 
+**The product is "Hub"** (`hub.graham-williams.com`, landing page at `/`; the repo keeps this name). Two
+halves behind one password: the voice-first Inbox (`/inbox`) and the jobs dashboard (`/dashboard`).
+
 Jobs & backups dashboard for Graham's self-hosted estate: one page + one JSON endpoint answering, for every
 scheduled or on-demand job, what it protects, how, last run, last success, whether the destination actually has
 fresh bytes, and how far behind manual jobs are. Read `DESIGN.md` first — it is the spec and the frozen API
@@ -8,7 +11,8 @@ contract (the "State precedence (as implemented)" section there is the authorita
 ## Stack
 Python 3.12, Flask 3.1.3, SQLite (WAL), PyYAML for `jobs.yml`, gunicorn, rclone inside the container for
 destination probes, ntfy for alerts. No CDN assets, no webfonts, and one inline script per page (the
-`<time datetime>` localizer in `base.html`; `/inbox` adds an external `static/inbox.js`) allowed by a
+`<time datetime>` localizer in `base.html`; `/inbox` adds an external `static/inbox.js`; the Hub and the
+board have exactly one) allowed by a
 per-request CSP nonce — `default-src 'self'; script-src 'nonce-…'`. Docker + compose on the box behind the
 existing `km-tracker` Cloudflare tunnel.
 
@@ -30,7 +34,7 @@ enforces it and the only check is trying the house word at `/login` and seeing i
 
 | role     | port | routes | extras |
 |----------|------|--------|--------|
-| `read`   | 8080 | `/`, `/jobs/<id>`, `/api/v1/status`, `/api/v1/jobs/<id>`, `/login`, `/logout`, `/healthz`, `/static/*` | password gate + `Authorization: Bearer $READ_TOKEN` on `/api/v1/*`; `APP_HOST` Host/Origin pin; per-IP **and global** failed-login caps; `CF-Connecting-IP` trusted only from `TRUSTED_PROXY_CIDR`; **fails fast** (`ConfigError`) if `APP_ENV=prod` without `APP_PASSWORD`, or `APP_PASSWORD` without `SESSION_SECRET` |
+| `read`   | 8080 | `/` (the Hub, `hub.py`), `/dashboard` (the board), `/jobs/<id>`, `/inbox…`, `/api/v1/status`, `/api/v1/jobs/<id>`, `/login`, `/logout`, `/healthz`, `/static/*` | password gate + `Authorization: Bearer $READ_TOKEN` on `/api/v1/*`; `APP_HOST` Host/Origin pin; per-IP **and global** failed-login caps; `CF-Connecting-IP` trusted only from `TRUSTED_PROXY_CIDR`; **fails fast** (`ConfigError`) if `APP_ENV=prod` without `APP_PASSWORD`, or `APP_PASSWORD` without `SESSION_SECRET` |
 | `ingest` | 8081 | `POST /api/v1/ping/<id>`, `/healthz` (no static route) | bearer `INGEST_TOKEN`; rate-limit keyed on the TCP peer only; **single worker** — owns the scheduler thread (60 s state ticker + rclone probes every `PROBE_INTERVAL_S`) and all DB writes |
 
 `entrypoint.sh` starts as root ONLY to copy the `:ro`-mounted 0600 host rclone.conf into a 0700 tmpfs dir
@@ -43,8 +47,8 @@ roles in one process for local dev.
 ```
 uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -r requirements-dev.txt
 # (or: python3.12 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt)
-.venv/bin/python -m pytest -q                         # ~530 tests, no network, ~15 s
-/usr/bin/python3 -m pytest -o addopts="" tests/test_probes_*.py -q   # ~100 probe tests, MUST pass stdlib-only
+.venv/bin/python -m pytest -q                         # ~970 tests, no network, ~2 min
+/usr/bin/python3 -m pytest -o addopts="" tests/test_probes_*.py -q   # ~180 probe tests, MUST pass stdlib-only
 /usr/bin/python3 -m compileall -qf probes/             # 3.9 syntax gate (CI also RUNS the probe tests on 3.9)
 
 cp jobs.example.yml jobs.yml                          # local only; gitignored
@@ -60,6 +64,8 @@ export APP_PASSWORD=devpass SESSION_SECRET=devsecret INGEST_TOKEN=devtoken READ_
 #            INBOX_AUDIO_RETENTION_DAYS (90; audio also goes unconditionally at 2x that age),
 #            INBOX_GITHUB_REPOS (validated at startup), INBOX_GITHUB_TOKEN, INBOX_GITHUB_INTERVAL_S (900),
 #            INBOX_PRUNE_INTERVAL_S (3600)
+# Hostnames: APP_HOST (the Hub, e.g. hub.graham-williams.com) and APP_LEGACY_HOSTS (comma list of OLD
+#            names that only 307 to APP_HOST; validated at start-up, must differ from APP_HOST)
 
 curl -X POST -H 'Authorization: Bearer devtoken' -d result=success -d exit=0 localhost:8081/api/v1/ping/km-backup
 curl -X POST -H 'Authorization: Bearer devtoken' -H 'Content-Type: application/json' \
@@ -269,8 +275,11 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   the `Priority` header and `services.alert_severity` — keep it that way. No reason text ever leaves the box;
   never raises; returns False on a failed POST, which `Core` acts on (see below).
 - `ingest.py` — blueprint + pure payload parsers (`parse_json_payload`, `parse_form_payload`, `parse_metrics`).
-- `web.py` — read blueprint: http→https redirect, gate, host pin, security headers (per-request CSP nonce +
-  HSTS), HTML + JSON routes.
+- `web.py` — read blueprint: http→https redirect, the legacy-host redirect (`_legacy_host_redirect`,
+  registered after `_https_redirect` and before the gate and the pin), gate, host pin, security headers
+  (per-request CSP nonce + HSTS), the board at `/dashboard` (`web.board`) and the JSON routes.
+- `hub.py` — the Hub at `/` (`hub.index`): Inbox card first (Needs review, Record → `/inbox#capture`, open
+  count), then a health strip folded from the board's summary (`health_strip`). Read-only; one script.
 - `views.py` — builds the `/api/v1/status` contract and job detail from the store.
 - `password_gate.py`, `ratelimit.py` — gate helpers (`client_ip(trusted_cidrs)` vs `remote_ip()`) +
   sliding-window limiters (hard key cap with stalest-eviction, keys truncated to 64 chars).
@@ -289,7 +298,17 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   prune needs ALL THREE of `transcript_status='whisper'`, `reviewed=1`, and older than the retention. It
   lives here rather than in `inbox.py` because `inbox.py` imports `web` → `views` → `services`, and the
   scheduler importing that would close a cycle.
-- `inbox.py` — the blueprint. `MACHINE_ENDPOINTS` is what scopes `INBOX_TOKEN`; the create route raises
+- **Drafts (2026-09-28).** Voice notes get an AI draft in `draft_*` columns (the first real
+  `INBOX_COLUMNS` migration) made on the Mac by `probes/inbox_draft.py`; the Mac never writes
+  `title`/`body`/`project`. Ticking Reviewed on a voice note copies `draft_title` → `title` (manual) and
+  `COALESCE(draft_project, project)` → `project`. Needs review = voice, open, unreviewed, draft
+  `ready`|`failed`; it sorts first and has a tile, a filter (`?awaiting=review`) and a count. Reviewed is
+  voice-only (PATCH `reviewed:true` elsewhere = 400) and typed notes are created `reviewed=1`. A Graham
+  edit stamps `draft_edited_at` and no machine draft may overwrite it; a stale `src_sha` is a 409 that
+  burns nothing. `DRAFT_MAX_TITLE`/`DRAFT_MAX_BODY` are pinned against `probes/inbox_draft.py`. Spec:
+  DESIGN.md "Drafts, Needs review and the Hub".
+- `inbox.py` — the blueprint. `MACHINE_ENDPOINTS` is what scopes `INBOX_TOKEN` (now including
+  `inbox.draft_queue` and `inbox.post_draft`); the create route raises
   `request.max_content_length` PER REQUEST (the global 64 KB cap in `__init__.py` protects every other
   route and must stay); the Origin/Referer CSRF pin covers POST/PUT/PATCH/DELETE but EXEMPTS a
   bearer-authenticated call, because `curl` sends neither header and every Mac-worker POST would 403 on
@@ -322,10 +341,12 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   work identically without it), PLUS the external `static/inbox.js` that only `/inbox` loads, via a
   `{% block scripts %}` no other template fills. Don't add a third — the CSP nonce is generated once per
   request via `csp_nonce()`, and `tests/test_web.py` asserts the board page still has exactly ONE
-  `<script>` while `/inbox` has exactly two, both nonce'd. Note `script-src` is `'nonce-…'` with NO
+  `<script>` (so does the Hub) while `/inbox` has exactly two, both nonce'd. Note `script-src` is `'nonce-…'` with NO
   `'self'`, so an external `<script src>` works ONLY if it also carries the nonce; do not add `'self'`.
   `inbox.js` uses `textContent`, never `innerHTML`, and the rows are rendered server-side — it only
-  shows/hides/reorders DOM that is already there, so the table works with JS off.
+  shows/hides/reorders DOM that is already there, so the table works with JS off. The draft edit form is
+  rendered hidden in each voice row; the script shows it, PATCHes the three fields and reloads.
+  `tests/test_inbox_js.py` RUNS the file in node against a fake DOM (capture and draft editing).
 - Tests must stay network-free: mock `probes.probe_job` / `subprocess.run` and use `RecordingNotifier`.
   `run_probe_cycle` passes `timeout=` to `probe_job`, so a stub must accept it (`lambda job, **kw: …`).
 - Test fixtures pin `jobs.created_at` to 2030 (`conftest.pin_created_at`) so the never-pinged → LATE rule
@@ -386,7 +407,7 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   `.get()`, and end in an explicit PASS/FAIL that exits non-zero.
 - Machine IPs, account ids and Drive folder ids never go in code, tests or docs — use
   `<box-tailscale-ip>`-style placeholders; real values live in the gitignored `.env`/`jobs.yml`/env files.
-- Hopper's bearer reads go through the public hostname (`https://dashboard.graham-williams.com/api/v1/status`
+- Hopper's bearer reads go through the public hostname (`https://hub.graham-williams.com/api/v1/status`
   with `Authorization: Bearer $READ_TOKEN`) — that is the intended path. An in-container read against
   `127.0.0.1:8080` must also send `Host: <APP_HOST>` or the Host pin returns 403 (only `/healthz` is exempt).
 - **HTTPS at the origin (`web._https_redirect`) redirects ONLY when `X-Forwarded-Proto` is exactly `http`.**
@@ -396,7 +417,8 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   (`RAW_URI`/`REQUEST_URI`), because `request.path` is already URL-decoded and would silently rewrite
   `/a%2Fb` to `/a/b`. Unset `APP_HOST` → no redirect (fail open, which is what keeps the documented local
   visual-QA path and the test suite working). **Because that failure is silent-by-design, `docker-compose.yml`
-  defaults `APP_HOST` to `dashboard.graham-williams.com` rather than to empty** — the value normally comes
+  defaults `APP_HOST` to `hub.graham-williams.com` (and `APP_LEGACY_HOSTS` to `dashboard.graham-williams.com`)
+  rather than to empty** — the value normally comes
   from the gitignored `.env`, which no PR can edit, so an empty default would let a box with an older `.env`
   bring the redirect up disabled (the same shape as the `jobs.yml` deploy trap). The app-level fail-open is
   unchanged; only the container's default differs.
@@ -414,13 +436,17 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   `100.101.1.28`, or the compose service name `hopper-dashboard`) *validated*, so every plain-http visitor
   got a live `Location: https://localhost/…`: broken for everyone, and silent precisely BECAUSE the value
   passed validation, so the loud fail-open branch never fired. Those values now fail open + warn. Strictly
-  a tightening — `dashboard.graham-williams.com`, the CI fixture `dashboard.ci.example`, the apex and the
+  a tightening — `hub.graham-williams.com`, the CI fixture `hub.ci.example`, the apex and the
   253-char boundary host all still pass.
 - **⚠️ `_HOSTNAME_RE` and `_SAFE_TARGET_RE` are safe ONLY under `.fullmatch()`.** `_SAFE_TARGET_RE` is
   unanchored, so `.match('/x\n')` **succeeds** — one `fullmatch`→`match` slip is a header-injection hole.
   `^…$` would not save it either: in Python `$` also matches immediately before a *trailing* newline.
   Both patterns carry that warning at their definition and `tests/test_web.py` pins the newline rejection
   (and asserts the `.match()` trap explicitly, so it can't be "tidied" away).
+- **The legacy-host redirect is `307` for EVERY method too, with `no-store`** (house rule: never 301). It
+  answers `APP_LEGACY_HOSTS` only, exempts `/healthz`, builds the Location from `https_redirect_host` + the
+  raw target (never the request's Host), and fails CLOSED (403) when `APP_HOST` is malformed. Moving the
+  hostname has an order (DNS first, then `.env`, then the Mac's `INBOX_URL`): DEPLOY.md §3a.
 - **The redirect is `307`, not `301`, and carries `Cache-Control: no-store` + `Vary: X-Forwarded-Proto`.**
   The `Location` is byte-identical to the requested URL, so a cacheable answer is self-referential: under
   RFC 9111 a 301 with no `Cache-Control` is heuristically cacheable *indefinitely*, which would make one
@@ -581,6 +607,22 @@ there is no default URL in the code, by design.
     failure, because three of those mark every queued voice note permanently un-transcribable.
   - **An environment fault and an item failure are different things** and the distinction is load-bearing.
     Keep it if you touch `handle_item` / `transcribe_file`.
+  - **Phase two: drafting** (`probes/inbox_draft.py`, no-op unless `INBOX_CLAUDE_BIN` is set). After
+    Whisper, up to `INBOX_DRAFT_LIMIT` (5) notes go to a locked-down `claude -p` (`--safe-mode --tools ""
+    --strict-mcp-config --no-session-persistence --disable-slash-commands --output-format json
+    --json-schema`, our system prompt, transcript as JSON on stdin, empty temp cwd, `minimal_env` +
+    `CLAUDE_CODE_OAUTH_TOKEN` from the 0600 `INBOX_CLAUDE_TOKEN_FILE` + `DISABLE_AUTOUPDATER=1`, 120 s).
+    **⚠️ NEVER `--bare`** (it ignores OAuth) and never a `--dangerously-*` flag; never import an
+    Anthropic SDK under `probes/` (an `ast` test bans it). **SYSTEMIC vs BAD RESULT is the same
+    load-bearing split as EnvironmentFault vs item failure**: not logged in / expired / limit / 5xx /
+    timeout / missing binary stop drafting, burn nothing and fail the heartbeat; only an invalid
+    structured result (or a 400/413) burns one of the note's 3 attempts; a 409 is skipped. The CLI's
+    error envelope still says `subtype: "success"` — decide on `is_error` + `api_error_status`, never
+    `subtype`. The TRANSCRIPT TEXT goes to Anthropic; the audio never does. Tests run a FAKE `claude`
+    executable (argv, stdin, cwd and env are observed, not assumed).
+  - `INBOX_URL` must be the Hub host. The probe HTTP client refuses cross-host redirects
+    (`common._SameOriginRedirects`), so an old `dashboard…` URL fails every run instead of following the
+    legacy 307.
   - `probes/backlog.py` DUPLICATES `dashboard/inbox_db.normalise_backlog_key` (stdlib-only, cannot import
     Flask). `tests/test_backlog_mirror.py` imports both and pins the agreement — drift archives every
     mirrored row and re-creates it, losing its reviewed tick and its linked issues. Change both together.
