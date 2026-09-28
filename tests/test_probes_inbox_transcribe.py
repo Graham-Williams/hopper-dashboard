@@ -884,14 +884,48 @@ def test_only_narrow_errors_are_systemic(tmp_path, monkeypatch, mode, systemic):
         assert "MODEL RAMBLING" not in drafts[ID_A]["error"]
 
 
-def test_the_circuit_breaker_stops_after_two_failures_with_no_success(tmp_path, monkeypatch):
+def test_two_bad_notes_at_the_head_never_block_a_good_one(tmp_path, monkeypatch):
+    """The re-review finding: stopping at the second failure meant a good note C behind two
+    bad ones was NEVER reached, run after run. The batch is always finished; C's success
+    proves drafting works, so A and B's failures are real and are counted."""
     exe = _fake_claude(tmp_path, ["no_structured", "no_structured", "ok"])
     api = DraftApi([_ditem(ID_A), _ditem(ID_B), _ditem(ID_C)])
     sent = _wire(monkeypatch, api)
-    assert it.main(["--env", _denv(tmp_path, exe), "--quiet"]) == 1
-    assert api.drafts() == []                     # nothing burned
-    assert len(_calls(exe)) == 2                  # stopped before the third note
-    assert "circuit breaker" in sent[0][3]["note"]
+    assert it.main(["--env", _denv(tmp_path, exe), "--quiet"]) == 0
+    drafts = dict(api.drafts())
+    assert drafts[ID_C]["title"] == "Fix the wheel"
+    assert drafts[ID_A]["failed"] is True and drafts[ID_B]["failed"] is True
+    assert len(_calls(exe)) == 3 and sent[0][3]["status"] == "ok"
+
+
+def test_the_breaker_burns_nothing_until_three_tripped_runs_in_a_row(tmp_path, monkeypatch):
+    """Every note bad and none succeeding looks like a systemic fault, so the first two such
+    runs burn nothing. A third in a row means the notes really are bad: their failures are
+    counted, so they reach `failed` and stop sitting at the head of the queue."""
+    exe = _fake_claude(tmp_path, ["no_structured"])
+    api = DraftApi([_ditem(ID_A), _ditem(ID_B)])
+    sent = _wire(monkeypatch, api)
+    env = _denv(tmp_path, exe)
+    state = tmp_path / "draft-state.json"
+    for trip in (1, 2):
+        assert it.main(["--env", env, "--quiet"]) == 1
+        assert api.drafts() == []
+        assert "circuit breaker" in sent[-1][3]["note"]
+        assert json.loads(state.read_text())["breaker_trips"] == trip
+    assert len(_calls(exe)) == 4                  # the batch was finished every time
+    assert it.main(["--env", env, "--quiet"]) == 0
+    assert sorted(i for i, b in api.drafts() if b["failed"]) == [ID_A, ID_B]
+    assert json.loads(state.read_text())["breaker_trips"] == 0
+
+
+def test_a_successful_run_resets_the_trip_count(tmp_path, monkeypatch):
+    exe = _fake_claude(tmp_path, ["ok"])
+    (tmp_path / "draft-state.json").write_text(json.dumps({"timed_out": None,
+                                                           "breaker_trips": 2}))
+    api = DraftApi([_ditem(ID_A)])
+    _wire(monkeypatch, api)
+    assert it.main(["--env", _denv(tmp_path, exe), "--quiet"]) == 0
+    assert json.loads((tmp_path / "draft-state.json").read_text())["breaker_trips"] == 0
 
 
 def test_a_lone_bad_note_is_still_burned_when_the_queue_runs_out(tmp_path, monkeypatch):
@@ -911,11 +945,12 @@ def test_a_note_that_times_out_twice_running_burns_an_attempt(tmp_path, monkeypa
     assert it.main(["--env", env, "--quiet"]) == 1          # first time: systemic
     assert api.drafts() == []
     state = json.loads((tmp_path / "draft-state.json").read_text())
-    assert state == {"timed_out": ID_A}
+    assert state == {"timed_out": ID_A, "breaker_trips": 0}
     assert it.main(["--env", env, "--quiet"]) == 0          # same note again: its fault
     ((item_id, body),) = api.drafts()
     assert item_id == ID_A and body["failed"] and "two consecutive runs" in body["error"]
-    assert json.loads((tmp_path / "draft-state.json").read_text()) == {"timed_out": None}
+    assert json.loads((tmp_path / "draft-state.json").read_text()) == {
+        "timed_out": None, "breaker_trips": 0}
 
 
 def test_a_timeout_on_a_different_note_is_systemic_again(tmp_path, monkeypatch):

@@ -482,9 +482,13 @@ def post_draft(cfg: Dict[str, str], item_id: str, body: Dict[str, object]) -> No
              timeout=float(cfg["INBOX_HTTP_TIMEOUT"]))
 
 
-#: Circuit breaker: this many bad results in a run with NO success stops drafting and burns
-#: nothing — a fault that looks per-note but hits every note is really systemic.
+#: Circuit breaker: a run that ENDS with no success and at least this many bad results burns
+#: nothing — a fault that looks per-note but hits every note is really systemic. It never
+#: stops the batch early (a good note behind two bad ones must still be drafted), and after
+#: BREAKER_MAX_TRIPS tripped runs in a row the held failures ARE burned, so genuinely bad notes
+#: reach `failed` instead of blocking the head of the queue for ever.
 BREAKER_FAILURES = 2
+BREAKER_MAX_TRIPS = 3
 
 
 def _load_draft_state(path: str) -> Dict[str, object]:
@@ -530,7 +534,12 @@ def run_drafting(cfg: Dict[str, str], log: Logger, dry_run: bool,
         return counts, None
     model = (cfg.get("INBOX_DRAFT_MODEL") or inbox_draft.DEFAULT_MODEL).strip()
     state_path = cfg.get("INBOX_DRAFT_STATE") or ""
-    last_timeout = _load_draft_state(state_path).get("timed_out") if state_path else None
+    state = _load_draft_state(state_path) if state_path else {}
+    last_timeout = state.get("timed_out")
+    try:
+        trips = max(0, int(state.get("breaker_trips") or 0))
+    except (TypeError, ValueError):
+        trips = 0
     this_timeout: Optional[str] = None
     held: List[Tuple[str, str, str]] = []          # (item_id, detail, sha) not yet reported
     successes = 0
@@ -589,10 +598,6 @@ def run_drafting(cfg: Dict[str, str], log: Logger, dry_run: bool,
                     report(item_id, bad, item["sha"])
                     continue
                 held.append((item_id, bad, item["sha"]))
-                if len(held) >= BREAKER_FAILURES:
-                    raise inbox_draft.SystemicFailure(
-                        "circuit breaker: %d notes failed and none succeeded this run — "
-                        "nothing counted against them" % len(held))
                 continue
             body = dict(draft)
             body.update({"src_sha": item["sha"], "model": model})
@@ -614,7 +619,25 @@ def run_drafting(cfg: Dict[str, str], log: Logger, dry_run: bool,
                     % (item_id, len(draft["title"]), len(draft["body"]),
                        ", project %s" % draft["project"] if draft["project"] else ""))
             flush()                # a success proves drafting works: held failures are real
-        flush()                    # queue exhausted without tripping the breaker
+        # The batch is done. No success and >= BREAKER_FAILURES bad results trips the breaker.
+        if not successes and len(held) >= BREAKER_FAILURES:
+            trips += 1
+            if trips >= BREAKER_MAX_TRIPS:
+                log.error("circuit breaker tripped %d runs in a row — these notes are "
+                          "genuinely bad: counting %d failure(s) against them"
+                          % (trips, len(held)))
+                trips = 0
+                flush()
+            else:
+                n = len(held)
+                held.clear()
+                raise inbox_draft.SystemicFailure(
+                    "circuit breaker: %d notes failed and none succeeded this run "
+                    "(trip %d of %d) — nothing counted against them"
+                    % (n, trips, BREAKER_MAX_TRIPS))
+        else:
+            trips = 0
+            flush()                # a success (or a lone failure) — the failures are real
     except inbox_draft.SystemicFailure as e:
         held.clear()               # a systemic run burns nothing
         fatal = "drafting: %s" % flatten_for_log(e, 300)
@@ -624,7 +647,7 @@ def run_drafting(cfg: Dict[str, str], log: Logger, dry_run: bool,
         fatal = "drafting: %s" % flatten_for_log(e, 300)
         log.error(fatal)
     if state_path and not dry_run:
-        _save_draft_state(state_path, {"timed_out": this_timeout})
+        _save_draft_state(state_path, {"timed_out": this_timeout, "breaker_trips": trips})
     return counts, fatal
 
 
