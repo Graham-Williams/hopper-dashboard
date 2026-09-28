@@ -328,7 +328,12 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
 - `github_mirror.py` — `sync(conn, repos, now, fetch)` with `fetch` injected for tests. ETag-conditional,
   skips anything with a `pull_request` key, honours `X-RateLimit-Reset`/`Retry-After` into `backoff_until`,
   and closes items ONLY after a complete, error-free repo fetch (a partial page must never close anything).
-- `templates/inbox.html`, `static/inbox.js` — see the JS convention above.
+- `templates/inbox.html`, `static/inbox.js` — see the JS convention above. Rows are ONE column at every
+  width (phone-first): badges, draft title/body, Transcript `<details>`, the player, one action row
+  (Edit draft · the Reviewed pill toggle · Delete as a quiet danger text button, all ≥44px), then the meta
+  line. The two capture notes sit in one collapsed "About recordings and privacy" `<details>`. Needs
+  review links go to `/inbox?awaiting=review#items`; `#items`/`.item` carry `scroll-margin-top` for the
+  sticky nav. Check phone layout with a real 390px viewport, not a narrowed desktop window.
 - Scheduler: `Scheduler.step()` carries `last_github` and `last_prune`, each re-armed from its own END clock
   and each in its own try/except, both writing `inbox.db` only and NEVER inside `run_probe_cycle`. A failing
   GitHub sync must not kill the probe cycle or the tick.

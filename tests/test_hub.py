@@ -23,7 +23,7 @@ def test_inbox_card_comes_first_and_links_to_capture(authed):
     # Record is a REAL link (works with JS off), and it is inside the Inbox card.
     inbox_card = html.split('class="hub-card hub-inbox"', 1)[1].split("</section>", 1)[0]
     assert re.search(r'<a class="hub-record" href="/inbox#capture">', inbox_card)
-    assert 'href="/inbox?awaiting=review"' in inbox_card
+    assert 'href="/inbox?awaiting=review#items"' in inbox_card      # straight to the list
     assert 'href="/inbox"' in inbox_card
     dash_card = html.split('class="hub-card hub-dashboard"', 1)[1].split("</section>", 1)[0]
     assert 'href="/dashboard"' in dash_card

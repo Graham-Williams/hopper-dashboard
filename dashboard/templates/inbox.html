@@ -12,7 +12,7 @@
 {% set c = page.counts %}
 <section class="summary inbox-summary" aria-label="Inbox summary">
   <a class="tile tile-behind tile-link {% if not c.needs_review %}zero{% endif %}"
-     href="{{ url_for('inbox.board', awaiting='review') }}">
+     href="{{ url_for('inbox.board', awaiting='review', _anchor='items') }}">
     <span class="n">{{ c.needs_review }}</span><span class="l">Needs review</span>
   </a>
   <div class="tile tile-ok {% if not c.open %}zero{% endif %}">
@@ -70,6 +70,10 @@
       <button type="submit" id="capture-submit">Add to inbox</button>
     </div>
     <p id="capture-error" class="hint bad" hidden></p>
+    {#- One collapsed block, so the list is not pushed a screen down on a phone.
+        The wording inside is unchanged. -#}
+    <details class="about-recordings">
+    <summary>About recordings and privacy</summary>
     <p class="muted small privacy-note">
       Audio stays on this box and your Mac. The transcript and title (not the audio) are sent from the Mac to Anthropic (Claude) to draft the item.
       Whisper on the Mac transcribes every few minutes, so a new voice note
@@ -89,6 +93,7 @@
       different matter: database backups already taken still contain it, and
       those age out after about 30 days.
     </p>
+    </details>
   </form>
 </section>
 
@@ -187,6 +192,41 @@
           <p class="item-body">{{ it.body }}</p>
         </details>
         {% endif %}
+        {% else %}
+        <h3 class="item-title">{{ it.title }}</h3>
+        {% if it.body and it.body != it.title %}
+        <p class="item-body">{{ it.body }}</p>
+        {% endif %}
+        {% endif %}
+        {% if it.has_audio %}
+        {# Right under the transcript it transcribes. Played back from the SERVER
+           URL, never a blob: — a blob would need media-src blob: in the CSP and
+           the CSP is not being loosened. #}
+        <audio class="player" controls preload="none"
+               src="{{ url_for('inbox.audio', item_id=it.id) }}"></audio>
+        {% endif %}
+        {#- ONE action row: Edit draft and the Reviewed toggle side by side (each
+            >= 44px), and Delete last as a quiet text button — it destroys the
+            row and the recording, so it must never look like the main action. -#}
+        <div class="item-actions">
+          {% if voice %}
+          <button type="button" class="edit-draft secondary" data-id="{{ it.id }}" hidden>Edit draft</button>
+          {% endif %}
+          {#- Voice notes, plus an OLDER typed note (inbox.reviewable); the PATCH
+              applies the same rule. -#}
+          {% if it.reviewable %}
+          <label class="review">
+            <input type="checkbox" class="review-box" data-id="{{ it.id }}"
+                   {% if it.reviewed %}checked{% endif %}>
+            <span>Reviewed</span>
+          </label>
+          {% endif %}
+          {# Needs JS (it is a DELETE), so it is hidden until inbox.js wires it and
+             is never a button that does nothing. #}
+          <button type="button" class="delete-item" data-id="{{ it.id }}" hidden
+                  title="Delete this item and its recording">Delete</button>
+        </div>
+        {% if voice %}
         {#- The edit form is rendered HERE, hidden; inbox.js only shows/hides it
             and PATCHes the three fields with fetch. It never builds markup. -#}
         <form class="draft-edit" id="edit-{{ it.id }}" data-id="{{ it.id }}" hidden>
@@ -211,11 +251,6 @@
             <button type="button" class="edit-cancel secondary">Cancel</button>
           </div>
         </form>
-        {% else %}
-        <h3 class="item-title">{{ it.title }}</h3>
-        {% if it.body and it.body != it.title %}
-        <p class="item-body">{{ it.body }}</p>
-        {% endif %}
         {% endif %}
         <p class="item-meta muted small">
           {{ when(it.created_at, now) }}
@@ -239,33 +274,6 @@
           <a class="issue" href="{{ it.mirror_url }}" rel="noopener noreferrer" target="_blank">{{ it.mirror_key }}</a>
         </p>
         {% endif %}
-      </div>
-      <div class="item-controls">
-        {#- Voice notes, plus an OLDER typed note that is still unticked (typed notes
-            are born reviewed now). A mirrored row is already filed upstream. The
-            PATCH applies the same rule (inbox.reviewable). -#}
-        {% if voice %}
-        <button type="button" class="edit-draft secondary" data-id="{{ it.id }}" hidden>Edit draft</button>
-        {% endif %}
-        {% if it.reviewable %}
-        <label class="review">
-          <input type="checkbox" class="review-box" data-id="{{ it.id }}"
-                 {% if it.reviewed %}checked{% endif %}>
-          <span>Reviewed</span>
-        </label>
-        {% endif %}
-        {% if it.has_audio %}
-        {# Played back from the SERVER URL, never a blob: — a blob would need
-           media-src blob: in the CSP and the CSP is not being loosened. #}
-        <audio class="player" controls preload="none"
-               src="{{ url_for('inbox.audio', item_id=it.id) }}"></audio>
-        {% endif %}
-        {# The one control that destroys something. Needs JS (it is a DELETE),
-           which is acceptable for a deliberate destructive action in a way it
-           would not be for capture — and it is hidden until inbox.js wires it,
-           so it is never a button that does nothing. #}
-        <button type="button" class="delete-item" data-id="{{ it.id }}" hidden
-                title="Delete this item and its recording">Delete</button>
       </div>
     </li>
     {% endfor %}

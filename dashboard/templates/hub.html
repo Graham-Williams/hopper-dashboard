@@ -11,7 +11,7 @@
   <section class="hub-card hub-inbox" aria-labelledby="hub-inbox-h">
     <h2 id="hub-inbox-h">Inbox</h2>
     <a class="hub-stat {% if not counts.needs_review %}zero{% endif %}"
-       href="{{ url_for('inbox.board', awaiting='review') }}">
+       href="{{ url_for('inbox.board', awaiting='review', _anchor='items') }}">
       <span class="n">{{ counts.needs_review|default(0) }}</span>
       <span class="l">Needs review</span>
     </a>

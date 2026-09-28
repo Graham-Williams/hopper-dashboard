@@ -1367,7 +1367,8 @@ def test_needs_review_tile_and_filter_replace_waiting_on(authed, bot):
     _drafted(authed, bot)
     html = authed.get("/inbox").data.decode()
     summary = html.split('class="summary inbox-summary"', 1)[1].split("</section>", 1)[0]
-    assert "Needs review" in summary and 'href="/inbox?awaiting=review"' in summary
+    # Straight to the list, not to the top of the page.
+    assert "Needs review" in summary and 'href="/inbox?awaiting=review#items"' in summary
     assert "Awaiting filing" not in summary and "Transcribing" not in summary
     assert 'id="filter-awaiting"' not in html and "Waiting on" not in html
     assert 'id="filter-review"' in html and 'name="awaiting" value="review"' in html
@@ -1603,3 +1604,49 @@ def test_a_final_failed_draft_goes_straight_to_failed(authed, bot, settings):
     d2 = bot.post(f"/api/v1/inbox/items/{other}/draft", headers=machine(),
                   json={"failed": True, "src_sha": osha}).get_json()["draft"]
     assert d2["status"] == "pending" and d2["attempts"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# Phone layout (QA round)
+# --------------------------------------------------------------------------- #
+
+def test_a_voice_row_is_one_column_in_the_designed_order(authed, bot):
+    item = _drafted(authed, bot)
+    row = _row(authed.get("/inbox").data.decode(), item)
+    order = [row.index(m) for m in ('class="item-head"', 'class="item-title"',
+                                    'draft-body', '<details class="transcript">',
+                                    '<audio class="player"', 'class="item-actions"',
+                                    'class="item-meta muted small"')]
+    assert order == sorted(order), order
+    actions = row.split('class="item-actions"', 1)[1].split("</div>", 1)[0]
+    # Edit draft, the Reviewed toggle, then Delete LAST, all in the one row.
+    assert (actions.index('class="edit-draft') < actions.index('class="review"')
+            < actions.index('class="delete-item"'))
+    assert "item-controls" not in row
+
+
+def test_the_capture_notes_are_one_collapsed_details(authed):
+    html = authed.get("/inbox").data.decode()
+    block = html.split('<details class="about-recordings">', 1)[1].split("</details>", 1)[0]
+    assert "<summary>About recordings and privacy</summary>" in block
+    assert "Audio stays on this box and your Mac." in block
+    assert "minutes of speech" in block and "about 30 days" in block
+    assert " open" not in html.split('<details class="about-recordings"', 1)[1].split(">", 1)[0]
+
+
+def test_the_phone_layout_css_rules():
+    """Pinned because each one passes every server test while looking wrong on a phone."""
+    css = _code("dashboard/static/app.css")
+    delete = css.split(".item-actions button.delete-item {", 1)[1].split("}", 1)[0]
+    assert "background: transparent" in delete and "var(--fail)" in delete
+    assert "min-height: 44px" in delete and "margin-left: auto" in delete
+    review = css.split(".item-actions .review {", 1)[1].split("}", 1)[0]
+    assert "min-height: 44px" in review and "border-radius: 999px" in review
+    assert "min-height: 44px" in css.split(".item-actions .edit-draft {", 1)[1].split("}", 1)[0]
+    assert ".filters select { min-height: 44px; }" in css or \
+        ".filters select" in css.split("{ min-height: 44px; }", 1)[0].rsplit("\n", 1)[-1]
+    clear = css.split(".filters .clear {", 1)[1].split("}", 1)[0]
+    assert "min-height: 44px" in clear
+    assert "scroll-margin-top" in css.split(".items {", 1)[1].split("}", 1)[0]
+    assert "scroll-margin-top" in css.split(".item {", 1)[1].split("}", 1)[0]
+    assert "flex-direction: row" not in css.split(".item {", 1)[1].split(".item-filing", 1)[0]
