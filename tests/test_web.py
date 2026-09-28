@@ -284,6 +284,100 @@ def test_redirect_runs_before_the_password_gate(settings, registry, notifier):
     assert r.status_code == 307 and r.headers["Location"] == f"{HTTPS_BASE}/"
 
 
+# --------------------------------------------------------------------------- #
+# Legacy hostname -> APP_HOST (the dashboard.* -> hub.* move)
+# --------------------------------------------------------------------------- #
+
+LEGACY_HOST = "old.example.com"
+LEGACY_BASE = f"https://{LEGACY_HOST}"
+
+
+def _legacy(settings, registry, notifier, **overrides):
+    return _pinned(settings, registry, notifier,
+                   app_legacy_hosts=(LEGACY_HOST,), **overrides)
+
+
+def test_legacy_host_get_and_head_are_301_to_app_host(settings, registry, notifier):
+    c = _legacy(settings, registry, notifier)
+    for method in ("get", "head"):
+        r = getattr(c, method)("/jobs/snap", base_url=LEGACY_BASE)
+        assert r.status_code == 301, method
+        assert r.headers["Location"] == f"{HTTPS_BASE}/jobs/snap", method
+        assert r.headers["Cache-Control"] == "no-store", method
+
+
+def test_legacy_host_other_methods_are_308(settings, registry, notifier):
+    """308 keeps the method and body: a POST is re-sent, never downgraded."""
+    c = _legacy(settings, registry, notifier)
+    for method in ("post", "patch", "put", "delete"):
+        r = getattr(c, method)("/login", base_url=LEGACY_BASE,
+                               data={"password": "x"})
+        assert r.status_code == 308, method
+        assert r.headers["Location"] == f"{HTTPS_BASE}/login", method
+
+
+def test_legacy_host_preserves_path_and_query_byte_for_byte(settings, registry, notifier):
+    c = _legacy(settings, registry, notifier)
+    raw = "/inbox?q=a%2Fb%20c&e=%C3%A9&awaiting=review"
+    r = c.get(raw, base_url=LEGACY_BASE)
+    assert r.status_code == 301
+    assert r.headers["Location"] == HTTPS_BASE + raw
+
+
+def test_legacy_host_is_answered_before_the_gate(settings, registry, notifier):
+    """Not bounced to a /login on the old host, and no page or API is served."""
+    c = _legacy(settings, registry, notifier)
+    r = c.get("/api/v1/status", base_url=LEGACY_BASE, headers=bearer())
+    assert r.status_code == 301
+    assert r.headers["Location"] == f"{HTTPS_BASE}/api/v1/status"
+
+
+def test_legacy_redirect_never_reflects_the_host(settings, registry, notifier):
+    """The Location host is the APP_HOST pin, whatever the request says; a
+    host that is neither legacy nor APP_HOST still gets the pin's 403."""
+    c = _legacy(settings, registry, notifier)
+    r = c.get("/", base_url=f"https://{LEGACY_HOST}:8443")
+    assert r.status_code == 301 and r.headers["Location"] == f"{HTTPS_BASE}/"
+    assert c.get("/login", base_url="https://evil.example").status_code == 403
+    # Forged raw targets fall back to the re-quoted path.
+    for forged in ("/x\r\nX-Evil: 1", "http://evil.example/x"):
+        r = c.get("/healthy", base_url=LEGACY_BASE,
+                  environ_overrides={"RAW_URI": forged, "REQUEST_URI": forged})
+        assert r.headers["Location"] == f"{HTTPS_BASE}/healthy", forged
+
+
+def test_legacy_host_healthz_is_served(settings, registry, notifier):
+    c = _legacy(settings, registry, notifier)
+    r = c.get("/healthz", base_url=LEGACY_BASE)
+    assert r.status_code == 200 and "Location" not in r.headers
+
+
+def test_legacy_host_over_http_goes_straight_to_https_app_host(settings, registry, notifier):
+    c = _legacy(settings, registry, notifier)
+    r = c.get("/inbox", base_url=f"http://{LEGACY_HOST}", headers=xfp("http"))
+    assert r.status_code == 307
+    assert r.headers["Location"] == f"{HTTPS_BASE}/inbox"
+
+
+def test_app_host_itself_is_not_redirected(settings, registry, notifier):
+    c = _legacy(settings, registry, notifier)
+    assert c.get("/login", base_url=HTTPS_BASE).status_code == 200
+
+
+def test_legacy_host_fails_closed_when_app_host_is_malformed(settings, registry, notifier):
+    """No safe Location to emit → 403, never a redirect built from a bad host."""
+    c = _legacy(settings, registry, notifier,
+                app_host="dashboard.example.test@evil.example")
+    r = c.get("/", base_url=LEGACY_BASE)
+    assert r.status_code == 403 and "Location" not in r.headers
+
+
+def test_no_legacy_hosts_means_the_old_host_is_pinned_out(settings, registry, notifier):
+    """Control: without APP_LEGACY_HOSTS the old name is just a wrong Host."""
+    c = _pinned(settings, registry, notifier)
+    assert c.get("/login", base_url=LEGACY_BASE).status_code == 403
+
+
 # The DNS maximum is 253 characters. Both sides of that boundary are pinned:
 # a 253-char host must still work, 254 must not. Built from valid 63-char
 # labels so ONLY the total length can be what rejects the long one.
@@ -384,7 +478,7 @@ def test_location_patterns_are_safe_only_under_fullmatch():
     assert not _HOSTNAME_RE.fullmatch(_OVERLONG_HOST)
     # B1: a PUBLIC origin pin always has a dot, and is never a bare IP literal.
     # Strictly a TIGHTENING — every host these apps actually use still passes.
-    for good in ("dashboard.graham-williams.com", "graham-williams.com",
+    for good in ("dashboard.graham-williams.com", "hub.graham-williams.com", "graham-williams.com",
                  "dashboard.ci.example", "a.b"):
         assert _HOSTNAME_RE.fullmatch(good), good
     for bad in ("localhost", "x", "hopper-dashboard", "127.0.0.1",

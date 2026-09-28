@@ -9,7 +9,8 @@ for POSTs, Origin/Referer as a CSRF defence.
 
 This role also enforces HTTPS at the origin (``X-Forwarded-Proto: http`` → 307
 to ``https://<APP_HOST>…``, plus HSTS). The INGEST role does not, and must not:
-see ``_https_redirect`` below.
+see ``_https_redirect`` below. Old hostnames in ``APP_LEGACY_HOSTS`` get a
+permanent redirect to ``APP_HOST`` and nothing else (``_legacy_host_redirect``).
 """
 
 from __future__ import annotations
@@ -233,6 +234,42 @@ def _https_redirect():
         return None
     resp = redirect(f"https://{app_host}{_request_target()}", code=307)
     resp.vary.add("X-Forwarded-Proto")
+    return resp
+
+
+@bp.before_app_request
+def _legacy_host_redirect():
+    """An old public hostname (``APP_LEGACY_HOSTS``) only redirects to APP_HOST.
+
+    The product moved hostnames; bookmarks, the apex page's old link and
+    Hopper's saved URLs keep working through this. It is NOT dual-serving: a
+    legacy host never sees the gate, a page or the API — only a redirect.
+
+    - GET/HEAD → 301, every other method → 308 (method and body preserved), to
+      ``https://<APP_HOST><raw target>``: path and query byte-exact, and the
+      host comes from the validated pin, never the request (no reflection).
+    - ``Cache-Control: no-store`` all the same, so a mistaken deploy can be
+      recalled rather than sticking in every browser.
+    - ``/healthz`` is exempt, so a probe through the old name still answers.
+    - APP_HOST malformed (``https_redirect_host`` empty) → 403, fail CLOSED:
+      the Host pin would refuse this host anyway, and there is no safe
+      Location to emit.
+
+    Registered after ``_https_redirect`` (an http visitor on the old host is
+    sent straight to https on the new one) and before the gate and the Host
+    pin, which would otherwise bounce or 403 the old host first.
+    """
+    settings = _settings()
+    if not settings.app_legacy_hosts or request.path == "/healthz":
+        return None
+    if request.host.split(":", 1)[0].lower() not in settings.app_legacy_hosts:
+        return None
+    target_host = settings.https_redirect_host
+    if not target_host:
+        abort(403)
+    code = 301 if request.method in ("GET", "HEAD") else 308
+    resp = redirect(f"https://{target_host}{_request_target()}", code=code)
+    resp.headers["Cache-Control"] = "no-store"
     return resp
 
 

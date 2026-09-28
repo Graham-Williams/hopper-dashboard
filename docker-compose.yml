@@ -1,7 +1,8 @@
 # hopper-dashboard on the box, behind the existing km-tracker Cloudflare tunnel.
 #
 # - Read side (:8080) has NO host port: the tunnel routes
-#   dashboard.graham-williams.com -> http://hopper-dashboard:8080 over the
+#   hub.graham-williams.com (and the legacy dashboard.graham-williams.com, which
+#   the app only redirects) -> http://hopper-dashboard:8080 over the
 #   external `km-tracker_default` network; the shared APP_PASSWORD gates it.
 #   NOTE: every other container on km-tracker_default can also reach BOTH
 #   ports by service name (read side: password/READ_TOKEN gate; ingest:
@@ -57,7 +58,10 @@ services:
       # box whose .env predates APP_HOST would bring the redirect up SILENTLY
       # DISABLED, with only a start-up log line to say so. Same shape as the
       # jobs.yml deploy trap. Override in .env for any other deployment.
-      APP_HOST: ${APP_HOST:-dashboard.graham-williams.com}
+      APP_HOST: ${APP_HOST:-hub.graham-williams.com}
+      # The product's old hostname: answered with a redirect to APP_HOST and nothing
+      # else (web._legacy_host_redirect). Defaulted for the same reason as APP_HOST.
+      APP_LEGACY_HOSTS: ${APP_LEGACY_HOSTS:-dashboard.graham-williams.com}
       APP_ENV: ${APP_ENV:-prod}
       TRUSTED_PROXY_CIDR: ${TRUSTED_PROXY_CIDR:-}
       PROBE_INTERVAL_S: ${PROBE_INTERVAL_S:-300}

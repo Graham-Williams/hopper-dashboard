@@ -81,6 +81,35 @@ _HOSTNAME_RE = re.compile(
     r"\.(?![0-9]+\Z)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
 
 
+def _env_legacy_hosts(name: str, app_host: str) -> tuple[str, ...]:
+    """Comma-separated OLD public hostnames that the read role answers with a
+    permanent redirect to ``APP_HOST`` (and nothing else).
+
+    Each one must be a bare hostname by the same rule as ``APP_HOST``
+    (``_HOSTNAME_RE``), must differ from ``APP_HOST`` (a legacy host equal to
+    the live one would redirect the site to itself for ever), and needs
+    ``APP_HOST`` to be set at all — there is nowhere to redirect to otherwise.
+    Validated at STARTUP so a typo is a container that refuses to come up
+    naming the bad value, not a hostname that silently 403s.
+    """
+    raw = os.environ.get(name, "")
+    out: list[str] = []
+    for part in raw.split(","):
+        part = part.strip().lower()
+        if not part:
+            continue
+        if not _HOSTNAME_RE.fullmatch(part):
+            raise ValueError(f"{name}: {part!r} is not a bare hostname")
+        if part == app_host:
+            raise ValueError(f"{name}: {part!r} is the same as APP_HOST")
+        if part not in out:
+            out.append(part)
+    if out and not app_host:
+        raise ValueError(f"{name} is set but APP_HOST is empty — there is "
+                         f"nothing to redirect to")
+    return tuple(out)
+
+
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name, "")
     if not raw.strip():
@@ -156,6 +185,9 @@ class Settings:
     ntfy_url: str = ""
     ntfy_topic: str = ""
     app_host: str = ""
+    # Old public hostnames that now only redirect to APP_HOST (301 for GET/HEAD,
+    # 308 otherwise). See web._legacy_host_redirect. Validated in from_env.
+    app_legacy_hosts: tuple[str, ...] = ()
     app_env: str = "prod"
     probe_interval_s: int = 300
     tick_interval_s: int = 60
@@ -303,6 +335,7 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
+        app_host = os.environ.get("APP_HOST", "").strip().lower()
         return cls(
             data_dir=os.environ.get("DASHBOARD_DATA", "/app/data"),
             jobs_file=os.environ.get("JOBS_FILE", "/app/jobs.yml"),
@@ -313,7 +346,8 @@ class Settings:
             read_token=os.environ.get("READ_TOKEN", ""),
             ntfy_url=os.environ.get("NTFY_URL", "").rstrip("/"),
             ntfy_topic=os.environ.get("NTFY_TOPIC", "").strip(),
-            app_host=os.environ.get("APP_HOST", "").strip().lower(),
+            app_host=app_host,
+            app_legacy_hosts=_env_legacy_hosts("APP_LEGACY_HOSTS", app_host),
             app_env=(os.environ.get("APP_ENV", "prod").strip().lower() or "prod"),
             probe_interval_s=_env_int("PROBE_INTERVAL_S", 300),
             tick_interval_s=_env_int("TICK_INTERVAL_S", 60),
