@@ -457,24 +457,33 @@ token cannot write redirect rules; the old hostname keeps its tunnel rule and CN
 `draft_*` columns ALONGSIDE the note — the Mac never writes `title`/`body`/`project`, because `body` is the
 transcript and the audio prune depends on it being Whisper's. Rules:
 
-- `draft_status`: NULL (no transcript yet, or a pre-drafting row) → `pending` (a transcript landed) →
-  `ready` | `failed` (three bad results). A new transcript, or Graham editing `body`, resets a machine draft
-  to `pending` with zero attempts; `draft_src_sha` (sha256 of the transcript it was made from) makes a draft
+- `draft_status`: NULL (no transcript yet, an empty one, or a pre-drafting row) → `pending` (a transcript
+  landed) → `ready` | `failed` (three bad results). A new transcript, or Graham editing `body` on an
+  unreviewed voice note whose draft he has not edited, makes it `pending` with zero attempts — even from
+  NULL, so a note whose Whisper transcript FAILED can be drafted from what he types; an empty body makes it
+  NULL (never a permanent "Drafting…"). The queue drafts every `pending` note with text; `draft_src_sha` (sha256 of the transcript it was made from) makes a draft
   of an older transcript stale — the POST is a 409 and burns nothing.
 - Graham editing any draft field stamps `draft_edited_at`: from then on no machine draft may overwrite it
   (409), and the draft is `ready`. A manual title typed at capture is forced into `draft_title`, and the
   capture form's project seeds `draft_project`.
 - **Ticking Reviewed on a voice note copies the draft**: `title := draft_title` (made `manual`; only over a
   still-derived title, or a draft edited in the same request, so a re-tick never takes back a rename) and
-  `project := COALESCE(draft_project, project)`. Hopper's filing loop keeps reading `title`/`project`, and
+  `project := draft_project` — only on the FIRST copy (`draft_copied_at IS NULL`; `reviewed_at` cannot say
+  it, an untick clears it) or when `draft_project` is in the same request. **Editing the draft after review**
+  also writes `title` (manual) and `project`, so what is filed is what Graham sees.
+- **Every write that acts on a draft is a conditional UPDATE** (`set_draft`: `reviewed=0 AND draft_edited_at
+  IS NULL AND body IS <the body it hashed>`; the review copy: `reviewed=0` and the draft values it read;
+  `note_draft_attempt`: the attempt count it read). A lost race is a 409, never a stale write. Hopper's filing loop keeps reading `title`/`project`, and
   gains `draft.body` as the issue description.
-- **Needs review** = voice, open, not archived, `reviewed=0`, `draft_status IN ('ready','failed')` —
-  failed too, so nothing strands; the row says "Couldn't draft — edit to write one". It sorts first, then
+- **Needs review** = voice, open, not archived, `reviewed=0`, and `draft_status IN ('ready','failed')` OR
+  `transcript_status='failed'` — failures too, so nothing strands; the row says why ("Couldn't draft — edit
+  to write one" / "Whisper couldn't transcribe this — play it and write the draft"). It sorts first, then
   awaiting-filing, then newest.
-- **Reviewed is a voice-note control.** The checkbox renders only on voice rows and a PATCH of
-  `reviewed:true` on anything else is a 400 (unticking stays allowed). Typed notes are created with
-  `reviewed=1` — typing one is the deliberate act — so the filing loop still picks them up. Rows created
-  before this change are untouched.
+- **Reviewed is a voice-note control.** The checkbox renders on voice rows and on OLDER typed notes that
+  are still `reviewed=0` (made before typed notes were born reviewed — otherwise they would be stranded);
+  a PATCH of `reviewed:true` on anything else is a 400 (unticking stays allowed; items expose
+  `reviewable`). Typed notes are now created with `reviewed=1` — typing one is the deliberate act — so the
+  filing loop picks them up. No data was migrated.
 
 **Contract addendum** (additive; `/api/v1/status` is unchanged):
 
@@ -489,7 +498,7 @@ transcript and the audio prune depends on it being Whisper's. Rules:
   notes with no draft) and notes whose draft is stale. `known_projects` = the repo names of
   `INBOX_GITHUB_REPOS` plus the board's projects.
 - `POST /api/v1/inbox/items/<id>/draft` (INBOX_TOKEN) with `{title, body, project, src_sha, model}` or
-  `{failed: true, error, src_sha}`. Title one line ≤ 120, body ≤ 2000, both through `clean_text`; an unknown
+  `{failed: true, error, src_sha}` (`src_sha` is required on both). Title one line ≤ 120, body ≤ 2000, both through `clean_text`; an unknown
   project becomes NULL; stale sha / reviewed / edited → 409, no attempt burned. The caps are pinned between
   `inbox_db` and `probes/inbox_draft.py` by a test.
 
@@ -498,21 +507,25 @@ awaiting filing (`?awaiting=filing`: reviewed, open, local, no linked issue, not
 files it from `title`, `project` and `draft.body`: repo work becomes a GitHub issue recorded with
 `POST /api/v1/inbox/items/<id>/issues`; anything else (Hopper itself, the Mac or box, a chore) becomes ONE
 `backlog.txt` line in Hopper's own words ending `(voice <first 8 chars of id>)`, recorded with
-`POST /api/v1/inbox/items/<id>/filed-backlog {"line": …}` (INBOX_TOKEN; one line, `clean_text`, ≤
-`MAX_BACKLOG_LINE` = 500, must carry the tag; idempotent — the first `filed_backlog_at` is kept). The note
+`POST /api/v1/inbox/items/<id>/filed-backlog {"line": …}` (INBOX_TOKEN; the note must be reviewed, open
+and not archived, else 409; one line, `clean_text`, ≤ `MAX_BACKLOG_LINE` = 500, must carry the tag;
+idempotent — the first `filed_backlog_at` is kept). The note
 then leaves awaiting-filing, and the backlog-mirror row that line comes back as (matched by the tag,
-whichever arrives first) is **hidden from the default list and the counts** — the simpler of hiding or
+whichever arrives first) is **hidden from the default list and the counts while that note is not closed
+or archived** (shown again once it is) — the simpler of hiding or
 nesting — and linked as `filed_backlog.mirror_key` on the note. `?source=backlog` still lists it.
 
-**The `claude -p` call** is locked down: `--safe-mode --tools "" --strict-mcp-config
+**The `claude -p` call** is locked down: `--safe-mode --setting-sources "" --tools "" --strict-mcp-config
 --no-session-persistence --disable-slash-commands --output-format json --json-schema … --model sonnet
 --system-prompt …`, the transcript as JSON on stdin framed as data, an empty temp cwd, an allowlisted env
 plus `CLAUDE_CODE_OAUTH_TOKEN` from a 0600 file. Never `--bare` (it ignores OAuth). The result envelope was
 recorded from the real CLI: success is `is_error:false` with the object in `structured_output`; every API
 problem is `is_error:true`, `terminal_reason:"api_error"`, `api_error_status` = HTTP status or null, and
-`subtype` still reads "success". Systemic failures (not logged in, expired, limit, 5xx, timeout, missing
-binary) stop drafting and fail the heartbeat without burning attempts; only a bad structured result, or a
-400/413 about that request, burns one.
+`subtype` still reads "success". Systemic is NARROW — missing/relative binary, non-envelope output, an
+auth failure or usage limit, an `api_error` other than 400/413 — and stops drafting and fails the
+heartbeat without burning attempts. Anything else is per-note, subject to a circuit breaker (two failures
+and no success in a run → stop, burn nothing) and a timeout rule (systemic unless the same note timed out
+last run too). No error message raised from the CLI's output ever carries stdout (it can be model text).
 
 ## Box facts (recon 2026-09-04, read-only)
 Ubuntu 24.04, Python 3.12, Docker 29 + Compose v5, host rclone 1.60 (old), curl present, no sqlite3 CLI.

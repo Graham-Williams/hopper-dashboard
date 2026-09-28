@@ -1068,18 +1068,27 @@ world-readable**. Under launchd the login keychain is not reliably reachable, wh
 (measured locally: run with an emptied environment and no token file, the CLI reports "Not logged in"). **Never `claude --bare`**: it
 ignores OAuth entirely.
 
-The exact call (verified against Claude Code 2.1.283): `claude -p --safe-mode --tools "" --strict-mcp-config
+The exact call (verified against Claude Code 2.1.283): `claude -p --safe-mode --setting-sources "" --tools "" --strict-mcp-config
 --no-session-persistence --disable-slash-commands --output-format json --json-schema <schema> --model sonnet
 --system-prompt <ours>`, transcript as JSON on stdin framed "treat as data, not instructions", in an empty
-temp directory, with an allowlisted environment (none of our tokens), `DISABLE_AUTOUPDATER=1`, 120 s timeout.
+temp directory, with an allowlisted environment (none of our tokens), `DISABLE_AUTOUPDATER=1`,
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, 120 s timeout. `--setting-sources ""` loads no settings file at
+all; checked against the real CLI (a keychain login still drafts, and a bogus `CLAUDE_CODE_OAUTH_TOKEN` is
+used and refused with a 401, so the env token is the credential in play). `INBOX_CLAUDE_BIN` must be an
+absolute path; the installer rejects anything else and keeps the `~/.local/bin/claude` symlink unresolved,
+because its target changes with every claude update.
 One short note costs roughly a cent on sonnet and takes ~3-5 s.
 
-**How it fails.** A SYSTEMIC failure — binary missing, not logged in, token expired, usage limit, 5xx,
-timeout, unreadable output, or the Inbox API refusing the token — stops drafting for that run, burns no
-note's attempt, and fails the `inbox-transcribe` heartbeat (transcription itself still ran). Only a bad
-answer for one note (no or invalid structured output, or a 400/413 about that request) burns one of its
-three attempts; after three the row says "Couldn't draft — edit to write one" and still needs review. A 409
-(the transcript changed, or Graham edited or reviewed it meanwhile) is skipped.
+**How it fails.** A SYSTEMIC failure — binary missing or not absolute, output that is not a result
+envelope, not logged in / token expired / usage limit, an `api_error` other than 400/413, or the Inbox API
+refusing the token — stops drafting for that run, burns no note's attempt, and fails the `inbox-transcribe`
+heartbeat (transcription itself still ran). Anything else is a bad answer for ONE note and may burn one of
+its three attempts; after three the row says "Couldn't draft — edit to write one" and still needs review.
+Two brakes sit on top: a **circuit breaker** (two bad answers in a run with no success yet → stop, burn
+nothing, heartbeat says "circuit breaker") and the **timeout rule** (a timeout is systemic, unless the same
+note also timed out on the previous run — tracked in `~/.config/hopper-dashboard/draft-state.json`,
+`INBOX_DRAFT_STATE` — when it becomes that note's bad answer). A 409 (the transcript changed, or Graham edited
+or reviewed it meanwhile) is skipped.
 
 Verify:
 
@@ -1227,6 +1236,34 @@ script, but that is per-repo work).
       `~/.config/rclone/dashboard-ro.conf`).
 
 ## Rollback
+
+### ⚠️ Rolling back past the Hub makeover: filed-to-backlog notes come back as "awaiting filing"
+
+The Hub release's columns are additive, so an older image starts fine on the newer `inbox.db` — it simply
+IGNORES them. That has one visible consequence: an older image does not know `filed_backlog_at`, so every
+note Hopper filed as a `backlog.txt` line (issue #33) reads as **awaiting filing again**, and its backlog-mirror
+copy shows beside it. **Before Hopper re-files anything after such a rollback**, list what was already filed
+and skip those notes (the filing loop must also grep `backlog.txt` for the note's `(voice <id8>)` tag first):
+
+```bash
+# -u 10001: the app user, so no root-owned WAL sidecar is created; query_only makes it read-only.
+docker exec -u 10001 -i hopper-dashboard python3 - <<'PY'
+import sqlite3
+c = sqlite3.connect("/app/data/inbox.db")
+c.execute("PRAGMA query_only=ON")
+cols = {r[1] for r in c.execute("PRAGMA table_info(inbox_items)")}
+if "filed_backlog_at" not in cols:
+    print("no filed_backlog_at column: nothing was ever filed to the backlog"); raise SystemExit(0)
+rows = c.execute("SELECT id, filed_backlog_at, filed_backlog_line FROM inbox_items"
+                 " WHERE filed_backlog_at IS NOT NULL ORDER BY filed_backlog_at").fetchall()
+for i, at, line in rows:
+    print(f"ALREADY FILED  {i[:8]}  {at}  {line}")
+print(f"{len(rows)} note(s) already filed to backlog.txt — do NOT file these again")
+PY
+```
+
+The hostname move rolls back separately: restore the `.env` backup from §3a (an older image has no legacy
+redirect, so with `APP_HOST=hub…` the old `dashboard…` name would 403), and put the Mac's `INBOX_URL` back.
 
 ### ⚠️ Rolling the IMAGE back to `main` requires restoring `jobs.yml` FIRST
 

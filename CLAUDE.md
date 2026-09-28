@@ -301,17 +301,22 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
 - **Drafts (2026-09-28).** Voice notes get an AI draft in `draft_*` columns (the first real
   `INBOX_COLUMNS` migration) made on the Mac by `probes/inbox_draft.py`; the Mac never writes
   `title`/`body`/`project`. Ticking Reviewed on a voice note copies `draft_title` → `title` (manual) and
-  `COALESCE(draft_project, project)` → `project`. Needs review = voice, open, unreviewed, draft
-  `ready`|`failed`; it sorts first and has a tile, a filter (`?awaiting=review`) and a count. Reviewed is
-  voice-only (PATCH `reviewed:true` elsewhere = 400) and typed notes are created `reviewed=1`. A Graham
-  edit stamps `draft_edited_at` and no machine draft may overwrite it; a stale `src_sha` is a 409 that
-  burns nothing. `DRAFT_MAX_TITLE`/`DRAFT_MAX_BODY` are pinned against `probes/inbox_draft.py`. Spec:
+  `draft_project` → `project` only on the first copy (`draft_copied_at`) or when it is in the same
+  PATCH; editing the draft after review also writes `title`/`project`. Needs review = voice, open,
+  unreviewed, draft `ready`|`failed` OR a failed transcript; it sorts first and has a tile, a filter
+  (`?awaiting=review`) and a count. Reviewed is voice-only plus legacy typed notes still at `reviewed=0`
+  (`inbox.reviewable`); new typed notes are created `reviewed=1`. A Graham edit stamps `draft_edited_at`
+  and no machine draft may overwrite it; a stale `src_sha` is a 409 that burns nothing. **Draft writes are
+  conditional UPDATEs with a rowcount check** (`inbox_db.Conflict` / `DraftRefused("conflict")` → 409) —
+  keep them conditional. `DRAFT_MAX_TITLE`/`DRAFT_MAX_BODY` are pinned against `probes/inbox_draft.py`. Spec:
   DESIGN.md "Drafts, Needs review and the Hub".
 - **Filed to backlog.txt (issue #33).** Hopper's filing loop files a non-repo note as one backlog.txt line
   ending `(voice <id8>)` and records it with `POST /api/v1/inbox/items/<id>/filed-backlog` (INBOX_TOKEN,
   idempotent, `filed_backlog_at`/`filed_backlog_line`). The note leaves awaiting-filing (SQL AND
   `item_json`), and the backlog-mirror row carrying that tag is hidden from the default list and counts
-  (`_FILED_COPY_SQL`; `?source=backlog` still shows it). The tag is the ONLY link — keep the convention.
+  while the note is not closed or archived (`_FILED_COPY_SQL`; `?source=backlog` still shows it). The
+  route needs a reviewed, open note (409). An older image ignores these columns, so a rollback brings
+  filed notes back as awaiting filing — DEPLOY.md Rollback has the check. The tag is the ONLY link — keep the convention.
 - `inbox.py` — the blueprint. `MACHINE_ENDPOINTS` is what scopes `INBOX_TOKEN` (now including
   `inbox.draft_queue` and `inbox.post_draft`); the create route raises
   `request.max_content_length` PER REQUEST (the global 64 KB cap in `__init__.py` protects every other
@@ -614,14 +619,20 @@ there is no default URL in the code, by design.
     Keep it if you touch `handle_item` / `transcribe_file`.
   - **Phase two: drafting** (`probes/inbox_draft.py`, no-op unless `INBOX_CLAUDE_BIN` is set). After
     Whisper, up to `INBOX_DRAFT_LIMIT` (5) notes go to a locked-down `claude -p` (`--safe-mode --tools ""
-    --strict-mcp-config --no-session-persistence --disable-slash-commands --output-format json
-    --json-schema`, our system prompt, transcript as JSON on stdin, empty temp cwd, `minimal_env` +
-    `CLAUDE_CODE_OAUTH_TOKEN` from the 0600 `INBOX_CLAUDE_TOKEN_FILE` + `DISABLE_AUTOUPDATER=1`, 120 s).
+    --setting-sources "" --strict-mcp-config --no-session-persistence --disable-slash-commands
+    --output-format json --json-schema`, our system prompt, transcript as JSON on stdin, empty temp cwd,
+    `minimal_env` + `CLAUDE_CODE_OAUTH_TOKEN` from the 0600 `INBOX_CLAUDE_TOKEN_FILE` +
+    `DISABLE_AUTOUPDATER=1` + `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, 120 s; the binary path must be
+    absolute).
     **⚠️ NEVER `--bare`** (it ignores OAuth) and never a `--dangerously-*` flag; never import an
     Anthropic SDK under `probes/` (an `ast` test bans it). **SYSTEMIC vs BAD RESULT is the same
-    load-bearing split as EnvironmentFault vs item failure**: not logged in / expired / limit / 5xx /
-    timeout / missing binary stop drafting, burn nothing and fail the heartbeat; only an invalid
-    structured result (or a 400/413) burns one of the note's 3 attempts; a 409 is skipped. The CLI's
+    load-bearing split as EnvironmentFault vs item failure**, and systemic is NARROW: missing/relative
+    binary, non-envelope output, auth failure or usage limit, an `api_error` other than 400/413. Those
+    stop drafting, burn nothing and fail the heartbeat. Everything else is per-note, behind a CIRCUIT
+    BREAKER (two failures with no success in a run → stop, burn nothing; held failures are reported only
+    after a success or when the queue runs out) and a TIMEOUT RULE (systemic, unless the same note timed
+    out last run too — `draft-state.json` next to `state.json`). A 409 is skipped. Never put the CLI's
+    stdout in an error message: it can be model output, and those messages reach the heartbeat. The CLI's
     error envelope still says `subtype: "success"` — decide on `is_error` + `api_error_status`, never
     `subtype`. The TRANSCRIPT and TITLE go to Anthropic; the audio never does. Tests run a FAKE `claude`
     executable (argv, stdin, cwd and env are observed, not assumed).
