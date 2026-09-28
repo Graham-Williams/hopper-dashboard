@@ -1084,8 +1084,10 @@ envelope, not logged in / token expired / usage limit, an `api_error` other than
 refusing the token — stops drafting for that run, burns no note's attempt, and fails the `inbox-transcribe`
 heartbeat (transcription itself still ran). Anything else is a bad answer for ONE note and may burn one of
 its three attempts; after three the row says "Couldn't draft — edit to write one" and still needs review.
-Two brakes sit on top: a **circuit breaker** (two bad answers in a run with no success yet → stop, burn
-nothing, heartbeat says "circuit breaker") and the **timeout rule** (a timeout is systemic, unless the same
+Two brakes sit on top: a **circuit breaker** (a run that ENDS with no success and two or more bad answers
+burns nothing and the heartbeat says "circuit breaker … trip N of 3"; the batch is always finished, so a good
+note behind bad ones is still drafted; on the third tripped run in a row the failures ARE counted, so bad
+notes reach "failed" and leave the head of the queue) and the **timeout rule** (a timeout is systemic, unless the same
 note also timed out on the previous run — tracked in `~/.config/hopper-dashboard/draft-state.json`,
 `INBOX_DRAFT_STATE` — when it becomes that note's bad answer). A 409 (the transcript changed, or Graham edited
 or reviewed it meanwhile) is skipped.

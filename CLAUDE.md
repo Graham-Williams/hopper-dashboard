@@ -304,8 +304,10 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   `draft_project` → `project` only on the first copy (`draft_copied_at`) or when it is in the same
   PATCH; editing the draft after review also writes `title`/`project`. Needs review = voice, open,
   unreviewed, draft `ready`|`failed` OR a failed transcript; it sorts first and has a tile, a filter
-  (`?awaiting=review`) and a count. Reviewed is voice-only plus legacy typed notes still at `reviewed=0`
-  (`inbox.reviewable`); new typed notes are created `reviewed=1`. A Graham edit stamps `draft_edited_at`
+  (`?awaiting=review`) and a count. Reviewed is voice-only plus LEGACY typed notes, ticked or not
+  (`inbox.reviewable`: typed and `reviewed_at != created_at` — a note born reviewed has the two equal
+  from the same INSERT); new typed notes are created `reviewed=1`. The migration backfills
+  `draft_copied_at = reviewed_at` for already-reviewed voice notes (NULLs only). A Graham edit stamps `draft_edited_at`
   and no machine draft may overwrite it; a stale `src_sha` is a 409 that burns nothing. **Draft writes are
   conditional UPDATEs with a rowcount check** (`inbox_db.Conflict` / `DraftRefused("conflict")` → 409) —
   keep them conditional. `DRAFT_MAX_TITLE`/`DRAFT_MAX_BODY` are pinned against `probes/inbox_draft.py`. Spec:
@@ -629,8 +631,7 @@ there is no default URL in the code, by design.
     load-bearing split as EnvironmentFault vs item failure**, and systemic is NARROW: missing/relative
     binary, non-envelope output, auth failure or usage limit, an `api_error` other than 400/413. Those
     stop drafting, burn nothing and fail the heartbeat. Everything else is per-note, behind a CIRCUIT
-    BREAKER (two failures with no success in a run → stop, burn nothing; held failures are reported only
-    after a success or when the queue runs out) and a TIMEOUT RULE (systemic, unless the same note timed
+    BREAKER (a run that ENDS with no success and 2+ bad results burns nothing (the whole batch is still worked, so a good note behind bad ones is drafted); on the 3rd such run in a row, counted in `draft-state.json`, the held failures are burned so bad notes reach `failed`; after any success the held failures are reported) and a TIMEOUT RULE (systemic, unless the same note timed
     out last run too — `draft-state.json` next to `state.json`). A 409 is skipped. Never put the CLI's
     stdout in an error message: it can be model output, and those messages reach the heartbeat. The CLI's
     error envelope still says `subtype: "success"` — decide on `is_error` + `api_error_status`, never

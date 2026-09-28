@@ -42,9 +42,9 @@ is NARROW: the binary missing or not runnable, output that is not a result envel
 auth failure or usage limit, or an ``api_error`` whose status is not 400/413. EVERYTHING ELSE is
 a BAD RESULT for that one note (any other ``is_error``, a 400/413, missing or invalid structured
 output), which may burn one of its three attempts. The worker adds two brakes on top
-(``inbox_transcribe.run_drafting``): a CIRCUIT BREAKER (no successes yet and two bad results in
-a run → stop, burn nothing, fail the heartbeat, because that is what a systemic fault that looks
-per-note does) and a TIMEOUT rule (a timeout is systemic, unless the same note also timed out in
+(``inbox_transcribe.run_drafting``): a CIRCUIT BREAKER (a run that ends with no success and two or
+more bad results burns nothing and fails the heartbeat, because that is what a systemic fault that
+looks per-note does; the batch is always finished, and the third such run in a row burns them) and a TIMEOUT rule (a timeout is systemic, unless the same note also timed out in
 the previous run, when it becomes that note's bad result).
 
 Stdlib only, Python 3.9-clean. Never import an Anthropic SDK here: the ``claude`` CLI is

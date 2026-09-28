@@ -469,7 +469,8 @@ transcript and the audio prune depends on it being Whisper's. Rules:
 - **Ticking Reviewed on a voice note copies the draft**: `title := draft_title` (made `manual`; only over a
   still-derived title, or a draft edited in the same request, so a re-tick never takes back a rename) and
   `project := draft_project` — only on the FIRST copy (`draft_copied_at IS NULL`; `reviewed_at` cannot say
-  it, an untick clears it) or when `draft_project` is in the same request. **Editing the draft after review**
+  it, an untick clears it; the migration backfills it from `reviewed_at` for voice notes reviewed before it
+  existed) or when `draft_project` is in the same request. **Editing the draft after review**
   also writes `title` (manual) and `project`, so what is filed is what Graham sees.
 - **Every write that acts on a draft is a conditional UPDATE** (`set_draft`: `reviewed=0 AND draft_edited_at
   IS NULL AND body IS <the body it hashed>`; the review copy: `reviewed=0` and the draft values it read;
@@ -479,8 +480,11 @@ transcript and the audio prune depends on it being Whisper's. Rules:
   `transcript_status='failed'` — failures too, so nothing strands; the row says why ("Couldn't draft — edit
   to write one" / "Whisper couldn't transcribe this — play it and write the draft"). It sorts first, then
   awaiting-filing, then newest.
-- **Reviewed is a voice-note control.** The checkbox renders on voice rows and on OLDER typed notes that
-  are still `reviewed=0` (made before typed notes were born reviewed — otherwise they would be stranded);
+- **Reviewed is a voice-note control.** The checkbox renders on voice rows and on OLDER typed notes,
+  ticked or not, so an accidental tick can be undone. "Older" is `reviewed_at != created_at`: a typed note
+  made since the release is born reviewed in the same INSERT, so its two timestamps are identical; a legacy
+  note's are NULL or a later tick. (Unticking a new typed note makes it look legacy — harmless: it gets a
+  checkbox back.)
   a PATCH of `reviewed:true` on anything else is a 400 (unticking stays allowed; items expose
   `reviewable`). Typed notes are now created with `reviewed=1` — typing one is the deliberate act — so the
   filing loop picks them up. No data was migrated.
@@ -523,8 +527,7 @@ recorded from the real CLI: success is `is_error:false` with the object in `stru
 problem is `is_error:true`, `terminal_reason:"api_error"`, `api_error_status` = HTTP status or null, and
 `subtype` still reads "success". Systemic is NARROW — missing/relative binary, non-envelope output, an
 auth failure or usage limit, an `api_error` other than 400/413 — and stops drafting and fails the
-heartbeat without burning attempts. Anything else is per-note, subject to a circuit breaker (two failures
-and no success in a run → stop, burn nothing) and a timeout rule (systemic unless the same note timed out
+heartbeat without burning attempts. Anything else is per-note, subject to a circuit breaker (a run that ENDS with no success and 2+ bad results burns nothing (the whole batch is still worked, so a good note behind bad ones is drafted); on the 3rd such run in a row, counted in `draft-state.json`, the held failures are burned so bad notes reach `failed`) and a timeout rule (systemic unless the same note timed out
 last run too). No error message raised from the CLI's output ever carries stdout (it can be model text).
 
 ## Box facts (recon 2026-09-04, read-only)

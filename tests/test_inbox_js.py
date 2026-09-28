@@ -410,6 +410,34 @@ function refused() { return Promise.resolve({ok: false, status: 400, json: funct
   out.failed = {reloads: w.reloads(), formHidden: w.form.hidden, title: w.title.value,
                 error: w.err.textContent, errHidden: w.err.hidden, saveDisabled: w.save.disabled};
 
+  /* A 409 on the Reviewed tick: show the server's reason, put the box back, reload. */
+  {
+    const box = el('input', {'class': 'review-box', 'data-id': 'b'.repeat(32)});
+    box.checked = true;
+    const err2 = el('p', {id: 'capture-error'});
+    let reloads2 = 0;
+    const win2 = {
+      fetch: function () {
+        return Promise.resolve({ok: false, status: 409, json: function () {
+          return Promise.resolve({error: 'the item changed while saving — reload and try again'}); }});
+      },
+      setInterval: function () { return 0; }, clearInterval: function () {},
+      setTimeout: function (fn) { fn(); return 0; },
+      confirm: function () { return false; }, addEventListener: function () {},
+      location: {reload: function () { reloads2 += 1; }}
+    };
+    const doc2 = {
+      getElementById: function (i) { return i === 'capture-error' ? err2 : null; },
+      querySelectorAll: function (sel) { return sel === '.review-box' ? [box] : []; }
+    };
+    vm.runInNewContext(SRC, {document: doc2, window: win2, navigator: {}, console: console,
+                             Blob: function () {}, FormData: function () {}});
+    box.fire('change');
+    await settle();
+    out.tick409 = {error: err2.textContent, errHidden: err2.hidden, reloads: reloads2,
+                   checked: box.checked, disabled: box.disabled};
+  }
+
   process.stdout.write(JSON.stringify(out));
 })().catch(function (err) {
   process.stderr.write(String((err && err.stack) || err));
@@ -462,3 +490,10 @@ def test_a_failed_save_keeps_the_form_and_the_text_and_says_why(edited):
     assert failed["title"] == "Kept on failure"
     assert failed["error"].startswith("Could not save that draft") and not failed["errHidden"]
     assert failed["saveDisabled"] is False
+
+
+def test_a_409_on_the_reviewed_tick_says_why_and_reloads(edited):
+    t = edited["tick409"]
+    assert t["error"] == "the item changed while saving — reload and try again"
+    assert t["errHidden"] is False and t["reloads"] == 1
+    assert t["checked"] is False and t["disabled"] is False

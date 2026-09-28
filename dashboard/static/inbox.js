@@ -507,6 +507,16 @@
           headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
           body: JSON.stringify({reviewed: wanted})
         }).then(function (response) {
+          if (response.status === 409) {
+            /* The row changed underneath the tick (a new draft landed): the server
+               wrote nothing. Say why, then reload so Graham reviews what is really
+               there — the same message path the draft editor uses. */
+            return response.json().catch(function () { return {}; }).then(function (body) {
+              box.checked = !wanted;
+              fail(body.error || 'That item changed — reloading.');
+              window.setTimeout(function () { window.location.reload(); }, 1500);
+            });
+          }
           if (!response.ok) { throw new Error('save failed'); }
           var row = document.getElementById('item-' + id);
           if (row) { row.setAttribute('data-reviewed', wanted ? '1' : '0'); }
