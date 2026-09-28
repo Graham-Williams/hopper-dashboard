@@ -53,6 +53,7 @@ from typing import Dict, List, Optional, Tuple
 # Allow `/usr/bin/python3 probes/inbox_transcribe.py` as well as `python -m probes.inbox_transcribe`.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from probes import inbox_draft  # noqa: E402
 from probes.common import (  # noqa: E402
     DEFAULT_ENV_FILE,
     HTTP_TIMEOUT_S,
@@ -176,6 +177,12 @@ def load_settings(env_path: str) -> Dict[str, str]:
         "INBOX_TRANSCRIBE_TIMEOUT": str(DEFAULT_TIMEOUT_S),
         "INBOX_TRANSCRIBE_LOG": DEFAULT_LOG,
         "INBOX_HTTP_TIMEOUT": str(HTTP_TIMEOUT_S),
+        # Drafting (phase two). Empty INBOX_CLAUDE_BIN = drafting is off: a no-op.
+        "INBOX_CLAUDE_BIN": "",
+        "INBOX_CLAUDE_TOKEN_FILE": "",
+        "INBOX_DRAFT_MODEL": inbox_draft.DEFAULT_MODEL,
+        "INBOX_DRAFT_LIMIT": str(inbox_draft.DEFAULT_LIMIT),
+        "INBOX_DRAFT_TIMEOUT": str(inbox_draft.DEFAULT_TIMEOUT_S),
     }
     for k, v in defaults.items():
         cfg.setdefault(k, v)
@@ -432,6 +439,114 @@ def handle_item(cfg: Dict[str, str], item: Dict[str, object], log: Logger,
 
 
 # ---------------------------------------------------------------------------
+# Phase two: drafting (probes/inbox_draft.py)
+# ---------------------------------------------------------------------------
+def fetch_draft_queue(cfg: Dict[str, str], limit: int) -> Tuple[List[Dict[str, object]],
+                                                                List[str]]:
+    base = inbox_base(cfg)
+    url = "%s/api/v1/inbox/draft/queue?limit=%d" % (base, max(1, int(limit)))
+    doc = api_json(url, cfg["INBOX_TOKEN"], timeout=float(cfg["INBOX_HTTP_TIMEOUT"]))
+    items = doc.get("items")
+    if not isinstance(items, list):
+        raise ProbeError("draft queue: 'items' was not a list")
+    known = doc.get("known_projects")
+    known = [p for p in known if isinstance(p, str)] if isinstance(known, list) else []
+    out = [raw for raw in items if isinstance(raw, dict) and valid_item_id(raw.get("id"))
+           and isinstance(raw.get("sha"), str)]
+    return out, known
+
+
+def post_draft(cfg: Dict[str, str], item_id: str, body: Dict[str, object]) -> None:
+    if not valid_item_id(item_id):
+        raise ProbeError("refusing to post to a malformed item id")
+    url = "%s/api/v1/inbox/items/%s/draft" % (inbox_base(cfg), item_id)
+    api_json(url, cfg["INBOX_TOKEN"], method="POST", body=body,
+             timeout=float(cfg["INBOX_HTTP_TIMEOUT"]))
+
+
+def run_drafting(cfg: Dict[str, str], log: Logger, dry_run: bool,
+                 runner=None) -> Tuple[Dict[str, int], Optional[str]]:
+    """Draft up to INBOX_DRAFT_LIMIT transcribed notes. Returns ``(counts, fatal)``.
+
+    A no-op unless INBOX_CLAUDE_BIN is set. ``fatal`` is set for a SYSTEMIC failure (claude
+    missing / not logged in / limit / 5xx / timeout, or the Inbox API refusing us): drafting
+    stops at once, no note's attempt is burned, and the caller fails the heartbeat. A bad
+    result for one note is reported as that note's failed attempt and the run carries on.
+    A 409 (the transcript changed, or Graham edited/reviewed it meanwhile) is simply skipped.
+    """
+    counts = {"drafted": 0, "draft_failed": 0, "draft_skipped": 0}
+    claude_bin = (cfg.get("INBOX_CLAUDE_BIN") or "").strip()
+    if not claude_bin:
+        return counts, None
+    limit = _int(cfg, "INBOX_DRAFT_LIMIT", inbox_draft.DEFAULT_LIMIT)
+    if limit <= 0:
+        return counts, None
+    model = (cfg.get("INBOX_DRAFT_MODEL") or inbox_draft.DEFAULT_MODEL).strip()
+    try:
+        items, known = fetch_draft_queue(cfg, limit)
+        log.log("draft queue: %d item(s)%s" % (len(items), " [dry-run]" if dry_run else ""))
+        if dry_run:
+            for item in items[:limit]:
+                log.log("would draft %s (%d chars)"
+                        % (item["id"], len(str(item.get("transcript") or ""))))
+            counts["draft_skipped"] = len(items[:limit])
+            return counts, None
+        if not items:
+            return counts, None
+        if not (os.path.isfile(claude_bin) and os.access(claude_bin, os.X_OK)):
+            raise inbox_draft.SystemicFailure(
+                "INBOX_CLAUDE_BIN %r is not an executable file" % claude_bin)
+        token = inbox_draft.read_token(cfg.get("INBOX_CLAUDE_TOKEN_FILE") or "")
+        env = inbox_draft.child_env(minimal_env, token)
+        timeout = float(_int(cfg, "INBOX_DRAFT_TIMEOUT", inbox_draft.DEFAULT_TIMEOUT_S))
+        for item in items[:limit]:
+            item_id = str(item["id"])
+            try:
+                draft = inbox_draft.draft_one(claude_bin, model, item, known, env,
+                                              timeout=timeout, runner=runner)
+            except inbox_draft.BadResult as e:
+                detail = flatten_for_log(e, 200)
+                log.error("%s: draft unusable: %s" % (item_id, detail))
+                counts["draft_failed"] += 1
+                try:
+                    post_draft(cfg, item_id, {"failed": True, "error": detail,
+                                              "src_sha": item["sha"]})
+                except ProbeError as pe:
+                    if is_auth_failure(pe):
+                        raise
+                    log.error("%s: failure report not delivered: %s"
+                              % (item_id, flatten_for_log(pe, 200)))
+                continue
+            body = dict(draft)
+            body.update({"src_sha": item["sha"], "model": model})
+            try:
+                post_draft(cfg, item_id, body)
+            except ProbeError as pe:
+                if is_auth_failure(pe):
+                    raise
+                if getattr(pe, "status", None) == 409 or "HTTP 409" in str(pe):
+                    log.log("%s: draft not needed any more (409) — skipped" % item_id)
+                    counts["draft_skipped"] += 1
+                    continue
+                log.error("%s: draft not stored: %s" % (item_id, flatten_for_log(pe, 200)))
+                counts["draft_failed"] += 1
+                continue
+            counts["drafted"] += 1
+            log.log("%s: drafted (%d-char title, %d-char body%s)"
+                    % (item_id, len(draft["title"]), len(draft["body"]),
+                       ", project %s" % draft["project"] if draft["project"] else ""))
+    except inbox_draft.SystemicFailure as e:
+        fatal = "drafting: %s" % flatten_for_log(e, 300)
+        log.error(fatal)
+        return counts, fatal
+    except ProbeError as e:
+        fatal = "drafting: %s" % flatten_for_log(e, 300)
+        log.error(fatal)
+        return counts, fatal
+    return counts, None
+
+
+# ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 JOB_ID = "inbox-transcribe"
@@ -487,9 +602,27 @@ def main(argv: Optional[List[str]] = None) -> int:
         fatal = "%s: %s" % (type(e).__name__, e)
         log.error("crashed: %s\n%s" % (e, traceback.format_exc()))
 
+    # Phase two, independent of phase one: a Whisper environment fault (no ffmpeg) must not
+    # stop notes that are ALREADY transcribed from being drafted.
+    draft_counts = {"drafted": 0, "draft_failed": 0, "draft_skipped": 0}
+    try:
+        draft_counts, draft_fatal = run_drafting(cfg, log, args.dry_run)
+    except Exception as e:  # noqa: BLE001 — same last line of defence as above
+        draft_fatal = "drafting crashed: %s: %s" % (type(e).__name__, e)
+        log.error("%s\n%s" % (draft_fatal, traceback.format_exc()))
+    if draft_fatal:
+        fatal = "%s; %s" % (fatal, draft_fatal) if fatal else draft_fatal
+    if (cfg.get("INBOX_CLAUDE_BIN") or "").strip():
+        log.log("drafted %d (%d failed, %d skipped)"
+                % (draft_counts["drafted"], draft_counts["draft_failed"],
+                   draft_counts["draft_skipped"]))
+
     metrics = {"queued": queued, "transcribed": counts["done"],
                "failed": counts["failed"], "skipped": counts["skipped"],
                "duration_s": round(time.time() - t0, 1)}
+    if (cfg.get("INBOX_CLAUDE_BIN") or "").strip():
+        metrics["drafted"] = draft_counts["drafted"]
+        metrics["draft_failed"] = draft_counts["draft_failed"]
     heartbeat = build_ping(
         "fail" if fatal else "ok",
         started_at=started, finished_at=now_iso(),
