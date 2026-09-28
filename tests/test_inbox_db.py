@@ -687,3 +687,32 @@ def test_a_filed_copy_shows_again_once_its_note_is_closed(conn):
     assert [r["source"] for r in inbox_db.list_items(conn)] == ["typed"]
     inbox_db.update_item(conn, item, {"state": "closed"})
     assert sorted(r["source"] for r in inbox_db.list_items(conn)) == ["backlog", "typed"]
+
+
+def test_the_migration_backfills_draft_copied_at_for_reviewed_voice_notes(tmp_path):
+    """A voice note reviewed before draft_copied_at existed has had its first review: a
+    re-tick must not copy the draft project over whatever Graham has since set."""
+    import sqlite3
+    path = str(tmp_path / "inbox.db")
+    old = sqlite3.connect(path)
+    old.executescript(inbox_db.INBOX_SCHEMA)
+    rows = [("a" * 32, "voice", 1, "2026-09-01T00:00:00Z"),
+            ("b" * 32, "voice", 0, None),
+            ("c" * 32, "typed", 1, "2026-09-02T00:00:00Z")]
+    for i, src, rev, at in rows:
+        old.execute("INSERT INTO inbox_items (id, source, title, created_at, updated_at,"
+                    " reviewed, reviewed_at) VALUES (?,?,?,?,?,?,?)",
+                    (i, src, "t", NOW, NOW, rev, at))
+    old.commit()
+    old.close()
+    c = inbox_db.connect(path)
+    inbox_db.init_inbox_schema(c)
+    got = {r["id"][0]: r["draft_copied_at"] for r in
+           c.execute("SELECT id, draft_copied_at FROM inbox_items")}
+    assert got == {"a": "2026-09-01T00:00:00Z", "b": None, "c": None}
+    c.execute("UPDATE inbox_items SET draft_copied_at='2026-09-09T00:00:00Z' WHERE id=?",
+              ("a" * 32,))
+    inbox_db.init_inbox_schema(c)                       # idempotent: NULLs only
+    assert c.execute("SELECT draft_copied_at FROM inbox_items WHERE id=?",
+                     ("a" * 32,)).fetchone()[0] == "2026-09-09T00:00:00Z"
+    c.close()

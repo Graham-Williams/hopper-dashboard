@@ -254,6 +254,11 @@ def init_inbox_schema(conn: sqlite3.Connection) -> None:
         for column, decl in INBOX_COLUMNS:
             if column not in cols:
                 _add_column(conn, "inbox_items", column, decl)
+        # Backfill draft_copied_at for voice notes reviewed before it existed: their review
+        # already happened, so a re-tick must count as a RE-tick. Idempotent (NULLs only).
+        conn.execute("UPDATE inbox_items SET draft_copied_at = reviewed_at"
+                     " WHERE source = 'voice' AND reviewed = 1"
+                     " AND draft_copied_at IS NULL AND reviewed_at IS NOT NULL")
     except Exception:
         conn.execute("ROLLBACK")
         raise

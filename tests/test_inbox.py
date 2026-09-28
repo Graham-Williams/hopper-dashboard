@@ -1505,7 +1505,9 @@ def _legacy_typed(settings):
     """A typed note made before typed notes were born reviewed."""
     conn = inbox_db.connect(settings.inbox_db_path)
     with conn:
-        item = inbox_db.create_item(conn, source="typed", text="an older typed note")
+        # Made BEFORE the release (so a later tick can never share its creation second).
+        item = inbox_db.create_item(conn, source="typed", text="an older typed note",
+                                    now="2026-09-01T00:00:00Z")
     conn.close()
     return item
 
@@ -1570,3 +1572,16 @@ def test_an_edit_after_review_shows_on_the_row(authed, bot):
     assert r.get_json()["title"] == "Edited after review"
     row = _row(authed.get("/inbox").data.decode(), item)
     assert '<h3 class="item-title">Edited after review</h3>' in row and "New body" in row
+
+
+def test_a_legacy_typed_tick_can_be_undone_and_new_typed_notes_get_no_box(authed, settings):
+    item = _legacy_typed(settings)
+    assert authed.patch(f"/api/v1/inbox/items/{item}",
+                        json={"reviewed": True}).status_code == 200
+    row = _row(authed.get("/inbox").data.decode(), item)
+    assert 'class="review-box"' in row and "checked" in row     # still there, ticked
+    r = authed.patch(f"/api/v1/inbox/items/{item}", json={"reviewed": False})
+    assert r.status_code == 200 and r.get_json()["reviewable"] is True
+    new = post_note(authed).get_json()
+    assert new["reviewable"] is False and new["reviewed_at"] == new["created_at"]
+    assert 'class="review-box"' not in _row(authed.get("/inbox").data.decode(), new["id"])

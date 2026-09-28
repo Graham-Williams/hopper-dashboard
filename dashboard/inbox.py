@@ -228,9 +228,17 @@ def _float_or_none(raw, cap: float = 24 * 3600) -> float | None:
 # --------------------------------------------------------------------------- #
 
 def reviewable(row: dict) -> bool:
-    """Whether the Reviewed tick applies: every voice note, and a typed note made
-    before typed notes were born reviewed (it is still ``reviewed=0``)."""
-    return row["source"] == "voice" or (row["source"] == "typed" and not row["reviewed"])
+    """Whether the Reviewed tick applies: every voice note, and a LEGACY typed note.
+
+    A typed note made since the Hub release is born reviewed in the same INSERT, so its
+    ``reviewed_at`` equals its ``created_at`` to the byte. Anything else — ``reviewed_at``
+    NULL (never ticked, or unticked) or a later time (ticked by hand) — is a note made before
+    that rule, and it keeps its checkbox in BOTH states so an accidental tick can be undone.
+    No flag column and no migration: the two timestamps already say it.
+    """
+    if row["source"] == "voice":
+        return True
+    return row["source"] == "typed" and row["reviewed_at"] != row["created_at"]
 
 
 def item_json(row: dict, issues: list[dict] | None = None,
