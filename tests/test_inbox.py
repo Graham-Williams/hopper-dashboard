@@ -107,6 +107,8 @@ MACHINE_CALLS = [
     ("inbox.mirror_backlog", "post", "/api/v1/inbox/mirror/backlog",
      {"json": {"complete": True, "items": [{"text": "a thing"}]}}),
     ("inbox.draft_queue", "get", "/api/v1/inbox/draft/queue", {}),
+    ("inbox.post_filed_backlog", "post", "/api/v1/inbox/items/{item}/filed-backlog",
+     {"json": {"line": "Do the thing"}}),
     ("inbox.post_draft", "post", "/api/v1/inbox/items/{item}/draft",
      {"json": {"title": "t", "body": "b", "src_sha": "0" * 64}}),
 ]
@@ -1385,3 +1387,111 @@ def test_known_projects_feed_the_datalist(authed, settings):
     html = authed.get("/inbox").data.decode()
     datalist = html.split('<datalist id="project-list">', 1)[1].split("</datalist>", 1)[0]
     assert '<option value="km-tracker">' in datalist
+
+
+# --------------------------------------------------------------------------- #
+# Filed to backlog.txt instead of an issue (issue #33)
+# --------------------------------------------------------------------------- #
+
+def _reviewed_voice(authed, bot):
+    item = _transcribed(authed, bot)
+    assert authed.patch(f"/api/v1/inbox/items/{item}",
+                        json={"reviewed": True}).status_code == 200
+    return item
+
+
+def _file(bot, item, line=None, headers=None):
+    line = line if line is not None else f"Fix the Mac fan noise ({'voice ' + item[:8]})"
+    return bot.post(f"/api/v1/inbox/items/{item}/filed-backlog", json={"line": line},
+                    headers=headers if headers is not None else machine())
+
+
+def test_filed_backlog_is_machine_only(authed, bot):
+    item = _reviewed_voice(authed, bot)
+    line = {"line": f"x (voice {item[:8]})"}
+    url = f"/api/v1/inbox/items/{item}/filed-backlog"
+    assert authed.post(url, json=line).status_code == 401                 # a session
+    assert authed.post(url, json=line, headers=machine()).status_code == 401
+    assert bot.post(url, json=line, headers=reader()).status_code == 401  # READ_TOKEN
+    assert bot.post(url, json=line).status_code == 401
+    assert bot.post(url, json=line, headers=machine()).status_code == 200
+
+
+def test_a_filed_note_leaves_awaiting_filing_idempotently(authed, bot):
+    item = _reviewed_voice(authed, bot)
+    assert [i["id"] for i in authed.get("/api/v1/inbox/items?awaiting=filing")
+            .get_json()["items"]] == [item]
+    first = _file(bot, item).get_json()
+    assert first["awaiting_filing"] is False
+    assert first["filed_backlog"]["line"] == f"Fix the Mac fan noise (voice {item[:8]})"
+    at = first["filed_backlog"]["at"]
+    again = _file(bot, item).get_json()                       # idempotent
+    assert again["filed_backlog"]["at"] == at and again["awaiting_filing"] is False
+    listing = authed.get("/api/v1/inbox/items").get_json()
+    assert listing["counts"]["awaiting_filing"] == 0
+    assert authed.get("/api/v1/inbox/items?awaiting=filing").get_json()["items"] == []
+    html = authed.get("/inbox").data.decode()
+    assert "filed to backlog.txt" in html
+
+
+def test_the_backlog_copy_is_linked_and_not_shown_twice(authed, bot):
+    item = _reviewed_voice(authed, bot)
+    tag = f"(voice {item[:8]})"
+    other = bot.post("/api/v1/inbox/mirror/backlog", headers=machine(), json={
+        "complete": True, "items": [{"text": f"Fix the Mac fan noise {tag}"},
+                                    {"text": "Unrelated chore"}]})
+    assert other.status_code == 200
+    before = authed.get("/api/v1/inbox/items").get_json()
+    assert len(before["items"]) == 3 and before["counts"]["total"] == 3
+    body = _file(bot, item, line=f"Fix the Mac fan noise {tag}").get_json()
+    mirror = body["filed_backlog"]["mirror_key"]
+    assert mirror and mirror.startswith("backlog:")
+    after = authed.get("/api/v1/inbox/items").get_json()
+    texts = sorted(i["title"] for i in after["items"])
+    assert len(after["items"]) == 2 and "Unrelated chore" in texts
+    assert after["counts"]["total"] == 2
+    # Still there when asked for explicitly — hidden, not deleted.
+    only = authed.get("/api/v1/inbox/items?source=backlog").get_json()["items"]
+    assert len(only) == 2
+    listed = next(i for i in after["items"] if i["id"] == item)
+    assert listed["filed_backlog"]["mirror_key"] == mirror
+
+
+def test_the_mirror_row_can_arrive_after_the_filing_call(authed, bot):
+    item = _reviewed_voice(authed, bot)
+    tag = f"(voice {item[:8]})"
+    assert _file(bot, item).get_json()["filed_backlog"]["mirror_key"] is None
+    bot.post("/api/v1/inbox/mirror/backlog", headers=machine(),
+             json={"complete": True, "items": [{"text": f"Fix the Mac fan noise {tag}"}]})
+    items = authed.get("/api/v1/inbox/items").get_json()["items"]
+    assert [i["id"] for i in items] == [item]
+    assert items[0]["filed_backlog"]["mirror_key"].startswith("backlog:")
+
+
+def test_the_filed_line_is_validated(authed, bot):
+    item = _reviewed_voice(authed, bot)
+    tag = f"(voice {item[:8]})"
+    assert _file(bot, item, line="two\nlines " + tag).status_code == 400
+    assert _file(bot, item, line="   ").status_code == 400
+    assert _file(bot, item, line="no tag here").status_code == 400
+    assert bot.post(f"/api/v1/inbox/items/{item}/filed-backlog", json={"line": 5},
+                    headers=machine()).status_code == 400
+    assert _file(bot, "0" * 32, line="x (voice 00000000)").status_code == 404
+    mirrored = bot.post("/api/v1/inbox/mirror/backlog", headers=machine(),
+                        json={"complete": True, "items": [{"text": "a chore"}]})
+    assert mirrored.status_code == 200
+    mid = authed.get("/api/v1/inbox/items?source=backlog").get_json()["items"][0]["id"]
+    assert _file(bot, mid, line=f"x (voice {mid[:8]})").status_code == 409
+    # Control characters are cleaned and the length is capped at the server's limit.
+    long = "\x1b[2J" + "y" * 900 + " " + tag
+    r = _file(bot, item, line=long)
+    assert r.status_code == 400                     # the cap cut the tag off: refused
+    ok = _file(bot, item, line="\x1b[2J" + "y" * 100 + " " + tag).get_json()
+    assert "\x1b" not in ok["filed_backlog"]["line"]
+
+
+def test_the_backlog_line_cap_is_pinned():
+    """Hopper's filing loop keeps the line under this; changing it is a contract change."""
+    assert inbox_db.MAX_BACKLOG_LINE == 500
+    line = "z" * 600
+    assert len(inbox_db.clean_text(line, inbox_db.MAX_BACKLOG_LINE)) == 500

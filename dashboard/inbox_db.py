@@ -108,6 +108,17 @@ DRAFT_MAX_BODY = 2000
 #: browser transcript. Never ``pending``/``failed`` (no text yet).
 DRAFTABLE_TRANSCRIPT_STATUSES = (TRANSCRIPT_WHISPER, TRANSCRIPT_LIVE)
 
+#: A backlog.txt line Hopper files a note as (issue #33). One line, capped — the server
+#: truncates to this. Pinned by tests/test_inbox.py.
+MAX_BACKLOG_LINE = 500
+#: The tag the filing loop ends that line with, and the ONLY link between a filed note and
+#: the backlog-mirror row the line later comes back as: ``(voice <first 8 chars of id>)``.
+VOICE_TAG_RE = re.compile(r"\(voice ([0-9a-f]{8})\)")
+
+
+def voice_tag(item_id: str) -> str:
+    return "(voice %s)" % item_id[:8]
+
 
 INBOX_SCHEMA = """
 CREATE TABLE IF NOT EXISTS inbox_items (
@@ -200,6 +211,9 @@ INBOX_COLUMNS: tuple[tuple[str, str], ...] = (
     ("draft_model", "TEXT"),
     ("draft_src_sha", "TEXT"),         # sha256 of the transcript it was made from
     ("draft_edited_at", "TEXT"),       # Graham edited it: no machine may overwrite
+    # Filed to backlog.txt instead of a GitHub issue (issue #33): not repo work.
+    ("filed_backlog_at", "TEXT"),
+    ("filed_backlog_line", "TEXT"),
 )
 
 
@@ -596,6 +610,44 @@ def note_draft_attempt(conn: sqlite3.Connection, item_id: str, *,
     return get_item(conn, item_id)
 
 
+def mark_filed_backlog(conn: sqlite3.Connection, item_id: str, *, line: str,
+                       now: str | None = None) -> dict | None:
+    """Record that Hopper filed this note as a backlog.txt line (issue #33).
+
+    Idempotent: a repeat keeps the FIRST ``filed_backlog_at`` and takes the latest line. The
+    note leaves awaiting-filing (``_AWAITING_FILING_SQL``), and the backlog-mirror row the line
+    comes back as — matched by its ``(voice <id8>)`` tag — is hidden from the default list, so
+    the note does not show twice.
+    """
+    row = get_item(conn, item_id)
+    if row is None:
+        return None
+    now = now or now_iso()
+    conn.execute("UPDATE inbox_items SET filed_backlog_at=COALESCE(filed_backlog_at, ?),"
+                 " filed_backlog_line=?, updated_at=? WHERE id=?",
+                 (now, line, now, item_id))
+    return get_item(conn, item_id)
+
+
+def backlog_copies(conn: sqlite3.Connection, item_ids: Iterable[str]) -> dict[str, dict]:
+    """For filed notes, the backlog-mirror row carrying their ``(voice <id8>)`` tag, as
+    ``{note_id: {"id", "mirror_key"}}``. Matched in Python over the (few) backlog rows that
+    carry any tag, so a line that arrives in the mirror before or after the filing call links
+    either way."""
+    wanted = {i[:8]: i for i in item_ids if isinstance(i, str) and len(i) >= 8}
+    if not wanted:
+        return {}
+    out: dict[str, dict] = {}
+    for row in conn.execute(
+            "SELECT id, mirror_key, body FROM inbox_items WHERE source = 'backlog'"
+            " AND archived_at IS NULL AND body LIKE '%(voice %'"):
+        for tag in VOICE_TAG_RE.findall(row["body"] or ""):
+            note = wanted.get(tag)
+            if note and note not in out:
+                out[note] = {"id": row["id"], "mirror_key": row["mirror_key"]}
+    return out
+
+
 def link_issue(conn: sqlite3.Connection, item_id: str, *, repo: str,
                number: int, url: str, title: str | None = None,
                now: str | None = None) -> dict:
@@ -938,7 +990,7 @@ def get_item_by_mirror_key(conn: sqlite3.Connection, key: str) -> dict | None:
 # yet. That set is the whole point of the review tick, so it sorts first.
 _AWAITING_FILING_SQL = (
     "(reviewed = 1 AND state = 'open' AND archived_at IS NULL"
-    " AND source IN ('voice','typed')"
+    " AND source IN ('voice','typed') AND filed_backlog_at IS NULL"
     " AND NOT EXISTS (SELECT 1 FROM inbox_issues i WHERE i.item_id = inbox_items.id))")
 _AWAITING_TRANSCRIPTION_SQL = (
     "(audio_path IS NOT NULL AND transcript_status IN "
@@ -949,6 +1001,14 @@ _AWAITING_TRANSCRIPTION_SQL = (
 _NEEDS_REVIEW_SQL = (
     "(source = 'voice' AND state = 'open' AND archived_at IS NULL"
     " AND reviewed = 0 AND draft_status IN ('ready','failed'))")
+
+# A backlog-mirror row that IS a filed note's line (it carries the note's voice tag). Hidden
+# from the default list and the counts, so a note filed to backlog.txt does not show twice;
+# still listed when the source filter is explicitly `backlog`.
+_FILED_COPY_SQL = (
+    "(source = 'backlog' AND EXISTS (SELECT 1 FROM inbox_items n"
+    " WHERE n.filed_backlog_at IS NOT NULL AND n.source IN ('voice','typed')"
+    " AND instr(inbox_items.body, '(voice ' || substr(n.id, 1, 8) || ')') > 0))")
 
 MAX_LIMIT = 500
 _LIKE_ESCAPE = str.maketrans({"\\": "\\\\", "%": "\\%", "_": "\\_"})
@@ -967,6 +1027,8 @@ def list_items(conn: sqlite3.Connection, *, q: str | None = None,
     args: list[Any] = []
     if not include_archived:
         where.append("archived_at IS NULL")
+    if source != "backlog":
+        where.append(f"NOT {_FILED_COPY_SQL}")
     if source in SOURCES:
         where.append("source = ?")
         args.append(source)
@@ -1048,7 +1110,7 @@ def counts(conn: sqlite3.Connection) -> dict:
         f" SUM({_AWAITING_FILING_SQL}) AS awaiting_filing,"
         f" SUM({_AWAITING_TRANSCRIPTION_SQL}) AS awaiting_transcription,"
         f" SUM({_NEEDS_REVIEW_SQL}) AS needs_review"
-        f" FROM inbox_items WHERE archived_at IS NULL").fetchone()
+        f" FROM inbox_items WHERE archived_at IS NULL AND NOT {_FILED_COPY_SQL}").fetchone()
     return {k: int(row[k] or 0) for k in
             ("total", "open", "reviewed", "awaiting_filing",
              "awaiting_transcription", "needs_review")}

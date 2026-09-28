@@ -217,7 +217,8 @@ inbox_items(id TEXT PK,                     -- uuid4 hex; opaque, appears in URL
   mirror_key, mirror_url, mirror_seen_at,
   -- added 2026-09-28 through INBOX_COLUMNS (the additive migration's first real use):
   draft_title, draft_body, draft_project, draft_status, draft_at, draft_attempts,
-  draft_model, draft_src_sha, draft_edited_at)
+  draft_model, draft_src_sha, draft_edited_at,
+  filed_backlog_at, filed_backlog_line)       -- issue #33
 inbox_issues(id INTEGER PK, item_id → inbox_items(id), repo, number, url, title,
   state, linked_at, checked_at, closed_at)
 inbox_mirror_state(key PK, etag, last_sync_at, last_status, last_error,
@@ -491,6 +492,17 @@ transcript and the audio prune depends on it being Whisper's. Rules:
   `{failed: true, error, src_sha}`. Title one line ≤ 120, body ≤ 2000, both through `clean_text`; an unknown
   project becomes NULL; stale sha / reviewed / edited → 409, no attempt burned. The caps are pinned between
   `inbox_db` and `probes/inbox_draft.py` by a test.
+
+**Filing to backlog.txt instead of an issue (issue #33).** Hopper's filing loop takes every note that is
+awaiting filing (`?awaiting=filing`: reviewed, open, local, no linked issue, not filed to the backlog) and
+files it from `title`, `project` and `draft.body`: repo work becomes a GitHub issue recorded with
+`POST /api/v1/inbox/items/<id>/issues`; anything else (Hopper itself, the Mac or box, a chore) becomes ONE
+`backlog.txt` line in Hopper's own words ending `(voice <first 8 chars of id>)`, recorded with
+`POST /api/v1/inbox/items/<id>/filed-backlog {"line": …}` (INBOX_TOKEN; one line, `clean_text`, ≤
+`MAX_BACKLOG_LINE` = 500, must carry the tag; idempotent — the first `filed_backlog_at` is kept). The note
+then leaves awaiting-filing, and the backlog-mirror row that line comes back as (matched by the tag,
+whichever arrives first) is **hidden from the default list and the counts** — the simpler of hiding or
+nesting — and linked as `filed_backlog.mirror_key` on the note. `?source=backlog` still lists it.
 
 **The `claude -p` call** is locked down: `--safe-mode --tools "" --strict-mcp-config
 --no-session-persistence --disable-slash-commands --output-format json --json-schema … --model sonnet

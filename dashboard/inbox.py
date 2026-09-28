@@ -24,6 +24,7 @@ route                                        auth    notes
 ``GET  /api/v1/inbox/draft/queue``           I
 ``POST /api/v1/inbox/items/<id>/draft``      I
 ``POST /api/v1/inbox/items/<id>/issues``     I
+``POST /api/v1/inbox/items/<id>/filed-backlog`` I
 ``POST /api/v1/inbox/mirror/backlog``        I
 ===========================================  ======  =====================
 
@@ -73,6 +74,7 @@ MACHINE_ENDPOINTS = frozenset({
     "inbox.draft_queue",
     "inbox.post_draft",
     "inbox.post_issues",
+    "inbox.post_filed_backlog",
     "inbox.mirror_backlog",
 })
 
@@ -225,7 +227,8 @@ def _float_or_none(raw, cap: float = 24 * 3600) -> float | None:
 # View models
 # --------------------------------------------------------------------------- #
 
-def item_json(row: dict, issues: list[dict] | None = None) -> dict:
+def item_json(row: dict, issues: list[dict] | None = None,
+              backlog_copy: dict | None = None) -> dict:
     """One row, as both the JSON API and the template see it.
 
     ``has_audio`` rather than a path: the relative path is an internal detail
@@ -243,7 +246,8 @@ def item_json(row: dict, issues: list[dict] | None = None) -> dict:
         and row["transcript_status"] in inbox_db.TRANSCRIBABLE_STATUSES)
     awaiting_filing = bool(
         row["reviewed"] and row["state"] == "open" and not row["archived_at"]
-        and row["source"] in inbox_db.LOCAL_SOURCES and not issues)
+        and row["source"] in inbox_db.LOCAL_SOURCES and not issues
+        and not row.get("filed_backlog_at"))
     needs_review = bool(
         row["source"] == "voice" and row["state"] == "open"
         and not row["archived_at"] and not row["reviewed"]
@@ -286,6 +290,12 @@ def item_json(row: dict, issues: list[dict] | None = None) -> dict:
             "model": row.get("draft_model"),
             "edited_at": row.get("draft_edited_at"),
         },
+        # Filed as a backlog.txt line instead of an issue (#33); `mirror_key` is the backlog
+        # row that line came back as, when the mirror has seen it.
+        "filed_backlog": ({"at": row.get("filed_backlog_at"),
+                           "line": row.get("filed_backlog_line"),
+                           "mirror_key": (backlog_copy or {}).get("mirror_key")}
+                          if row.get("filed_backlog_at") else None),
         "issues": [{"repo": i["repo"], "number": i["number"], "url": i["url"],
                     "title": i["title"], "state": i["state"]} for i in issues],
     }
@@ -316,11 +326,14 @@ def _list_args(args) -> dict:
 def _load_page(conn, args: dict) -> dict:
     rows = inbox_db.list_items(conn, **args)
     issues = inbox_db.issues_for(conn, [r["id"] for r in rows])
+    copies = inbox_db.backlog_copies(
+        conn, [r["id"] for r in rows if r.get("filed_backlog_at")])
     return {
         "generated_at": inbox_db.now_iso(),
         "counts": inbox_db.counts(conn),
         "projects": inbox_db.projects(conn),
-        "items": [item_json(r, issues.get(r["id"], [])) for r in rows],
+        "items": [item_json(r, issues.get(r["id"], []), copies.get(r["id"]))
+                  for r in rows],
     }
 
 
@@ -883,6 +896,50 @@ def post_issues(item_id: str):
         row = inbox_db.get_item(conn, item_id)
         issues = inbox_db.issues_for(conn, [item_id]).get(item_id, [])
         return jsonify({"item": item_json(row, issues), "issue": issue}), 201
+    finally:
+        conn.close()
+
+
+@bp.post("/api/v1/inbox/items/<item_id>/filed-backlog")
+def post_filed_backlog(item_id: str):
+    """I. Hopper filed this note as a ``backlog.txt`` line, not a GitHub issue (issue #33) —
+    it is not repo work (Hopper itself, the Mac or box, a chore).
+
+    ``{"line": "<the backlog.txt line>"}``. The line is one line (a newline is a 400), cleaned
+    with ``clean_text`` and truncated to ``MAX_BACKLOG_LINE``, and must end with — or at least
+    carry — the note's ``(voice <first 8 chars of id>)`` tag: that tag is the only thing that
+    links the note to the backlog-mirror row the line comes back as. Idempotent.
+
+    The note leaves awaiting-filing, and its mirror row is hidden from the default list.
+    """
+    denied = _require_inbox_token()
+    if denied is not None:
+        return denied
+    doc = request.get_json(silent=True)
+    if not isinstance(doc, dict):
+        return _err("body must be a JSON object")
+    raw = doc.get("line")
+    if not isinstance(raw, str):
+        return _err("line must be a string")
+    if "\n" in raw.strip() or "\r" in raw.strip():
+        return _err("line must be a single line")
+    line = inbox_db.clean_text(raw, inbox_db.MAX_BACKLOG_LINE)
+    if not line:
+        return _err("line is required")
+    conn = _conn()
+    try:
+        row = inbox_db.get_item(conn, item_id)
+        if row is None:
+            return _err("no such item", 404)
+        if row["source"] not in inbox_db.LOCAL_SOURCES:
+            return _err("only a voice or typed note can be filed", 409)
+        if inbox_db.voice_tag(item_id) not in line:
+            return _err(f"line must carry the tag {inbox_db.voice_tag(item_id)}")
+        with conn:
+            row = inbox_db.mark_filed_backlog(conn, item_id, line=line)
+        issues = inbox_db.issues_for(conn, [item_id]).get(item_id, [])
+        copy = inbox_db.backlog_copies(conn, [item_id]).get(item_id)
+        return jsonify(item_json(row, issues, copy))
     finally:
         conn.close()
 

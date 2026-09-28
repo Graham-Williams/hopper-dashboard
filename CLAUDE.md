@@ -307,6 +307,11 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   edit stamps `draft_edited_at` and no machine draft may overwrite it; a stale `src_sha` is a 409 that
   burns nothing. `DRAFT_MAX_TITLE`/`DRAFT_MAX_BODY` are pinned against `probes/inbox_draft.py`. Spec:
   DESIGN.md "Drafts, Needs review and the Hub".
+- **Filed to backlog.txt (issue #33).** Hopper's filing loop files a non-repo note as one backlog.txt line
+  ending `(voice <id8>)` and records it with `POST /api/v1/inbox/items/<id>/filed-backlog` (INBOX_TOKEN,
+  idempotent, `filed_backlog_at`/`filed_backlog_line`). The note leaves awaiting-filing (SQL AND
+  `item_json`), and the backlog-mirror row carrying that tag is hidden from the default list and counts
+  (`_FILED_COPY_SQL`; `?source=backlog` still shows it). The tag is the ONLY link — keep the convention.
 - `inbox.py` — the blueprint. `MACHINE_ENDPOINTS` is what scopes `INBOX_TOKEN` (now including
   `inbox.draft_queue` and `inbox.post_draft`); the create route raises
   `request.max_content_length` PER REQUEST (the global 64 KB cap in `__init__.py` protects every other

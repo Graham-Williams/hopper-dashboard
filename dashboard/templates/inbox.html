@@ -228,6 +228,11 @@
           <a class="issue issue-{{ i.state }}" href="{{ i.url }}" rel="noopener noreferrer" target="_blank">{{ i.repo }}#{{ i.number }}</a>{% if i.state == 'closed' %}<span class="muted"> closed</span>{% endif %}{% if not loop.last %} · {% endif %}
           {% endfor %}
         </p>
+        {% elif it.filed_backlog %}
+        <p class="item-issues small">
+          <span class="badge badge-backlog">filed to backlog.txt</span>
+          <span class="muted">{{ it.filed_backlog.line }}</span>
+        </p>
         {% elif it.mirror_url %}
         <p class="item-issues small">
           <a class="issue" href="{{ it.mirror_url }}" rel="noopener noreferrer" target="_blank">{{ it.mirror_key }}</a>
