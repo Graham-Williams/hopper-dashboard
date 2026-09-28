@@ -189,7 +189,8 @@ def test_the_origin_pin_now_covers_patch(settings, registry, notifier):
     no CSRF pin at all. Widened BEFORE the route existed, not after."""
     client = _pinned_client(settings, registry, notifier)
     base = "https://dash.example.com"
-    created = client.post("/api/v1/inbox/items", data={"text": "hello"},
+    created = client.post("/api/v1/inbox/items",
+                          data={"text": "", "audio": (io_bytes(WEBM), "n", "audio/webm")},
                           content_type="multipart/form-data", base_url=base,
                           headers={"Origin": base, "Accept": "application/json"})
     assert created.status_code == 201
@@ -231,7 +232,8 @@ def test_a_session_plus_a_machine_token_is_still_csrf_pinned(
     app = _pinned_app(settings, registry, notifier)
     client = _pinned_client(settings, registry, notifier, app)
     base = "https://dash.example.com"
-    created = client.post("/api/v1/inbox/items", data={"text": "pin me"},
+    created = client.post("/api/v1/inbox/items",
+                          data={"text": "pin me", "audio": (io_bytes(WEBM), "n", "audio/webm")},
                           content_type="multipart/form-data", base_url=base,
                           headers={"Origin": base, "Accept": "application/json"})
     item = created.get_json()["id"]
@@ -424,7 +426,7 @@ def test_a_bad_project_is_refused(authed):
 
 
 def test_patch_validates_and_rejects_unknown_fields(authed):
-    item = post_note(authed).get_json()["id"]
+    item = _voice_note(authed)["id"]
     assert authed.patch(f"/api/v1/inbox/items/{item}",
                         json={"nope": 1}).status_code == 400
     assert authed.patch(f"/api/v1/inbox/items/{item}",
@@ -468,7 +470,7 @@ def test_the_write_limiter_returns_429(authed, read_app):
     read_app.extensions["inbox_write_limiter"].max_events = 2
     for _ in range(2):
         assert authed.patch(f"/api/v1/inbox/items/{item}",
-                            json={"reviewed": True}).status_code == 200
+                            json={"reviewed": False}).status_code == 200
     assert authed.patch(f"/api/v1/inbox/items/{item}",
                         json={"reviewed": False}).status_code == 429
 
@@ -946,7 +948,8 @@ def test_delete_is_session_only_and_origin_pinned(bot, authed, settings,
 
     client = _pinned_client(settings, registry, notifier)
     base = "https://dash.example.com"
-    created = client.post("/api/v1/inbox/items", data={"text": "pin me"},
+    created = client.post("/api/v1/inbox/items",
+                          data={"text": "pin me", "audio": (io_bytes(WEBM), "n", "audio/webm")},
                           content_type="multipart/form-data", base_url=base,
                           headers={"Origin": base, "Accept": "application/json"})
     pinned = created.get_json()["id"]
@@ -1078,3 +1081,48 @@ def test_a_repo_with_a_trailing_newline_is_not_a_valid_repo():
     assert not GITHUB_REPO_RE.match("a/b\nc/d")
     assert GITHUB_TOKEN_RE.match("ghp_abc123")
     assert not GITHUB_TOKEN_RE.match("ghp_abc123\n")
+
+
+# --------------------------------------------------------------------------- #
+# Reviewed is a voice-note control; typed notes are born reviewed
+# --------------------------------------------------------------------------- #
+
+def test_a_typed_note_is_created_reviewed_and_awaiting_filing(authed):
+    body = post_note(authed, "typed on purpose").get_json()
+    assert body["reviewed"] is True and body["reviewed_at"]
+    assert body["awaiting_filing"] is True
+
+
+def test_a_voice_note_is_created_unreviewed(authed):
+    body = _voice_note(authed)
+    assert body["reviewed"] is False and body["awaiting_filing"] is False
+
+
+def test_reviewed_true_is_refused_on_a_non_voice_row(authed, settings):
+    typed = post_note(authed).get_json()["id"]
+    r = authed.patch(f"/api/v1/inbox/items/{typed}", json={"reviewed": True})
+    assert r.status_code == 400 and "voice" in r.get_json()["error"]
+    conn = inbox_db.connect(settings.inbox_db_path)
+    with conn:
+        mirrored = inbox_db.upsert_mirror_item(
+            conn, mirror_key="backlog:abc", source="backlog", title="a line")
+    conn.close()
+    assert authed.patch(f"/api/v1/inbox/items/{mirrored}",
+                        json={"reviewed": True}).status_code == 400
+    # Unticking stays allowed everywhere, so a legacy tick can be undone.
+    r = authed.patch(f"/api/v1/inbox/items/{typed}", json={"reviewed": False})
+    assert r.status_code == 200 and r.get_json()["reviewed"] is False
+    voice = _voice_note(authed)["id"]
+    assert authed.patch(f"/api/v1/inbox/items/{voice}",
+                        json={"reviewed": True}).get_json()["reviewed"] is True
+
+
+def test_only_voice_rows_render_a_reviewed_checkbox(authed):
+    typed = post_note(authed, "typed row").get_json()["id"]
+    voice = _voice_note(authed)["id"]
+    html = authed.get("/inbox").data.decode()
+
+    def row(item_id):
+        return html.split(f'id="item-{item_id}"', 1)[1].split("</li>", 1)[0]
+    assert 'class="review-box"' in row(voice)
+    assert 'class="review-box"' not in row(typed)

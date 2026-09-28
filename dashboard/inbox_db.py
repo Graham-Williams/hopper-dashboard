@@ -293,13 +293,18 @@ def create_item(conn: sqlite3.Connection, *, source: str, text: str = "",
                 audio: dict | None = None,
                 mirror_key: str | None = None,
                 mirror_url: str | None = None,
-                title_source: str | None = None) -> str:
+                title_source: str | None = None,
+                reviewed: bool = False) -> str:
     """Insert one item and return its id.
 
     ``title`` given explicitly defaults to ``manual`` and is then never
     re-derived — that is what stops the Whisper backfill overwriting a title
     Graham typed. A MIRRORED row passes ``title_source='derived'`` explicitly:
     its title belongs upstream and must keep tracking it until Graham edits it.
+
+    ``reviewed=True`` is for a TYPED note: typing it was the deliberate act the
+    Reviewed tick exists to capture for a voice note, so it is born reviewed and
+    Hopper's filing loop picks it up without a second tap.
     """
     if source not in SOURCES:
         raise ValueError(f"unknown source {source!r}")
@@ -318,11 +323,12 @@ def create_item(conn: sqlite3.Connection, *, source: str, text: str = "",
     audio = audio or {}
     conn.execute(
         "INSERT INTO inbox_items (id, source, title, title_source, body, project,"
-        " created_at, updated_at, reviewed, state, transcript_status,"
+        " created_at, updated_at, reviewed, reviewed_at, state, transcript_status,"
         " transcript_at, audio_path, audio_bytes, audio_mime, audio_sha256,"
         " audio_secs, mirror_key, mirror_url, mirror_seen_at)"
-        " VALUES (?,?,?,?,?,?,?,?,0,'open',?,?,?,?,?,?,?,?,?,?)",
+        " VALUES (?,?,?,?,?,?,?,?,?,?,'open',?,?,?,?,?,?,?,?,?,?)",
         (item_id, source, title_text, title_source, body, project, now, now,
+         1 if reviewed else 0, now if reviewed else None,
          transcript_status,
          now if transcript_status in (TRANSCRIPT_TYPED, TRANSCRIPT_LIVE) else None,
          audio.get("path"), audio.get("bytes"), audio.get("mime"),

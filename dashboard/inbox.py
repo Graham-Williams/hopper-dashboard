@@ -390,10 +390,13 @@ def create_item():
     conn = _conn()
     try:
         with conn:
+            # A typed note is born reviewed: typing it WAS the deliberate act
+            # the tick exists for, and Hopper's filing loop reads reviewed=1.
             inbox_db.create_item(conn, source="voice" if data else "typed",
                                  text=text, title=title, project=project,
                                  now=now, item_id=item_id,
-                                 transcript_status=status, audio=audio_row)
+                                 transcript_status=status, audio=audio_row,
+                                 reviewed=not data)
         row = inbox_db.get_item(conn, item_id)
     except Exception:                                    # noqa: BLE001
         # The row is what matters; a file with no row is an orphan the
@@ -506,6 +509,15 @@ def patch_item(item_id: str):
             return _err(str(exc))
     conn = _conn()
     try:
+        current = inbox_db.get_item(conn, item_id)
+        if current is None:
+            return _err("no such item", 404)
+        # Reviewed is a VOICE-note control: it means "I have read the machine's
+        # transcript/draft and it is worth doing". A typed note is reviewed by
+        # being typed, and a mirrored row is already filed upstream. Unticking
+        # stays allowed everywhere, so a legacy tick can always be undone.
+        if changes.get("reviewed") is True and current["source"] != "voice":
+            return _err("only a voice note can be marked reviewed")
         with conn:
             row = inbox_db.update_item(conn, item_id, changes)
         if row is None:

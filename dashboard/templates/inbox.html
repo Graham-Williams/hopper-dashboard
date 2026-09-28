@@ -183,11 +183,15 @@
         {% endif %}
       </div>
       <div class="item-controls">
+        {#- Voice notes only: a typed note is reviewed by being typed, and a
+            mirrored row is already filed upstream. The PATCH refuses it too. -#}
+        {% if it.source == 'voice' %}
         <label class="review">
           <input type="checkbox" class="review-box" data-id="{{ it.id }}"
                  {% if it.reviewed %}checked{% endif %}>
           <span>Reviewed</span>
         </label>
+        {% endif %}
         {% if it.has_audio %}
         {# Played back from the SERVER URL, never a blob: — a blob would need
            media-src blob: in the CSP and the CSP is not being loosened. #}
