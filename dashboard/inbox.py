@@ -227,6 +227,12 @@ def _float_or_none(raw, cap: float = 24 * 3600) -> float | None:
 # View models
 # --------------------------------------------------------------------------- #
 
+def reviewable(row: dict) -> bool:
+    """Whether the Reviewed tick applies: every voice note, and a typed note made
+    before typed notes were born reviewed (it is still ``reviewed=0``)."""
+    return row["source"] == "voice" or (row["source"] == "typed" and not row["reviewed"])
+
+
 def item_json(row: dict, issues: list[dict] | None = None,
               backlog_copy: dict | None = None) -> dict:
     """One row, as both the JSON API and the template see it.
@@ -251,7 +257,8 @@ def item_json(row: dict, issues: list[dict] | None = None,
     needs_review = bool(
         row["source"] == "voice" and row["state"] == "open"
         and not row["archived_at"] and not row["reviewed"]
-        and row.get("draft_status") in (inbox_db.DRAFT_READY, inbox_db.DRAFT_FAILED))
+        and (row.get("draft_status") in (inbox_db.DRAFT_READY, inbox_db.DRAFT_FAILED)
+             or row["transcript_status"] == inbox_db.TRANSCRIPT_FAILED))
     return {
         "id": row["id"],
         "source": row["source"],
@@ -262,6 +269,7 @@ def item_json(row: dict, issues: list[dict] | None = None,
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
         "reviewed": bool(row["reviewed"]),
+        "reviewable": reviewable(row),
         "reviewed_at": row["reviewed_at"],
         "state": row["state"],
         "closed_at": row["closed_at"],
@@ -567,15 +575,20 @@ def patch_item(item_id: str):
             return _err("no such item", 404)
         # Reviewed is a VOICE-note control: it means "I have read the machine's
         # transcript/draft and it is worth doing". A typed note is reviewed by
-        # being typed, and a mirrored row is already filed upstream. Unticking
-        # stays allowed everywhere, so a legacy tick can always be undone.
-        if changes.get("reviewed") is True and current["source"] != "voice":
-            return _err("only a voice note can be marked reviewed")
+        # being typed — except a LEGACY one, made before that rule, which is still
+        # reviewed=0 and would otherwise be stranded. A mirrored row is already
+        # filed upstream. Unticking stays allowed everywhere.
+        if changes.get("reviewed") is True and not reviewable(current):
+            return _err("only a voice note (or an unticked older typed note) "
+                        "can be marked reviewed")
         if (any(k in changes for k in inbox_db.DRAFT_FIELDS)
                 and current["source"] != "voice"):
             return _err("only a voice note has a draft")
-        with conn:
-            row = inbox_db.update_item(conn, item_id, changes)
+        try:
+            with conn:
+                row = inbox_db.update_item(conn, item_id, changes)
+        except inbox_db.Conflict:
+            return _err("the item changed while saving — reload and try again", 409)
         if row is None:
             return _err("no such item", 404)
         issues = inbox_db.issues_for(conn, [row["id"]]).get(row["id"], [])
@@ -834,6 +847,9 @@ def post_draft(item_id: str):
         if src_sha is not None and src_sha != inbox_db.transcript_sha(row["body"]):
             return _err("stale: the transcript changed since it was queued", 409)
         if doc.get("failed"):
+            if src_sha is None:
+                return _err("src_sha is required, so a failure against an old "
+                            "transcript is refused rather than counted")
             with conn:
                 row = inbox_db.note_draft_attempt(conn, item_id)
             reason = inbox_db.clean_text(doc.get("error"), 200)
@@ -933,6 +949,8 @@ def post_filed_backlog(item_id: str):
             return _err("no such item", 404)
         if row["source"] not in inbox_db.LOCAL_SOURCES:
             return _err("only a voice or typed note can be filed", 409)
+        if not row["reviewed"] or row["state"] != "open" or row["archived_at"]:
+            return _err("only a reviewed, open note can be filed", 409)
         if inbox_db.voice_tag(item_id) not in line:
             return _err(f"line must carry the tag {inbox_db.voice_tag(item_id)}")
         with conn:

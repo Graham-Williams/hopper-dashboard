@@ -214,6 +214,9 @@ INBOX_COLUMNS: tuple[tuple[str, str], ...] = (
     # Filed to backlog.txt instead of a GitHub issue (issue #33): not repo work.
     ("filed_backlog_at", "TEXT"),
     ("filed_backlog_line", "TEXT"),
+    # When a review first copied the draft into title/project. A re-tick copies the draft
+    # project again only if this is NULL (``reviewed_at`` cannot say it: an untick clears it).
+    ("draft_copied_at", "TEXT"),
 )
 
 
@@ -397,36 +400,51 @@ DRAFT_FIELDS = ("draft_title", "draft_body", "draft_project")
 
 def update_item(conn: sqlite3.Connection, item_id: str, changes: dict,
                 now: str | None = None) -> dict | None:
-    """Apply a validated PATCH. Returns the updated row, or None if unknown.
+    """Apply a validated PATCH. Returns the updated row, or None if unknown. Raises
+    ``Conflict`` when a conditional write finds the row changed underneath it.
 
     Editing the title makes it ``manual`` — the Whisper backfill then leaves it
     alone for ever, which is the whole point of ``title_source``.
 
-    Editing a ``draft_*`` field stamps ``draft_edited_at`` (no machine draft may
-    overwrite it after that) and makes the draft ``ready``. Editing ``body``
-    (the transcript) resets a machine draft to ``pending`` so it is redrafted
-    from the new text — unless Graham has edited the draft himself.
+    Drafts (voice notes):
 
-    **Ticking Reviewed on a voice note copies the draft across**: ``title :=
-    draft_title`` (made ``manual``, so nothing re-derives it; only over a title
-    that is still derived) and ``project := COALESCE(draft_project, project)``. Hopper's filing loop keeps reading
-    ``title``/``project``, so this copy is what hands it the draft.
+    - Editing a ``draft_*`` field stamps ``draft_edited_at`` (no machine draft may
+      overwrite it after that) and makes the draft ``ready``. On a note that is
+      ALREADY reviewed the edit also writes ``title`` (manual) / ``project``, so what
+      gets filed is what Graham sees.
+    - Editing ``body`` on an unreviewed voice note whose draft Graham has not edited
+      makes the draft ``pending`` with zero attempts (``NULL`` if the body is now
+      empty — there is nothing to draft, so the row never reads "Drafting…" for ever).
+    - **Ticking Reviewed copies the draft across**: ``title := draft_title`` (made
+      ``manual``; only over a still-derived title, or a draft edited in the same
+      request) and ``project := draft_project`` (only on the FIRST copy,
+      ``draft_copied_at IS NULL``, or when ``draft_project`` is in the same request —
+      so a re-tick never takes back a project Graham changed). Hopper's filing loop
+      reads ``title``/``project``.
+
+    Writes that act on the draft are CONDITIONAL (the draft values read, ``reviewed``,
+    ``draft_edited_at``), so a machine draft landing between the read and the write is
+    a ``Conflict``, never a silently stale copy.
     """
     row = get_item(conn, item_id)
     if row is None:
         return None
     now = now or now_iso()
+    voice = row["source"] == "voice"
     sets: list[str] = []
     args: list[Any] = []
-    if any(k in changes for k in DRAFT_FIELDS):
+    guards: list[str] = []
+    guard_args: list[Any] = []
+    draft_edit = any(k in changes for k in DRAFT_FIELDS)
+    if draft_edit:
         sets += ["draft_edited_at=?", "draft_status=?"]
         args += [now, DRAFT_READY]
-    elif "body" in changes and not row.get("draft_edited_at") and \
-            row.get("draft_status") is not None:
+    elif ("body" in changes and voice and not row["reviewed"]
+          and not row.get("draft_edited_at")):
+        has_text = bool(clean_text(changes["body"], MAX_TEXT))
         sets += ["draft_status=?", "draft_attempts=0"]
-        args.append(DRAFT_PENDING)
-    copy_draft = (changes.get("reviewed") is True and not row["reviewed"]
-                  and row["source"] == "voice")
+        args.append(DRAFT_PENDING if has_text else None)
+        guards += ["reviewed = 0", "draft_edited_at IS NULL"]
     for key in _PATCHABLE:
         if key not in changes:
             continue
@@ -455,29 +473,53 @@ def update_item(conn: sqlite3.Connection, item_id: str, changes: dict,
         elif key == "state":
             sets += ["state=?", "closed_at=?"]
             args += [value, now if value == "closed" else None]
+
+    d_title = (clean_draft_title(changes["draft_title"])
+               if "draft_title" in changes else row.get("draft_title"))
+    d_project = (changes["draft_project"] if "draft_project" in changes
+                 else row.get("draft_project"))
+    copy_draft = voice and changes.get("reviewed") is True and not row["reviewed"]
+    edit_after_review = (voice and draft_edit and row["reviewed"]
+                         and changes.get("reviewed") is not False)
     if copy_draft:
-        # Read the draft as it will be AFTER this same PATCH, so "edit the
-        # draft and tick Reviewed" in one request copies the edited text.
-        d_title = (clean_draft_title(changes["draft_title"])
-                   if "draft_title" in changes else row.get("draft_title"))
-        d_project = (changes["draft_project"] if "draft_project" in changes
-                     else row.get("draft_project"))
-        # Only over a still-DERIVED title (or a draft edited in this same
-        # request): once a title is manual — typed at capture, a previous
-        # review's copy, or a rename — a re-tick must not take it back.
+        # Only over a still-DERIVED title (or a draft edited in this same request):
+        # once a title is manual — typed at capture, a previous review's copy, or a
+        # rename — a re-tick must not take it back.
         if (d_title and "title" not in changes
                 and (row.get("title_source") != "manual" or "draft_title" in changes)):
             sets += ["title=?", "title_source='manual'"]
             args.append(d_title)
-        if d_project and "project" not in changes:
+        # The same rule for the project: the first copy, or an edit in this request.
+        if (d_project and "project" not in changes
+                and (not row.get("draft_copied_at") or "draft_project" in changes)):
             sets.append("project=?")
             args.append(d_project)
+        if not row.get("draft_copied_at"):
+            sets.append("draft_copied_at=?")
+            args.append(now)
+        # Copy exactly the draft that was read: a machine draft landing in between
+        # must not be copied unseen.
+        guards += ["reviewed = 0", "draft_title IS ?", "draft_project IS ?"]
+        guard_args += [row.get("draft_title"), row.get("draft_project")]
+    elif edit_after_review:
+        # Already reviewed: the filing loop reads title/project, so the edit goes there
+        # too — otherwise Graham would file something other than what he sees.
+        if "draft_title" in changes and d_title and "title" not in changes:
+            sets += ["title=?", "title_source='manual'"]
+            args.append(d_title)
+        if "draft_project" in changes and "project" not in changes:
+            sets.append("project=?")
+            args.append(d_project or None)
+        guards.append("reviewed = 1")
     if not sets:
         return row
     sets.append("updated_at=?")
     args.append(now)
-    args.append(item_id)
-    conn.execute(f"UPDATE inbox_items SET {', '.join(sets)} WHERE id=?", args)
+    where = " AND ".join(["id=?"] + guards)
+    cur = conn.execute(f"UPDATE inbox_items SET {', '.join(sets)} WHERE {where}",
+                       args + [item_id] + guard_args)
+    if cur.rowcount == 0:
+        raise Conflict(item_id)
     return get_item(conn, item_id)
 
 
@@ -499,9 +541,9 @@ def set_transcript(conn: sqlite3.Connection, item_id: str, *, text: str,
     # A new transcript means a (re)draft is due — unless Graham has written or
     # edited the draft himself, which no machine may ever overwrite.
     if (row["source"] == "voice" and not row.get("draft_edited_at")
-            and status in DRAFTABLE_TRANSCRIPT_STATUSES):
+            and not row["reviewed"] and status in DRAFTABLE_TRANSCRIPT_STATUSES):
         sets += ["draft_status=?", "draft_attempts=0"]
-        args.append(DRAFT_PENDING)
+        args.append(DRAFT_PENDING if body else None)
     if row.get("title_source") != "manual":
         sets.append("title=?")
         args.append(derive_title(body))
@@ -547,6 +589,11 @@ def clean_draft_title(value: Any) -> str:
     return text[:DRAFT_MAX_TITLE].rstrip()
 
 
+class Conflict(Exception):
+    """A conditional write lost a race: the row changed between the read and the write.
+    The route answers 409 and nothing was written."""
+
+
 class DraftRefused(Exception):
     """``set_draft`` would overwrite something it must not. ``reason`` is one of
     ``missing``, ``reviewed``, ``edited``, ``stale``."""
@@ -581,13 +628,19 @@ def set_draft(conn: sqlite3.Connection, item_id: str, *, title: str,
     d_title = clean_draft_title(title)
     if row.get("title_source") == "manual":
         d_title = clean_draft_title(row["title"])
-    conn.execute(
+    # CONDITIONAL on exactly what was checked above, so a review, an edit or a new
+    # transcript that lands between the read and this write wins instead of being
+    # overwritten.
+    cur = conn.execute(
         "UPDATE inbox_items SET draft_title=?, draft_body=?, draft_project=?,"
         " draft_status=?, draft_at=?, draft_model=?, draft_src_sha=?,"
-        " updated_at=? WHERE id=?",
+        " updated_at=? WHERE id=? AND reviewed = 0 AND draft_edited_at IS NULL"
+        " AND body IS ?",
         (d_title or None, clean_text(body, DRAFT_MAX_BODY) or None,
          project or row.get("draft_project"), DRAFT_READY, now,
-         clean_text(model, 64) or None, src_sha, now, item_id))
+         clean_text(model, 64) or None, src_sha, now, item_id, row["body"]))
+    if cur.rowcount == 0:
+        raise DraftRefused("conflict")
     return get_item(conn, item_id)
 
 
@@ -606,7 +659,9 @@ def note_draft_attempt(conn: sqlite3.Connection, item_id: str, *,
     attempts = int(row.get("draft_attempts") or 0) + 1
     status = DRAFT_FAILED if attempts >= max_attempts else DRAFT_PENDING
     conn.execute("UPDATE inbox_items SET draft_attempts=?, draft_status=?,"
-                 " updated_at=? WHERE id=?", (attempts, status, now, item_id))
+                 " updated_at=? WHERE id=? AND reviewed = 0"
+                 " AND draft_edited_at IS NULL AND draft_attempts = ?",
+                 (attempts, status, now, item_id, attempts - 1))
     return get_item(conn, item_id)
 
 
@@ -1000,7 +1055,8 @@ _AWAITING_TRANSCRIPTION_SQL = (
 # ready or has failed (failed too, so nothing strands — he can write it by hand).
 _NEEDS_REVIEW_SQL = (
     "(source = 'voice' AND state = 'open' AND archived_at IS NULL"
-    " AND reviewed = 0 AND draft_status IN ('ready','failed'))")
+    " AND reviewed = 0 AND (draft_status IN ('ready','failed')"
+    " OR transcript_status = 'failed'))")
 
 # A backlog-mirror row that IS a filed note's line (it carries the note's voice tag). Hidden
 # from the default list and the counts, so a note filed to backlog.txt does not show twice;
@@ -1008,6 +1064,7 @@ _NEEDS_REVIEW_SQL = (
 _FILED_COPY_SQL = (
     "(source = 'backlog' AND EXISTS (SELECT 1 FROM inbox_items n"
     " WHERE n.filed_backlog_at IS NOT NULL AND n.source IN ('voice','typed')"
+    " AND n.state != 'closed' AND n.archived_at IS NULL"
     " AND instr(inbox_items.body, '(voice ' || substr(n.id, 1, 8) || ')') > 0))")
 
 MAX_LIMIT = 500
@@ -1134,7 +1191,7 @@ def draft_queue(conn: sqlite3.Connection, limit: int = 5,
         f" WHERE source = 'voice' AND state = 'open' AND archived_at IS NULL"
         f"   AND reviewed = 0 AND draft_edited_at IS NULL"
         f"   AND draft_attempts < ?"
-        f"   AND transcript_status IN ({placeholders})"
+        f"   AND (transcript_status IN ({placeholders}) OR draft_status = 'pending')"
         f"   AND body IS NOT NULL AND body != ''"
         f" ORDER BY created_at, id",
         (int(max_attempts), *DRAFTABLE_TRANSCRIPT_STATUSES)))

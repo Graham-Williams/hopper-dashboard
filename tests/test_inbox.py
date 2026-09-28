@@ -1495,3 +1495,78 @@ def test_the_backlog_line_cap_is_pinned():
     assert inbox_db.MAX_BACKLOG_LINE == 500
     line = "z" * 600
     assert len(inbox_db.clean_text(line, inbox_db.MAX_BACKLOG_LINE)) == 500
+
+
+# --------------------------------------------------------------------------- #
+# Security-gate fixes (routes)
+# --------------------------------------------------------------------------- #
+
+def _legacy_typed(settings):
+    """A typed note made before typed notes were born reviewed."""
+    conn = inbox_db.connect(settings.inbox_db_path)
+    with conn:
+        item = inbox_db.create_item(conn, source="typed", text="an older typed note")
+    conn.close()
+    return item
+
+
+def test_a_legacy_unticked_typed_note_can_still_be_reviewed(authed, settings):
+    item = _legacy_typed(settings)
+    row = _row(authed.get("/inbox").data.decode(), item)
+    assert 'class="review-box"' in row
+    r = authed.patch(f"/api/v1/inbox/items/{item}", json={"reviewed": True})
+    assert r.status_code == 200 and r.get_json()["awaiting_filing"] is True
+    # A new typed note (born reviewed) still gets no box, and mirrored rows stay refused.
+    new = post_note(authed).get_json()["id"]
+    assert 'class="review-box"' not in _row(authed.get("/inbox").data.decode(), new)
+
+
+def test_a_failed_transcript_says_why_on_the_board(authed, bot, settings):
+    item = _voice_note(authed)["id"]
+    for _ in range(3):
+        bot.post(f"/api/v1/inbox/items/{item}/transcript",
+                 json={"failed": True, "error": "x"}, headers=machine())
+    body = authed.get("/api/v1/inbox/items?awaiting=review").get_json()
+    assert [i["id"] for i in body["items"]] == [item] and body["items"][0]["needs_review"]
+    row = _row(authed.get("/inbox").data.decode(), item)
+    assert "Whisper couldn't transcribe this" in row and "Drafting…" not in row
+
+
+def test_a_failed_draft_post_needs_its_src_sha(authed, bot, settings):
+    item = _transcribed(authed, bot)
+    r = bot.post(f"/api/v1/inbox/items/{item}/draft", json={"failed": True},
+                 headers=machine())
+    assert r.status_code == 400
+    conn = inbox_db.connect(settings.inbox_db_path)
+    assert inbox_db.get_item(conn, item)["draft_attempts"] == 0
+    conn.close()
+
+
+def test_filing_to_the_backlog_needs_a_reviewed_open_note(authed, bot, settings):
+    item = _transcribed(authed, bot)                 # voice, NOT reviewed
+    assert _file(bot, item).status_code == 409
+    authed.patch(f"/api/v1/inbox/items/{item}", json={"reviewed": True})
+    authed.patch(f"/api/v1/inbox/items/{item}", json={"state": "closed"})
+    assert _file(bot, item).status_code == 409
+    authed.patch(f"/api/v1/inbox/items/{item}", json={"state": "open"})
+    assert _file(bot, item).status_code == 200
+
+
+def test_a_patch_that_loses_a_race_is_a_409(authed, bot, monkeypatch):
+    item = _transcribed(authed, bot)
+
+    def conflict(*a, **k):
+        raise inbox_db.Conflict(item)
+    monkeypatch.setattr(inbox_db, "update_item", conflict)
+    r = authed.patch(f"/api/v1/inbox/items/{item}", json={"reviewed": True})
+    assert r.status_code == 409
+
+
+def test_an_edit_after_review_shows_on_the_row(authed, bot):
+    item = _drafted(authed, bot)
+    authed.patch(f"/api/v1/inbox/items/{item}", json={"reviewed": True})
+    r = authed.patch(f"/api/v1/inbox/items/{item}",
+                     json={"draft_title": "Edited after review", "draft_body": "New body"})
+    assert r.get_json()["title"] == "Edited after review"
+    row = _row(authed.get("/inbox").data.decode(), item)
+    assert '<h3 class="item-title">Edited after review</h3>' in row and "New body" in row

@@ -586,3 +586,104 @@ def test_editing_the_draft_and_ticking_in_one_request_copies_the_edit(conn):
     row = inbox_db.update_item(conn, item, {"draft_title": "Edited draft title",
                                             "reviewed": True})
     assert row["title"] == "Edited draft title"
+
+
+# --------------------------------------------------------------------------- #
+# Security-gate fixes
+# --------------------------------------------------------------------------- #
+
+def test_a_retick_does_not_take_back_a_project_graham_changed(conn):
+    item = _voice(conn, project=None)
+    _draft(conn, item, project="km-tracker")
+    inbox_db.update_item(conn, item, {"reviewed": True})
+    inbox_db.update_item(conn, item, {"reviewed": False})
+    inbox_db.update_item(conn, item, {"project": "jjho"})
+    assert inbox_db.update_item(conn, item, {"reviewed": True})["project"] == "jjho"
+    # ...but a draft project edited in the SAME request is copied.
+    inbox_db.update_item(conn, item, {"reviewed": False})
+    row = inbox_db.update_item(conn, item, {"reviewed": True, "draft_project": "taste-twin"})
+    assert row["project"] == "taste-twin"
+
+
+def test_editing_the_draft_after_review_reaches_what_gets_filed(conn):
+    item = _voice(conn)
+    _draft(conn, item)
+    inbox_db.update_item(conn, item, {"reviewed": True})
+    row = inbox_db.update_item(conn, item, {"draft_title": "Better title",
+                                            "draft_body": "Better body",
+                                            "draft_project": "jjho"})
+    assert row["title"] == "Better title" and row["title_source"] == "manual"
+    assert row["project"] == "jjho" and row["draft_body"] == "Better body"
+    assert row["reviewed"] == 1
+
+
+def test_a_failed_transcript_needs_review(conn):
+    item = inbox_db.create_item(conn, source="voice", text="", now=NOW,
+                                transcript_status="pending",
+                                audio={"path": "x/f.webm", "bytes": 1})
+    for _ in range(3):
+        inbox_db.note_transcribe_attempt(conn, item, failed=True, now=NOW)
+    assert [r["id"] for r in inbox_db.list_items(conn, awaiting="review")] == [item]
+    assert inbox_db.counts(conn)["needs_review"] == 1
+
+
+def test_a_body_edit_makes_a_never_drafted_note_pending_and_queued(conn):
+    item = inbox_db.create_item(conn, source="voice", text="", now=NOW,
+                                transcript_status="failed",
+                                audio={"path": "x/g.webm", "bytes": 1})
+    assert inbox_db.get_item(conn, item)["draft_status"] is None
+    inbox_db.update_item(conn, item, {"body": "what I actually said"})
+    assert inbox_db.get_item(conn, item)["draft_status"] == "pending"
+    assert [r["id"] for r in inbox_db.draft_queue(conn)] == [item]
+    # An empty body is not draftable: never a permanent "Drafting…".
+    inbox_db.update_item(conn, item, {"body": "   "})
+    assert inbox_db.get_item(conn, item)["draft_status"] is None
+    assert inbox_db.draft_queue(conn) == []
+
+
+def test_an_empty_transcript_does_not_leave_a_pending_draft(conn):
+    item = _voice(conn, text="")
+    inbox_db.set_transcript(conn, item, text="   ")
+    assert inbox_db.get_item(conn, item)["draft_status"] is None
+
+
+def test_set_draft_loses_a_race_to_a_review_with_a_conflict(conn, monkeypatch):
+    item = _voice(conn)
+    stale = inbox_db.get_item(conn, item)
+    inbox_db.update_item(conn, item, {"reviewed": True})
+    real = inbox_db.get_item
+    monkeypatch.setattr(inbox_db, "get_item",
+                        lambda c, i: stale if i == item else real(c, i))
+    with pytest.raises(inbox_db.DraftRefused) as exc:
+        _draft(conn, item)
+    assert exc.value.reason == "conflict"
+    monkeypatch.setattr(inbox_db, "get_item", real)
+    assert inbox_db.get_item(conn, item)["draft_title"] is None
+
+
+def test_a_review_that_raced_a_new_draft_is_a_conflict(conn, monkeypatch):
+    item = _voice(conn)
+    _draft(conn, item, title="First draft")
+    stale = inbox_db.get_item(conn, item)
+    _draft(conn, item, title="Second draft")           # the machine redrafts meanwhile
+    real = inbox_db.get_item
+    calls = {"n": 0}
+
+    def once_stale(c, i):
+        calls["n"] += 1
+        return stale if calls["n"] == 1 else real(c, i)
+    monkeypatch.setattr(inbox_db, "get_item", once_stale)
+    with pytest.raises(inbox_db.Conflict):
+        inbox_db.update_item(conn, item, {"reviewed": True})
+    monkeypatch.setattr(inbox_db, "get_item", real)
+    assert inbox_db.get_item(conn, item)["reviewed"] == 0
+
+
+def test_a_filed_copy_shows_again_once_its_note_is_closed(conn):
+    item = inbox_db.create_item(conn, source="typed", text="chore", reviewed=True)
+    inbox_db.upsert_mirror_item(conn, mirror_key="backlog:x", source="backlog",
+                                title="chore", body=f"chore (voice {item[:8]})")
+    inbox_db.mark_filed_backlog(conn, item, line=f"chore (voice {item[:8]})")
+    assert [r["source"] for r in inbox_db.list_items(conn)] == ["typed"]
+    inbox_db.update_item(conn, item, {"state": "closed"})
+    assert sorted(r["source"] for r in inbox_db.list_items(conn)) == ["backlog", "typed"]

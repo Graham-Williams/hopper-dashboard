@@ -168,7 +168,9 @@
             it is reviewed; the review copies the draft title across, so after
             that `title` is the same text. The transcript is one tap away. -#}
         <h3 class="item-title">{{ d.title if (d.title and not it.reviewed) else it.title }}</h3>
-        {% if d.status == 'pending' and not it.reviewed %}
+        {% if it.transcript_status == 'failed' and not it.reviewed and not d.body %}
+        <p class="draft-state draft-failed small"><span aria-hidden="true">✕</span> Whisper couldn't transcribe this — play it and write the draft</p>
+        {% elif d.status == 'pending' and not it.reviewed %}
         <p class="draft-state draft-pending small">Drafting…</p>
         {% elif d.status == 'failed' and not d.edited_at %}
         <p class="draft-state draft-failed small"><span aria-hidden="true">✕</span> Couldn't draft — edit to write one</p>
@@ -240,10 +242,13 @@
         {% endif %}
       </div>
       <div class="item-controls">
-        {#- Voice notes only: a typed note is reviewed by being typed, and a
-            mirrored row is already filed upstream. The PATCH refuses it too. -#}
+        {#- Voice notes, plus an OLDER typed note that is still unticked (typed notes
+            are born reviewed now). A mirrored row is already filed upstream. The
+            PATCH applies the same rule (inbox.reviewable). -#}
         {% if voice %}
         <button type="button" class="edit-draft secondary" data-id="{{ it.id }}" hidden>Edit draft</button>
+        {% endif %}
+        {% if it.reviewable %}
         <label class="review">
           <input type="checkbox" class="review-box" data-id="{{ it.id }}"
                  {% if it.reviewed %}checked{% endif %}>
