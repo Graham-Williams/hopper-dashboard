@@ -185,8 +185,8 @@ class Settings:
     ntfy_url: str = ""
     ntfy_topic: str = ""
     app_host: str = ""
-    # Old public hostnames that now only redirect to APP_HOST (301 for GET/HEAD,
-    # 308 otherwise). See web._legacy_host_redirect. Validated in from_env.
+    # Old public hostnames that now only redirect to APP_HOST (307, no-store,
+    # every method). See web._legacy_host_redirect. Validated in from_env.
     app_legacy_hosts: tuple[str, ...] = ()
     app_env: str = "prod"
     probe_interval_s: int = 300

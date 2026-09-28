@@ -155,13 +155,14 @@ jobs:
             -H 'Authorization: Bearer ci-token' -d result=success http://127.0.0.1:8083/api/v1/ping/km-backup)" = "200"
           test -z "$(curl -s -o /dev/null -w '%{redirect_url}' -X POST -H 'X-Forwarded-Proto: http' \
             -H 'Authorization: Bearer ci-token' -d result=success http://127.0.0.1:8083/api/v1/ping/km-backup)"
-          # The LEGACY host only redirects: 301 for GET, 308 for POST, path+query kept,
-          # no-store, and /healthz still answers on it.
+          # The LEGACY host only redirects: 307 for every method (never 301 — a wrong
+          # APP_HOST must not stick in browsers), path+query kept, no-store, and
+          # /healthz still answers on it.
           L='Host: dashboard.ci.example'
           test "$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' -H "$L" 'http://127.0.0.1:8082/inbox?q=a%2Fb')" \
-            = "301 https://hub.ci.example/inbox?q=a%2Fb"
+            = "307 https://hub.ci.example/inbox?q=a%2Fb"
           test "$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' -X POST -H "$L" http://127.0.0.1:8082/login)" \
-            = "308 https://hub.ci.example/login"
+            = "307 https://hub.ci.example/login"
           curl -s -D- -o /dev/null -H "$L" http://127.0.0.1:8082/ | grep -qi '^cache-control: no-store'
           test "$(curl -s -o /dev/null -w '%{http_code}' -H "$L" http://127.0.0.1:8082/healthz)" = "200"
           docker logs hd3

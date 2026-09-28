@@ -245,11 +245,12 @@ def _legacy_host_redirect():
     Hopper's saved URLs keep working through this. It is NOT dual-serving: a
     legacy host never sees the gate, a page or the API — only a redirect.
 
-    - GET/HEAD → 301, every other method → 308 (method and body preserved), to
+    - 307 for EVERY method (method and body preserved), to
       ``https://<APP_HOST><raw target>``: path and query byte-exact, and the
       host comes from the validated pin, never the request (no reflection).
-    - ``Cache-Control: no-store`` all the same, so a mistaken deploy can be
-      recalled rather than sticking in every browser.
+    - 307 + ``Cache-Control: no-store``, never 301/308: a permanent redirect
+      built from a wrong APP_HOST would stick in every browser that saw it,
+      with no way to recall it. Same house rule as ``_https_redirect``.
     - ``/healthz`` is exempt, so a probe through the old name still answers.
     - APP_HOST malformed (``https_redirect_host`` empty) → 403, fail CLOSED:
       the Host pin would refuse this host anyway, and there is no safe
@@ -267,8 +268,7 @@ def _legacy_host_redirect():
     target_host = settings.https_redirect_host
     if not target_host:
         abort(403)
-    code = 301 if request.method in ("GET", "HEAD") else 308
-    resp = redirect(f"https://{target_host}{_request_target()}", code=code)
+    resp = redirect(f"https://{target_host}{_request_target()}", code=307)
     resp.headers["Cache-Control"] = "no-store"
     return resp
 

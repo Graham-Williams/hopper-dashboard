@@ -301,30 +301,23 @@ def _legacy(settings, registry, notifier, **overrides):
                    app_legacy_hosts=(LEGACY_HOST,), **overrides)
 
 
-def test_legacy_host_get_and_head_are_301_to_app_host(settings, registry, notifier):
+def test_legacy_host_is_307_no_store_for_every_method(settings, registry, notifier):
+    """307, never 301/308: a permanent redirect built from a wrong APP_HOST
+    would stick in every browser that saw it. 307 also keeps the method and
+    body, so a POST is re-sent rather than downgraded to a GET."""
     c = _legacy(settings, registry, notifier)
-    for method in ("get", "head"):
+    for method in ("get", "head", "post", "patch", "put", "delete"):
         r = getattr(c, method)("/jobs/snap", base_url=LEGACY_BASE)
-        assert r.status_code == 301, method
+        assert r.status_code == 307, method
         assert r.headers["Location"] == f"{HTTPS_BASE}/jobs/snap", method
         assert r.headers["Cache-Control"] == "no-store", method
-
-
-def test_legacy_host_other_methods_are_308(settings, registry, notifier):
-    """308 keeps the method and body: a POST is re-sent, never downgraded."""
-    c = _legacy(settings, registry, notifier)
-    for method in ("post", "patch", "put", "delete"):
-        r = getattr(c, method)("/login", base_url=LEGACY_BASE,
-                               data={"password": "x"})
-        assert r.status_code == 308, method
-        assert r.headers["Location"] == f"{HTTPS_BASE}/login", method
 
 
 def test_legacy_host_preserves_path_and_query_byte_for_byte(settings, registry, notifier):
     c = _legacy(settings, registry, notifier)
     raw = "/inbox?q=a%2Fb%20c&e=%C3%A9&awaiting=review"
     r = c.get(raw, base_url=LEGACY_BASE)
-    assert r.status_code == 301
+    assert r.status_code == 307
     assert r.headers["Location"] == HTTPS_BASE + raw
 
 
@@ -332,7 +325,7 @@ def test_legacy_host_is_answered_before_the_gate(settings, registry, notifier):
     """Not bounced to a /login on the old host, and no page or API is served."""
     c = _legacy(settings, registry, notifier)
     r = c.get("/api/v1/status", base_url=LEGACY_BASE, headers=bearer())
-    assert r.status_code == 301
+    assert r.status_code == 307
     assert r.headers["Location"] == f"{HTTPS_BASE}/api/v1/status"
 
 
@@ -341,7 +334,7 @@ def test_legacy_redirect_never_reflects_the_host(settings, registry, notifier):
     host that is neither legacy nor APP_HOST still gets the pin's 403."""
     c = _legacy(settings, registry, notifier)
     r = c.get("/", base_url=f"https://{LEGACY_HOST}:8443")
-    assert r.status_code == 301 and r.headers["Location"] == f"{HTTPS_BASE}/"
+    assert r.status_code == 307 and r.headers["Location"] == f"{HTTPS_BASE}/"
     assert c.get("/login", base_url="https://evil.example").status_code == 403
     # Forged raw targets fall back to the re-quoted path.
     for forged in ("/x\r\nX-Evil: 1", "http://evil.example/x"):
