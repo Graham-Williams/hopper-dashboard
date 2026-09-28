@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% from "_macros.html" import chip, when, history_strip, disk_gauge %}
-{% block title %}{{ job.name }} — Hopper Dashboard{% endblock %}
+{% block title %}{{ job.name }} · Dashboard · Hub{% endblock %}
 {% block content %}
 <p class="crumbs"><a href="{{ url_for('web.board') }}">← Dashboard</a></p>
 <article class="card detail state-{{ job.state|lower }}">

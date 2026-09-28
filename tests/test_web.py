@@ -741,7 +741,7 @@ def test_login_page_has_no_nav_links_but_board_does(read_app, authed):
     assert "Sign out" not in login and 'href="/api/v1/status"' not in login
     assert "hopper-dashboard v" in login                       # footer stays
     board = authed.get("/dashboard").data.decode()
-    assert "Sign out" in board and 'href="/api/v1/status"' in board
+    assert "Sign out" in board and 'href="/api/v1/status"' not in board   # JSON link dropped
 
 
 def test_summary_timestamps_are_localizable_time_elements(authed, core):
@@ -1024,3 +1024,17 @@ def test_login_and_logout_land_on_the_hub(settings, registry, notifier, authed):
     settings.app_env = "dev"
     c = create_app("read", settings, registry, notifier).test_client()
     assert c.get("/logout").headers["Location"] == "/"
+
+
+def test_rebranded_as_hub_with_no_json_nav_link(authed, read_app):
+    pages = {"/": "<title>Hub</title>", "/dashboard": "<title>Dashboard · Hub</title>",
+             "/inbox": "<title>Inbox · Hub</title>"}
+    for path, title in pages.items():
+        html = authed.get(path).data.decode()
+        assert title in html, path
+        assert "Hopper Dashboard" not in html, path
+        nav = html.split('<nav class="top"', 1)[1].split("</nav>", 1)[0]
+        assert "/api/v1/status" not in nav and ">JSON<" not in nav, path
+        assert "Hub · hopper-dashboard v" in html, path
+    login = read_app.test_client().get("/login").data.decode()
+    assert "<title>Sign in · Hub</title>" in login

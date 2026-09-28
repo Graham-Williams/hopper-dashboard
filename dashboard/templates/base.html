@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
-<title>{% block title %}Hopper Dashboard{% endblock %}</title>
+<title>{% block title %}Hub{% endblock %}</title>
 <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
 <link rel="icon" href="{{ url_for('static', filename='favicon.svg') }}" type="image/svg+xml">
 {% block head %}{% endblock %}
@@ -12,14 +12,13 @@
 <body>
 <nav class="top">
   <a class="brand" href="{{ url_for('hub.index') }}">
-    <span class="dot" aria-hidden="true"></span> Hopper Dashboard
+    <span class="dot" aria-hidden="true"></span> Hub
     {% if app_env != 'prod' %}<span class="env">{{ app_env }}</span>{% endif %}
   </a>
   <span class="spacer"></span>
   {# login.html overrides this block to empty: a signed-out visitor has nothing to sign out of. #}
   {% block nav %}
   <a href="{{ url_for('inbox.board') }}">Inbox</a>
-  <a href="{{ url_for('web.api_status') }}">JSON</a>
   <a href="{{ url_for('web.logout') }}">Sign out</a>
   {% endblock %}
 </nav>
@@ -27,7 +26,7 @@
 {% block content %}{% endblock %}
 </main>
 <footer class="foot">
-  hopper-dashboard v{{ app_version }} · observe-only · actions stay with Hopper over SSH
+  Hub · hopper-dashboard v{{ app_version }} · observe-only · actions stay with Hopper over SSH
 </footer>
 {# The ONLY script on the site, allowed by a per-request CSP nonce (script-src 'nonce-…').
    It localizes every <time datetime> to the viewer's clock: the visible relative text is left

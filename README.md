@@ -1,6 +1,10 @@
 # hopper-dashboard
 
-A small self-hosted dashboard that shows the health of every backup and scheduled job across one home server
+**Hub** — a small self-hosted app with two halves behind one password: a jobs dashboard and a voice-first
+Inbox. The landing page (`/`) is the Hub: an Inbox card (what needs review, a Record button) and a one-row
+health strip of the dashboard. The repo keeps its original name.
+
+The dashboard (`/dashboard`) shows the health of every backup and scheduled job across one home server
 and one Mac — last run, last success, whether the destination really has fresh bytes, and how far behind the
 manual jobs are. API-first (JSON) with an HTML board on top, dead-man's-switch heartbeats, destination probes
 via rclone, and push alerts via ntfy.
@@ -14,7 +18,7 @@ target) or **UNKNOWN** (never heard from). Every transition is recorded and push
 uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -r requirements-dev.txt
 cp jobs.example.yml jobs.yml
 export INGEST_TOKEN=devtoken READ_TOKEN=devread APP_ENV=dev   # APP_ENV=dev + no APP_PASSWORD = gate off (prod refuses)
-.venv/bin/python -m dashboard                             # board: http://127.0.0.1:8080  ingest: :8081
+.venv/bin/python -m dashboard                             # Hub: http://127.0.0.1:8080  ingest: :8081
 curl -X POST -H 'Authorization: Bearer devtoken' -d result=success http://127.0.0.1:8081/api/v1/ping/km-backup
 ```
 `.venv/bin/python -m pytest -q` runs the suite (no network needed).
