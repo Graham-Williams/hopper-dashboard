@@ -63,16 +63,25 @@ h2 { font-size: 1.05rem; text-transform: uppercase; letter-spacing: .06em;
 .bad { color: var(--fail); font-weight: 600; }
 
 /* nav */
+/* One row at 390px with no horizontal scroll: brand, two EQUAL tabs that share
+   the free width, then a short Sign out link. Every link is >= 44px tall. */
 nav.top {
-  display: flex; align-items: center; gap: 1rem; padding: .7rem .9rem;
+  display: flex; align-items: center; gap: .6rem; padding: 0 .9rem;
   background: var(--panel); border-bottom: 1px solid var(--rule);
-  position: sticky; top: 0; z-index: 2;
+  position: sticky; top: 0; z-index: 2; min-height: 52px;
 }
-nav.top .brand { color: var(--ink); font-weight: 700; display: flex; align-items: center; gap: .5rem; }
+nav.top a { color: var(--muted); min-height: 44px; display: flex; align-items: center; }
+nav.top .brand { color: var(--ink); font-weight: 700; gap: .45rem; flex: 0 0 auto; white-space: nowrap; }
 nav.top .brand .dot { width: .7rem; height: .7rem; border-radius: 50%; background: var(--accent); display: inline-block; }
 nav.top .env { font-size: .7rem; padding: .05rem .4rem; border-radius: 3px; background: var(--late); color: var(--on-state); text-transform: uppercase; }
-nav.top .spacer { flex: 1; }
-nav.top a { color: var(--muted); padding: .4rem 0; }
+nav.top .tabs { flex: 1 1 auto; display: grid; grid-template-columns: 1fr 1fr; gap: .25rem;
+                max-width: 20rem; margin: 0 auto; min-width: 0; }
+nav.top .tab { justify-content: center; padding: 0 .4rem; border-radius: 8px; font-weight: 600;
+               font-size: .95rem; white-space: nowrap; border-bottom: 3px solid transparent; }
+nav.top .tab:hover { background: var(--panel-2); text-decoration: none; }
+nav.top .tab[aria-current="page"] { color: var(--ink); border-bottom-color: var(--accent);
+                                    border-radius: 8px 8px 0 0; }
+nav.top .signout { flex: 0 0 auto; font-size: .88rem; white-space: nowrap; padding: 0 .1rem; }
 
 /* summary tiles */
 .summary { display: grid; grid-template-columns: repeat(3, 1fr); gap: .6rem; margin: .4rem 0 1.2rem; }
@@ -183,7 +192,7 @@ button:hover { filter: brightness(1.08); }
 .foot { color: var(--muted); font-size: .8rem; text-align: center; padding: 1rem .9rem 2rem; }
 
 @media (max-width: 480px) {
-  nav.top { gap: .7rem; }
+  nav.top { gap: .4rem; padding: 0 .75rem; }
   .card dl { grid-template-columns: 1fr; gap: .05rem; }
   .card dt { font-size: .76rem; text-transform: uppercase; letter-spacing: .05em; margin-top: .35rem; }
 }
@@ -273,3 +282,53 @@ progress.record-level {
 .ts-failed { color: var(--fail); }
 .issue { font-weight: 600; }
 .issue-closed { color: var(--muted); text-decoration: line-through; }
+
+/* -------------------------------------------------------------------- hub -- */
+/* The landing page. Mobile-first: cards stack, Inbox first; at 640px they sit
+   side by side at EQUAL width. The Record button is the one loud thing on the
+   page and is >= 56px tall; every other tap target is >= 44px. */
+.hub { display: grid; grid-template-columns: 1fr; gap: .9rem; margin: .4rem 0 1rem; }
+@media (min-width: 640px) { .hub { grid-template-columns: 1fr 1fr; align-items: stretch; } }
+.hub-card {
+  background: var(--panel); border: 1px solid var(--rule); border-radius: 12px;
+  box-shadow: var(--shadow); padding: 1rem 1rem .9rem; display: flex;
+  flex-direction: column; gap: .75rem; min-width: 0; border-top: 4px solid var(--accent);
+}
+.hub-dashboard { border-top-color: var(--ok); }
+.hub-card h2 { color: var(--ink); }
+.hub-stat {
+  display: flex; align-items: baseline; gap: .6rem; color: var(--ink);
+  padding: .5rem .7rem; border-radius: 8px; background: var(--panel-2); min-height: 44px;
+}
+.hub-stat:hover { text-decoration: none; filter: brightness(.98); }
+.hub-stat .n { font-size: 2.4rem; font-weight: 750; line-height: 1; color: var(--behind); }
+.hub-stat .l { font-size: 1rem; font-weight: 600; }
+.hub-stat.zero .n { color: var(--muted); }
+a.hub-record {
+  display: flex; align-items: center; justify-content: center; gap: .5rem;
+  min-height: 56px; width: 100%; border-radius: 10px; background: var(--fail);
+  color: #fff; font-size: 1.1rem; font-weight: 700; letter-spacing: .01em;
+}
+a.hub-record:hover { text-decoration: none; filter: brightness(1.08); }
+a.hub-record:focus-visible, a.hub-open:focus-visible, .hub-stat:focus-visible {
+  outline: 3px solid var(--accent); outline-offset: 2px;
+}
+.hub-meta { margin: 0; font-size: .9rem; }
+a.hub-open {
+  display: flex; align-items: center; justify-content: center; gap: .35rem;
+  min-height: 44px; border-radius: 8px; border: 1px solid var(--rule);
+  font-weight: 600; margin-top: auto;
+}
+a.hub-open:hover { background: var(--panel-2); text-decoration: none; }
+.health { margin: 0; display: flex; flex-wrap: wrap; align-items: center; gap: .25rem .45rem;
+          font-size: 1.05rem; font-weight: 650; padding: .55rem .7rem; border-radius: 8px;
+          background: var(--panel-2); min-height: 44px; }
+.health .sep { color: var(--muted); font-weight: 400; }
+.health .hs { white-space: nowrap; }
+.health .hs.zero { color: var(--muted); font-weight: 500; }
+.hs-ok .glyph { color: var(--ok); }
+.hs-behind:not(.zero) { color: var(--behind); }
+.hs-failing:not(.zero) { color: var(--fail); }
+.hs-unknown { color: var(--muted); }
+.hub-warn { margin: 0; padding: .5rem .7rem; border-radius: 8px; border: 1px solid var(--late);
+            font-size: .9rem; }

@@ -10,16 +10,22 @@
 {% block head %}{% endblock %}
 </head>
 <body>
+{#- Which tab is current, from the endpoint: a job page belongs to the Dashboard. -#}
+{%- set ep = request.endpoint or '' -%}
+{%- set section = 'dashboard' if ep in ('web.board', 'web.job_page') else ('inbox' if ep.startswith('inbox.') else ('hub' if ep == 'hub.index' else '')) -%}
 <nav class="top">
-  <a class="brand" href="{{ url_for('hub.index') }}">
+  <a class="brand" href="{{ url_for('hub.index') }}"{% if section == 'hub' %} aria-current="page"{% endif %}>
     <span class="dot" aria-hidden="true"></span> Hub
     {% if app_env != 'prod' %}<span class="env">{{ app_env }}</span>{% endif %}
   </a>
-  <span class="spacer"></span>
   {# login.html overrides this block to empty: a signed-out visitor has nothing to sign out of. #}
   {% block nav %}
-  <a href="{{ url_for('inbox.board') }}">Inbox</a>
-  <a href="{{ url_for('web.logout') }}">Sign out</a>
+  {#- One row at 390px, no horizontal scroll: two EQUAL tabs, then a short text link. -#}
+  <div class="tabs">
+    <a class="tab" href="{{ url_for('web.board') }}"{% if section == 'dashboard' %} aria-current="page"{% endif %}>Dashboard</a>
+    <a class="tab" href="{{ url_for('inbox.board') }}"{% if section == 'inbox' %} aria-current="page"{% endif %}>Inbox</a>
+  </div>
+  <a class="signout" href="{{ url_for('web.logout') }}">Sign out</a>
   {% endblock %}
 </nav>
 <main>
