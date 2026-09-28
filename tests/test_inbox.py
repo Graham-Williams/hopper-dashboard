@@ -743,8 +743,8 @@ def test_the_board_still_has_exactly_one_script_and_the_inbox_has_two(authed):
     'self' in script-src — so anything that lands in that block must carry the
     same per-request nonce as the inline localizer."""
     import re
-    board = authed.get("/")
-    assert board.data.decode().count("<script") == 1
+    for path in ("/", "/dashboard"):
+        assert authed.get(path).data.decode().count("<script") == 1, path
     r = authed.get("/inbox")
     html = r.data.decode()
     nonce = re.search(r"script-src 'nonce-([A-Za-z0-9_-]{16,})'",

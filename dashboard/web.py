@@ -364,7 +364,7 @@ def healthz():
 @bp.get("/login")
 def login():
     if not _gate_enabled():
-        return redirect(url_for("web.index"))
+        return redirect(url_for("hub.index"))
     if session.get(SESSION_KEY) is True:
         return redirect(safe_next(request.args.get("next")))
     return render_template("login.html", next=request.args.get("next", ""),
@@ -374,7 +374,7 @@ def login():
 @bp.post("/login")
 def login_post():
     if not _gate_enabled():
-        return redirect(url_for("web.index"))
+        return redirect(url_for("hub.index"))
     next_target = request.form.get("next", "")
     ip = client_ip()
     limiter = current_app.extensions["login_limiter"]
@@ -403,7 +403,7 @@ def logout():
     session.clear()
     if _gate_enabled():
         return redirect(url_for("web.login"))
-    return redirect(url_for("web.index"))
+    return redirect(url_for("hub.index"))
 
 
 # --------------------------------------------------------------------------- #
@@ -420,8 +420,16 @@ def _conn():
     return db.connect_query_only(_settings().db_path)
 
 
-@bp.get("/")
-def index():
+def scheduler_stale(status: dict, now: float) -> bool:
+    """No state recomputed in five minutes: the ingest scheduler may be down,
+    and LATE will not fire until it is back. Shown on the board and the Hub."""
+    computed = db.from_iso(status["summary"].get("computed_at"))
+    return computed is None or (now - computed) > 5 * 60
+
+
+@bp.get("/dashboard")
+def board():
+    """The jobs board. It lived at ``/`` until the Hub took that path."""
     registry = current_app.extensions["registry"]
     now = time.time()
     conn = _conn()
@@ -431,10 +439,8 @@ def index():
         conn.close()
     groups = [(m, [j for j in status["jobs"] if j["machine"] == m])
               for m in ("box", "mac")]
-    computed = db.from_iso(status["summary"].get("computed_at"))
-    scheduler_stale = computed is None or (now - computed) > 5 * 60
     return render_template("index.html", status=status, groups=groups,
-                           now=now, scheduler_stale=scheduler_stale)
+                           now=now, scheduler_stale=scheduler_stale(status, now))
 
 
 @bp.get("/jobs/<job_id>")

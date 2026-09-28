@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hub" aria-label="Hub">
+  <article class="hub-card hub-inbox">
+    <h2>Inbox</h2>
+    <p><span class="n">{{ counts.open }}</span> open</p>
+    <a href="{{ url_for('inbox.board') }}#capture">Record</a>
+    <a href="{{ url_for('inbox.board') }}">Open Inbox</a>
+  </article>
+  <article class="hub-card hub-dashboard">
+    <h2>Dashboard</h2>
+    <p>{{ health.ok }} OK · {{ health.behind }} behind · {{ health.failing }} failing</p>
+    <a href="{{ url_for('web.board') }}">Open Dashboard</a>
+  </article>
+</section>
+{% endblock %}

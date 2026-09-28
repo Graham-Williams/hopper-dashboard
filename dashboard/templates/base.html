@@ -11,7 +11,7 @@
 </head>
 <body>
 <nav class="top">
-  <a class="brand" href="{{ url_for('web.index') }}">
+  <a class="brand" href="{{ url_for('hub.index') }}">
     <span class="dot" aria-hidden="true"></span> Hopper Dashboard
     {% if app_env != 'prod' %}<span class="env">{{ app_env }}</span>{% endif %}
   </a>

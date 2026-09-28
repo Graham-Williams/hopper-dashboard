@@ -65,7 +65,7 @@ def client_ip(trusted_proxy_cidrs=()) -> str:
     return peer
 
 
-def safe_next(target: str | None, fallback_endpoint: str = "web.index") -> str:
+def safe_next(target: str | None, fallback_endpoint: str = "hub.index") -> str:
     """Return ``target`` only if it is a safe *local* path, else the fallback.
 
     Open-redirect defense: a valid ``next`` must be a single-slash, same-site

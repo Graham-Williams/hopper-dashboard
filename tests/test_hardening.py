@@ -311,7 +311,7 @@ def test_copy_tree_ignores_legacy_lag_bytes_for_staleness():
 def test_copy_tree_board_shows_missing_and_differ_separately(authed, core):
     core.record_ping(REG.get("tree"), {"status": "ok", "metrics": {
         "missing_files": 0, "missing_bytes": 0, "differ_files": 2, "differ_bytes": 2048}}, now=NOW)
-    html = authed.get("/").data.decode()
+    html = authed.get("/dashboard").data.decode()
     assert "2 files / 2.0 KB edited since last copy (normal lag)" in html
     assert "never uploaded" in html
 
@@ -711,14 +711,14 @@ def test_non_finite_string_metrics_never_500_the_readers(ingest, authed, core, r
     core.record_ping(tree, {"status": "ok", "metrics": {"missing_files": 0}}, now=NOW)
     r = ingest.post("/api/v1/ping/tree", json={"status": "metric", "metrics": metrics}, headers=auth())
     assert r.status_code in (200, 400), r.data
-    assert authed.get("/").status_code == 200
+    assert authed.get("/dashboard").status_code == 200
     assert authed.get("/api/v1/status").status_code == 200
     assert authed.get("/jobs/tree").status_code == 200
     assert authed.get("/api/v1/jobs/tree").status_code == 200
     # A run ping carrying the same metrics must not poison the row either.
     r = ingest.post("/api/v1/ping/tree", json={"status": "ok", "metrics": metrics}, headers=auth())
     assert r.status_code in (200, 400), r.data
-    assert authed.get("/").status_code == 200 and authed.get("/jobs/tree").status_code == 200
+    assert authed.get("/dashboard").status_code == 200 and authed.get("/jobs/tree").status_code == 200
     body = authed.get("/api/v1/status").get_json()
     tree_row = next(j for j in body["jobs"] if j["id"] == "tree")
     assert tree_row["state"] in ("OK", "STALE_DEST")   # computed, not crashed
@@ -839,7 +839,7 @@ def test_poisoned_dest_newest_iso_does_not_500(authed, read, core):
     core.record_ping(REG.get("offload"), {"status": "metric", "metrics": {
         "dest_newest_iso": POISON_ISO, "dest_count": 3, "lag_bytes": 0}}, now=NOW)
     core.record_ping(REG.get("offload"), {"status": "ok", "finished_at": "9999-12-31T23:59:59Z"}, now=NOW + 1)
-    assert authed.get("/").status_code == 200
+    assert authed.get("/dashboard").status_code == 200
     assert authed.get("/jobs/offload").status_code == 200
     r = read.get("/api/v1/status", headers=bearer())
     assert r.status_code == 200
@@ -854,7 +854,7 @@ def test_poisoned_probe_row_does_not_500(authed, core):
         db.insert_run(conn, "snap", received_at=to_iso(NOW), status="ok", started_at=POISON_ISO,
                       finished_at="not a date")
     assert authed.get("/jobs/snap").status_code == 200
-    assert authed.get("/").status_code == 200
+    assert authed.get("/dashboard").status_code == 200
 
 
 # --------------------------------------------------------------------------- #
@@ -921,7 +921,7 @@ def _card(html: str, job_id: str) -> str:
 
 def test_manual_never_run_is_explicit_on_board_and_api(authed, read, core):
     core.record_ping(REG.get("offload"), {"status": "metric", "metrics": {"lag_bytes": 0}}, now=NOW)
-    html = authed.get("/").data.decode()
+    html = authed.get("/dashboard").data.decode()
     card = _card(html, "offload")
     assert "Never run." in card and "ping.sh offload ok" in card and "inert until the first" in card
     assert "Never run." in _card(html, "info")          # informational manual job: same hint, no target text
@@ -929,7 +929,7 @@ def test_manual_never_run_is_explicit_on_board_and_api(authed, read, core):
     j = {x["id"]: x for x in read.get("/api/v1/status", headers=bearer()).get_json()["jobs"]}
     assert j["offload"]["never_run"] is True and j["offload"]["state"] == "OK"
     core.record_ping(REG.get("offload"), {"status": "ok", "note": "seeded"}, now=NOW + 1)
-    assert "Never run." not in _card(authed.get("/").data.decode(), "offload")
+    assert "Never run." not in _card(authed.get("/dashboard").data.decode(), "offload")
     assert {x["id"]: x for x in read.get("/api/v1/status", headers=bearer()).get_json()["jobs"]}["offload"]["never_run"] is False
 
 
