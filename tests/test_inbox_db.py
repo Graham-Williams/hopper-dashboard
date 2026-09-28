@@ -349,3 +349,240 @@ def test_mirror_state_roundtrip(conn):
     state = inbox_db.get_mirror_state(conn, "github:a/b")
     assert state["etag"] == 'W/"abc"'          # partial update, not a replace
     assert state["last_status"] == "error" and state["last_error"] == "boom"
+
+
+# --------------------------------------------------------------------------- #
+# Drafts (the draft_* columns)
+# --------------------------------------------------------------------------- #
+
+DRAFT_COLUMNS = {"draft_title", "draft_body", "draft_project", "draft_status",
+                 "draft_at", "draft_attempts", "draft_model", "draft_src_sha",
+                 "draft_edited_at"}
+
+
+def _columns(c):
+    return {r["name"] for r in c.execute("PRAGMA table_info(inbox_items)")}
+
+
+def test_draft_columns_migrate_onto_an_old_table(tmp_path):
+    """A box whose inbox.db predates the drafts gets the columns added, and a
+    second run is a no-op (the first real use of INBOX_COLUMNS)."""
+    import sqlite3
+    path = str(tmp_path / "inbox.db")
+    old = sqlite3.connect(path)
+    old.executescript(inbox_db.INBOX_SCHEMA)          # v1 table: no draft_* columns
+    old.execute("INSERT INTO inbox_items (id, source, title, created_at, updated_at)"
+                " VALUES ('a'||hex(randomblob(15)), 'voice', 't', ?, ?)", (NOW, NOW))
+    old.commit()
+    old.close()
+    for _ in range(2):
+        c = inbox_db.connect(path)
+        inbox_db.init_inbox_schema(c)
+        assert DRAFT_COLUMNS <= _columns(c)
+        row = c.execute("SELECT draft_attempts, draft_status FROM inbox_items").fetchone()
+        assert row["draft_attempts"] == 0 and row["draft_status"] is None
+        c.close()
+
+
+def test_concurrent_migration_of_an_old_table_never_raises(tmp_path):
+    import sqlite3
+    path = str(tmp_path / "inbox.db")
+    old = sqlite3.connect(path)
+    old.executescript(inbox_db.INBOX_SCHEMA)
+    old.close()
+    errors: list[Exception] = []
+
+    def go():
+        try:
+            c = inbox_db.connect(path)
+            try:
+                inbox_db.init_inbox_schema(c)
+            finally:
+                c.close()
+        except Exception as exc:                      # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=go) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    c = inbox_db.connect(path)
+    assert DRAFT_COLUMNS <= _columns(c)
+    c.close()
+
+
+def _voice(conn, text="the wheel sticks on km tracker", *, when=NOW, **kw):
+    item = inbox_db.create_item(conn, source="voice", text="", now=when,
+                                transcript_status="pending",
+                                audio={"path": f"x/{when}.webm", "bytes": 1}, **kw)
+    if text:
+        inbox_db.set_transcript(conn, item, text=text, now=when)
+    return item
+
+
+def _draft(conn, item, **kw):
+    row = inbox_db.get_item(conn, item)
+    args = {"title": "Fix the sticky wheel", "body": "It sticks.",
+            "project": "km-tracker", "src_sha": inbox_db.transcript_sha(row["body"]),
+            "model": "sonnet"}
+    args.update(kw)
+    return inbox_db.set_draft(conn, item, **args)
+
+
+def test_a_transcript_makes_a_draft_pending_and_queues_it(conn):
+    item = _voice(conn)
+    row = inbox_db.get_item(conn, item)
+    assert row["draft_status"] == "pending"
+    q = inbox_db.draft_queue(conn)
+    assert [r["id"] for r in q] == [item]
+    assert q[0]["sha"] == inbox_db.transcript_sha(row["body"])
+
+
+def test_backfill_selection(conn):
+    """Transcribed voice notes with no draft are queued (the backfill); nothing
+    untranscribed, typed, reviewed, closed, edited or given-up is."""
+    old = inbox_db.create_item(conn, source="voice", text="transcribed before drafts",
+                               now="2026-09-01T00:00:00Z", transcript_status="whisper",
+                               audio={"path": "x/old.webm", "bytes": 1})
+    assert inbox_db.get_item(conn, old)["draft_status"] is None   # pre-draft row
+    _voice(conn, text="")                                         # not transcribed
+    inbox_db.create_item(conn, source="typed", text="typed")
+    reviewed = _voice(conn, when="2026-09-02T00:00:00Z")
+    inbox_db.update_item(conn, reviewed, {"reviewed": True})
+    closed = _voice(conn, when="2026-09-03T00:00:00Z")
+    inbox_db.update_item(conn, closed, {"state": "closed"})
+    edited = _voice(conn, when="2026-09-04T00:00:00Z")
+    inbox_db.update_item(conn, edited, {"draft_body": "mine"})
+    given_up = _voice(conn, when="2026-09-05T00:00:00Z")
+    for _ in range(3):
+        inbox_db.note_draft_attempt(conn, given_up)
+    assert inbox_db.get_item(conn, given_up)["draft_status"] == "failed"
+    done = _voice(conn, when="2026-09-06T00:00:00Z")
+    _draft(conn, done)
+    fresh = _voice(conn, when="2026-09-07T00:00:00Z")
+    assert [r["id"] for r in inbox_db.draft_queue(conn)] == [old, fresh]
+    assert [r["id"] for r in inbox_db.draft_queue(conn, limit=1)] == [old]
+
+
+def test_a_new_transcript_redrafts(conn):
+    item = _voice(conn)
+    _draft(conn, item)
+    assert inbox_db.draft_queue(conn) == []
+    inbox_db.set_transcript(conn, item, text="a better transcript")
+    row = inbox_db.get_item(conn, item)
+    assert row["draft_status"] == "pending" and row["draft_attempts"] == 0
+    assert [r["id"] for r in inbox_db.draft_queue(conn)] == [item]
+    # A draft made from the OLD text is now stale and refused.
+    with pytest.raises(inbox_db.DraftRefused) as exc:
+        _draft(conn, item, src_sha=inbox_db.transcript_sha("the wheel sticks on km tracker"))
+    assert exc.value.reason == "stale"
+
+
+def test_editing_the_transcript_body_redrafts_unless_the_draft_was_edited(conn):
+    item = _voice(conn)
+    _draft(conn, item)
+    inbox_db.update_item(conn, item, {"body": "corrected transcript"})
+    assert inbox_db.get_item(conn, item)["draft_status"] == "pending"
+    assert [r["id"] for r in inbox_db.draft_queue(conn)] == [item]
+    inbox_db.update_item(conn, item, {"draft_title": "My own title"})
+    inbox_db.update_item(conn, item, {"body": "again"})
+    row = inbox_db.get_item(conn, item)
+    assert row["draft_status"] == "ready" and row["draft_title"] == "My own title"
+    assert inbox_db.draft_queue(conn) == []
+
+
+def test_no_machine_overwrite_after_an_edit_or_a_review(conn):
+    item = _voice(conn)
+    inbox_db.update_item(conn, item, {"draft_body": "I wrote this"})
+    with pytest.raises(inbox_db.DraftRefused) as exc:
+        _draft(conn, item)
+    assert exc.value.reason == "edited"
+    row = inbox_db.get_item(conn, item)
+    assert row["draft_body"] == "I wrote this" and row["draft_edited_at"]
+    other = _voice(conn, when="2026-09-20T00:00:00Z")
+    inbox_db.update_item(conn, other, {"reviewed": True})
+    with pytest.raises(inbox_db.DraftRefused) as exc:
+        _draft(conn, other)
+    assert exc.value.reason == "reviewed"
+    # note_draft_attempt is a no-op on either.
+    assert inbox_db.note_draft_attempt(conn, item)["draft_attempts"] == 0
+
+
+def test_set_draft_caps_and_cleans(conn):
+    item = _voice(conn)
+    row = _draft(conn, item, title="a\nmulti  line\ttitle " + "x" * 300,
+                 body="\x1b[31mred\x1b[0m " + "y" * 5000)
+    assert "\n" not in row["draft_title"] and row["draft_title"].startswith("a multi line title")
+    assert len(row["draft_title"]) <= inbox_db.DRAFT_MAX_TITLE
+    assert len(row["draft_body"]) <= inbox_db.DRAFT_MAX_BODY
+    assert "\x1b" not in row["draft_body"]
+    assert row["draft_status"] == "ready" and row["draft_model"] == "sonnet"
+
+
+def test_a_manual_title_wins_over_the_machine_draft_title(conn):
+    item = _voice(conn, title="What I typed")
+    row = _draft(conn, item, title="Something else")
+    assert row["draft_title"] == "What I typed"
+
+
+def test_capture_project_seeds_the_draft_project(conn):
+    item = _voice(conn, project="taste-twin")
+    assert inbox_db.get_item(conn, item)["draft_project"] == "taste-twin"
+    row = _draft(conn, item, project=None)
+    assert row["draft_project"] == "taste-twin"          # kept when the model has none
+
+
+def test_ticking_reviewed_copies_the_draft_into_title_and_project(conn):
+    item = _voice(conn, project=None)
+    body_before = inbox_db.get_item(conn, item)["body"]
+    _draft(conn, item)
+    row = inbox_db.update_item(conn, item, {"reviewed": True})
+    assert row["title"] == "Fix the sticky wheel" and row["title_source"] == "manual"
+    assert row["project"] == "km-tracker"
+    assert row["body"] == body_before                    # the transcript is untouched
+    # A later untick/retick does not clobber an edited title.
+    inbox_db.update_item(conn, item, {"reviewed": False})
+    inbox_db.update_item(conn, item, {"title": "Renamed"})
+    assert inbox_db.update_item(conn, item, {"reviewed": True})["title"] == "Renamed"
+
+
+def test_review_keeps_the_existing_project_when_the_draft_has_none(conn):
+    item = _voice(conn)
+    inbox_db.update_item(conn, item, {"project": "jjho"})
+    row = inbox_db.update_item(conn, item, {"reviewed": True})
+    assert row["project"] == "jjho" and row["title_source"] == "derived"
+
+
+def test_needs_review_filter_sort_and_count(conn):
+    a, b, c = _seed(conn)
+    ready = _voice(conn, when="2026-01-01T00:00:00Z")
+    _draft(conn, ready)
+    failed = _voice(conn, when="2026-01-02T00:00:00Z")
+    for _ in range(3):
+        inbox_db.note_draft_attempt(conn, failed)
+    pending = _voice(conn, when="2026-01-03T00:00:00Z")
+    inbox_db.update_item(conn, a, {"reviewed": True})   # awaiting filing (typed)
+    ids = [r["id"] for r in inbox_db.list_items(conn)]
+    assert set(ids[:2]) == {ready, failed}              # needs review first
+    assert ids[2] == a                                  # then awaiting filing
+    assert pending in ids[3:]
+    assert {r["id"] for r in inbox_db.list_items(conn, awaiting="review")} == {ready, failed}
+    assert inbox_db.counts(conn)["needs_review"] == 2
+    inbox_db.update_item(conn, ready, {"reviewed": True})
+    assert inbox_db.counts(conn)["needs_review"] == 1
+
+
+def test_search_covers_the_draft(conn):
+    item = _voice(conn, text="um so the thing")
+    _draft(conn, item, title="Sprocket alignment", body="Realign the sprocket.")
+    assert [r["id"] for r in inbox_db.list_items(conn, q="sprocket")] == [item]
+
+
+def test_editing_the_draft_and_ticking_in_one_request_copies_the_edit(conn):
+    item = _voice(conn, title="Typed at capture")
+    _draft(conn, item)
+    row = inbox_db.update_item(conn, item, {"draft_title": "Edited draft title",
+                                            "reviewed": True})
+    assert row["title"] == "Edited draft title"
