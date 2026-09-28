@@ -809,7 +809,10 @@ exposed" is NOT a valid test. Prove the ingest route simply does not exist on th
 
 ```bash
 RT="$(ssh <user>@<box-tailscale-ip> "grep '^READ_TOKEN=' ~/hopper-dashboard/.env | cut -d= -f2-")"
+# The Origin header gets the request past the browser-write origin pin (without it: 403, which proves
+# nothing either), so the answer comes from routing: the ingest route must not exist here.
 curl -sS -o /dev/null -w '%{http_code}\n' -X POST -H "Authorization: Bearer $RT" \
+  -H "Origin: https://hub.graham-williams.com" \
   https://hub.graham-williams.com/api/v1/ping/x                # MUST be 404 or 405 — never 200/400/401
 ssh <user>@<box-tailscale-ip> 'ss -ltnp | grep 8081'             # only <box-tailscale-ip>:8081, never 0.0.0.0
 ```
@@ -1136,7 +1139,7 @@ script, but that is per-repo work).
 - [ ] No root process in the container after start-up (check with `docker exec -u 10001 …`, §1c);
       `/tmp/rclone/rclone.conf` is `10001 600`.
 - [ ] `https://hub.graham-williams.com/` → login page; `/healthz` → 200; `POST /api/v1/ping/x` via the
-      public host **with the READ_TOKEN** is 404/405 (ingest isn't tunnelled; see §3 for why 401 proves nothing).
+      public host **with the READ_TOKEN and an `Origin: https://hub…` header** is 404/405 (ingest isn't tunnelled; see §3 for why 401 proves nothing).
 - [ ] **Hostname move** (§3a), in order: `hub` DNS + ingress first (`/healthz` 200 on `hub`), then the box
       `.env` (`APP_HOST=hub…`, `APP_LEGACY_HOSTS=dashboard…`), then the Mac's `INBOX_URL`.
       `https://dashboard.graham-williams.com/inbox?q=x` → **307** to `https://hub.graham-williams.com/inbox?q=x`

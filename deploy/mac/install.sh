@@ -152,6 +152,8 @@ if [[ -n "$WANT_INBOX" ]] && ! grep -q '^INBOX_CLAUDE_BIN=' "$ENV_FILE"; then
   echo "appended the drafting keys to $ENV_FILE"
 fi
 if [[ -n "$WANT_INBOX" ]]; then
+  # BSD stat on the Mac; GNU stat (CI) reads `-f` as "filesystem status" and prints junk.
+  file_mode() { if [[ "$(uname)" == Darwin ]]; then stat -f '%Lp' "$1"; else stat -c '%a' "$1"; fi; }
   CB="$(grep -m1 '^INBOX_CLAUDE_BIN=' "$ENV_FILE" | cut -d= -f2- || true)"
   TF="$(grep -m1 '^INBOX_CLAUDE_TOKEN_FILE=' "$ENV_FILE" | cut -d= -f2- || true)"
   if [[ -n "$CB" ]]; then
@@ -159,8 +161,8 @@ if [[ -n "$WANT_INBOX" ]]; then
       echo "WARN: no claude token file at ${TF:-<INBOX_CLAUDE_TOKEN_FILE unset>}. Run 'claude setup-token',"
       echo "      save the printed token in that file and chmod 600 it. Until then drafting fails the"
       echo "      inbox-transcribe heartbeat (transcription itself is unaffected)."
-    elif [[ "$(stat -f '%Lp' "$TF")" != "600" ]]; then
-      echo "WARN: $TF is mode $(stat -f '%Lp' "$TF"), not 600 — the worker refuses it: chmod 600 '$TF'"
+    elif [[ "$(file_mode "$TF")" != "600" ]]; then
+      echo "WARN: $TF is mode $(file_mode "$TF"), not 600 — the worker refuses it: chmod 600 '$TF'"
     else
       echo "claude token file OK ($TF, mode 600)"
     fi
