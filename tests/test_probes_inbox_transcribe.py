@@ -557,6 +557,15 @@ elif mode == "bad_request":
     error(400, "prompt is too long")
 elif mode == "garbage":
     print("segfault or something"); sys.exit(3)
+elif mode == "chatty_garbage":
+    print("MODEL SAYS A PRIVATE THING"); sys.stderr.write("boom line one\nline two\n"); sys.exit(1)
+elif mode == "max_turns":
+    d = dict(base, is_error=True, terminal_reason="max_turns", result="MODEL RAMBLING TEXT")
+    print(json.dumps(d)); sys.exit(1)
+elif mode == "usage_text":
+    d = dict(base, is_error=True, terminal_reason="error_during_execution",
+             result="Claude usage limit reached; resets at 5pm")
+    print(json.dumps(d)); sys.exit(1)
 elif mode == "sleep":
     time.sleep(5)
 '''
@@ -630,6 +639,8 @@ def _ditem(item_id, transcript="the wheel on km tracker sticks", **kw):
 def _denv(tmp_path, exe, **extra):
     if "INBOX_CLAUDE_TOKEN_FILE" not in extra:
         extra["INBOX_CLAUDE_TOKEN_FILE"] = _token_file(tmp_path)
+    # NEVER the real ~/.config/hopper-dashboard/draft-state.json.
+    extra.setdefault("INBOX_DRAFT_STATE", str(tmp_path / "draft-state.json"))
     return _env(tmp_path, INBOX_CLAUDE_BIN=exe, **extra)
 
 
@@ -658,6 +669,8 @@ def test_a_draft_is_made_with_a_locked_down_claude_and_posted_back(tmp_path, mon
     argv = call["argv"]
     # No tools, no MCP, no skills, no saved session, no customisations, JSON out + schema.
     assert argv[:2] == ["-p", "--safe-mode"]
+    # No settings files of any kind (user/project/local); verified to keep OAuth working.
+    assert argv[argv.index("--setting-sources") + 1] == ""
     i = argv.index("--tools")
     assert argv[i + 1] == ""
     for flag in ("--strict-mcp-config", "--no-session-persistence",
@@ -682,6 +695,7 @@ def test_a_draft_is_made_with_a_locked_down_claude_and_posted_back(tmp_path, mon
     env = call["env"]
     assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-FAKE-TOKEN"
     assert env["DISABLE_AUTOUPDATER"] == "1"
+    assert env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
     assert "INBOX_TOKEN" not in env and "INGEST_TOKEN" not in env
     (_, _, _, hb), = sent
     assert hb["status"] == "ok" and hb["metrics"]["drafted"] == 1
@@ -733,7 +747,8 @@ def test_a_bad_result_burns_that_notes_attempt_and_the_run_carries_on(
     api = DraftApi([_ditem(ID_A), _ditem(ID_B)])
     sent = _wire(monkeypatch, api)
     assert it.main(["--env", _denv(tmp_path, exe), "--quiet"]) == 0
-    (a_id, a_body), (b_id, b_body) = api.drafts()
+    # A's failure is HELD until B succeeds (the circuit breaker), so it is reported second.
+    (b_id, b_body), (a_id, a_body) = api.drafts()
     assert a_id == ID_A and a_body["failed"] is True and a_body["src_sha"] == "a" * 64
     assert b_id == ID_B and b_body["title"] == "Fix the wheel"
     assert sent[0][3]["metrics"]["draft_failed"] == 1
@@ -826,3 +841,87 @@ def test_the_draft_caps_match_the_server():
     assert inbox_draft.MAX_TITLE == inbox_db.DRAFT_MAX_TITLE
     assert inbox_draft.MAX_BODY == inbox_db.DRAFT_MAX_BODY
     assert inbox_draft.SCHEMA["properties"]["title"]["maxLength"] == inbox_db.DRAFT_MAX_TITLE
+
+
+
+# --- security-gate fixes to the drafter ------------------------------------------------
+def test_a_relative_claude_bin_is_refused_before_any_call(tmp_path, monkeypatch):
+    exe = _fake_claude(tmp_path, ["ok"])
+    api = DraftApi([_ditem(ID_A)])
+    sent = _wire(monkeypatch, api)
+    monkeypatch.chdir(os.path.dirname(exe))
+    assert it.main(["--env", _denv(tmp_path, "claude"), "--quiet"]) == 1
+    assert "absolute path" in sent[0][3]["note"]
+    assert _calls(exe) == [] and api.drafts() == []
+
+
+def test_unparseable_output_never_reaches_the_heartbeat(tmp_path, monkeypatch):
+    exe = _fake_claude(tmp_path, ["chatty_garbage"])
+    api = DraftApi([_ditem(ID_A)])
+    sent = _wire(monkeypatch, api)
+    assert it.main(["--env", _denv(tmp_path, exe), "--quiet"]) == 1
+    note = sent[0][3]["note"]
+    assert "MODEL SAYS" not in note and "PRIVATE" not in note
+    assert "rc 1" in note and "bytes of stdout" in note and "boom line one" in note
+    assert "line two" not in note
+    assert "PRIVATE" not in (tmp_path / "worker.log").read_text()
+
+
+@pytest.mark.parametrize("mode,systemic", [("max_turns", False), ("bad_request", False),
+                                           ("usage_text", True), ("expired", True),
+                                           ("limit", True), ("not_logged_in", True)])
+def test_only_narrow_errors_are_systemic(tmp_path, monkeypatch, mode, systemic):
+    exe = _fake_claude(tmp_path, [mode, "ok"])
+    api = DraftApi([_ditem(ID_A), _ditem(ID_B)])
+    sent = _wire(monkeypatch, api)
+    rc = it.main(["--env", _denv(tmp_path, exe), "--quiet"])
+    if systemic:
+        assert rc == 1 and api.drafts() == [] and len(_calls(exe)) == 1
+    else:
+        assert rc == 0
+        drafts = dict(api.drafts())
+        assert drafts[ID_A]["failed"] is True and drafts[ID_B]["title"] == "Fix the wheel"
+        assert "MODEL RAMBLING" not in drafts[ID_A]["error"]
+
+
+def test_the_circuit_breaker_stops_after_two_failures_with_no_success(tmp_path, monkeypatch):
+    exe = _fake_claude(tmp_path, ["no_structured", "no_structured", "ok"])
+    api = DraftApi([_ditem(ID_A), _ditem(ID_B), _ditem(ID_C)])
+    sent = _wire(monkeypatch, api)
+    assert it.main(["--env", _denv(tmp_path, exe), "--quiet"]) == 1
+    assert api.drafts() == []                     # nothing burned
+    assert len(_calls(exe)) == 2                  # stopped before the third note
+    assert "circuit breaker" in sent[0][3]["note"]
+
+
+def test_a_lone_bad_note_is_still_burned_when_the_queue_runs_out(tmp_path, monkeypatch):
+    exe = _fake_claude(tmp_path, ["no_structured"])
+    api = DraftApi([_ditem(ID_A)])
+    sent = _wire(monkeypatch, api)
+    assert it.main(["--env", _denv(tmp_path, exe), "--quiet"]) == 0
+    ((item_id, body),) = api.drafts()
+    assert item_id == ID_A and body["failed"] is True
+
+
+def test_a_note_that_times_out_twice_running_burns_an_attempt(tmp_path, monkeypatch):
+    exe = _fake_claude(tmp_path, ["sleep"])
+    api = DraftApi([_ditem(ID_A)])
+    sent = _wire(monkeypatch, api)
+    env = _denv(tmp_path, exe, INBOX_DRAFT_TIMEOUT="1")
+    assert it.main(["--env", env, "--quiet"]) == 1          # first time: systemic
+    assert api.drafts() == []
+    state = json.loads((tmp_path / "draft-state.json").read_text())
+    assert state == {"timed_out": ID_A}
+    assert it.main(["--env", env, "--quiet"]) == 0          # same note again: its fault
+    ((item_id, body),) = api.drafts()
+    assert item_id == ID_A and body["failed"] and "two consecutive runs" in body["error"]
+    assert json.loads((tmp_path / "draft-state.json").read_text()) == {"timed_out": None}
+
+
+def test_a_timeout_on_a_different_note_is_systemic_again(tmp_path, monkeypatch):
+    exe = _fake_claude(tmp_path, ["sleep"])
+    (tmp_path / "draft-state.json").write_text(json.dumps({"timed_out": ID_B}))
+    api = DraftApi([_ditem(ID_A)])
+    _wire(monkeypatch, api)
+    assert it.main(["--env", _denv(tmp_path, exe, INBOX_DRAFT_TIMEOUT="1"), "--quiet"]) == 1
+    assert api.drafts() == []

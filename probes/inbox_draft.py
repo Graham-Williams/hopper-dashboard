@@ -8,9 +8,9 @@ outcome Graham wants, and a PROJECT picked from the known list (or none). It run
 ``POST /api/v1/inbox/items/<id>/draft``. The draft is stored ALONGSIDE the note; Graham reads
 and edits it on /inbox, and ticking Reviewed copies it into the note.
 
-PRIVACY: the TRANSCRIPT TEXT is sent to Anthropic (Claude) by this module. The audio never is
-— it stays on the box and this Mac. Nothing else about the note is sent beyond its manual
-title and project hint, plus the list of project names.
+PRIVACY: the TRANSCRIPT and the TITLE (a manual title, when Graham typed one) are sent to
+Anthropic (Claude) by this module. The audio never is — it stays on the box and this Mac. Nothing
+else about the note is sent beyond its project hint and the list of project names.
 
   GET  /api/v1/inbox/draft/queue          → items to draft + known_projects
   POST /api/v1/inbox/items/<id>/draft     → {"title","body","project","src_sha","model"}
@@ -20,13 +20,15 @@ The ``claude -p`` call (verified against Claude Code 2.1.283, see DEPLOY.md §4)
 
   * argv is a LIST, no shell. No tools (``--tools ""``), no MCP servers from any config
     (``--strict-mcp-config``), no skills, no session saved to disk, no user/project
-    customisations (``--safe-mode``), our own system prompt. NEVER ``--bare``: it ignores
+    customisations (``--safe-mode``), no settings files at all (``--setting-sources ""``,
+    verified to keep OAuth working), our own system prompt. NEVER ``--bare``: it ignores
     OAuth, and the credential here is an OAuth token. Never any ``--dangerously-*`` flag.
   * The transcript goes in on STDIN as JSON, framed as data, never on the command line.
   * It runs in an empty temp directory, with an ALLOWLISTED environment
     (``common.minimal_env``) plus ``CLAUDE_CODE_OAUTH_TOKEN`` read from a 0600 file
     (``INBOX_CLAUDE_TOKEN_FILE``, made once with ``claude setup-token``) and
-    ``DISABLE_AUTOUPDATER=1``. None of our own tokens reach the child.
+    ``DISABLE_AUTOUPDATER=1`` + ``CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1``. None of our own
+    tokens reach the child.
   * ``--output-format json`` prints ONE result envelope on stdout. On success it has
     ``is_error: false`` and the schema-validated object in ``structured_output``. On any API
     problem it has ``is_error: true``, ``terminal_reason: "api_error"``, ``api_error_status``
@@ -34,11 +36,16 @@ The ``claude -p`` call (verified against Claude Code 2.1.283, see DEPLOY.md §4)
     "success", so it is never used to decide anything.
 
 Two kinds of failure, and the difference is load-bearing (same rule as Whisper's
-EnvironmentFault): a SYSTEMIC failure (binary missing, not logged in, token expired, usage
-limit, 5xx, timeout, unreadable output) stops drafting for the run, burns NO attempt and
-fails the heartbeat — otherwise one expired token would mark every queued note "couldn't
-draft". Only a BAD RESULT for one note (structured output missing or invalid, or a 400/413
-that is about this request) burns one of that note's three attempts.
+EnvironmentFault): a SYSTEMIC failure stops drafting for the run, burns NO attempt and fails the
+heartbeat — otherwise one expired token would mark every queued note "couldn't draft". Systemic
+is NARROW: the binary missing or not runnable, output that is not a result envelope at all, an
+auth failure or usage limit, or an ``api_error`` whose status is not 400/413. EVERYTHING ELSE is
+a BAD RESULT for that one note (any other ``is_error``, a 400/413, missing or invalid structured
+output), which may burn one of its three attempts. The worker adds two brakes on top
+(``inbox_transcribe.run_drafting``): a CIRCUIT BREAKER (no successes yet and two bad results in
+a run → stop, burn nothing, fail the heartbeat, because that is what a systemic fault that looks
+per-note does) and a TIMEOUT rule (a timeout is systemic, unless the same note also timed out in
+the previous run, when it becomes that note's bad result).
 
 Stdlib only, Python 3.9-clean. Never import an Anthropic SDK here: the ``claude`` CLI is
 subprocessed, exactly as Whisper is.
@@ -109,6 +116,11 @@ class BadResult(Exception):
     """This note's draft came back unusable. Burns one of its attempts."""
 
 
+class DraftTimeout(SystemicFailure):
+    """claude did not answer in time. Systemic, unless the same note timed out last run too
+    (the worker decides that, from its small state file)."""
+
+
 # ---------------------------------------------------------------------------
 # Building the call
 # ---------------------------------------------------------------------------
@@ -117,6 +129,7 @@ def build_argv(claude_bin: str, model: str = DEFAULT_MODEL) -> List[str]:
     return [
         claude_bin, "-p",
         "--safe-mode",
+        "--setting-sources", "",
         "--tools", "",
         "--strict-mcp-config",
         "--no-session-persistence",
@@ -171,7 +184,7 @@ def read_token(path: str) -> str:
 def child_env(minimal_env, token: str) -> Dict[str, str]:
     """``minimal_env`` (the allowlist) plus exactly what claude needs. Passed in so this
     module keeps no import of ``probes.common`` and stays unit-testable on its own."""
-    extra = {"DISABLE_AUTOUPDATER": "1"}
+    extra = {"DISABLE_AUTOUPDATER": "1", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"}
     if token:
         extra["CLAUDE_CODE_OAUTH_TOKEN"] = token
     return minimal_env(extra)
@@ -201,32 +214,61 @@ def _one_line(text: str) -> str:
     return " ".join(text.replace("\x00", " ").split())
 
 
+#: An ``is_error`` result whose message says one of these is the CREDENTIAL's or the
+#: ACCOUNT's problem, whatever ``terminal_reason`` says. Lower-cased substrings.
+SYSTEMIC_MARKERS = ("not logged in", "failed to authenticate", "usage limit",
+                    "rate limit", "credit balance")
+#: Statuses that are never one note's fault: auth, forbidden, rate/usage limit.
+SYSTEMIC_STATUSES = frozenset((401, 403, 429))
+
+
+def _first_line(text: str, limit: int = 120) -> str:
+    for line in (text or "").splitlines():
+        line = _one_line(line)
+        if line:
+            return line[:limit]
+    return ""
+
+
 def parse_envelope(rc: int, stdout: str, stderr: str) -> Dict[str, object]:
-    """The structured output, or ``SystemicFailure`` / ``BadResult``. See the module docstring
-    for which is which; the envelope shape was recorded from the real CLI."""
+    """The structured output, or ``SystemicFailure`` / ``DraftTimeout`` / ``BadResult``. See
+    the module docstring for which is which; the envelope shape was recorded from the real CLI.
+
+    No message raised here ever carries stdout: it can hold MODEL OUTPUT, and these messages
+    end up in the Mac log and the heartbeat. Only the rc, a byte count, the envelope's own
+    status fields and one capped line of stderr are used."""
     if rc == -2:
-        raise SystemicFailure("claude binary could not be run: %s" % _one_line(stderr)[:200])
+        raise SystemicFailure("claude binary could not be run: %s" % _first_line(stderr))
     if rc == -1:
-        raise SystemicFailure("claude timed out")
+        raise DraftTimeout("claude timed out")
     try:
         env = json.loads(stdout.strip().splitlines()[-1] if stdout.strip() else "")
     except (ValueError, IndexError):
-        raise SystemicFailure("claude printed no JSON result (rc %d): %s"
-                              % (rc, _one_line(stderr or stdout)[:200]))
+        env = None
     if not isinstance(env, dict):
-        raise SystemicFailure("claude result was not an object")
+        raise SystemicFailure("claude printed no JSON result (rc %d, %d bytes of stdout)%s"
+                              % (rc, len(stdout or ""),
+                                 (": " + _first_line(stderr)) if _first_line(stderr) else ""))
     if env.get("is_error"):
         status = env.get("api_error_status")
-        message = _one_line(str(env.get("result") or ""))[:200]
-        if isinstance(status, int) and status in ITEM_ERROR_STATUSES:
-            raise BadResult("request rejected (HTTP %d): %s" % (status, message))
-        raise SystemicFailure("claude error (%s): %s"
-                              % (status if status is not None else "no status", message))
-    if rc != 0:
-        raise SystemicFailure("claude exited %d without reporting an error" % rc)
+        status = status if isinstance(status, int) else None
+        reason = str(env.get("terminal_reason") or "")
+        message = str(env.get("result") or "")
+        lowered = message.lower()
+        if (status in SYSTEMIC_STATUSES
+                or any(m in lowered for m in SYSTEMIC_MARKERS)
+                or (reason == "api_error" and status not in ITEM_ERROR_STATUSES)):
+            raise SystemicFailure("claude error (%s, %s): %s"
+                                  % (reason or "no reason",
+                                     status if status is not None else "no status",
+                                     _one_line(message)[:200]))
+        # Per note. The message is NOT included: outside an api_error it can be model text.
+        raise BadResult("claude reported an error for this note (%s, %s)"
+                        % (reason or "no reason",
+                           status if status is not None else "no status"))
     out = env.get("structured_output")
     if not isinstance(out, dict):
-        raise BadResult("no structured output in the result")
+        raise BadResult("no structured output in the result (rc %d)" % rc)
     return out
 
 

@@ -18,9 +18,10 @@ transcription it drafts up to INBOX_DRAFT_LIMIT (5) notes with `claude -p`:
   POST /api/v1/inbox/items/<id>/draft   → {"title","body","project","src_sha","model"}
                                    ...or  {"failed": true, "error", "src_sha"}
 
-The TRANSCRIPT TEXT goes to Anthropic in that phase; the audio never leaves the box and this Mac.
-A systemic drafting failure (claude missing, not logged in, limit, 5xx, timeout) fails the
-heartbeat and burns no note's attempt; see inbox_draft's docstring.
+The TRANSCRIPT and TITLE go to Anthropic in that phase; the audio never leaves the box and this
+Mac. A systemic drafting failure (claude missing, not logged in, limit, 5xx) fails the heartbeat
+and burns no note's attempt; a circuit breaker and a two-run timeout rule sit on top — see
+run_drafting and inbox_draft's docstring.
 
 TWO CREDENTIALS, TWO HOSTS, and mixing them up is the most likely mistake here:
   * INBOX_URL  + INBOX_TOKEN   → the PUBLIC host (hub.graham-williams.com), Inbox API. NOT the
@@ -68,6 +69,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from probes import inbox_draft  # noqa: E402
 from probes.common import (  # noqa: E402
     DEFAULT_ENV_FILE,
+    DEFAULT_STATE_FILE,
     HTTP_TIMEOUT_S,
     Logger,
     ProbeError,
@@ -195,6 +197,10 @@ def load_settings(env_path: str) -> Dict[str, str]:
         "INBOX_DRAFT_MODEL": inbox_draft.DEFAULT_MODEL,
         "INBOX_DRAFT_LIMIT": str(inbox_draft.DEFAULT_LIMIT),
         "INBOX_DRAFT_TIMEOUT": str(inbox_draft.DEFAULT_TIMEOUT_S),
+        # Which note timed out LAST run (the two-consecutive-timeouts rule). Next to the
+        # hourly probe's state.json.
+        "INBOX_DRAFT_STATE": os.path.join(os.path.dirname(DEFAULT_STATE_FILE),
+                                          "draft-state.json"),
     }
     for k, v in defaults.items():
         cfg.setdefault(k, v)
@@ -476,15 +482,44 @@ def post_draft(cfg: Dict[str, str], item_id: str, body: Dict[str, object]) -> No
              timeout=float(cfg["INBOX_HTTP_TIMEOUT"]))
 
 
+#: Circuit breaker: this many bad results in a run with NO success stops drafting and burns
+#: nothing — a fault that looks per-note but hits every note is really systemic.
+BREAKER_FAILURES = 2
+
+
+def _load_draft_state(path: str) -> Dict[str, object]:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        return doc if isinstance(doc, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_draft_state(path: str, doc: Dict[str, object]) -> None:
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = path + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh)
+        os.replace(tmp, path)
+    except OSError:
+        pass                      # losing it only delays the two-run timeout rule
+
+
 def run_drafting(cfg: Dict[str, str], log: Logger, dry_run: bool,
                  runner=None) -> Tuple[Dict[str, int], Optional[str]]:
     """Draft up to INBOX_DRAFT_LIMIT transcribed notes. Returns ``(counts, fatal)``.
 
-    A no-op unless INBOX_CLAUDE_BIN is set. ``fatal`` is set for a SYSTEMIC failure (claude
-    missing / not logged in / limit / 5xx / timeout, or the Inbox API refusing us): drafting
-    stops at once, no note's attempt is burned, and the caller fails the heartbeat. A bad
-    result for one note is reported as that note's failed attempt and the run carries on.
-    A 409 (the transcript changed, or Graham edited/reviewed it meanwhile) is simply skipped.
+    A no-op unless INBOX_CLAUDE_BIN is set (and it must be an ABSOLUTE path). ``fatal`` is set
+    for a SYSTEMIC failure, a tripped circuit breaker, or a first timeout: drafting stops at
+    once, nothing is burned, and the caller fails the heartbeat.
+
+    Bad results are HELD while the run has no success yet: the first success (or the end of
+    the queue) reports them as those notes' failed attempts; a second one before any success
+    trips the breaker and they are dropped unreported. A 409 (the transcript changed, or
+    Graham edited or reviewed it meanwhile) is skipped.
     """
     counts = {"drafted": 0, "draft_failed": 0, "draft_skipped": 0}
     claude_bin = (cfg.get("INBOX_CLAUDE_BIN") or "").strip()
@@ -494,7 +529,30 @@ def run_drafting(cfg: Dict[str, str], log: Logger, dry_run: bool,
     if limit <= 0:
         return counts, None
     model = (cfg.get("INBOX_DRAFT_MODEL") or inbox_draft.DEFAULT_MODEL).strip()
+    state_path = cfg.get("INBOX_DRAFT_STATE") or ""
+    last_timeout = _load_draft_state(state_path).get("timed_out") if state_path else None
+    this_timeout: Optional[str] = None
+    held: List[Tuple[str, str, str]] = []          # (item_id, detail, sha) not yet reported
+    successes = 0
+
+    def report(item_id: str, detail: str, sha: str) -> None:
+        try:
+            post_draft(cfg, item_id, {"failed": True, "error": detail, "src_sha": sha})
+        except ProbeError as pe:
+            if is_auth_failure(pe):
+                raise
+            log.error("%s: failure report not delivered: %s"
+                      % (item_id, flatten_for_log(pe, 200)))
+
+    def flush() -> None:
+        while held:
+            report(*held.pop(0))
+
+    fatal: Optional[str] = None
     try:
+        if not os.path.isabs(claude_bin):
+            raise inbox_draft.SystemicFailure(
+                "INBOX_CLAUDE_BIN %r must be an absolute path" % claude_bin)
         items, known = fetch_draft_queue(cfg, limit)
         log.log("draft queue: %d item(s)%s" % (len(items), " [dry-run]" if dry_run else ""))
         if dry_run:
@@ -503,31 +561,38 @@ def run_drafting(cfg: Dict[str, str], log: Logger, dry_run: bool,
                         % (item["id"], len(str(item.get("transcript") or ""))))
             counts["draft_skipped"] = len(items[:limit])
             return counts, None
-        if not items:
-            return counts, None
-        if not (os.path.isfile(claude_bin) and os.access(claude_bin, os.X_OK)):
-            raise inbox_draft.SystemicFailure(
-                "INBOX_CLAUDE_BIN %r is not an executable file" % claude_bin)
-        token = inbox_draft.read_token(cfg.get("INBOX_CLAUDE_TOKEN_FILE") or "")
-        env = inbox_draft.child_env(minimal_env, token)
-        timeout = float(_int(cfg, "INBOX_DRAFT_TIMEOUT", inbox_draft.DEFAULT_TIMEOUT_S))
+        if items:
+            if not (os.path.isfile(claude_bin) and os.access(claude_bin, os.X_OK)):
+                raise inbox_draft.SystemicFailure(
+                    "INBOX_CLAUDE_BIN %r is not an executable file" % claude_bin)
+            token = inbox_draft.read_token(cfg.get("INBOX_CLAUDE_TOKEN_FILE") or "")
+            env = inbox_draft.child_env(minimal_env, token)
+            timeout = float(_int(cfg, "INBOX_DRAFT_TIMEOUT", inbox_draft.DEFAULT_TIMEOUT_S))
         for item in items[:limit]:
             item_id = str(item["id"])
+            bad: Optional[str] = None
             try:
                 draft = inbox_draft.draft_one(claude_bin, model, item, known, env,
                                               timeout=timeout, runner=runner)
+            except inbox_draft.DraftTimeout:
+                if last_timeout == item_id:
+                    bad = "claude timed out on this note in two consecutive runs"
+                else:
+                    this_timeout = item_id
+                    raise
             except inbox_draft.BadResult as e:
-                detail = flatten_for_log(e, 200)
-                log.error("%s: draft unusable: %s" % (item_id, detail))
+                bad = flatten_for_log(e, 200)
+            if bad is not None:
+                log.error("%s: draft unusable: %s" % (item_id, bad))
                 counts["draft_failed"] += 1
-                try:
-                    post_draft(cfg, item_id, {"failed": True, "error": detail,
-                                              "src_sha": item["sha"]})
-                except ProbeError as pe:
-                    if is_auth_failure(pe):
-                        raise
-                    log.error("%s: failure report not delivered: %s"
-                              % (item_id, flatten_for_log(pe, 200)))
+                if successes:
+                    report(item_id, bad, item["sha"])
+                    continue
+                held.append((item_id, bad, item["sha"]))
+                if len(held) >= BREAKER_FAILURES:
+                    raise inbox_draft.SystemicFailure(
+                        "circuit breaker: %d notes failed and none succeeded this run — "
+                        "nothing counted against them" % len(held))
                 continue
             body = dict(draft)
             body.update({"src_sha": item["sha"], "model": model})
@@ -543,19 +608,24 @@ def run_drafting(cfg: Dict[str, str], log: Logger, dry_run: bool,
                 log.error("%s: draft not stored: %s" % (item_id, flatten_for_log(pe, 200)))
                 counts["draft_failed"] += 1
                 continue
+            successes += 1
             counts["drafted"] += 1
             log.log("%s: drafted (%d-char title, %d-char body%s)"
                     % (item_id, len(draft["title"]), len(draft["body"]),
                        ", project %s" % draft["project"] if draft["project"] else ""))
+            flush()                # a success proves drafting works: held failures are real
+        flush()                    # queue exhausted without tripping the breaker
     except inbox_draft.SystemicFailure as e:
+        held.clear()               # a systemic run burns nothing
         fatal = "drafting: %s" % flatten_for_log(e, 300)
         log.error(fatal)
-        return counts, fatal
     except ProbeError as e:
+        held.clear()
         fatal = "drafting: %s" % flatten_for_log(e, 300)
         log.error(fatal)
-        return counts, fatal
-    return counts, None
+    if state_path and not dry_run:
+        _save_draft_state(state_path, {"timed_out": this_timeout})
+    return counts, fatal
 
 
 # ---------------------------------------------------------------------------
