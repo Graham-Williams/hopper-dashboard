@@ -21,6 +21,8 @@ route                                        auth    notes
 ``GET  /inbox/audio/<id>``                   S | I
 ``GET  /api/v1/inbox/transcribe/queue``      I
 ``POST /api/v1/inbox/items/<id>/transcript`` I
+``GET  /api/v1/inbox/draft/queue``           I
+``POST /api/v1/inbox/items/<id>/draft``      I
 ``POST /api/v1/inbox/items/<id>/issues``     I
 ``POST /api/v1/inbox/mirror/backlog``        I
 ===========================================  ======  =====================
@@ -44,6 +46,7 @@ microphone to Google/Apple and was removed for exactly that reason.
 from __future__ import annotations
 
 import logging
+import re
 import time
 
 from flask import (Blueprint, current_app, jsonify, redirect, render_template,
@@ -63,6 +66,8 @@ MACHINE_ENDPOINTS = frozenset({
     "inbox.audio",
     "inbox.transcribe_queue",
     "inbox.post_transcript",
+    "inbox.draft_queue",
+    "inbox.post_draft",
     "inbox.post_issues",
     "inbox.mirror_backlog",
 })
@@ -88,6 +93,8 @@ MAX_BACKLOG_ITEMS = 2000
 AUDIO_BYTES_PER_SEC = 48000 // 8
 QUEUE_MAX = 50
 TRANSCRIBE_MAX_ATTEMPTS = 3
+DRAFT_QUEUE_MAX = 20
+SHA_RE = re.compile(r"^[0-9a-f]{64}\Z")
 
 
 def _settings():
@@ -233,6 +240,10 @@ def item_json(row: dict, issues: list[dict] | None = None) -> dict:
     awaiting_filing = bool(
         row["reviewed"] and row["state"] == "open" and not row["archived_at"]
         and row["source"] in inbox_db.LOCAL_SOURCES and not issues)
+    needs_review = bool(
+        row["source"] == "voice" and row["state"] == "open"
+        and not row["archived_at"] and not row["reviewed"]
+        and row.get("draft_status") in (inbox_db.DRAFT_READY, inbox_db.DRAFT_FAILED))
     return {
         "id": row["id"],
         "source": row["source"],
@@ -258,6 +269,19 @@ def item_json(row: dict, issues: list[dict] | None = None) -> dict:
         "mirror_url": row["mirror_url"],
         "awaiting_filing": awaiting_filing,
         "awaiting_transcription": awaiting_transcription,
+        "needs_review": needs_review,
+        # The AI draft (voice notes). Held ALONGSIDE the note: ticking Reviewed
+        # copies title/project across; `body` above stays the transcript.
+        "draft": {
+            "title": row.get("draft_title"),
+            "body": row.get("draft_body"),
+            "project": row.get("draft_project"),
+            "status": row.get("draft_status"),
+            "at": row.get("draft_at"),
+            "attempts": int(row.get("draft_attempts") or 0),
+            "model": row.get("draft_model"),
+            "edited_at": row.get("draft_edited_at"),
+        },
         "issues": [{"repo": i["repo"], "number": i["number"], "url": i["url"],
                     "title": i["title"], "state": i["state"]} for i in issues],
     }
@@ -482,7 +506,8 @@ def patch_item(item_id: str):
     doc = request.get_json(silent=True)
     if not isinstance(doc, dict):
         return _err("body must be a JSON object")
-    unknown = sorted(set(doc) - {"reviewed", "title", "project", "body", "state"})
+    unknown = sorted(set(doc) - {"reviewed", "title", "project", "body", "state",
+                                 *inbox_db.DRAFT_FIELDS})
     if unknown:
         return _err(f"unknown field(s): {', '.join(unknown)}")
     changes: dict = {}
@@ -507,6 +532,16 @@ def patch_item(item_id: str):
             changes["project"] = clean_project(doc["project"])
         except ValueError as exc:
             return _err(str(exc))
+    for key in ("draft_title", "draft_body"):
+        if key in doc:
+            if not isinstance(doc[key], str):
+                return _err(f"{key} must be a string")
+            changes[key] = doc[key]
+    if "draft_project" in doc:
+        try:
+            changes["draft_project"] = clean_project(doc["draft_project"])
+        except ValueError as exc:
+            return _err(str(exc))
     conn = _conn()
     try:
         current = inbox_db.get_item(conn, item_id)
@@ -518,6 +553,9 @@ def patch_item(item_id: str):
         # stays allowed everywhere, so a legacy tick can always be undone.
         if changes.get("reviewed") is True and current["source"] != "voice":
             return _err("only a voice note can be marked reviewed")
+        if (any(k in changes for k in inbox_db.DRAFT_FIELDS)
+                and current["source"] != "voice"):
+            return _err("only a voice note has a draft")
         with conn:
             row = inbox_db.update_item(conn, item_id, changes)
         if row is None:
@@ -687,6 +725,126 @@ def post_transcript(item_id: str):
                 conn, item_id, text=text,
                 status=inbox_db.TRANSCRIPT_WHISPER,
                 metrics={"duration_s": _float_or_none(doc.get("duration_s"))})
+        return jsonify(item_json(row))
+    finally:
+        conn.close()
+
+
+def known_projects(conn) -> list[str]:
+    """What the drafter may choose a project from: the repo NAMES of
+    ``INBOX_GITHUB_REPOS`` (the same projection the GitHub mirror uses) plus
+    every project already on the board."""
+    from .github_mirror import _project_for
+    names = {p for p in (_project_for(r) for r in _settings().inbox_github_repos) if p}
+    names.update(inbox_db.projects(conn))
+    return sorted(names)
+
+
+@bp.get("/api/v1/inbox/draft/queue")
+def draft_queue():
+    """I. The Mac's drafting worker asks what to draft. Oldest first; includes
+    the backfill (transcribed notes that have never had a draft) and notes
+    whose transcript changed since their draft (stale ``sha``).
+
+    ``transcript`` is the note's body, and it is the ONLY note text that leaves
+    for Anthropic — the audio never does. ``sha`` must be echoed back on POST so
+    a draft made from an old transcript is refused rather than stored.
+    """
+    denied = _require_inbox_token()
+    if denied is not None:
+        return denied
+    try:
+        limit = int(request.args.get("limit", 5))
+    except (TypeError, ValueError):
+        limit = 5
+    conn = _conn()
+    try:
+        rows = inbox_db.draft_queue(conn, limit=max(1, min(limit, DRAFT_QUEUE_MAX)))
+        projects = known_projects(conn)
+    finally:
+        conn.close()
+    return jsonify({
+        "generated_at": inbox_db.now_iso(),
+        "max_attempts": inbox_db.DRAFT_MAX_ATTEMPTS,
+        "max_title": inbox_db.DRAFT_MAX_TITLE,
+        "max_body": inbox_db.DRAFT_MAX_BODY,
+        "known_projects": projects,
+        "items": [{
+            "id": r["id"],
+            "transcript": r["body"],
+            "manual_title": r["title"] if r["title_source"] == "manual" else None,
+            "project": r["draft_project"] or r["project"],
+            "sha": r["sha"],
+        } for r in rows],
+    })
+
+
+@bp.post("/api/v1/inbox/items/<item_id>/draft")
+def post_draft(item_id: str):
+    """I. The Mac posts a draft, or a failed attempt.
+
+    ``{"title", "body", "project", "src_sha", "model"}`` stores it;
+    ``{"failed": true, "error": "…", "src_sha": …}`` counts one bad result (the
+    note becomes ``failed`` after ``DRAFT_MAX_ATTEMPTS``). A stale ``src_sha``
+    (the transcript changed since the queue handed it out) is a 409 and burns
+    NO attempt; so are a reviewed note and one whose draft Graham edited —
+    nothing a machine sends may overwrite either.
+
+    Title is capped at DRAFT_MAX_TITLE and made one line, body at
+    DRAFT_MAX_BODY, both through clean_text. A project not in
+    ``known_projects`` becomes NULL rather than inventing a label.
+    """
+    denied = _require_inbox_token()
+    if denied is not None:
+        return denied
+    doc = request.get_json(silent=True)
+    if not isinstance(doc, dict):
+        return _err("body must be a JSON object")
+    src_sha = doc.get("src_sha")
+    if src_sha is not None and (not isinstance(src_sha, str)
+                                or not SHA_RE.match(src_sha)):
+        return _err("src_sha must be 64 lowercase hex characters")
+    conn = _conn()
+    try:
+        row = inbox_db.get_item(conn, item_id)
+        if row is None:
+            return _err("no such item", 404)
+        if row["source"] != "voice":
+            return _err("only a voice note has a draft", 409)
+        if row["reviewed"] or row.get("draft_edited_at"):
+            return _err("the note is reviewed or its draft was edited", 409)
+        if src_sha is not None and src_sha != inbox_db.transcript_sha(row["body"]):
+            return _err("stale: the transcript changed since it was queued", 409)
+        if doc.get("failed"):
+            with conn:
+                row = inbox_db.note_draft_attempt(conn, item_id)
+            reason = inbox_db.clean_text(doc.get("error"), 200)
+            reason = reason.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+            log.warning("draft failed for %s: %s", item_id, reason)
+            return jsonify(item_json(row))
+        if src_sha is None:
+            return _err("src_sha is required")
+        title = doc.get("title")
+        body = doc.get("body")
+        if not isinstance(title, str) or not inbox_db.clean_draft_title(title):
+            return _err("title is required (or send failed: true)")
+        if not isinstance(body, str):
+            return _err("body must be a string")
+        project = doc.get("project")
+        try:
+            project = clean_project(project) if isinstance(project, str) else None
+        except ValueError:
+            project = None
+        if project is not None and project not in known_projects(conn):
+            project = None
+        model = doc.get("model") if isinstance(doc.get("model"), str) else None
+        try:
+            with conn:
+                row = inbox_db.set_draft(conn, item_id, title=title, body=body,
+                                         project=project, src_sha=src_sha,
+                                         model=model)
+        except inbox_db.DraftRefused as exc:
+            return _err(f"refused: {exc.reason}", 409)
         return jsonify(item_json(row))
     finally:
         conn.close()
