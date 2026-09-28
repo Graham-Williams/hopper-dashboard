@@ -42,6 +42,10 @@
       clock shows measured minutes-remaining and a progress bar shows the fill,
       because “2 MB” tells nobody how long they may talk.
 
+   The page does not talk to Anthropic either. The Mac, not the browser, sends
+   the TRANSCRIPT TEXT (never the audio) to Claude to draft each note; this file
+   only lets Graham edit that draft (PATCH, same origin).
+
    And the page must degrade: with JavaScript off the table, the filters and
    the typed-note form all still work. Only the microphone needs this file. */
 (function () {
@@ -519,6 +523,79 @@
   }
 
   /* ------------------------------------------------------------------ */
+  /* Edit a voice note's draft                                          */
+  /* ------------------------------------------------------------------ */
+
+  /* The form is rendered server-side, hidden, inside each voice row. This only
+     shows/hides it and PATCHes its three fields; on success the page reloads so
+     the row is re-rendered by Jinja (the same rule capture follows). Nothing
+     here builds markup or reads a value back into the DOM. */
+  var editors = document.querySelectorAll('.edit-draft');
+  for (var ed = 0; ed < editors.length; ed++) {
+    (function (btn) {
+      var id = btn.getAttribute('data-id');
+      var formEl = document.getElementById('edit-' + id);
+      if (!formEl) { return; }
+      btn.hidden = false;          // only shown once it actually works
+      var cancel = formEl.querySelector('.edit-cancel');
+      var save = formEl.querySelector('.edit-save');
+      function field(name) {
+        var input = formEl.querySelector('[name="' + name + '"]');
+        return input ? String(input.value || '') : '';
+      }
+      function close() {
+        formEl.hidden = true;
+        btn.hidden = false;
+        btn.setAttribute('aria-expanded', 'false');
+      }
+      btn.addEventListener('click', function () {
+        formEl.hidden = false;
+        btn.hidden = true;
+        btn.setAttribute('aria-expanded', 'true');
+        var first = formEl.querySelector('[name="draft_title"]');
+        if (first && first.focus) { first.focus(); }
+      });
+      if (cancel) {
+        cancel.addEventListener('click', function () {
+          /* Put the fields back to what the server rendered, so a cancelled
+             edit cannot be saved by accident later. */
+          if (formEl.reset) { formEl.reset(); }
+          close();
+        });
+      }
+      formEl.addEventListener('submit', function (event) {
+        event.preventDefault();
+        fail('');
+        var project = field('draft_project').trim();
+        if (save) { save.disabled = true; }
+        window.fetch('/api/v1/inbox/items/' + encodeURIComponent(id), {
+          method: 'PATCH',
+          credentials: 'same-origin',
+          headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
+          body: JSON.stringify({draft_title: field('draft_title'),
+                                draft_body: field('draft_body'),
+                                draft_project: project || null})
+        }).then(function (response) {
+          return response.json().catch(function () { return {}; }).then(function (body) {
+            if (!response.ok) {
+              throw new Error(body.error || ('save failed (' + response.status + ')'));
+            }
+            close();
+            window.location.reload();
+          });
+        }).catch(function (err) {
+          /* Keep the form open with what was typed: an edit is never thrown
+             away because the network blinked. */
+          fail('Could not save that draft — ' +
+               (err && err.message ? err.message : 'check your connection.'));
+        }).then(function () {
+          if (save) { save.disabled = false; }
+        });
+      });
+    })(editors[ed]);
+  }
+
+  /* ------------------------------------------------------------------ */
   /* Delete (the only way a recording of Graham's voice leaves the box)  */
   /* ------------------------------------------------------------------ */
 
@@ -560,7 +637,7 @@
   var q = document.getElementById('filter-q');
   var source = document.getElementById('filter-source');
   var state = document.getElementById('filter-state');
-  var awaiting = document.getElementById('filter-awaiting');
+  var review = document.getElementById('filter-review');
   var countEl = document.getElementById('filter-count');
 
   function matches(row) {
@@ -574,10 +651,8 @@
     if (state && state.value && row.getAttribute('data-state') !== state.value) {
       return false;
     }
-    if (awaiting && awaiting.value) {
-      var key = awaiting.value === 'filing'
-        ? 'data-awaiting-filing' : 'data-awaiting-transcription';
-      if (row.getAttribute(key) !== '1') { return false; }
+    if (review && review.checked && row.getAttribute('data-needs-review') !== '1') {
+      return false;
     }
     return true;
   }
@@ -601,6 +676,6 @@
     if (q) { q.addEventListener('input', applyFilter); }
     if (source) { source.addEventListener('change', applyFilter); }
     if (state) { state.addEventListener('change', applyFilter); }
-    if (awaiting) { awaiting.addEventListener('change', applyFilter); }
+    if (review) { review.addEventListener('change', applyFilter); }
   }
 })();

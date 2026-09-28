@@ -37,10 +37,14 @@ GitHub, lines from backlog.txt. It is escaped at render (Jinja autoescape for
 HTML, ``jsonify`` for JSON) and the page's JS uses ``textContent`` only — there
 is no path from a stored string to markup.
 
-**Voice notes never leave the box.** Audio is uploaded to this origin, stored
-as a file on the data volume, and transcribed locally by Whisper on Graham's
-Mac. The browser speech API that used to produce a live transcript streamed the
-microphone to Google/Apple and was removed for exactly that reason.
+**Audio stays on this box and your Mac. The transcript text — not the audio —
+is sent from the Mac to Anthropic (Claude) to draft the item.** Audio is
+uploaded to this origin, stored as a file on the data volume, and transcribed
+locally by Whisper on Graham's Mac; the Mac then drafts a title and description
+from the transcript with ``claude -p`` (``probes/inbox_draft.py``) and posts the
+draft back here. The browser speech API that used to produce a live transcript
+streamed the microphone to Google/Apple and was removed for exactly that
+reason; the browser still talks to nothing but this origin.
 """
 
 from __future__ import annotations
@@ -333,6 +337,7 @@ def board():
     conn = _conn()
     try:
         page = _load_page(conn, _list_args(request.args))
+        page["projects"] = known_projects(conn)     # the datalists' suggestions
     finally:
         conn.close()
     return render_template("inbox.html", page=page, now=time.time(),

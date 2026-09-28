@@ -1304,3 +1304,84 @@ def test_a_patch_of_draft_fields_is_csrf_pinned_and_session_only(settings, regis
                         base_url=base, headers={"Origin": "https://evil.example"}
                         ).status_code == 403
 
+
+
+def test_a_draft_is_escaped_on_the_board(authed, bot):
+    item = _transcribed(authed, bot)
+    sha = _queue(bot)["items"][0]["sha"]
+    bot.post(f"/api/v1/inbox/items/{item}/draft", headers=machine(), json={
+        "title": "<img src=x onerror=alert(1)>", "body": "</p><script>alert(2)</script>",
+        "src_sha": sha})
+    html = authed.get("/inbox").data.decode()
+    assert "<img src=x" not in html and "<script>alert(2)" not in html
+    assert "&lt;img src=x onerror=alert(1)&gt;" in html
+
+
+def _drafted(authed, bot, **draft):
+    item = _transcribed(authed, bot)
+    sha = _queue(bot)["items"][0]["sha"]
+    body = {"title": "Fix the sticky wheel", "body": "It sticks.\nOften.",
+            "src_sha": sha}
+    body.update(draft)
+    assert bot.post(f"/api/v1/inbox/items/{item}/draft", headers=machine(),
+                    json=body).status_code == 200
+    return item
+
+
+def _row(html, item):
+    return html.split(f'id="item-{item}"', 1)[1].split("</li>", 1)[0]
+
+
+def test_a_voice_row_shows_draft_transcript_player_and_a_hidden_edit_form(authed, bot):
+    item = _drafted(authed, bot)
+    row = _row(authed.get("/inbox").data.decode(), item)
+    assert '<h3 class="item-title">Fix the sticky wheel</h3>' in row
+    assert 'class="item-body draft-body">It sticks.\nOften.</p>' in row
+    assert "<details class=\"transcript\">" in row and "the wheel on km tracker sticks" in row
+    assert 'class="player"' in row and 'class="review-box"' in row
+    assert "needs review" in row and 'data-needs-review="1"' in row
+    form = row.split('<form class="draft-edit"', 1)[1].split("</form>", 1)[0]
+    assert " hidden>" in form.split("\n", 1)[0]
+    assert 'name="draft_title"' in form and 'value="Fix the sticky wheel"' in form
+    assert 'name="draft_project"' in form and 'list="project-list"' in form
+    assert 'enterkeyhint=' in form
+    assert 'class="edit-draft secondary"' in row
+
+
+def test_draft_states_are_visible(authed, bot):
+    pending = _transcribed(authed, bot)
+    failed = _transcribed(authed, bot, text="another note")
+    sha = next(i["sha"] for i in _queue(bot)["items"] if i["id"] == failed)
+    for _ in range(3):
+        bot.post(f"/api/v1/inbox/items/{failed}/draft", headers=machine(),
+                 json={"failed": True, "src_sha": sha})
+    html = authed.get("/inbox").data.decode()
+    assert "Drafting…" in _row(html, pending)
+    assert "Couldn't draft — edit to write one" in _row(html, failed)
+    assert 'data-needs-review="1"' in _row(html, failed)
+
+
+def test_needs_review_tile_and_filter_replace_waiting_on(authed, bot):
+    _drafted(authed, bot)
+    html = authed.get("/inbox").data.decode()
+    summary = html.split('class="summary inbox-summary"', 1)[1].split("</section>", 1)[0]
+    assert "Needs review" in summary and 'href="/inbox?awaiting=review"' in summary
+    assert "Awaiting filing" not in summary and "Transcribing" not in summary
+    assert 'id="filter-awaiting"' not in html and "Waiting on" not in html
+    assert 'id="filter-review"' in html and 'name="awaiting" value="review"' in html
+    filtered = authed.get("/inbox?awaiting=review").data.decode()
+    assert "checked" in filtered.split('id="filter-review"', 1)[1].split(">", 1)[0]
+
+
+def test_the_privacy_note_says_the_transcript_goes_to_anthropic(authed):
+    html = authed.get("/inbox").data.decode()
+    assert ("Audio stays on this box and your Mac. The transcript text — not the\n"
+            "      audio — is sent from the Mac to Anthropic (Claude) to draft the item.") in html
+    assert "Recordings never leave this box" not in html
+
+
+def test_known_projects_feed_the_datalist(authed, settings):
+    settings.inbox_github_repos = ("Owner/km-tracker",)
+    html = authed.get("/inbox").data.decode()
+    datalist = html.split('<datalist id="project-list">', 1)[1].split("</datalist>", 1)[0]
+    assert '<option value="km-tracker">' in datalist

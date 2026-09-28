@@ -210,8 +210,9 @@ button:hover { filter: brightness(1.08); }
      are never truncated: a wrapped sentence is readable, a clipped one is not.
    Tap targets are >= 44px. */
 
-.inbox-summary { grid-template-columns: repeat(3, 1fr); }
-@media (min-width: 640px) { .inbox-summary { grid-template-columns: repeat(3, 1fr) 2fr; } }
+.inbox-summary { grid-template-columns: repeat(2, 1fr); }
+@media (min-width: 640px) { .inbox-summary { grid-template-columns: 1fr 1fr 2fr; } }
+
 
 .capture-form { display: flex; flex-direction: column; gap: .6rem; }
 .field { display: flex; flex-direction: column; gap: .25rem; font-size: .9rem; color: var(--muted); }
@@ -253,7 +254,8 @@ progress.record-level {
   .item { flex-direction: row; align-items: flex-start; justify-content: space-between; gap: 1rem; }
   .item-controls { flex: 0 0 auto; align-items: flex-end; }
 }
-.item-filing { border-left-color: var(--behind); }
+.item-filing { border-left-color: var(--late); }
+.item-review { border-left-color: var(--behind); }
 .item.state-closed { border-left-color: var(--ok); opacity: .75; }
 .item-main { min-width: 0; flex: 1 1 auto; }
 .item-head { display: flex; flex-wrap: wrap; gap: .3rem; margin-bottom: .35rem; }
@@ -265,7 +267,8 @@ progress.record-level {
 .item-controls .review { display: flex; align-items: center; gap: .45rem;
   font-size: .9rem; min-height: 44px; cursor: pointer; white-space: nowrap; }
 .item-controls .review input { width: 1.2rem; height: 1.2rem; }
-.item-controls .player { width: 100%; max-width: 16rem; height: 34px; }
+.item-controls .player { width: 100%; height: 40px; }
+@media (min-width: 640px) { .item-controls { width: 17rem; } }
 
 .badge { display: inline-block; padding: .05rem .45rem; border-radius: 999px;
          font-size: .72rem; font-weight: 600; background: var(--panel-2);
@@ -275,6 +278,7 @@ progress.record-level {
 .badge-github { background: var(--stale); color: var(--on-state); }
 .badge-backlog { background: var(--skipped); color: var(--on-state); }
 .badge-filing { background: var(--late); color: var(--on-state); }
+.badge-review { background: var(--behind); color: var(--on-state); }
 .badge-closed, .badge-archived { background: var(--panel-2); color: var(--muted); }
 .ts { font-weight: 600; }
 .ts-pending, .ts-live { color: var(--late); }
@@ -332,3 +336,27 @@ a.hub-open:hover { background: var(--panel-2); text-decoration: none; }
 .hs-unknown { color: var(--muted); }
 .hub-warn { margin: 0; padding: .5rem .7rem; border-radius: 8px; border: 1px solid var(--late);
             font-size: .9rem; }
+
+/* Drafts (voice notes). The draft body keeps the model's line breaks
+   (pre-line) and is autoescaped like everything else. */
+.draft-body { white-space: pre-line; }
+.draft-state { margin: .3rem 0 0; font-weight: 600; }
+.draft-pending { color: var(--late); }
+.draft-failed { color: var(--fail); }
+details.transcript { margin: .45rem 0 0; font-size: .9rem; }
+details.transcript summary { cursor: pointer; color: var(--link); min-height: 44px;
+                             display: flex; align-items: center; width: fit-content; }
+details.transcript .item-body { color: var(--muted); margin-top: 0; }
+.draft-edit { display: flex; flex-direction: column; gap: .5rem; margin-top: .6rem;
+              padding: .7rem; border-radius: 8px; background: var(--panel-2); }
+.draft-edit[hidden] { display: none; }
+.edit-actions { display: flex; gap: .5rem; }
+.edit-actions button { flex: 1 1 0; }
+button.secondary { background: transparent; color: var(--link); border: 1px solid var(--rule); }
+button.secondary:hover { background: var(--panel-2); filter: none; }
+.item-controls .edit-draft { width: 100%; }
+label.check { display: flex; align-items: center; gap: .45rem; min-height: 44px;
+              font-size: .95rem; color: var(--ink); cursor: pointer; }
+label.check input { width: 1.2rem; height: 1.2rem; }
+a.tile-link { color: inherit; }
+a.tile-link:hover { text-decoration: none; filter: brightness(.98); }
