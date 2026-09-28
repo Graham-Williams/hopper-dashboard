@@ -1377,8 +1377,8 @@ def test_needs_review_tile_and_filter_replace_waiting_on(authed, bot):
 
 def test_the_privacy_note_says_the_transcript_goes_to_anthropic(authed):
     html = authed.get("/inbox").data.decode()
-    assert ("Audio stays on this box and your Mac. The transcript text — not the\n"
-            "      audio — is sent from the Mac to Anthropic (Claude) to draft the item.") in html
+    assert ("Audio stays on this box and your Mac. The transcript and title (not the audio) "
+            "are sent from the Mac to Anthropic (Claude) to draft the item.") in html
     assert "Recordings never leave this box" not in html
 
 

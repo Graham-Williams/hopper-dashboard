@@ -112,8 +112,8 @@ elif [[ -n "$WANT_INBOX" ]]; then
 fi
 
 # --- 1c. Drafting keys (opt-in, with --inbox) ------------------------------------
-# The worker's second phase runs `claude -p` on each new transcript. The TRANSCRIPT TEXT is
-# sent to Anthropic; the audio never is. Empty INBOX_CLAUDE_BIN = drafting stays off.
+# The worker's second phase runs `claude -p` on each new transcript. The TRANSCRIPT and TITLE
+# are sent to Anthropic; the audio never is. Empty INBOX_CLAUDE_BIN = drafting stays off.
 # The credential is an OAuth token from `claude setup-token`, in a 0600 FILE — never in the
 # env file and never on a command line. (Not `claude --bare`: it ignores OAuth.)
 if [[ -n "$WANT_INBOX" ]] && ! grep -q '^INBOX_CLAUDE_BIN=' "$ENV_FILE"; then
@@ -122,14 +122,24 @@ if [[ -n "$WANT_INBOX" ]] && ! grep -q '^INBOX_CLAUDE_BIN=' "$ENV_FILE"; then
   read -r -p "INBOX_CLAUDE_BIN (the claude CLI for drafting; '-' leaves drafting off) [$DEFAULT_CLAUDE]: " CLAUDE_BIN
   CLAUDE_BIN="${CLAUDE_BIN:-$DEFAULT_CLAUDE}"
   if [[ "$CLAUDE_BIN" == "-" ]]; then CLAUDE_BIN=""; fi
-  if [[ -n "$CLAUDE_BIN" && ! -x "$CLAUDE_BIN" ]]; then
-    echo "WARN: $CLAUDE_BIN is not executable — drafting will fail the heartbeat until it is"
+  # ABSOLUTE only: the worker refuses anything else, because launchd's PATH is not a shell's.
+  if [[ -n "$CLAUDE_BIN" && "$CLAUDE_BIN" != /* ]]; then
+    echo "ERROR: INBOX_CLAUDE_BIN must be an absolute path (got '$CLAUDE_BIN')"; exit 2
+  fi
+  if [[ -n "$CLAUDE_BIN" ]]; then
+    # realpath proves the (usually symlinked) path resolves to a real executable. The UNRESOLVED
+    # path is what gets stored: ~/.local/bin/claude points at a versioned binary that updates
+    # replace, so pinning the resolved target would break at the next claude update.
+    RESOLVED="$(realpath "$CLAUDE_BIN" 2>/dev/null || true)"
+    if [[ -z "$RESOLVED" || ! -x "$RESOLVED" ]]; then
+      echo "WARN: $CLAUDE_BIN does not resolve to an executable — drafting will fail the heartbeat until it does"
+    fi
   fi
   umask 077
   {
     echo
     echo "# --- Inbox drafting (phase two of com.hopper.inbox-transcribe) ---"
-    echo "# The transcript TEXT (not the audio) goes to Anthropic (Claude) to draft each note."
+    echo "# The transcript and title (not the audio) go to Anthropic (Claude) to draft each note."
     echo "# Empty INBOX_CLAUDE_BIN = drafting off. The token file is made once with"
     echo "# 'claude setup-token' and must be chmod 600."
     echo "INBOX_CLAUDE_BIN=$CLAUDE_BIN"

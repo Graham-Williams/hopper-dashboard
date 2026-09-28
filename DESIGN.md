@@ -160,10 +160,10 @@ Outputs:
   board).
 - ntfy (a third party) receives only `job_id: FROM → TO` — never the free-text reason (container names,
   client notes, rclone stderr stay on the board).
-- **A voice note's AUDIO never reaches a third party; its TRANSCRIPT TEXT goes to Anthropic.** (Changed
+- **A voice note's AUDIO never reaches a third party; its TRANSCRIPT and TITLE go to Anthropic.** (Changed
   2026-09-28 with drafting — see "Drafts, Needs review and the Hub".) The page says: "Audio stays on this box
-  and your Mac. The transcript text — not the audio — is sent from the Mac to Anthropic (Claude) to draft
-  the item." The browser still talks to nothing but this origin. The browser uploads audio to the box and does
+  and your Mac. The transcript and title (not the audio) are sent from the Mac to Anthropic (Claude) to
+  draft the item." (Also sent: the project hint and the list of project names.) The browser still talks to nothing but this origin. The browser uploads audio to the box and does
   nothing else with it: there is deliberately no in-browser speech recognition, because the Web Speech API
   streams the microphone to Google's or Apple's servers to do the work — inherent to it, not a setting.
   Transcription instead happens on Graham's own Mac, by mlx-whisper running locally. So the full path of a

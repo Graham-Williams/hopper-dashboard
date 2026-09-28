@@ -968,8 +968,9 @@ That is why it is on a 5-minute `StartInterval` and not the probe's hour.
 
 It also has a privacy consequence worth stating: because transcription happens here, on Graham's own Mac,
 **the audio of a voice note never leaves his own machines.** It goes browser → the box, and box → this Mac.
-No third party is ever sent the audio. **The transcript TEXT is**: with drafting on (§4c) the worker sends
-each new transcript from this Mac to Anthropic (Claude) to draft the item. The page says so in the same words.
+No third party is ever sent the audio. **The transcript and title are**: with drafting on (§4c) the worker
+sends each new transcript (and a title Graham typed, if any) from this Mac to Anthropic (Claude) to draft
+the item. The page says so in the same words.
 
 **Prerequisites on the Mac**, both of which the installer only WARNS about (it cannot fix them for you):
 
@@ -1042,7 +1043,7 @@ After transcribing, the same worker drafts each new voice note: a concise impera
 Mac and posts to `POST /api/v1/inbox/items/<id>/draft`. The draft is stored ALONGSIDE the note
 (`draft_*` columns); the note's `body` stays the transcript. Graham reads and edits it on `/inbox`, and
 **ticking Reviewed copies the draft into the note's title and project** — which is what Hopper's filing
-loop then reads. **The transcript text goes to Anthropic; the audio never does.**
+loop then reads. **The transcript and title go to Anthropic; the audio never does.**
 
 Off until `INBOX_CLAUDE_BIN` is set. `deploy/mac/install.sh --inbox` prompts for it (`-` leaves it off) and
 appends four keys:

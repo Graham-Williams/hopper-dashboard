@@ -38,8 +38,8 @@ GitHub, lines from backlog.txt. It is escaped at render (Jinja autoescape for
 HTML, ``jsonify`` for JSON) and the page's JS uses ``textContent`` only — there
 is no path from a stored string to markup.
 
-**Audio stays on this box and your Mac. The transcript text — not the audio —
-is sent from the Mac to Anthropic (Claude) to draft the item.** Audio is
+**Audio stays on this box and your Mac. The transcript and title (not the audio) are
+sent from the Mac to Anthropic (Claude) to draft the item.** Audio is
 uploaded to this origin, stored as a file on the data volume, and transcribed
 locally by Whisper on Graham's Mac; the Mac then drafts a title and description
 from the transcript with ``claude -p`` (``probes/inbox_draft.py``) and posts the

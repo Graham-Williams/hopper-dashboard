@@ -623,7 +623,7 @@ there is no default URL in the code, by design.
     timeout / missing binary stop drafting, burn nothing and fail the heartbeat; only an invalid
     structured result (or a 400/413) burns one of the note's 3 attempts; a 409 is skipped. The CLI's
     error envelope still says `subtype: "success"` — decide on `is_error` + `api_error_status`, never
-    `subtype`. The TRANSCRIPT TEXT goes to Anthropic; the audio never does. Tests run a FAKE `claude`
+    `subtype`. The TRANSCRIPT and TITLE go to Anthropic; the audio never does. Tests run a FAKE `claude`
     executable (argv, stdin, cwd and env are observed, not assumed).
   - `INBOX_URL` must be the Hub host. The probe HTTP client refuses cross-host redirects
     (`common._SameOriginRedirects`), so an old `dashboard…` URL fails every run instead of following the

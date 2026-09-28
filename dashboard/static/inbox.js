@@ -43,7 +43,7 @@
       because “2 MB” tells nobody how long they may talk.
 
    The page does not talk to Anthropic either. The Mac, not the browser, sends
-   the TRANSCRIPT TEXT (never the audio) to Claude to draft each note; this file
+   the TRANSCRIPT and TITLE (never the audio) to Claude to draft each note; this file
    only lets Graham edit that draft (PATCH, same origin).
 
    And the page must degrade: with JavaScript off the table, the filters and
