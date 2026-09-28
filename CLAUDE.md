@@ -631,7 +631,7 @@ there is no default URL in the code, by design.
     load-bearing split as EnvironmentFault vs item failure**, and systemic is NARROW: missing/relative
     binary, non-envelope output, auth failure or usage limit, an `api_error` other than 400/413. Those
     stop drafting, burn nothing and fail the heartbeat. Everything else is per-note, behind a CIRCUIT
-    BREAKER (a run that ENDS with no success and 2+ bad results burns nothing (the whole batch is still worked, so a good note behind bad ones is drafted); on the 3rd such run in a row, counted in `draft-state.json`, the held failures are burned so bad notes reach `failed`; after any success the held failures are reported) and a TIMEOUT RULE (systemic, unless the same note timed
+    BREAKER (a run that ENDS with no success and 2+ bad results burns nothing (the whole batch is still worked, so a good note behind bad ones is drafted); on the 3rd such run in a row, counted in `draft-state.json`, the held notes go straight to `failed` (every remaining attempt burned, via `"final": true` on the failed POST), so they show in Needs review after 3 runs, not 9; after any success the held failures are reported) and a TIMEOUT RULE (systemic, unless the same note timed
     out last run too — `draft-state.json` next to `state.json`). A 409 is skipped. Never put the CLI's
     stdout in an error message: it can be model output, and those messages reach the heartbeat. The CLI's
     error envelope still says `subtype: "success"` — decide on `is_error` + `api_error_status`, never

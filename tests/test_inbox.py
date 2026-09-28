@@ -1585,3 +1585,21 @@ def test_a_legacy_typed_tick_can_be_undone_and_new_typed_notes_get_no_box(authed
     new = post_note(authed).get_json()
     assert new["reviewable"] is False and new["reviewed_at"] == new["created_at"]
     assert 'class="review-box"' not in _row(authed.get("/inbox").data.decode(), new["id"])
+
+
+def test_a_final_failed_draft_goes_straight_to_failed(authed, bot, settings):
+    """The worker's breaker gives up after three tripped runs: the note must show in Needs
+    review as failed now, not after six more runs."""
+    item = _transcribed(authed, bot)
+    sha = _queue(bot)["items"][0]["sha"]
+    r = bot.post(f"/api/v1/inbox/items/{item}/draft", headers=machine(),
+                 json={"failed": True, "final": True, "error": "breaker", "src_sha": sha})
+    d = r.get_json()
+    assert d["draft"]["status"] == "failed" and d["draft"]["attempts"] == 3
+    assert d["needs_review"] is True and _queue(bot)["items"] == []
+    # Without `final` it is still one attempt.
+    other = _transcribed(authed, bot, text="another")
+    osha = next(i["sha"] for i in _queue(bot)["items"] if i["id"] == other)
+    d2 = bot.post(f"/api/v1/inbox/items/{other}/draft", headers=machine(),
+                  json={"failed": True, "src_sha": osha}).get_json()["draft"]
+    assert d2["status"] == "pending" and d2["attempts"] == 1

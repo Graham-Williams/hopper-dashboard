@@ -915,6 +915,9 @@ def test_the_breaker_burns_nothing_until_three_tripped_runs_in_a_row(tmp_path, m
     assert len(_calls(exe)) == 4                  # the batch was finished every time
     assert it.main(["--env", env, "--quiet"]) == 0
     assert sorted(i for i, b in api.drafts() if b["failed"]) == [ID_A, ID_B]
+    # Straight to `failed` (every remaining attempt), so they reach Needs review after
+    # three runs rather than nine.
+    assert all(b.get("final") is True for _, b in api.drafts())
     assert json.loads(state.read_text())["breaker_trips"] == 0
 
 
@@ -960,3 +963,17 @@ def test_a_timeout_on_a_different_note_is_systemic_again(tmp_path, monkeypatch):
     _wire(monkeypatch, api)
     assert it.main(["--env", _denv(tmp_path, exe, INBOX_DRAFT_TIMEOUT="1"), "--quiet"]) == 1
     assert api.drafts() == []
+
+
+@pytest.mark.parametrize("value", ["Infinity", "-Infinity", "NaN", '"lots"', "[1]"])
+def test_a_corrupt_trip_count_in_the_state_file_is_read_as_zero(tmp_path, monkeypatch, value):
+    """json.load accepts Infinity/NaN, and int(inf) raises OverflowError — which used to
+    escape the TypeError/ValueError guard and crash drafting for every run after."""
+    exe = _fake_claude(tmp_path, ["no_structured"])
+    (tmp_path / "draft-state.json").write_text('{"timed_out": null, "breaker_trips": %s}' % value)
+    api = DraftApi([_ditem(ID_A), _ditem(ID_B)])
+    sent = _wire(monkeypatch, api)
+    assert it.main(["--env", _denv(tmp_path, exe), "--quiet"]) == 1
+    assert "circuit breaker" in sent[0][3]["note"] and "trip 1 of 3" in sent[0][3]["note"]
+    assert api.drafts() == []
+    assert json.loads((tmp_path / "draft-state.json").read_text())["breaker_trips"] == 1

@@ -1086,8 +1086,9 @@ heartbeat (transcription itself still ran). Anything else is a bad answer for ON
 its three attempts; after three the row says "Couldn't draft — edit to write one" and still needs review.
 Two brakes sit on top: a **circuit breaker** (a run that ENDS with no success and two or more bad answers
 burns nothing and the heartbeat says "circuit breaker … trip N of 3"; the batch is always finished, so a good
-note behind bad ones is still drafted; on the third tripped run in a row the failures ARE counted, so bad
-notes reach "failed" and leave the head of the queue) and the **timeout rule** (a timeout is systemic, unless the same
+note behind bad ones is still drafted; on the third tripped run in a row those notes go straight to "failed"
+(every remaining attempt burned at once), so they show in Needs review after 3 runs, not 9, and leave the head
+of the queue) and the **timeout rule** (a timeout is systemic, unless the same
 note also timed out on the previous run — tracked in `~/.config/hopper-dashboard/draft-state.json`,
 `INBOX_DRAFT_STATE` — when it becomes that note's bad answer). A 409 (the transcript changed, or Graham edited
 or reviewed it meanwhile) is skipped.

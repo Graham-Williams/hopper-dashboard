@@ -44,7 +44,7 @@ a BAD RESULT for that one note (any other ``is_error``, a 400/413, missing or in
 output), which may burn one of its three attempts. The worker adds two brakes on top
 (``inbox_transcribe.run_drafting``): a CIRCUIT BREAKER (a run that ends with no success and two or
 more bad results burns nothing and fails the heartbeat, because that is what a systemic fault that
-looks per-note does; the batch is always finished, and the third such run in a row burns them) and a TIMEOUT rule (a timeout is systemic, unless the same note also timed out in
+looks per-note does; the batch is always finished, and on the third such run in a row they go straight to `failed`) and a TIMEOUT rule (a timeout is systemic, unless the same note also timed out in
 the previous run, when it becomes that note's bad result).
 
 Stdlib only, Python 3.9-clean. Never import an Anthropic SDK here: the ``claude`` CLI is

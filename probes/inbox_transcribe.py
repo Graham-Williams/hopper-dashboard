@@ -485,8 +485,9 @@ def post_draft(cfg: Dict[str, str], item_id: str, body: Dict[str, object]) -> No
 #: Circuit breaker: a run that ENDS with no success and at least this many bad results burns
 #: nothing — a fault that looks per-note but hits every note is really systemic. It never
 #: stops the batch early (a good note behind two bad ones must still be drafted), and after
-#: BREAKER_MAX_TRIPS tripped runs in a row the held failures ARE burned, so genuinely bad notes
-#: reach `failed` instead of blocking the head of the queue for ever.
+#: BREAKER_MAX_TRIPS tripped runs in a row the held notes go STRAIGHT to `failed` (``final``:
+#: every remaining attempt burned), so genuinely bad notes show in Needs review after 3 runs
+#: instead of blocking the head of the queue.
 BREAKER_FAILURES = 2
 BREAKER_MAX_TRIPS = 3
 
@@ -517,13 +518,17 @@ def run_drafting(cfg: Dict[str, str], log: Logger, dry_run: bool,
     """Draft up to INBOX_DRAFT_LIMIT transcribed notes. Returns ``(counts, fatal)``.
 
     A no-op unless INBOX_CLAUDE_BIN is set (and it must be an ABSOLUTE path). ``fatal`` is set
-    for a SYSTEMIC failure, a tripped circuit breaker, or a first timeout: drafting stops at
-    once, nothing is burned, and the caller fails the heartbeat.
+    for a SYSTEMIC failure or a first timeout (drafting stops at once, nothing is burned) and
+    for a tripped circuit breaker; either way the caller fails the heartbeat.
 
-    Bad results are HELD while the run has no success yet: the first success (or the end of
-    the queue) reports them as those notes' failed attempts; a second one before any success
-    trips the breaker and they are dropped unreported. A 409 (the transcript changed, or
-    Graham edited or reviewed it meanwhile) is skipped.
+    Bad results are HELD while the run has no success yet, and the batch is always finished.
+    A success reports the held ones as those notes' failed attempts at once. At the end of the
+    batch: no success and at least BREAKER_FAILURES bad results trips the breaker — nothing is
+    counted, and the trip is recorded in the state file; on the BREAKER_MAX_TRIPS-th trip in a
+    row the held notes are sent straight to ``failed`` (``final``: every remaining attempt
+    burned, so they reach Needs review after 3 runs, not 9). Fewer bad results than that with
+    no success are counted normally. A 409 (the transcript changed, or Graham edited or
+    reviewed it meanwhile) is skipped.
     """
     counts = {"drafted": 0, "draft_failed": 0, "draft_skipped": 0}
     claude_bin = (cfg.get("INBOX_CLAUDE_BIN") or "").strip()
@@ -538,24 +543,27 @@ def run_drafting(cfg: Dict[str, str], log: Logger, dry_run: bool,
     last_timeout = state.get("timed_out")
     try:
         trips = max(0, int(state.get("breaker_trips") or 0))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):   # a hand-edited or corrupt state file
         trips = 0
     this_timeout: Optional[str] = None
     held: List[Tuple[str, str, str]] = []          # (item_id, detail, sha) not yet reported
     successes = 0
 
-    def report(item_id: str, detail: str, sha: str) -> None:
+    def report(item_id: str, detail: str, sha: str, final: bool = False) -> None:
+        body = {"failed": True, "error": detail, "src_sha": sha}
+        if final:
+            body["final"] = True
         try:
-            post_draft(cfg, item_id, {"failed": True, "error": detail, "src_sha": sha})
+            post_draft(cfg, item_id, body)
         except ProbeError as pe:
             if is_auth_failure(pe):
                 raise
             log.error("%s: failure report not delivered: %s"
                       % (item_id, flatten_for_log(pe, 200)))
 
-    def flush() -> None:
+    def flush(final: bool = False) -> None:
         while held:
-            report(*held.pop(0))
+            report(*held.pop(0), final=final)
 
     fatal: Optional[str] = None
     try:
@@ -624,10 +632,10 @@ def run_drafting(cfg: Dict[str, str], log: Logger, dry_run: bool,
             trips += 1
             if trips >= BREAKER_MAX_TRIPS:
                 log.error("circuit breaker tripped %d runs in a row — these notes are "
-                          "genuinely bad: counting %d failure(s) against them"
+                          "genuinely bad: marking %d of them failed"
                           % (trips, len(held)))
                 trips = 0
-                flush()
+                flush(final=True)
             else:
                 n = len(held)
                 held.clear()

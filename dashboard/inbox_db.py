@@ -651,22 +651,28 @@ def set_draft(conn: sqlite3.Connection, item_id: str, *, title: str,
 
 def note_draft_attempt(conn: sqlite3.Connection, item_id: str, *,
                        max_attempts: int = DRAFT_MAX_ATTEMPTS,
+                       final: bool = False,
                        now: str | None = None) -> dict | None:
     """One BAD draft result (invalid structured output). ``failed`` once it
     has happened ``max_attempts`` times — a note that can never be drafted must
-    not be retried on every run for ever. A failed draft still needs review."""
+    not be retried on every run for ever. A failed draft still needs review.
+
+    ``final=True`` burns ALL remaining attempts at once: the worker's circuit
+    breaker sends it after three tripped runs in a row, when the note has already
+    failed three times without anything being counted."""
     row = get_item(conn, item_id)
     if row is None:
         return None
     if row["reviewed"] or row.get("draft_edited_at"):
         return row
     now = now or now_iso()
-    attempts = int(row.get("draft_attempts") or 0) + 1
+    before = int(row.get("draft_attempts") or 0)
+    attempts = max(before + 1, max_attempts) if final else before + 1
     status = DRAFT_FAILED if attempts >= max_attempts else DRAFT_PENDING
     conn.execute("UPDATE inbox_items SET draft_attempts=?, draft_status=?,"
                  " updated_at=? WHERE id=? AND reviewed = 0"
                  " AND draft_edited_at IS NULL AND draft_attempts = ?",
-                 (attempts, status, now, item_id, attempts - 1))
+                 (attempts, status, now, item_id, before))
     return get_item(conn, item_id)
 
 

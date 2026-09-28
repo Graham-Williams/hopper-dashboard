@@ -824,7 +824,8 @@ def post_draft(item_id: str):
 
     ``{"title", "body", "project", "src_sha", "model"}`` stores it;
     ``{"failed": true, "error": "…", "src_sha": …}`` counts one bad result (the
-    note becomes ``failed`` after ``DRAFT_MAX_ATTEMPTS``). A stale ``src_sha``
+    note becomes ``failed`` after ``DRAFT_MAX_ATTEMPTS``); ``"final": true`` burns
+    every remaining attempt at once (the worker's breaker giving up). A stale ``src_sha``
     (the transcript changed since the queue handed it out) is a 409 and burns
     NO attempt; so are a reviewed note and one whose draft Graham edited —
     nothing a machine sends may overwrite either.
@@ -859,7 +860,8 @@ def post_draft(item_id: str):
                 return _err("src_sha is required, so a failure against an old "
                             "transcript is refused rather than counted")
             with conn:
-                row = inbox_db.note_draft_attempt(conn, item_id)
+                row = inbox_db.note_draft_attempt(conn, item_id,
+                                                  final=doc.get("final") is True)
             reason = inbox_db.clean_text(doc.get("error"), 200)
             reason = reason.replace("\r", " ").replace("\n", " ").replace("\t", " ")
             log.warning("draft failed for %s: %s", item_id, reason)

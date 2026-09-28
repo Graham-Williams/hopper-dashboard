@@ -502,7 +502,8 @@ transcript and the audio prune depends on it being Whisper's. Rules:
   notes with no draft) and notes whose draft is stale. `known_projects` = the repo names of
   `INBOX_GITHUB_REPOS` plus the board's projects.
 - `POST /api/v1/inbox/items/<id>/draft` (INBOX_TOKEN) with `{title, body, project, src_sha, model}` or
-  `{failed: true, error, src_sha}` (`src_sha` is required on both). Title one line ≤ 120, body ≤ 2000, both through `clean_text`; an unknown
+  `{failed: true, error, src_sha, final?}` (`src_sha` is required on both; `final: true` burns every
+  remaining attempt at once — the worker's breaker giving up). Title one line ≤ 120, body ≤ 2000, both through `clean_text`; an unknown
   project becomes NULL; stale sha / reviewed / edited → 409, no attempt burned. The caps are pinned between
   `inbox_db` and `probes/inbox_draft.py` by a test.
 
@@ -527,7 +528,7 @@ recorded from the real CLI: success is `is_error:false` with the object in `stru
 problem is `is_error:true`, `terminal_reason:"api_error"`, `api_error_status` = HTTP status or null, and
 `subtype` still reads "success". Systemic is NARROW — missing/relative binary, non-envelope output, an
 auth failure or usage limit, an `api_error` other than 400/413 — and stops drafting and fails the
-heartbeat without burning attempts. Anything else is per-note, subject to a circuit breaker (a run that ENDS with no success and 2+ bad results burns nothing (the whole batch is still worked, so a good note behind bad ones is drafted); on the 3rd such run in a row, counted in `draft-state.json`, the held failures are burned so bad notes reach `failed`) and a timeout rule (systemic unless the same note timed out
+heartbeat without burning attempts. Anything else is per-note, subject to a circuit breaker (a run that ENDS with no success and 2+ bad results burns nothing (the whole batch is still worked, so a good note behind bad ones is drafted); on the 3rd such run in a row, counted in `draft-state.json`, the held notes go straight to `failed` (every remaining attempt burned, via `"final": true` on the failed POST), so they show in Needs review after 3 runs, not 9) and a timeout rule (systemic unless the same note timed out
 last run too). No error message raised from the CLI's output ever carries stdout (it can be model text).
 
 ## Box facts (recon 2026-09-04, read-only)
