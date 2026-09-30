@@ -1037,28 +1037,41 @@ def test_an_over_long_setup_brief_is_capped_with_a_marker(tmp_path, monkeypatch)
 
 
 @pytest.mark.parametrize("case", ["missing", "group_writable", "world_writable",
-                                  "not_utf8", "directory", "empty"])
+                                  "directory", "empty", "symlink", "not_mine",
+                                  "is_the_token_file", "hard_link_to_the_token"])
 def test_a_bad_setup_brief_means_no_brief_and_one_warning_never_a_failure(
         tmp_path, monkeypatch, case):
     exe = _fake_claude(tmp_path, ["ok"])
+    token = _token_file(tmp_path)
     if case == "missing":
         path = str(tmp_path / "nope.md")
     elif case == "group_writable":
         path = _brief(tmp_path, "SECRET BRIEF TEXT\n", mode=0o664)
     elif case == "world_writable":
         path = _brief(tmp_path, "SECRET BRIEF TEXT\n", mode=0o646)
-    elif case == "not_utf8":
-        path = str(tmp_path / "latin1.md")
-        with open(path, "wb") as fh:
-            fh.write(b"SECRET BRIEF TEXT \xff\xfe\n")
     elif case == "directory":
         path = str(tmp_path / "adir")
         os.mkdir(path)
+    elif case == "symlink":
+        # O_NOFOLLOW: a link could point the worker at any file this user can read.
+        real = _brief(tmp_path, "SECRET BRIEF TEXT\n", name="real.md")
+        path = str(tmp_path / "link.md")
+        os.symlink(real, path)
+    elif case == "not_mine":
+        path = _brief(tmp_path, "SECRET BRIEF TEXT\n")
+        uid = os.getuid()
+        monkeypatch.setattr(inbox_draft.os, "getuid", lambda: uid + 1)
+    elif case == "is_the_token_file":
+        path = token                         # the one file that must never be sent
+    elif case == "hard_link_to_the_token":
+        path = str(tmp_path / "brief.md")
+        os.link(token, path)
     else:
         path = _brief(tmp_path, "  \n")
     api = DraftApi([_ditem(ID_A)])
     sent = _wire(monkeypatch, api)
-    assert it.main(["--env", _denv(tmp_path, exe, INBOX_DRAFT_CONTEXT_FILE=path),
+    assert it.main(["--env", _denv(tmp_path, exe, INBOX_DRAFT_CONTEXT_FILE=path,
+                                   INBOX_CLAUDE_TOKEN_FILE=token),
                     "--quiet"]) == 0
     (call,) = _calls(exe)
     doc = json.loads(call["stdin"])
@@ -1071,6 +1084,42 @@ def test_a_bad_setup_brief_means_no_brief_and_one_warning_never_a_failure(
     warnings = [ln for ln in log.splitlines() if "INBOX_DRAFT_CONTEXT_FILE" in ln]
     assert len(warnings) == 1 and "warning:" in warnings[0]
     assert "SECRET" not in log
+    assert "FAKE-TOKEN" not in json.dumps(doc) and "FAKE-TOKEN" not in log
+
+
+def _brief_bytes(tmp_path, data, name="draft-context.md"):
+    f = tmp_path / name
+    f.write_bytes(data)
+    f.chmod(0o644)
+    return str(f)
+
+
+def _sent_context(tmp_path, monkeypatch, path):
+    exe = _fake_claude(tmp_path, ["ok"])
+    _wire(monkeypatch, DraftApi([_ditem(ID_A)]))
+    assert it.main(["--env", _denv(tmp_path, exe, INBOX_DRAFT_CONTEXT_FILE=path),
+                    "--quiet"]) == 0
+    return json.loads(_calls(exe)[0]["stdin"]).get("context")
+
+
+def test_nuls_are_stripped_before_the_cap_so_they_cannot_cost_real_text(tmp_path, monkeypatch):
+    body = "A" * (inbox_draft.MAX_CONTEXT - 10) + "\x00" * 50 + "TAIL"
+    ctx = _sent_context(tmp_path, monkeypatch, _brief_bytes(tmp_path, body.encode()))
+    assert ctx == "A" * (inbox_draft.MAX_CONTEXT - 10) + "TAIL"      # whole, and no marker
+
+
+def test_bad_utf8_is_replaced_never_dropping_the_whole_brief(tmp_path, monkeypatch):
+    ctx = _sent_context(tmp_path, monkeypatch,
+                        _brief_bytes(tmp_path, b"- repo: wheel page \xff\xfe spinner\n"))
+    assert ctx == "- repo: wheel page \ufffd\ufffd spinner\n"
+
+
+def test_a_brief_cut_mid_character_is_replaced_and_marked(tmp_path, monkeypatch):
+    # Well past the byte bound, ending inside a multi-byte character: still sent, capped,
+    # marked — never refused.
+    data = "é".encode() * (inbox_draft.MAX_CONTEXT_BYTES // 2) + "é".encode()[:1]
+    ctx = _sent_context(tmp_path, monkeypatch, _brief_bytes(tmp_path, data))
+    assert ctx == "é" * inbox_draft.MAX_CONTEXT + inbox_draft.CONTEXT_TRUNCATED
 
 
 def test_no_setup_brief_configured_means_no_context_field_and_no_warning(tmp_path, monkeypatch):

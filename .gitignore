@@ -27,6 +27,12 @@ data/
 *.ogg
 *.wav
 
+# The drafter's setup brief (INBOX_DRAFT_CONTEXT_FILE) is Graham's own description of his
+# projects. It lives outside the repo; these catch a copy made next to the committed
+# example (deploy/mac/draft-context.example.md, which stays tracked).
+draft-context.md
+voice-context.md
+
 # python
 __pycache__/
 *.pyc

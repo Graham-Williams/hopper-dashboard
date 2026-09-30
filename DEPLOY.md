@@ -1071,7 +1071,7 @@ drafts adds just that key):
 | `INBOX_CLAUDE_TOKEN_FILE` | `~/.config/hopper-dashboard/claude-token`: ONE line, the OAuth token, **chmod 600** |
 | `INBOX_DRAFT_MODEL` | `sonnet` |
 | `INBOX_DRAFT_LIMIT` | notes drafted per 5-minute run, `5` |
-| `INBOX_DRAFT_CONTEXT_FILE` | optional setup brief sent with each note as reference data: `~/personal-assistant/docs/voice-context.md` when that exists at install time, else empty (no brief). Shape: `deploy/mac/draft-context.example.md`. Read fresh each run, cut at 6000 chars; missing/unreadable/group- or world-WRITABLE = no brief + one `warning:` line in the worker log, never a failed heartbeat. 0644 is fine |
+| `INBOX_DRAFT_CONTEXT_FILE` | optional setup brief sent with each note as reference data: `~/personal-assistant/docs/voice-context.md` when that exists at install time, else empty (no brief). Shape: `deploy/mac/draft-context.example.md`. Read fresh each run, cut at 6000 chars. Refused (no brief + one `warning:` line in the worker log, never a failed heartbeat): missing, a symlink, not yours, group/world-WRITABLE, empty, or the claude token file. 0644 is fine; point it at the real file, not a link to it |
 
 To add or change the brief on an existing install: edit the env line by hand (or re-run `install.sh --inbox`
 if the key is absent), then check the next run's log for `setup brief: N chars` — a `warning:

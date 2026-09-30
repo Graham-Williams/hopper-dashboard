@@ -28,9 +28,10 @@ The ``claude -p`` call (verified against Claude Code 2.1.283, see DEPLOY.md §4)
     OAuth, and the credential here is an OAuth token. Never any ``--dangerously-*`` flag.
   * The transcript goes in on STDIN as JSON, framed as data, never on the command line. So
     does the setup brief (a ``context`` field, reference data only): read fresh each run,
-    UTF-8, capped at MAX_CONTEXT characters. A missing, unreadable or group/world-WRITABLE
-    brief means no brief and one log line — never a systemic failure, never a burned attempt,
-    and its text never reaches the log or the heartbeat.
+    capped at MAX_CONTEXT characters (see ``read_context`` for what is refused — symlinks,
+    other owners, writable-by-others, the token file itself). A refused brief means no brief
+    and one log line — never a systemic failure, never a burned attempt, and its text never
+    reaches the log or the heartbeat.
   * It runs in an empty temp directory, with an ALLOWLISTED environment
     (``common.minimal_env``) plus ``CLAUDE_CODE_OAUTH_TOKEN`` read from a 0600 file
     (``INBOX_CLAUDE_TOKEN_FILE``, made once with ``claude setup-token``) and
@@ -59,6 +60,7 @@ subprocessed, exactly as Whisper is.
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import stat
@@ -79,6 +81,9 @@ MAX_TRANSCRIPT = 12000
 #: draft costs and what one careless edit could send.
 MAX_CONTEXT = 6000
 CONTEXT_TRUNCATED = "\n[... brief truncated]"
+#: At most this many BYTES of the brief are read: a mistaken path to a huge file costs
+#: nothing, and it is far more than MAX_CONTEXT characters can ever need (4 bytes each).
+MAX_CONTEXT_BYTES = 256 * 1024
 
 DEFAULT_MODEL = "sonnet"
 DEFAULT_LIMIT = 5
@@ -185,40 +190,77 @@ def build_stdin(item: Dict[str, object], known_projects: List[str],
     return json.dumps(doc, ensure_ascii=False)
 
 
-def read_context(path: str) -> Tuple[Optional[str], Optional[str]]:
+def read_context(path: str, token_path: str = "") -> Tuple[Optional[str], Optional[str]]:
     """The setup brief from ``INBOX_DRAFT_CONTEXT_FILE``: ``(text or None, warning or None)``.
 
-    Optional and never fatal: a missing, unreadable, non-UTF-8 or empty file gives no brief
-    and a one-line warning (not a SystemicFailure — drafting works without it, just less
-    well). A group/world-WRITABLE file is refused the same way, because anyone who can write
-    it can put words in front of the model on every draft (it cannot give the model tools —
-    there are none — but it could steer every title). Readable-by-others is fine: the brief is
-    not a secret the way the token is. The warning names the path and the reason, never the
-    content. Over MAX_CONTEXT characters is cut, with a marker."""
+    Optional and never fatal: anything wrong with it gives no brief and a one-line warning
+    (not a SystemicFailure — drafting works without it, just less well). The warning names
+    the path and the reason, never the content. Refused:
+
+    * a SYMLINK (``O_NOFOLLOW``) or anything but a regular file (checked with ``fstat`` on
+      the descriptor actually read, so nothing can be swapped in between the check and the
+      read; ``O_NONBLOCK`` so a FIFO cannot hang the worker);
+    * a file this user does not own, or one that is group/world WRITABLE — anyone who can
+      write it can put words in front of the model on every draft (no tools, but it could
+      steer every title). Readable-by-others (0644) is fine: the brief is not a secret;
+    * the claude TOKEN file itself (same ``st_dev``/``st_ino``, so a hard link is caught
+      too) — the one file that must never be sent to Anthropic;
+    * an empty file.
+
+    Content rules: at most ``MAX_CONTEXT_BYTES`` are read; NULs are stripped BEFORE the cap
+    (so they cannot cost real text); bytes are decoded as UTF-8 with ``errors="replace"``, so
+    a bad byte, or a cut through a multi-byte character, never drops the whole brief; and the
+    text is cut at ``MAX_CONTEXT`` characters with a marker only when something was cut."""
     if not path:
         return None, None
     path = os.path.expanduser(path)
+
+    def refuse(why: str) -> Tuple[Optional[str], Optional[str]]:
+        return None, ("INBOX_DRAFT_CONTEXT_FILE %r %s — drafting without the setup brief"
+                      % (path, why))
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
-        st = os.stat(path)
-        if not stat.S_ISREG(st.st_mode):
-            return None, "INBOX_DRAFT_CONTEXT_FILE %r is not a regular file — drafting " \
-                         "without the setup brief" % path
-        if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-            return None, ("INBOX_DRAFT_CONTEXT_FILE %r is group/world writable (mode %o) — "
-                          "ignored; chmod 644 or 600 it" % (path, st.st_mode & 0o777))
-        with open(path, encoding="utf-8") as fh:
-            text = fh.read(MAX_CONTEXT + 1)
-    except UnicodeDecodeError:
-        return None, "INBOX_DRAFT_CONTEXT_FILE %r is not UTF-8 — drafting without the " \
-                     "setup brief" % path
+        fd = os.open(path, flags)
     except OSError as e:
-        return None, ("INBOX_DRAFT_CONTEXT_FILE %r is not readable (%s) — drafting without "
-                      "the setup brief" % (path, e.strerror or type(e).__name__))
-    text = text.replace("\x00", "")
+        if e.errno == errno.ELOOP:
+            return refuse("is a symlink (refused)")
+        return refuse("is not readable (%s)" % (e.strerror or type(e).__name__))
+    raw = b""
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return refuse("is not a regular file")
+        if st.st_uid != os.getuid():
+            return refuse("is not owned by this user (uid %d) — refused" % st.st_uid)
+        if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            return refuse("is group/world writable (mode %o) — ignored; chmod 644 or 600 it"
+                          % (st.st_mode & 0o777))
+        if token_path:
+            try:
+                tok = os.stat(os.path.expanduser(token_path))
+            except OSError:
+                tok = None
+            if tok is not None and (tok.st_dev, tok.st_ino) == (st.st_dev, st.st_ino):
+                return refuse("is the claude token file (refused: it must never be sent)")
+        chunks = []
+        got = 0
+        while got <= MAX_CONTEXT_BYTES:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            got += len(chunk)
+        raw = b"".join(chunks)
+    except OSError as e:
+        return refuse("is not readable (%s)" % (e.strerror or type(e).__name__))
+    finally:
+        os.close(fd)
+    cut = len(raw) > MAX_CONTEXT_BYTES
+    text = raw[:MAX_CONTEXT_BYTES].replace(b"\x00", b"").decode("utf-8", errors="replace")
     if not text.strip():
-        return None, "INBOX_DRAFT_CONTEXT_FILE %r is empty — drafting without the setup " \
-                     "brief" % path
-    if len(text) > MAX_CONTEXT:
+        return refuse("is empty")
+    if cut or len(text) > MAX_CONTEXT:
         text = text[:MAX_CONTEXT] + CONTEXT_TRUNCATED
     return text, None
 

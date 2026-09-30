@@ -168,9 +168,13 @@ Outputs:
   brief is `INBOX_DRAFT_CONTEXT_FILE` on the Mac — a page Graham (or Hopper) keeps describing his projects
   and their nicknames, so the drafter can tell what "the backup thing" means. It rides stdin as a
   `context` field marked as reference data, never argv; the system prompt says to use it to pick the
-  project and word the description and never to copy it into the output. It is read fresh each run, UTF-8,
-  cut at 6000 characters with a marker. Missing, unreadable, not UTF-8, empty, or group/world-WRITABLE =
-  no brief and one log line (not systemic, burns nothing). Writable-by-others is refused because anyone who
+  project and word the description and never to copy it into the output. It is read fresh each run
+  (`inbox_draft.read_context`): opened `O_NOFOLLOW|O_NONBLOCK` and `fstat`ed on the descriptor read, at
+  most 256 KiB, NULs stripped BEFORE the 6000-character cap, decoded with `errors="replace"` (a bad byte
+  or a cut character never drops the brief), and marked only when something was cut. Refused, with no
+  brief and one log line (not systemic, burns nothing): missing, unreadable, a symlink, not a regular
+  file, not owned by the worker's user, group/world-WRITABLE, empty, or the claude TOKEN file itself
+  (same `st_dev`/`st_ino`, so a hard link is caught too). Writable-by-others is refused because anyone who
   can write it can steer every draft; readable-by-others (0644) is allowed because, unlike the OAuth
   token, it is not a secret. Its text never reaches the log or the heartbeat — only a character count or
   the warning's path and reason. The browser still talks to nothing but this origin. The browser uploads audio to the box and does

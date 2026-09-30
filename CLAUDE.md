@@ -662,7 +662,9 @@ there is no default URL in the code, by design.
     error envelope still says `subtype: "success"` — decide on `is_error` + `api_error_status`, never
     `subtype`. The TRANSCRIPT and TITLE go to Anthropic, plus the optional SETUP BRIEF
     (`INBOX_DRAFT_CONTEXT_FILE`, a `context` field on stdin, capped at `MAX_CONTEXT` = 6000 chars, read fresh
-    each run; missing/unreadable/group- or world-writable = no brief + one log warning, never systemic; its
+    each run by `read_context` — O_NOFOLLOW + fstat, owner = this user, not group/world-writable, never the
+    token file (st_dev/st_ino), NULs stripped before the cap, bad UTF-8 replaced not refused; a refused brief
+    = no brief + one log warning, never systemic; its
     text never reaches the log or heartbeat; example `deploy/mac/draft-context.example.md`); the audio never does. Tests run a FAKE `claude`
     executable (argv, stdin, cwd and env are observed, not assumed).
   - `INBOX_URL` must be the Hub host. The probe HTTP client refuses cross-host redirects

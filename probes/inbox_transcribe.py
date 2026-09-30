@@ -592,7 +592,8 @@ def run_drafting(cfg: Dict[str, str], log: Logger, dry_run: bool,
             # neither the brief nor any of it goes into the log or the heartbeat — only the
             # warning (path + reason) and a character count.
             context, warning = inbox_draft.read_context(
-                cfg.get("INBOX_DRAFT_CONTEXT_FILE") or "")
+                cfg.get("INBOX_DRAFT_CONTEXT_FILE") or "",
+                token_path=cfg.get("INBOX_CLAUDE_TOKEN_FILE") or "")
             if warning:
                 log.log("warning: %s" % flatten_for_log(warning, 300))
             elif context:
