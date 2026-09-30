@@ -319,23 +319,29 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   while the note is not closed or archived (`_FILED_COPY_SQL`; `?source=backlog` still shows it). The
   route needs a reviewed, open note (409). An older image ignores these columns, so a rollback brings
   filed notes back as awaiting filing — DEPLOY.md Rollback has the check. The tag is the ONLY link — keep the convention.
-  **The backlog rule** (`inbox_db.apply_filed_backlog_rule`): every push sets a backlog row's state from
-  its What: line (`BACKLOG_DONE_MARKER` "✅ DONE" → closed); after a COMPLETE push (upserts + archive, never
-  per row) a filed note whose tagged lines went open → removed/done closes with `closed_by='backlog'`, and
-  reopens only if that rule closed it and a tagged line is open again. **The issues rule**
+  **The backlog rule** (`inbox_db.apply_filed_backlog_rule`, inside `apply_backlog_push` — one real
+  transaction; `with conn:` is NOT one on these autocommit connections): every push sets a backlog row's
+  state from its What: line (`BACKLOG_DONE_RE` `✅️?\s*(DONE|RESOLVED)\b` anywhere → closed; `closed_by`
+  cleared); after a COMPLETE push (upserts + archive, never per row) a filed note closes with
+  `closed_by='backlog'` when its tagged What: line becomes done (at once) or is missing from 2
+  consecutive complete pushes (`backlog_absent_pushes`, capped), and reopens only if that rule closed it
+  and a tagged line is open again. A tag counts ONLY in the What: line (first line of the text; anywhere in
+  it) in all three matchers — `backlog_tags`/`WHAT_LINE_SQL`, pinned together by a test. The filed copy
+  is hidden whenever its note exists (any state). An unchanged push writes NOTHING (`upsert_mirror_item`
+  only writes a real change). **The issues rule**
   (`inbox_db.apply_issue_transitions`, notes only) is edge-triggered too: `github_mirror` snapshots the
   stored `inbox_issues` states (`issue_states`) at the start of a complete scan, and a note closes
   (`closed_by='issues'`) only when the scan moves its LAST open issue to closed, and reopens only if that
   rule closed it and the scan moved an issue closed → open. Mirrored github/backlog rows are VIEWS and
-  follow upstream every scan/push. Every hand state change clears
-  `closed_by`. The filed copy stays hidden while its note is open or `closed_by='backlog'`.
+  follow upstream every scan/push. Every hand state change clears `closed_by`.
 - **Item lifecycle** — what closed/archived/reopen mean per source (voice, typed, github, backlog), and which
   of them is automatic: the table in DESIGN.md "Item lifecycle". One table (`inbox_items`), `state`
   open/closed plus `archived_at`. Update the table when any close/archive/reopen rule changes.
-- **Never `return` from inside `with conn:`.** It is a normal exit, so it COMMITS every write made before
-  it — that is how a 400 on one backlog item used to keep the items ahead of it. Validate the whole request
-  first (the backlog push does), or raise to roll back. `tests/test_inbox.py` pins it with an `ast` guard
-  over `dashboard/`.
+- **`with conn:` is NOT a transaction here.** Both stores connect with `isolation_level=None`
+  (autocommit), so every statement commits as it runs and `with conn:` rolls nothing back. Validate the
+  whole request before the first write (the backlog push does: a 400 on one item used to keep the items
+  ahead of it), and put anything that must land whole in `inbox_db.transaction(conn)` (`BEGIN IMMEDIATE`).
+  `tests/test_inbox.py` also pins "no `return` inside `with conn:`" with an `ast` guard over `dashboard/`.
 - `inbox.py` — the blueprint. `MACHINE_ENDPOINTS` is what scopes `INBOX_TOKEN` (now including
   `inbox.draft_queue` and `inbox.post_draft`); the create route raises
   `request.max_content_length` PER REQUEST (the global 64 KB cap in `__init__.py` protects every other

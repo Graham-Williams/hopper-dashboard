@@ -276,23 +276,26 @@ button today.
 
 | source | becomes closed | becomes archived | reopens | who |
 |---|---|---|---|---|
-| `voice` | (1) by hand; (2) the ISSUES rule: a complete scan moves its LAST open linked issue to closed (edge-triggered: the stored `inbox_issues.state` before vs after the scan; `closed_by='issues'`); (3) the BACKLOG rule: it was filed to backlog.txt and, over one complete push, its `(voice <id8>)` line(s) went from open to removed or ✅ DONE (`closed_by='backlog'`) | never | by hand; or automatically, ONLY by the rule that closed it: `issues` when a scan moves any linked issue from closed to open, `backlog` when a tagged line is live and open again. A note closed by hand is never reopened automatically, and a hand reopen sticks until the next real change upstream | (1) by hand, (2)(3) automatic |
+| `voice` | (1) by hand; (2) the ISSUES rule: a complete scan moves its LAST open linked issue to closed (edge-triggered: the stored `inbox_issues.state` before vs after the scan; `closed_by='issues'`); (3) the BACKLOG rule: it was filed to backlog.txt and its `(voice <id8>)` line was marked ✅ DONE/RESOLVED (closes on that push) or has been missing from 2 consecutive COMPLETE pushes (`backlog_absent_pushes`; `closed_by='backlog'`) | never | by hand; or automatically, ONLY by the rule that closed it: `issues` when a scan moves any linked issue from closed to open, `backlog` when a tagged What: line is live and open again. A note closed by hand is never reopened automatically, and a hand reopen sticks until the next real change upstream | (1) by hand, (2)(3) automatic |
 | `typed` | the same as `voice` | never | the same as `voice` | the same as `voice` |
 | `github` (mirrored issue) | automatically, when a complete open-issue scan of its repo no longer lists it (closed, transferred or deleted upstream); a hand close lasts only until the next complete scan | never | automatically, on every complete scan that lists it as open | automatic, on EVERY scan, by design: the row is a VIEW of the issue, so upstream always wins (act on it on GitHub — the row links there; it has no Delete) |
-| `backlog` (mirrored line), also a VIEW of upstream (no Delete; edit backlog.txt) | automatically, when its What: line carries ✅ DONE (`inbox_db.BACKLOG_DONE_MARKER`, matched case-insensitively on the first line of the text): the state is set from the text on EVERY upsert, complete push or not, so a hand close lasts only until the next push | automatically, when a COMPLETE push no longer has that exact What: line — removed, or edited: any What: edit (adding or removing ✅ DONE or ⭐ included) is a new key, so the old row archives and a new one appears | by the text: taking ✅ DONE off posts the unmarked line again, which un-archives its earlier open row (or creates a new one); a hand close is undone by the next push unless the line is marked done | automatic: the text wins |
+| `backlog` (mirrored line), also a VIEW of upstream (no Delete; edit backlog.txt) | automatically, when its What: line carries a done marker anywhere (`inbox_db.BACKLOG_DONE_RE`: `✅️?\s*(DONE\|RESOLVED)\b`, case-insensitive — "✅ DONE 2026-08-21 — …", "… — ✅ DONE 2026-07-08 via …", "✅ RESOLVED"): the state is set from the text on EVERY upsert, complete push or not (and `closed_by` cleared), so a hand close lasts only until the next push | automatically, when a COMPLETE push no longer has that exact What: line — removed, or edited: any What: edit (adding or removing ✅ DONE or ⭐ included) is a new key, so the old row archives and a new one appears | by the text: taking ✅ DONE off posts the unmarked line again, which un-archives its earlier open row (or creates a new one); a hand close is undone by the next push unless the line is marked done | automatic: the text wins |
 
 Removal is ARCHIVE, not close, for a backlog row: the file is the only record, and "removed" and "done"
 are different facts (the ✅ DONE convention keeps done entries in the file, but a shipped entry is often
 just deleted). For a FILED NOTE both mean done, and both close it.
 
-A backlog row that carries a filed note's tag is HIDDEN from the default list and the counts while that
-note is open or was closed by the backlog rule (see "Filing to backlog.txt" below) — it is the same piece
-of work. It shows again when the note was closed by hand or by its issues, where the line may be the only
-live view of work that is still open in the file.
+A backlog row whose What: line carries a filed note's tag is HIDDEN from the default list and the counts
+WHENEVER that note exists, in any state (see "Filing to backlog.txt" below) — it is the same piece of
+work, and the note is where its state shows. It shows again only if the note is deleted. A tag counts
+only in the What: line (anywhere in it) — never under Why:/Notes:/Context: — in all three matchers
+(`filed_line_status`, `backlog_copies`, `_FILED_COPY_SQL`, via `backlog_tags` / `WHAT_LINE_SQL`).
 
-The backlog rule acts on the TRANSITION over a whole push (status of the note's tagged lines at the start
-vs the end), so a note Graham reopens by hand stays open while its line stays gone or done, and an edit
-that swaps keys within one push never flaps it. The issues rule is edge-triggered the same way, per scan
+The backlog rule runs once per COMPLETE push, after the whole push is applied (never per row), so an edit
+that swaps keys within one push never flaps a note. Done acts on the transition into done (a hand reopen
+of a done note sticks); removal needs the tag missing from TWO consecutive complete pushes (a capped
+count on the note), so one truncated read of the file, or a filing call that beat its line into the
+file, closes nothing — and a note whose line was added and removed between two pushes still closes. The issues rule is edge-triggered the same way, per scan
 (`inbox_db.apply_issue_transitions`, fed the stored `inbox_issues` states from before the scan): a hand
 reopen of a note whose issues are all closed sticks until an issue next changes upstream, and a change
 that happened during a mirror outage is caught by the first good scan, because it compares stored state,
@@ -584,35 +587,55 @@ transcript and the audio prune depends on it being Whisper's. Rules:
 awaiting filing (`?awaiting=filing`: reviewed, open, local, no linked issue, not filed to the backlog) and
 files it from `title`, `project` and `draft.body`: repo work becomes a GitHub issue recorded with
 `POST /api/v1/inbox/items/<id>/issues`; anything else (Hopper itself, the Mac or box, a chore) becomes ONE
-`backlog.txt` line in Hopper's own words ending `(voice <first 8 chars of id>)`, recorded with
+`backlog.txt` ENTRY in Hopper's own words whose What: line ends `(voice <first 8 chars of id>)` (the
+format is pinned below), recorded with
 `POST /api/v1/inbox/items/<id>/filed-backlog {"line": …}` (INBOX_TOKEN; the note must be reviewed, open
 and not archived, else 409; one line, `clean_text`, ≤ `MAX_BACKLOG_LINE` = 500, must carry the tag;
 idempotent — the first `filed_backlog_at` is kept). The note
-then leaves awaiting-filing, and the backlog-mirror row that line comes back as (matched by the tag,
-whichever arrives first) is **hidden from the default list and the counts while that note is not closed
-or archived** (shown again once it is) — the simpler of hiding or
+then leaves awaiting-filing, and the backlog-mirror row that entry comes back as (matched by the tag in
+its What: line, whichever arrives first) is **hidden from the default list and the counts whenever that
+note exists** (shown again only if the note is deleted) — the simpler of hiding or
 nesting — and linked as `filed_backlog.mirror_key` on the note. `?source=backlog` still lists it.
 
-**Removing the line, or marking it ✅ DONE, closes the note** (the backlog twin of "all linked issues
-closed → close"). Every backlog push first sets each row's state from its What: line (✅ DONE → closed,
-otherwise open). Then, ONLY for a COMPLETE push and only after all of it — every upsert and the archive —
-`inbox_db.apply_filed_backlog_rule` compares each tag's status at the start of the push with the end:
-`open` (some live tagged row is open), `done` (live tagged rows, all closed) or `gone` (only archived ones).
-An open, filed note whose tag went from open (or never seen) to `done`/`gone` closes, with
-`closed_by='backlog'`. A note with `closed_by='backlog'` whose tag is `open` again reopens. Nothing else is
-touched: a note closed by hand has `closed_by` NULL (every hand state change clears it) and the issues rule
-(`apply_issue_transitions`) writes `issues`. What this means in practice:
+**Removing the line, or marking it done, closes the note** (the backlog twin of "all linked issues
+closed → close"). One push is ONE transaction (`inbox_db.apply_backlog_push`; these connections are
+autocommit, so `with conn:` would not be one). It first sets each row's state from its What: line (done
+marker → closed, otherwise open; `closed_by` cleared). Then, ONLY for a COMPLETE push and only after all
+of it — every upsert and the archive — `inbox_db.apply_filed_backlog_rule` looks at each filed note's tag
+in the What: lines: `open` (some live tagged row is open), `done` (live tagged rows, all closed) or none
+live. `done` closes an open note on the push it becomes done; none live counts the push in the note's
+`backlog_absent_pushes` (capped at 2) and closes it on the SECOND consecutive one; `open` resets the count
+and reopens a note with `closed_by='backlog'`. Nothing else is touched: a note closed by hand has
+`closed_by` NULL (every hand state change clears it) and the issues rule (`apply_issue_transitions`) writes
+`issues`. Every write is by primary key. What this means in practice:
 
 - a push is ALL OR NOTHING: `POST /api/v1/inbox/mirror/backlog` validates the whole payload before it
   writes anything, so a 400 (a non-object item, a bad project) changes nothing at all — it used to commit
-  every item upserted before the bad one. A push whose entries are all blank after cleaning is refused like
-  an empty one (a complete one would otherwise archive every row);
-- a partial (`complete: false`), refused or failed push closes and reopens nothing;
-- a reworded line that keeps the tag, or the tag moving to another entry, closes nothing (the tag is still
-  on a live open row at the end of the push);
+  every item upserted before the bad one — and the writes themselves are one transaction. A push whose
+  entries are all blank after cleaning is refused like an empty one (a complete one would otherwise archive
+  every row). The route has its own 1 MB body allowance (the real file is ~45 KB of JSON, 69% of the 64 KB
+  global cap that every other route keeps; the probe has no smaller cap of its own);
+- an UNCHANGED push writes nothing at all (no `updated_at`/`mirror_seen_at` churn, the absence count is
+  capped), so the 5-minute backup does not re-snapshot and re-upload `inbox.db` for nothing;
+- a partial (`complete: false`), refused or failed push closes, reopens and counts nothing;
+- a reworded line that keeps the tag, or the tag moving to another entry's What: line, closes nothing
+  (the tag is still on a live open row at the end of the push); a tag only under Why:/Notes:/Context:
+  does not count;
 - two lines with the same tag, one done and one open, keep the note open; both done closes it;
-- a filed note whose line has never reached the mirror is not closed — deliberately NOT "no tagged row =
-  close", because Hopper's filing call and the next hourly push of the file can land in either order.
+- a filed note whose line never reached the mirror (Hopper's filing call and the hourly push can land in
+  either order; the line may be added and removed between pushes) closes after two complete pushes
+  without it, like a removal; one truncated read of the file (only the first N entries) closes nothing.
+
+**The filing format** Hopper writes is a proper entry, appended with its own separator:
+
+```
+---
+What: <what to do, in Hopper's words> (voice <id8>)
+```
+
+A bare line appended without `---` becomes a continuation of the PREVIOUS entry's last field, not an
+entry of its own: it links nothing and the note would close after two pushes. The tag may sit anywhere in
+the What: line (a later "— ✅ DONE <date>" suffix is fine) but must not be moved to another field.
 
 Why a column (`closed_by`) rather than inferring from timestamps: it is the one fact each reopen needs
 ("did this rule close it?"), and a hand close in the same second as a push would otherwise be

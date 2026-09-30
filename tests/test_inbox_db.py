@@ -680,14 +680,16 @@ def test_a_review_that_raced_a_new_draft_is_a_conflict(conn, monkeypatch):
     assert inbox_db.get_item(conn, item)["reviewed"] == 0
 
 
-def test_a_filed_copy_shows_again_once_its_note_is_closed(conn):
+def test_a_filed_copy_stays_hidden_while_its_note_exists_and_shows_once_deleted(conn):
     item = inbox_db.create_item(conn, source="typed", text="chore", reviewed=True)
     inbox_db.upsert_mirror_item(conn, mirror_key="backlog:x", source="backlog",
                                 title="chore", body=f"chore (voice {item[:8]})")
     inbox_db.mark_filed_backlog(conn, item, line=f"chore (voice {item[:8]})")
     assert [r["source"] for r in inbox_db.list_items(conn)] == ["typed"]
     inbox_db.update_item(conn, item, {"state": "closed"})
-    assert sorted(r["source"] for r in inbox_db.list_items(conn)) == ["backlog", "typed"]
+    assert [r["source"] for r in inbox_db.list_items(conn)] == ["typed"]
+    inbox_db.delete_item(conn, item)
+    assert [r["source"] for r in inbox_db.list_items(conn)] == ["backlog"]
 
 
 def test_the_migration_backfills_draft_copied_at_for_reviewed_voice_notes(tmp_path):
@@ -717,3 +719,59 @@ def test_the_migration_backfills_draft_copied_at_for_reviewed_voice_notes(tmp_pa
     assert c.execute("SELECT draft_copied_at FROM inbox_items WHERE id=?",
                      ("a" * 32,)).fetchone()[0] == "2026-09-09T00:00:00Z"
     c.close()
+
+
+# --------------------------------------------------------------------------- #
+# The backlog push, as one unit (inbox_db.apply_backlog_push)
+# --------------------------------------------------------------------------- #
+
+def _entries(*texts):
+    return [(inbox_db.normalise_backlog_key(inbox_db.what_line(t)), t, None) for t in texts]
+
+
+def _filed_note(conn, line_suffix=""):
+    note = inbox_db.create_item(conn, source="typed", text="spoken", now=NOW, reviewed=True)
+    inbox_db.mark_filed_backlog(conn, note, line=f"x (voice {note[:8]})", now=NOW)
+    return note, f"Fix it{line_suffix} (voice {note[:8]})"
+
+
+def test_upsert_clears_closed_by_whenever_the_text_sets_the_state(conn):
+    key = inbox_db.normalise_backlog_key("Chore")
+    row = inbox_db.upsert_mirror_item(conn, mirror_key=key, source="backlog", title="Chore",
+                                      body="Chore", now=NOW, state="open")
+    conn.execute("UPDATE inbox_items SET state='closed', closed_by='issues' WHERE id=?", (row,))
+    inbox_db.upsert_mirror_item(conn, mirror_key=key, source="backlog", title="Chore",
+                                body="Chore", now=NOW, state="open")
+    got = inbox_db.get_item(conn, row)
+    assert (got["state"], got["closed_at"], got["closed_by"]) == ("open", None, None)
+
+
+def test_an_unchanged_backlog_push_writes_nothing(conn):
+    """A push of the same file must not touch inbox.db at all — no updated_at or
+    mirror_seen_at churn, no counter ticking — or the 5-minute backup re-snapshots it and
+    re-uploads it to Drive every time (about 96 times a day)."""
+    kept, kept_line = _filed_note(conn)
+    gone, _ = _filed_note(conn, " too")
+    entries = _entries(kept_line, "✅ DONE — a finished chore", "Open chore\nWhy: because")
+    for _ in range(3):                  # settle: the absent note closes after two pushes
+        inbox_db.apply_backlog_push(conn, entries, complete=True, now=NOW)
+    assert inbox_db.get_item(conn, gone)["state"] == "closed"
+    before = conn.total_changes
+    out = inbox_db.apply_backlog_push(conn, entries, complete=True, now="2026-09-19T13:00:00Z")
+    assert conn.total_changes == before, "an unchanged push wrote to inbox.db"
+    assert (out["archived"], out["closed_notes"], out["reopened_notes"]) == (0, 0, 0)
+
+
+def test_a_backlog_push_is_atomic(conn, monkeypatch):
+    """`with conn:` is not a transaction on these autocommit connections; the push is one
+    real transaction, so a failure part-way leaves nothing behind."""
+    inbox_db.apply_backlog_push(conn, _entries("One"), complete=True, now=NOW)
+    before = [dict(r) for r in conn.execute("SELECT * FROM inbox_items ORDER BY id")]
+
+    def boom(*a, **kw):
+        raise RuntimeError("disk full, say")
+    monkeypatch.setattr(inbox_db, "archive_missing", boom)
+    with pytest.raises(RuntimeError):
+        inbox_db.apply_backlog_push(conn, _entries("Two", "✅ DONE — One"), complete=True,
+                                    now=NOW)
+    assert [dict(r) for r in conn.execute("SELECT * FROM inbox_items ORDER BY id")] == before

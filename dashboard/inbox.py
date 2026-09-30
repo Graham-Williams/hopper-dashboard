@@ -82,6 +82,8 @@ MACHINE_ENDPOINTS = frozenset({
 #: Small on purpose: the point is to lift the body limit for ONE route by the
 #: least that works, never to raise the global 64 KB cap that protects the rest.
 MULTIPART_OVERHEAD = 64 * 1024
+#: The backlog push's own body allowance (the global cap stays 64 KB for every other route).
+BACKLOG_MAX_BODY_BYTES = 1024 * 1024
 
 #: The only URL shape an issue link may have. The board renders it as an
 #: ``href``, and Jinja's escaping does nothing about a ``javascript:`` scheme —
@@ -135,7 +137,7 @@ def _limited(name: str, key: str) -> bool:
 # --------------------------------------------------------------------------- #
 
 @bp.before_request
-def _lift_the_body_cap_for_the_create_route_only():
+def _lift_the_body_cap_for_the_two_routes_that_need_it():
     """Flask 3.1 lets ``max_content_length`` be set PER REQUEST, and that is the
     only reason a voice note (``INBOX_AUDIO_MAX_BYTES``, 2 MB by default) can
     reach a view at all: the app-wide ``MAX_CONTENT_LENGTH`` is 64 KB for both
@@ -150,6 +152,11 @@ def _lift_the_body_cap_for_the_create_route_only():
     if request.endpoint == "inbox.create_item":
         request.max_content_length = (_settings().inbox_audio_max_bytes
                                       + MULTIPART_OVERHEAD)
+    elif request.endpoint == "inbox.mirror_backlog":
+        # The whole of backlog.txt in one JSON body: the real file is ~45 KB of it, 69% of
+        # the global cap, and it only grows. The probe sends no more than MAX_BACKLOG_ITEMS
+        # entries of MAX_TEXT characters and has no cap of its own below this one.
+        request.max_content_length = BACKLOG_MAX_BODY_BYTES
 
 
 @bp.errorhandler(413)
@@ -1028,9 +1035,9 @@ def mirror_backlog():
     if len(items) > MAX_BACKLOG_ITEMS:
         return _err(f"more than {MAX_BACKLOG_ITEMS} items")
     complete = bool(doc.get("complete"))
-    # ALL OR NOTHING. The whole payload is validated here, before the transaction opens: a
-    # `return` inside `with conn:` COMMITS whatever was upserted before it, so one bad
-    # item in the middle used to leave the items ahead of it written (and states changed).
+    # ALL OR NOTHING. The whole payload is validated here, before anything is written: these
+    # connections are autocommit, so a write made before an error response stays written —
+    # one bad item in the middle used to leave the items ahead of it in the store.
     entries: list[tuple[str, str, str | None]] = []
     for raw in items:
         if not isinstance(raw, dict):
@@ -1040,7 +1047,8 @@ def mirror_backlog():
             continue
         key = raw.get("key")
         if not isinstance(key, str) or not key.startswith(inbox_db.MIRROR_BACKLOG + ":"):
-            key = inbox_db.normalise_backlog_key(text)
+            # The probe's derivation: the key is the What: line's, not the whole entry's.
+            key = inbox_db.normalise_backlog_key(inbox_db.what_line(text))
         try:
             project = clean_project(raw.get("project"))
         except ValueError as exc:
@@ -1052,31 +1060,10 @@ def mirror_backlog():
         return _err("refusing to sync an empty backlog — an unreadable file and "
                     "an emptied one look identical here; pass allow_empty:true "
                     "if you really mean it")
-    now = inbox_db.now_iso()
-    seen: list[str] = []
     conn = _conn()
     try:
-        with conn:
-            # Taken BEFORE any upsert: the filed-note rule acts on what this whole push changed.
-            before = inbox_db.filed_line_status(conn) if complete else {}
-            for key, text, project in entries:
-                # A backlog row's state IS its What: line: ✅ DONE → closed, else open.
-                inbox_db.upsert_mirror_item(
-                    conn, mirror_key=key, source="backlog",
-                    title=inbox_db.derive_title(text), body=text,
-                    project=project, now=now,
-                    state="closed" if inbox_db.backlog_is_done(text) else "open")
-                seen.append(key)
-            archived = closed = reopened = 0
-            if complete:
-                archived = inbox_db.archive_missing(
-                    conn, prefix=inbox_db.MIRROR_BACKLOG + ":",
-                    seen_keys=seen, now=now)
-                # After the WHOLE push (upserts + archive), never per row.
-                closed, reopened = inbox_db.apply_filed_backlog_rule(
-                    conn, before=before, now=now)
-        return jsonify({"synced": len(seen), "archived": archived,
-                        "complete": complete, "closed_notes": closed,
-                        "reopened_notes": reopened})
+        # ONE transaction (inbox_db.apply_backlog_push): the upserts, the archive and the
+        # filed-note rule land together or not at all.
+        return jsonify(inbox_db.apply_backlog_push(conn, entries, complete=complete))
     finally:
         conn.close()

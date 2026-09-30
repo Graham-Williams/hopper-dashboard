@@ -1586,13 +1586,40 @@ def _filed_with_line(authed, bot, what="Fix the Mac fan noise"):
     return item, line
 
 
-def test_a_filed_note_closes_when_its_line_leaves_backlog_txt(authed, bot):
+def _gone_twice(bot, *texts):
+    """A filed note's line counts as removed only after it has been missing from TWO
+    consecutive complete pushes (a truncated read of the file must not close anything)."""
+    first = _sync_backlog(bot, *texts).get_json()
+    second = _sync_backlog(bot, *texts).get_json()
+    return first, second
+
+
+def test_a_filed_note_closes_when_its_line_is_gone_from_two_pushes(authed, bot):
     item, _ = _filed_with_line(authed, bot)
+    assert _sync_backlog(bot, "Unrelated chore").get_json()["closed_notes"] == 0
     assert _state(authed, item) == ("open", None)
-    r = _sync_backlog(bot, "Unrelated chore")
-    assert r.status_code == 200 and r.get_json()["closed_notes"] == 1
+    assert _sync_backlog(bot, "Unrelated chore").get_json()["closed_notes"] == 1
     state, closed_at = _state(authed, item)
     assert state == "closed" and closed_at
+
+
+def test_a_file_truncated_for_one_push_never_closes_the_note(authed, bot):
+    """B-14: a push read the file mid-write and missed the line; the next one has it."""
+    item, line = _filed_with_line(authed, bot)
+    for _ in range(3):
+        assert _sync_backlog(bot, "Unrelated chore").get_json()["closed_notes"] == 0
+        assert _sync_backlog(bot, line, "Unrelated chore").get_json()["closed_notes"] == 0
+    assert _state(authed, item) == ("open", None)
+
+
+def test_a_line_added_and_removed_between_pushes_still_closes_its_note(authed, bot):
+    """Filed, but the mirror never saw the line (added and removed within an hour): the
+    grace period, not a "never seen" exception, decides — it closes after two pushes."""
+    item = _reviewed_voice(authed, bot)
+    _file(bot, item, line=f"Fix the fan (voice {item[:8]})")
+    first, second = _gone_twice(bot, "Unrelated chore")
+    assert (first["closed_notes"], second["closed_notes"]) == (0, 1)
+    assert _state(authed, item)[0] == "closed"
 
 
 def test_the_rule_is_idempotent_across_repeated_pushes(authed, bot):
@@ -1600,7 +1627,7 @@ def test_the_rule_is_idempotent_across_repeated_pushes(authed, bot):
     for _ in range(3):                                   # line present: nothing happens
         r = _sync_backlog(bot, line, "Unrelated chore").get_json()
         assert (r["closed_notes"], r["reopened_notes"]) == (0, 0)
-    _sync_backlog(bot, "Unrelated chore")
+    _gone_twice(bot, "Unrelated chore")
     closed_at = _state(authed, item)[1]
     for _ in range(3):                                   # line gone: closed once, stays put
         r = _sync_backlog(bot, "Unrelated chore").get_json()
@@ -1608,10 +1635,15 @@ def test_the_rule_is_idempotent_across_repeated_pushes(authed, bot):
     assert _state(authed, item) == ("closed", closed_at)
 
 
-def test_marking_the_line_done_closes_the_note_and_unmarking_reopens_it(authed, bot):
+@pytest.mark.parametrize("done", [
+    "✅ DONE 2026-10-01 — {line}",               # prefix, the older style
+    "{line} — ✅ DONE 2026-10-01 via PR #3",     # suffix: the tag is mid-line now
+    "{line} — ✅️ RESOLVED",                     # the emoji's variation selector, RESOLVED
+])
+def test_marking_the_line_done_closes_the_note_at_once_and_unmarking_reopens_it(
+        authed, bot, done):
     item, line = _filed_with_line(authed, bot)
-    done = "✅ DONE 2026-09-29 — " + line
-    r = _sync_backlog(bot, done, "Unrelated chore").get_json()
+    r = _sync_backlog(bot, done.format(line=line), "Unrelated chore").get_json()
     assert r["closed_notes"] == 1 and r["archived"] == 1          # the key changed with the text
     assert _state(authed, item)[0] == "closed"
     # The done line is a CLOSED backlog row, and it is not shown beside the closed note.
@@ -1625,16 +1657,18 @@ def test_marking_the_line_done_closes_the_note_and_unmarking_reopens_it(authed, 
 
 def test_a_backlog_rows_state_follows_its_done_marker(authed, bot):
     _sync_backlog(bot, "✅ DONE 2026-09-12 — Landing page", "Open chore",
-                  "✅done lowercase-ish counts too", "Mentions ✅ DONE only later\nWhy: x")
+                  "✅done lowercase-ish counts too", "Easier sign-in — ✅ DONE 2026-07-08 via #4",
+                  "Flaky probe ✅ RESOLVED")
     rows = {i["title"]: i for i in
             authed.get("/api/v1/inbox/items?source=backlog").get_json()["items"]}
     states = {t[:12]: r["state"] for t, r in rows.items()}
     assert states == {"✅ DONE 2026-": "closed", "Open chore": "open",
-                      "✅done lowerc": "closed", "Mentions ✅ D": "closed"}
+                      "✅done lowerc": "closed", "Easier sign-": "closed",
+                      "Flaky probe ": "closed"}
     # Done rows are not open: not in the Open count (the Inbox tile and the Hub card read it),
     # not under the open filter; they are still listed, as closed.
     listing = authed.get("/api/v1/inbox/items").get_json()
-    assert listing["counts"]["open"] == 1 and listing["counts"]["total"] == 4
+    assert listing["counts"]["open"] == 1 and listing["counts"]["total"] == 5
     assert [i["title"] for i in authed.get("/api/v1/inbox/items?state=open")
             .get_json()["items"]] == ["Open chore"]
     assert "1 open item<" in authed.get("/").data.decode().replace("\n", "")
@@ -1642,6 +1676,41 @@ def test_a_backlog_rows_state_follows_its_done_marker(authed, bot):
     _sync_backlog(bot, "Plain entry\nWhy: ✅ DONE is mentioned here")
     plain = authed.get("/api/v1/inbox/items?source=backlog&state=open").get_json()["items"]
     assert [i["title"] for i in plain] == ["Plain entry"]
+
+
+def test_a_tag_outside_the_what_line_links_nothing(authed, bot):
+    """Only the What: line carries the link. A tag quoted in Notes:/Context: (Hopper
+    cross-referencing a note, say) must not hide that entry, link it, or close anything."""
+    item, line = _filed_with_line(authed, bot)
+    tag = f"(voice {item[:8]})"
+    other = f"Different chore\nNotes: came up next to {tag}\nContext: see {tag}"
+    _sync_backlog(bot, line, other, "Unrelated chore")
+    listed = authed.get("/api/v1/inbox/items").get_json()["items"]
+    assert "Different chore" in [i["title"] for i in listed]      # not hidden as a copy
+    note = next(i for i in listed if i["id"] == item)
+    assert note["filed_backlog"]["mirror_key"] == inbox_db.normalise_backlog_key(line)
+    # The line itself goes; the Notes: mention must not keep the note open.
+    _gone_twice(bot, other, "Unrelated chore")
+    assert _state(authed, item)[0] == "closed"
+
+
+def test_the_what_line_tag_match_is_the_same_in_sql_and_python(settings):
+    """The three matchers must agree: _FILED_COPY_SQL (SQL) and filed_line_status /
+    backlog_copies (Python, via backlog_tags)."""
+    conn = inbox_db.connect(settings.inbox_db_path)
+    try:
+        corpus = ["Fix it (voice abcd1234)", "(voice abcd1234) Fix it", "Fix (voice abcd1234) — ✅ DONE",
+                  "Fix it\nNotes: (voice abcd1234)", "Fix it (voice abcd12345)",
+                  "Fix it (Voice abcd1234)", "", "Fix it (voice abcd1234)\n",
+                  "x (voice ffff0000) y (voice abcd1234)"]
+        for body in corpus:
+            py = "abcd1234" in inbox_db.backlog_tags(body)
+            sql = conn.execute(
+                "SELECT instr(" + inbox_db.WHAT_LINE_SQL.replace("inbox_items.body", "?")
+                + ", '(voice ' || ? || ')') > 0", (body, body, "abcd1234")).fetchone()[0]
+            assert bool(sql) == py, body
+    finally:
+        conn.close()
 
 
 def test_a_reworded_line_keeping_the_tag_never_flaps_the_note(authed, bot):
@@ -1657,8 +1726,9 @@ def test_the_tag_moving_to_a_different_entry_keeps_the_note_open(authed, bot):
     tag = f"(voice {item[:8]})"
     r = _sync_backlog(bot, "Fix the Mac fan noise", f"Unrelated chore {tag}").get_json()
     assert r["closed_notes"] == 0 and _state(authed, item) == ("open", None)
-    # ...and when that entry goes, the note closes.
-    assert _sync_backlog(bot, "Fix the Mac fan noise").get_json()["closed_notes"] == 1
+    # ...and when that entry goes too, the note closes (after the grace push).
+    first, second = _gone_twice(bot, "Fix the Mac fan noise")
+    assert (first["closed_notes"], second["closed_notes"]) == (0, 1)
 
 
 def test_two_lines_with_the_same_tag_one_done_keep_the_note_open(authed, bot):
@@ -1675,12 +1745,15 @@ def test_two_lines_with_the_same_tag_one_done_keep_the_note_open(authed, bot):
 
 def test_a_partial_or_refused_push_changes_nothing(authed, bot):
     item, line = _filed_with_line(authed, bot)
-    assert _sync_backlog(bot, "Unrelated chore", complete=False).status_code == 200
+    for _ in range(3):
+        assert _sync_backlog(bot, "Unrelated chore", complete=False).status_code == 200
     assert _sync_backlog(bot, complete=True).status_code == 400          # empty: refused
     bad = bot.post("/api/v1/inbox/mirror/backlog", headers=machine(), json={
         "complete": True, "items": [{"text": "Unrelated chore"}, "not an object"]})
     assert bad.status_code == 400
     assert _state(authed, item) == ("open", None)
+    # ...and partial pushes do not count towards the grace period either.
+    assert _sync_backlog(bot, "Unrelated chore").get_json()["closed_notes"] == 0
     # And the other way: a partial push with the line back does not reopen.
     _sync_backlog(bot, "Unrelated chore")
     assert _state(authed, item)[0] == "closed"
@@ -1700,8 +1773,7 @@ def _dump(settings):
                                  {"text": "Bad project", "project": "has spaces"}])
 def test_a_backlog_push_with_a_bad_item_in_the_middle_changes_nothing(
         authed, bot, settings, bad):
-    """All or nothing: a 400 on item 2 must not leave item 1 written (a return inside the
-    transaction used to COMMIT everything upserted before it)."""
+    """All or nothing: a 400 on item 2 must not leave item 1 written."""
     item, line = _filed_with_line(authed, bot)
     before = _dump(settings)
     r = bot.post("/api/v1/inbox/mirror/backlog", headers=machine(), json={
@@ -1713,10 +1785,11 @@ def test_a_backlog_push_with_a_bad_item_in_the_middle_changes_nothing(
 
 
 def test_no_route_returns_from_inside_a_write_transaction():
-    """A structural guard beside the behavioural test above, because the failure is silent:
-    `with conn:` COMMITS on a normal exit, and a `return` is a normal exit — so an error
-    response sent from inside the block keeps every write made before it. Validate first,
-    or raise to roll back."""
+    """A structural guard beside the behavioural tests, because the failure is silent. The
+    connections here are autocommit (`isolation_level=None`), so `with conn:` is NOT a
+    transaction: every statement commits as it runs, and an error response sent from inside
+    the block keeps every write made before it. Validate first, then write — atomically in
+    `inbox_db.transaction(conn)` when it is more than one statement."""
     import ast
     import pathlib
     offenders = []
@@ -1724,7 +1797,8 @@ def test_no_route_returns_from_inside_a_write_transaction():
                         / "dashboard").glob("*.py")):
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
             if isinstance(node, ast.With) and any(
-                    ast.unparse(i.context_expr).endswith("conn") for i in node.items):
+                    ast.unparse(i.context_expr).endswith(("conn", "conn)"))
+                    for i in node.items):
                 offenders += [f"{path.name}:{n.lineno}" for n in ast.walk(node)
                               if isinstance(n, ast.Return)]
     assert offenders == []
@@ -1739,28 +1813,33 @@ def test_a_push_of_only_blank_entries_is_refused_like_an_empty_one(authed, bot, 
     assert _dump(settings) == before
 
 
-def test_a_filed_note_waits_for_its_line_to_reach_the_mirror(authed, bot):
-    item = _reviewed_voice(authed, bot)
-    _file(bot, item, line=f"Fix the fan (voice {item[:8]})")
-    # Filed, but the push read the file before the line was written: nothing to close on.
-    assert _sync_backlog(bot, "Unrelated chore").get_json()["closed_notes"] == 0
-    assert _state(authed, item) == ("open", None)
+def test_a_backlog_file_bigger_than_the_global_cap_still_syncs(authed, bot, settings):
+    """B-24: the real file is 45 KB of JSON, 69% of the 64 KB app-wide cap. This route gets
+    its own 1 MB allowance; every other route keeps the global cap."""
+    texts = [f"Entry {i}: " + "x" * 900 for i in range(80)]           # ~75 KB of JSON
+    r = _sync_backlog(bot, *texts)
+    assert r.status_code == 200 and r.get_json()["synced"] == 80
+    huge = [f"Entry {i}: " + "y" * 19000 for i in range(60)]          # > 1 MB
+    assert _sync_backlog(bot, *huge).status_code == 413
+    item = post_note(authed).get_json()["id"]
+    assert authed.patch(f"/api/v1/inbox/items/{item}",
+                        json={"title": "z" * 70000}).status_code == 413
 
 
 def test_a_note_closed_by_hand_is_never_reopened_by_the_backlog_rule(authed, bot):
     item, line = _filed_with_line(authed, bot)
     assert authed.patch(f"/api/v1/inbox/items/{item}",
                         json={"state": "closed"}).status_code == 200
-    _sync_backlog(bot, "Unrelated chore")
+    _gone_twice(bot, "Unrelated chore")
     _sync_backlog(bot, line, "Unrelated chore")
     assert _state(authed, item)[0] == "closed"
-    # Closed by hand while the line is still open: the line is its only live view, so the
-    # copy is listed again.
-    assert any(i["source"] == "backlog" and "(voice" in i["title"]
-               for i in authed.get("/api/v1/inbox/items").get_json()["items"])
+    # Closed by hand while its line is still in the file: the copy STAYS hidden — it is the
+    # same piece of work as the note, whatever the note's state (only a Delete shows it).
+    listed = authed.get("/api/v1/inbox/items").get_json()["items"]
+    assert not any(i["source"] == "backlog" and "(voice" in i["title"] for i in listed)
     # One the rule closed and Graham then re-closed by hand is his now.
     item2, line2 = _filed_with_line(authed, bot, what="Tidy the box")
-    _sync_backlog(bot, line, "Unrelated chore")
+    _gone_twice(bot, line, "Unrelated chore")
     assert _state(authed, item2)[0] == "closed"
     authed.patch(f"/api/v1/inbox/items/{item2}", json={"state": "open"})
     authed.patch(f"/api/v1/inbox/items/{item2}", json={"state": "closed"})
@@ -1770,12 +1849,34 @@ def test_a_note_closed_by_hand_is_never_reopened_by_the_backlog_rule(authed, bot
 
 def test_a_note_reopened_by_hand_is_not_closed_again_while_its_line_stays_gone(authed, bot):
     item, _ = _filed_with_line(authed, bot)
-    _sync_backlog(bot, "Unrelated chore")
+    _gone_twice(bot, "Unrelated chore")
     assert _state(authed, item)[0] == "closed"
     authed.patch(f"/api/v1/inbox/items/{item}", json={"state": "open"})
-    _sync_backlog(bot, "Unrelated chore")
-    _sync_backlog(bot, "Unrelated chore", "Another chore")
+    for _ in range(3):
+        _sync_backlog(bot, "Unrelated chore", "Another chore")
     assert _state(authed, item) == ("open", None)
+
+
+def test_a_hand_reopen_of_a_note_whose_line_is_done_sticks(authed, bot):
+    item, line = _filed_with_line(authed, bot)
+    done = "✅ DONE 2026-10-01 — " + line
+    _sync_backlog(bot, done, "Unrelated chore")
+    assert _state(authed, item)[0] == "closed"
+    authed.patch(f"/api/v1/inbox/items/{item}", json={"state": "open"})
+    for _ in range(3):
+        _sync_backlog(bot, done, "Unrelated chore")
+    assert _state(authed, item) == ("open", None)
+
+
+def test_the_filed_copy_is_hidden_until_its_note_is_deleted(authed, bot):
+    item, line = _filed_with_line(authed, bot)
+    for state in ("closed", "open"):
+        authed.patch(f"/api/v1/inbox/items/{item}", json={"state": state})
+        titles = [i["title"] for i in authed.get("/api/v1/inbox/items").get_json()["items"]]
+        assert line not in titles
+    assert authed.delete(f"/api/v1/inbox/items/{item}").status_code == 200
+    titles = [i["title"] for i in authed.get("/api/v1/inbox/items").get_json()["items"]]
+    assert line in titles
 
 
 # --------------------------------------------------------------------------- #
