@@ -972,8 +972,8 @@ That is why it is on a 5-minute `StartInterval` and not the probe's hour.
 It also has a privacy consequence worth stating: because transcription happens here, on Graham's own Mac,
 **the audio of a voice note never leaves his own machines.** It goes browser → the box, and box → this Mac.
 No third party is ever sent the audio. **The transcript and title are**: with drafting on (§4c) the worker
-sends each new transcript (and a title Graham typed, if any) from this Mac to Anthropic (Claude) to draft
-the item. The page says so in the same words.
+sends each new transcript (and a title Graham typed, if any), plus the optional setup brief, from this Mac
+to Anthropic (Claude) to draft the item. The page says so in the same words.
 
 **Prerequisites on the Mac**, both of which the installer only WARNS about (it cannot fix them for you):
 
@@ -1046,10 +1046,11 @@ After transcribing, the same worker drafts each new voice note: a concise impera
 Mac and posts to `POST /api/v1/inbox/items/<id>/draft`. The draft is stored ALONGSIDE the note
 (`draft_*` columns); the note's `body` stays the transcript. Graham reads and edits it on `/inbox`, and
 **ticking Reviewed copies the draft into the note's title and project** — which is what Hopper's filing
-loop then reads. **The transcript and title go to Anthropic; the audio never does.**
+loop then reads. **The transcript, the title and the setup brief go to Anthropic; the audio never does.**
 
 Off until `INBOX_CLAUDE_BIN` is set. `deploy/mac/install.sh --inbox` prompts for it (`-` leaves it off) and
-appends four keys:
+appends four keys, plus `INBOX_DRAFT_CONTEXT_FILE` in its own step (so a re-run on an install that already
+drafts adds just that key):
 
 | key | what it is |
 |---|---|
@@ -1057,6 +1058,11 @@ appends four keys:
 | `INBOX_CLAUDE_TOKEN_FILE` | `~/.config/hopper-dashboard/claude-token`: ONE line, the OAuth token, **chmod 600** |
 | `INBOX_DRAFT_MODEL` | `sonnet` |
 | `INBOX_DRAFT_LIMIT` | notes drafted per 5-minute run, `5` |
+| `INBOX_DRAFT_CONTEXT_FILE` | optional setup brief sent with each note as reference data: `~/personal-assistant/docs/voice-context.md` when that exists at install time, else empty (no brief). Shape: `deploy/mac/draft-context.example.md`. Read fresh each run, cut at 6000 chars; missing/unreadable/group- or world-WRITABLE = no brief + one `warning:` line in the worker log, never a failed heartbeat. 0644 is fine |
+
+To add or change the brief on an existing install: edit the env line by hand (or re-run `install.sh --inbox`
+if the key is absent), then check the next run's log for `setup brief: N chars` — a `warning:
+INBOX_DRAFT_CONTEXT_FILE …` line means it is being ignored and says why.
 
 **The token: Graham runs `claude setup-token` once** (it opens a browser and prints a long-lived OAuth token)
 and saves it in the token file:

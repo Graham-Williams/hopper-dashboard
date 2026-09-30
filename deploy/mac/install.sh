@@ -12,6 +12,8 @@
 # It also prompts for INBOX_CLAUDE_BIN (the `claude` CLI that drafts each voice note; '-' =
 # drafting off) and checks the OAuth token file INBOX_CLAUDE_TOKEN_FILE is 0600 — it WARNS,
 # never fails, when the file is missing: make it once with `claude setup-token`.
+# It also sets INBOX_DRAFT_CONTEXT_FILE (the optional setup brief sent with each note) to
+# ~/personal-assistant/docs/voice-context.md when that exists, else leaves it empty.
 # It is opt-in because the transcription worker needs mlx-whisper in a venv on this Mac; the
 # probe needs nothing but the stock python3.
 #
@@ -43,7 +45,7 @@ while [[ $# -gt 0 ]]; do
     --inbox) WANT_INBOX=1; shift ;;
     --inbox-url) INBOX_URL="$2"; WANT_INBOX=1; shift 2 ;;
     --token|--inbox-token) echo "ERROR: $1 is not accepted (it would leak into shell history / ps); the script prompts with a hidden read" >&2; exit 2 ;;
-    -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -167,6 +169,25 @@ if [[ -n "$WANT_INBOX" ]]; then
       echo "claude token file OK ($TF, mode 600)"
     fi
   fi
+fi
+# The optional SETUP BRIEF: a plain-text description of Graham's projects and their
+# nicknames, sent with every note as reference data (so "the wheel page" can be placed).
+# Its own append, so an existing install that already has INBOX_CLAUDE_BIN still gets the key.
+# Default: Hopper's maintained brief when it exists on this Mac, else empty (no brief).
+# Shape: deploy/mac/draft-context.example.md. It is sent to Anthropic with each note.
+if [[ -n "$WANT_INBOX" ]] && ! grep -q '^INBOX_DRAFT_CONTEXT_FILE=' "$ENV_FILE"; then
+  CTX=""
+  [[ -f "$HOME/personal-assistant/docs/voice-context.md" ]] && CTX="$HOME/personal-assistant/docs/voice-context.md"
+  umask 077
+  {
+    echo "# Optional setup brief sent with each note as reference data (empty = none). The worker"
+    echo "# ignores a group/world-writable file. Example shape: deploy/mac/draft-context.example.md"
+    echo "INBOX_DRAFT_CONTEXT_FILE=$CTX"
+  } >> "$ENV_FILE"
+  umask 022
+  chmod 600 "$ENV_FILE"
+  if [[ -n "$CTX" ]]; then echo "drafting setup brief: $CTX"
+  else echo "no setup brief found; INBOX_DRAFT_CONTEXT_FILE left empty (see deploy/mac/draft-context.example.md)"; fi
 fi
 
 # --- 2. plists ------------------------------------------------------------------

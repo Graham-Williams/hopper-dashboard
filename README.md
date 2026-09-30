@@ -43,7 +43,9 @@ issue links and live open/closed state.
 
 **Audio never leaves your own machines; the transcript and title go to Anthropic for drafting.** Each
 transcribed note gets an AI draft (title, description, project) made on the Mac by the `claude` CLI, which
-you edit and approve by ticking Reviewed — the audio is never sent anywhere, only the transcript and title. The browser uploads the recording to the box and does nothing else
+you edit and approve by ticking Reviewed — the audio is never sent anywhere, only the transcript, the title
+and an optional short brief of your setup (`INBOX_DRAFT_CONTEXT_FILE`, shape in
+`deploy/mac/draft-context.example.md`) that helps it pick the right project. The browser uploads the recording to the box and does nothing else
 with it — there is deliberately no in-browser speech recognition, because the Web Speech API sends your
 microphone to a third party's servers to do the work. Transcription runs locally instead, on a Mac, via
 `probes/inbox_transcribe.py` and mlx-whisper. It is a job on the board like any other, so a transcription

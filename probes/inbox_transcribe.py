@@ -18,8 +18,8 @@ transcription it drafts up to INBOX_DRAFT_LIMIT (5) notes with `claude -p`:
   POST /api/v1/inbox/items/<id>/draft   → {"title","body","project","src_sha","model"}
                                    ...or  {"failed": true, "error", "src_sha"}
 
-The TRANSCRIPT and TITLE go to Anthropic in that phase; the audio never leaves the box and this
-Mac. A systemic drafting failure (claude missing, not logged in, limit, 5xx) fails the heartbeat
+The TRANSCRIPT and TITLE go to Anthropic in that phase, plus the optional setup brief
+(INBOX_DRAFT_CONTEXT_FILE, read fresh each run); the audio never leaves the box and this Mac. A systemic drafting failure (claude missing, not logged in, limit, 5xx) fails the heartbeat
 and burns no note's attempt; a circuit breaker and a two-run timeout rule sit on top — see
 run_drafting and inbox_draft's docstring.
 
@@ -194,6 +194,9 @@ def load_settings(env_path: str) -> Dict[str, str]:
         # Drafting (phase two). Empty INBOX_CLAUDE_BIN = drafting is off: a no-op.
         "INBOX_CLAUDE_BIN": "",
         "INBOX_CLAUDE_TOKEN_FILE": "",
+        # Optional plain-text brief of Graham's setup, sent with each note as reference data.
+        # Empty = none. Missing/unreadable/writable-by-others = none + one log warning.
+        "INBOX_DRAFT_CONTEXT_FILE": "",
         "INBOX_DRAFT_MODEL": inbox_draft.DEFAULT_MODEL,
         "INBOX_DRAFT_LIMIT": str(inbox_draft.DEFAULT_LIMIT),
         "INBOX_DRAFT_TIMEOUT": str(inbox_draft.DEFAULT_TIMEOUT_S),
@@ -585,12 +588,22 @@ def run_drafting(cfg: Dict[str, str], log: Logger, dry_run: bool,
             token = inbox_draft.read_token(cfg.get("INBOX_CLAUDE_TOKEN_FILE") or "")
             env = inbox_draft.child_env(minimal_env, token)
             timeout = float(_int(cfg, "INBOX_DRAFT_TIMEOUT", inbox_draft.DEFAULT_TIMEOUT_S))
+            # Read fresh each run, so an edit takes effect on the next cycle. Never fatal, and
+            # neither the brief nor any of it goes into the log or the heartbeat — only the
+            # warning (path + reason) and a character count.
+            context, warning = inbox_draft.read_context(
+                cfg.get("INBOX_DRAFT_CONTEXT_FILE") or "")
+            if warning:
+                log.log("warning: %s" % flatten_for_log(warning, 300))
+            elif context:
+                log.log("setup brief: %d chars" % len(context))
         for item in items[:limit]:
             item_id = str(item["id"])
             bad: Optional[str] = None
             try:
                 draft = inbox_draft.draft_one(claude_bin, model, item, known, env,
-                                              timeout=timeout, runner=runner)
+                                              timeout=timeout, runner=runner,
+                                              context=context)
             except inbox_draft.DraftTimeout:
                 if last_timeout == item_id:
                     bad = "claude timed out on this note in two consecutive runs"

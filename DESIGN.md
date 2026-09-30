@@ -160,10 +160,20 @@ Outputs:
   board).
 - ntfy (a third party) receives only `job_id: FROM → TO` — never the free-text reason (container names,
   client notes, rclone stderr stay on the board).
-- **A voice note's AUDIO never reaches a third party; its TRANSCRIPT and TITLE go to Anthropic.** (Changed
-  2026-09-28 with drafting — see "Drafts, Needs review and the Hub".) The page says: "Audio stays on this box
-  and your Mac. The transcript and title (not the audio) are sent from the Mac to Anthropic (Claude) to
-  draft the item." (Also sent: the project hint and the list of project names.) The browser still talks to nothing but this origin. The browser uploads audio to the box and does
+- **A voice note's AUDIO never reaches a third party; its TRANSCRIPT and TITLE go to Anthropic, with the
+  setup brief.** (Changed 2026-09-28 with drafting — see "Drafts, Needs review and the Hub"; the brief was
+  added 2026-09-29.) The page says: "Audio stays on this box, your Mac and the Drive backup. The
+  transcript, the title and a short brief of your setup (not the audio) are sent from the Mac to Anthropic
+  (Claude) to draft the item." (Also sent: the project hint and the list of project names.) The setup
+  brief is `INBOX_DRAFT_CONTEXT_FILE` on the Mac — a page Graham (or Hopper) keeps describing his projects
+  and their nicknames, so the drafter can tell what "the backup thing" means. It rides stdin as a
+  `context` field marked as reference data, never argv; the system prompt says to use it to pick the
+  project and word the description and never to copy it into the output. It is read fresh each run, UTF-8,
+  cut at 6000 characters with a marker. Missing, unreadable, not UTF-8, empty, or group/world-WRITABLE =
+  no brief and one log line (not systemic, burns nothing). Writable-by-others is refused because anyone who
+  can write it can steer every draft; readable-by-others (0644) is allowed because, unlike the OAuth
+  token, it is not a secret. Its text never reaches the log or the heartbeat — only a character count or
+  the warning's path and reason. The browser still talks to nothing but this origin. The browser uploads audio to the box and does
   nothing else with it: there is deliberately no in-browser speech recognition, because the Web Speech API
   streams the microphone to Google's or Apple's servers to do the work — inherent to it, not a setting.
   Transcription instead happens on Graham's own Mac, by mlx-whisper running locally. So the full path of a
@@ -522,7 +532,8 @@ nesting — and linked as `filed_backlog.mirror_key` on the note. `?source=backl
 
 **The `claude -p` call** is locked down: `--safe-mode --setting-sources "" --tools "" --strict-mcp-config
 --no-session-persistence --disable-slash-commands --output-format json --json-schema … --model sonnet
---system-prompt …`, the transcript as JSON on stdin framed as data, an empty temp cwd, an allowlisted env
+--system-prompt …`, the transcript (and the optional setup brief as a `context` field — see the privacy
+bullet above) as JSON on stdin framed as data, an empty temp cwd, an allowlisted env
 plus `CLAUDE_CODE_OAUTH_TOKEN` from a 0600 file. Never `--bare` (it ignores OAuth). The result envelope was
 recorded from the real CLI: success is `is_error:false` with the object in `structured_output`; every API
 problem is `is_error:true`, `terminal_reason:"api_error"`, `api_error_status` = HTTP status or null, and

@@ -1377,9 +1377,10 @@ def test_needs_review_tile_and_filter_replace_waiting_on(authed, bot):
 
 
 def test_the_privacy_note_says_the_transcript_goes_to_anthropic(authed):
-    html = authed.get("/inbox").data.decode()
-    assert ("Audio stays on this box and your Mac. The transcript and title (not the audio) "
-            "are sent from the Mac to Anthropic (Claude) to draft the item.") in html
+    html = " ".join(authed.get("/inbox").data.decode().split())
+    assert ("Audio stays on this box, your Mac and the Drive backup. The transcript, the "
+            "title and a short brief of your setup (not the audio) are sent from the Mac to "
+            "Anthropic (Claude) to draft the item.") in html
     assert "Recordings never leave this box" not in html
 
 
@@ -1629,7 +1630,7 @@ def test_the_capture_notes_are_one_collapsed_details(authed):
     html = authed.get("/inbox").data.decode()
     block = html.split('<details class="about-recordings">', 1)[1].split("</details>", 1)[0]
     assert "<summary>About recordings and privacy</summary>" in block
-    assert "Audio stays on this box and your Mac." in block
+    assert "Audio stays on this box, your Mac and the Drive backup." in block
     assert "minutes of speech" in block and "about 30 days" in block
     assert " open" not in html.split('<details class="about-recordings"', 1)[1].split(">", 1)[0]
 

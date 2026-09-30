@@ -640,7 +640,10 @@ there is no default URL in the code, by design.
     out last run too — `draft-state.json` next to `state.json`). A 409 is skipped. Never put the CLI's
     stdout in an error message: it can be model output, and those messages reach the heartbeat. The CLI's
     error envelope still says `subtype: "success"` — decide on `is_error` + `api_error_status`, never
-    `subtype`. The TRANSCRIPT and TITLE go to Anthropic; the audio never does. Tests run a FAKE `claude`
+    `subtype`. The TRANSCRIPT and TITLE go to Anthropic, plus the optional SETUP BRIEF
+    (`INBOX_DRAFT_CONTEXT_FILE`, a `context` field on stdin, capped at `MAX_CONTEXT` = 6000 chars, read fresh
+    each run; missing/unreadable/group- or world-writable = no brief + one log warning, never systemic; its
+    text never reaches the log or heartbeat; example `deploy/mac/draft-context.example.md`); the audio never does. Tests run a FAKE `claude`
     executable (argv, stdin, cwd and env are observed, not assumed).
   - `INBOX_URL` must be the Hub host. The probe HTTP client refuses cross-host redirects
     (`common._SameOriginRedirects`), so an old `dashboard…` URL fails every run instead of following the

@@ -977,3 +977,105 @@ def test_a_corrupt_trip_count_in_the_state_file_is_read_as_zero(tmp_path, monkey
     assert "circuit breaker" in sent[0][3]["note"] and "trip 1 of 3" in sent[0][3]["note"]
     assert api.drafts() == []
     assert json.loads((tmp_path / "draft-state.json").read_text())["breaker_trips"] == 1
+
+
+# --- the setup brief (INBOX_DRAFT_CONTEXT_FILE) -------------------------------------
+BRIEF = "- wheel-app: the spinner page; people call it the zq-spinny-thing\n"
+
+
+def _brief(tmp_path, text=BRIEF, mode=0o644, name="draft-context.md"):
+    f = tmp_path / name
+    f.write_text(text, encoding="utf-8")
+    f.chmod(mode)
+    return str(f)
+
+
+def test_the_setup_brief_reaches_claude_on_stdin_and_nowhere_else(tmp_path, monkeypatch):
+    exe = _fake_claude(tmp_path, ["ok"])
+    api = DraftApi([_ditem(ID_A)])
+    sent = _wire(monkeypatch, api)
+    rc = it.main(["--env", _denv(tmp_path, exe,
+                                 INBOX_DRAFT_CONTEXT_FILE=_brief(tmp_path)), "--quiet"])
+    assert rc == 0
+    (call,) = _calls(exe)
+    doc = json.loads(call["stdin"])
+    assert doc["context"] == BRIEF
+    assert "reference data" in doc["context_note"]
+    # Never on the command line, never in the heartbeat or the log.
+    assert not any("zq-spinny-thing" in a for a in call["argv"])
+    sp = call["argv"][call["argv"].index("--system-prompt") + 1]
+    assert '"context"' in sp and "Never copy it" in sp
+    (_, _, _, hb), = sent
+    assert "zq-spinny-thing" not in json.dumps(hb)
+    log = (tmp_path / "worker.log").read_text()
+    assert "zq-spinny-thing" not in log and "setup brief: %d chars" % len(BRIEF) in log
+
+
+def test_the_setup_brief_is_read_fresh_every_run(tmp_path, monkeypatch):
+    exe = _fake_claude(tmp_path, ["ok"])
+    path = _brief(tmp_path, "first version\n")
+    env = _denv(tmp_path, exe, INBOX_DRAFT_CONTEXT_FILE=path)
+    _wire(monkeypatch, DraftApi([_ditem(ID_A)]))
+    assert it.main(["--env", env, "--quiet"]) == 0
+    _brief(tmp_path, "second version\n")
+    _wire(monkeypatch, DraftApi([_ditem(ID_B)]))
+    assert it.main(["--env", env, "--quiet"]) == 0
+    first, second = _calls(exe)
+    assert json.loads(first["stdin"])["context"] == "first version\n"
+    assert json.loads(second["stdin"])["context"] == "second version\n"
+
+
+def test_an_over_long_setup_brief_is_capped_with_a_marker(tmp_path, monkeypatch):
+    exe = _fake_claude(tmp_path, ["ok"])
+    _wire(monkeypatch, DraftApi([_ditem(ID_A)]))
+    big = "é" * (inbox_draft.MAX_CONTEXT + 500)          # UTF-8, counted in characters
+    assert it.main(["--env", _denv(tmp_path, exe,
+                                   INBOX_DRAFT_CONTEXT_FILE=_brief(tmp_path, big)),
+                    "--quiet"]) == 0
+    ctx = json.loads(_calls(exe)[0]["stdin"])["context"]
+    assert ctx == "é" * inbox_draft.MAX_CONTEXT + inbox_draft.CONTEXT_TRUNCATED
+
+
+@pytest.mark.parametrize("case", ["missing", "group_writable", "world_writable",
+                                  "not_utf8", "directory", "empty"])
+def test_a_bad_setup_brief_means_no_brief_and_one_warning_never_a_failure(
+        tmp_path, monkeypatch, case):
+    exe = _fake_claude(tmp_path, ["ok"])
+    if case == "missing":
+        path = str(tmp_path / "nope.md")
+    elif case == "group_writable":
+        path = _brief(tmp_path, "SECRET BRIEF TEXT\n", mode=0o664)
+    elif case == "world_writable":
+        path = _brief(tmp_path, "SECRET BRIEF TEXT\n", mode=0o646)
+    elif case == "not_utf8":
+        path = str(tmp_path / "latin1.md")
+        with open(path, "wb") as fh:
+            fh.write(b"SECRET BRIEF TEXT \xff\xfe\n")
+    elif case == "directory":
+        path = str(tmp_path / "adir")
+        os.mkdir(path)
+    else:
+        path = _brief(tmp_path, "  \n")
+    api = DraftApi([_ditem(ID_A)])
+    sent = _wire(monkeypatch, api)
+    assert it.main(["--env", _denv(tmp_path, exe, INBOX_DRAFT_CONTEXT_FILE=path),
+                    "--quiet"]) == 0
+    (call,) = _calls(exe)
+    doc = json.loads(call["stdin"])
+    assert "context" not in doc and "context_note" not in doc
+    (item_id, body), = api.drafts()                # the note was still drafted, nothing burned
+    assert body["title"] == "Fix the wheel"
+    (_, _, _, hb), = sent
+    assert hb["status"] == "ok" and "SECRET" not in json.dumps(hb)
+    log = (tmp_path / "worker.log").read_text()
+    warnings = [ln for ln in log.splitlines() if "INBOX_DRAFT_CONTEXT_FILE" in ln]
+    assert len(warnings) == 1 and "warning:" in warnings[0]
+    assert "SECRET" not in log
+
+
+def test_no_setup_brief_configured_means_no_context_field_and_no_warning(tmp_path, monkeypatch):
+    exe = _fake_claude(tmp_path, ["ok"])
+    _wire(monkeypatch, DraftApi([_ditem(ID_A)]))
+    assert it.main(["--env", _denv(tmp_path, exe), "--quiet"]) == 0
+    assert "context" not in json.loads(_calls(exe)[0]["stdin"])
+    assert "INBOX_DRAFT_CONTEXT_FILE" not in (tmp_path / "worker.log").read_text()
