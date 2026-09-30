@@ -47,8 +47,8 @@ roles in one process for local dev.
 ```
 uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -r requirements-dev.txt
 # (or: python3.12 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt)
-.venv/bin/python -m pytest -q                         # ~1130 tests, no network, ~2.5 min
-/usr/bin/python3 -m pytest -o addopts="" tests/test_probes_*.py -q   # ~215 probe tests, MUST pass stdlib-only
+.venv/bin/python -m pytest -q                         # ~1180 tests, no network, ~3 min
+/usr/bin/python3 -m pytest -o addopts="" tests/test_probes_*.py -q   # ~220 probe tests, MUST pass stdlib-only
 /usr/bin/python3 -m compileall -qf probes/             # 3.9 syntax gate (CI also RUNS the probe tests on 3.9)
 
 cp jobs.example.yml jobs.yml                          # local only; gitignored
