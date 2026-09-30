@@ -301,6 +301,100 @@ def test_an_item_closed_by_hand_stays_closed_when_its_issue_reopens(conn):
     assert inbox_db.get_item(conn, spoken)["state"] == "closed"
 
 
+# --- the issues rule is EDGE-triggered, for notes -------------------------------- #
+# A note closes when a scan moves its LAST open linked issue to closed, and reopens (only if
+# that rule closed it) when a scan moves a linked issue from closed to open. Transitions are
+# read off the STORED inbox_issues.state before vs after the scan, so an outage cannot hide
+# one, and a hand close or reopen sticks until the next real change upstream.
+_ETAGS = iter(range(1, 1_000_000))
+
+
+def _scan(conn, *open_numbers, at=0):
+    """One complete, error-free scan of REPO in which exactly these issues are open."""
+    fetch = FakeGitHub([ok([issue(n) for n in open_numbers], etag=f'W/"s{next(_ETAGS)}"')])
+    return github_mirror.sync(conn, [REPO], now=NOW + at, fetch=fetch)["results"][0]
+
+
+def _outage(conn, at=0):
+    fetch = FakeGitHub([github_mirror.MirrorResponse(status=500, error="HTTP 500")])
+    assert github_mirror.sync(conn, [REPO], now=NOW + at,
+                              fetch=fetch)["results"][0]["status"] == "error"
+
+
+def _note_linked_to(conn, *numbers):
+    note = inbox_db.create_item(conn, source="voice", text="the wheel sticks",
+                                now="2026-09-01T00:00:00Z")
+    with conn:
+        for n in numbers:
+            inbox_db.link_issue(conn, note, repo=REPO, number=n, url=f"u{n}")
+    return note
+
+
+def _state(conn, note):
+    row = inbox_db.get_item(conn, note)
+    return row["state"], row["closed_by"]
+
+
+def test_a_hand_reopen_sticks_across_repeated_scans(conn):
+    note = _note_linked_to(conn, 7)
+    _scan(conn, 7)
+    _scan(conn, at=900)                                   # #7 closes upstream
+    assert _state(conn, note) == ("closed", "issues")
+    with conn:
+        inbox_db.update_item(conn, note, {"state": "open"})    # Graham: not done yet
+    for i in range(3):
+        _scan(conn, at=1800 + i * 900)                    # #7 is still closed upstream
+    assert _state(conn, note) == ("open", None)
+
+
+def test_a_later_real_close_upstream_closes_a_hand_reopened_note_again(conn):
+    note = _note_linked_to(conn, 7)
+    _scan(conn, 7)
+    _scan(conn, at=900)
+    with conn:
+        inbox_db.update_item(conn, note, {"state": "open"})
+    _scan(conn, at=1800)                                  # no change upstream: stays open
+    assert _state(conn, note) == ("open", None)
+    _scan(conn, 7, at=2700)                               # reopened upstream...
+    assert _state(conn, note) == ("open", None)
+    r = _scan(conn, at=3600)                              # ...and really closed again
+    assert r["closed_items"] == 1 and _state(conn, note) == ("closed", "issues")
+
+
+def test_a_transition_during_a_mirror_outage_is_caught_on_recovery(conn):
+    note = _note_linked_to(conn, 7)
+    _scan(conn, 7)
+    _outage(conn, at=900)                                 # #7 closes while GitHub is down
+    _outage(conn, at=1800)
+    assert _state(conn, note) == ("open", None)
+    assert _scan(conn, at=2700)["closed_items"] == 1      # the first good scan sees it
+    assert _state(conn, note) == ("closed", "issues")
+    _outage(conn, at=3600)                                # and the way back
+    assert _scan(conn, 7, at=4500)["reopened_items"] == 1
+    assert _state(conn, note) == ("open", None)
+
+
+def test_one_of_two_issues_reopening_reopens_the_note(conn):
+    note = _note_linked_to(conn, 1, 2)
+    _scan(conn, 1, 2)
+    _scan(conn, 2, at=900)
+    assert _state(conn, note) == ("open", None)           # #2 is still open
+    _scan(conn, at=1800)
+    assert _state(conn, note) == ("closed", "issues")
+    _scan(conn, 1, at=2700)                               # only #1 reopens
+    assert _state(conn, note) == ("open", None)
+
+
+def test_mirrored_github_rows_keep_following_upstream_every_scan(conn):
+    """The other half of the rule, and intended: a mirrored row is a VIEW of the issue."""
+    _scan(conn, 3)
+    row = inbox_db.list_items(conn)[0]
+    with conn:
+        inbox_db.update_item(conn, row["id"], {"state": "closed"})
+    _scan(conn, 3, at=900)
+    assert inbox_db.get_item(conn, row["id"])["state"] == "open"
+
+
 # --------------------------------------------------------------------------- #
 # Untrusted text
 # --------------------------------------------------------------------------- #

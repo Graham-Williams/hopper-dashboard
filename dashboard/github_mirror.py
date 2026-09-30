@@ -325,6 +325,9 @@ def _sync_repo(conn, repo: str, *, now: float, fetch, token: str) -> dict:
     open_numbers: list[int] = []
     mirrored = linked = 0
     with conn:
+        # The STORED state of every linked issue before this scan touches it: the issues
+        # rule acts on what this scan changes (edge-triggered), not on the end state.
+        before = inbox_db.issue_states(conn, repo)
         for raw in issues:
             number = raw.get("number")
             if not isinstance(number, int) or number <= 0:
@@ -353,10 +356,8 @@ def _sync_repo(conn, repo: str, *, now: float, fetch, token: str) -> dict:
             seen_keys=seen_keys, now=now_text)
         closed_issues = inbox_db.mark_issues_closed(conn, repo, open_numbers,
                                                     now=now_text)
-        closed_items = inbox_db.close_items_whose_issues_all_closed(
-            conn, repo, now=now_text)
-        # And back: an item that rule closed reopens when a linked issue is open again.
-        reopened_items = inbox_db.reopen_items_closed_by_issues(conn, repo, now=now_text)
+        closed_items, reopened_items = inbox_db.apply_issue_transitions(
+            conn, repo, before=before, now=now_text)
         inbox_db.set_mirror_state(
             conn, key, etag=new_etag or etag, last_sync_at=now_text,
             last_status="ok", last_error=None, backoff_until=None,

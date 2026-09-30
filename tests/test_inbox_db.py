@@ -226,11 +226,12 @@ def test_an_item_closes_only_when_every_linked_issue_is_closed(conn):
     item = inbox_db.create_item(conn, source="voice", text="spoken", now=NOW)
     inbox_db.link_issue(conn, item, repo="a/b", number=1, url="u1", now=NOW)
     inbox_db.link_issue(conn, item, repo="c/d", number=2, url="u2", now=NOW)
-    inbox_db.mark_issues_closed(conn, "a/b", open_numbers=[], now=NOW)
-    inbox_db.close_items_whose_issues_all_closed(conn, "a/b", now=NOW)
-    assert inbox_db.get_item(conn, item)["state"] == "open"   # c/d#2 still open
-    inbox_db.mark_issues_closed(conn, "c/d", open_numbers=[], now=NOW)
-    inbox_db.close_items_whose_issues_all_closed(conn, "c/d", now=NOW)
+    for repo in ("a/b", "c/d"):
+        before = inbox_db.issue_states(conn, repo)
+        inbox_db.mark_issues_closed(conn, repo, open_numbers=[], now=NOW)
+        inbox_db.apply_issue_transitions(conn, repo, before=before, now=NOW)
+        if repo == "a/b":
+            assert inbox_db.get_item(conn, item)["state"] == "open"   # c/d#2 still open
     assert inbox_db.get_item(conn, item)["state"] == "closed"
 
 

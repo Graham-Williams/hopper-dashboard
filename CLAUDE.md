@@ -322,8 +322,12 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   **The backlog rule** (`inbox_db.apply_filed_backlog_rule`): every push sets a backlog row's state from
   its What: line (`BACKLOG_DONE_MARKER` "✅ DONE" → closed); after a COMPLETE push (upserts + archive, never
   per row) a filed note whose tagged lines went open → removed/done closes with `closed_by='backlog'`, and
-  reopens only if that rule closed it and a tagged line is open again. The issues rule writes
-  `closed_by='issues'` and `reopen_items_closed_by_issues` undoes only that. Every hand state change clears
+  reopens only if that rule closed it and a tagged line is open again. **The issues rule**
+  (`inbox_db.apply_issue_transitions`, notes only) is edge-triggered too: `github_mirror` snapshots the
+  stored `inbox_issues` states (`issue_states`) at the start of a complete scan, and a note closes
+  (`closed_by='issues'`) only when the scan moves its LAST open issue to closed, and reopens only if that
+  rule closed it and the scan moved an issue closed → open. Mirrored github/backlog rows are VIEWS and
+  follow upstream every scan/push. Every hand state change clears
   `closed_by`. The filed copy stays hidden while its note is open or `closed_by='backlog'`.
 - **Item lifecycle** — what closed/archived/reopen mean per source (voice, typed, github, backlog), and which
   of them is automatic: the table in DESIGN.md "Item lifecycle". One table (`inbox_items`), `state`

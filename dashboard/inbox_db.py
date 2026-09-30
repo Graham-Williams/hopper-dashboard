@@ -218,8 +218,8 @@ INBOX_COLUMNS: tuple[tuple[str, str], ...] = (
     # project again only if this is NULL (``reviewed_at`` cannot say it: an untick clears it).
     ("draft_copied_at", "TEXT"),
     # WHO closed the row, when a rule did: 'backlog' = its backlog.txt line was removed or
-    # marked ✅ DONE (``apply_filed_backlog_rule``); 'issues' = every linked issue closed
-    # (``close_items_whose_issues_all_closed``). NULL for a hand close; cleared by every hand
+    # marked ✅ DONE (``apply_filed_backlog_rule``); 'issues' = a scan closed its last open
+    # linked issue (``apply_issue_transitions``). NULL for a hand close; cleared by every hand
     # state change — so each rule's reopen can only undo its own close.
     ("closed_by", "TEXT"),
 )
@@ -972,38 +972,57 @@ def refresh_issue(conn: sqlite3.Connection, repo: str, number: int, *,
         (title, url, state, now, state, now, repo, int(number)))
 
 
-def close_items_whose_issues_all_closed(conn: sqlite3.Connection,
-                                        repo: str,
-                                        now: str | None = None) -> int:
-    """Close every OPEN item all of whose linked issues are closed.
+def issue_states(conn: sqlite3.Connection, repo: str) -> dict[int, tuple[str, str]]:
+    """``{number: (state, item_id)}`` for every issue linked from ``repo`` — the STORED
+    state that :func:`apply_issue_transitions` compares a scan against."""
+    return {int(r["number"]): (r["state"], r["item_id"]) for r in conn.execute(
+        "SELECT number, state, item_id FROM inbox_issues WHERE repo=?", (repo,))}
 
-    "All", not "any": a voice note can spawn issues in two repos, and one of
-    them being done is not the note being done.
+
+def apply_issue_transitions(conn: sqlite3.Connection, repo: str, *,
+                            before: dict[int, tuple[str, str]],
+                            now: str | None = None) -> tuple[int, int]:
+    """The issues rule for NOTES, EDGE-triggered. Returns ``(closed, reopened)``.
+
+    Call at the end of a COMPLETE scan of ``repo`` (after :func:`refresh_issue` and
+    :func:`mark_issues_closed`), with ``before`` = :func:`issue_states` taken at its start.
+    Only what THIS scan changed counts, read off the stored ``inbox_issues.state``, so a
+    transition that happened during a mirror outage is still seen by the first good scan:
+
+    - an issue moved open → closed, and the note now has NO open linked issue (in any
+      repo — "all", not "any": a note can spawn issues in two repos) → close it,
+      ``closed_by='issues'``;
+    - an issue moved closed → open → reopen the note, ONLY if this rule closed it.
+
+    Being edge-triggered is the point: a hand reopen of a note whose issues are all closed
+    sticks until an issue next changes upstream (it used to be re-closed by every scan), and
+    a hand close is never undone (hand changes clear ``closed_by``). An issue linked since
+    ``before`` was taken counts as open before (``link_issue`` inserts it open). Mirrored
+    ``github`` rows are not touched here: they follow upstream on every scan by design.
     """
     now = now or now_iso()
-    return int(conn.execute(
-        "UPDATE inbox_items SET state='closed', closed_at=?, closed_by=?, updated_at=? "
-        "WHERE state='open' AND EXISTS ("
-        "   SELECT 1 FROM inbox_issues i WHERE i.item_id = inbox_items.id"
-        "     AND i.repo = ?)"
-        " AND NOT EXISTS ("
-        "   SELECT 1 FROM inbox_issues i WHERE i.item_id = inbox_items.id"
-        "     AND i.state != 'closed')",
-        (now, CLOSED_BY_ISSUES, now, repo)).rowcount or 0)
-
-
-def reopen_items_closed_by_issues(conn: sqlite3.Connection, repo: str,
-                                  now: str | None = None) -> int:
-    """The reverse of :func:`close_items_whose_issues_all_closed`: an item that rule closed
-    (``closed_by='issues'``) reopens when any of its linked issues in ``repo`` is open again.
-    An item closed by hand (``closed_by`` NULL) or by the backlog rule is never touched."""
-    now = now or now_iso()
-    return int(conn.execute(
-        "UPDATE inbox_items SET state='open', closed_at=NULL, closed_by=NULL, updated_at=? "
-        "WHERE state='closed' AND closed_by=? AND EXISTS ("
-        "   SELECT 1 FROM inbox_issues i WHERE i.item_id = inbox_items.id"
-        "     AND i.repo = ? AND i.state = 'open')",
-        (now, CLOSED_BY_ISSUES, repo)).rowcount or 0)
+    closing: set[str] = set()
+    reopening: set[str] = set()
+    for number, (state, item_id) in issue_states(conn, repo).items():
+        was = before.get(number, ("open", item_id))[0]
+        if was != "closed" and state == "closed":
+            closing.add(item_id)
+        elif was == "closed" and state != "closed":
+            reopening.add(item_id)
+    reopened = closed = 0
+    for item_id in sorted(reopening):
+        reopened += int(conn.execute(
+            "UPDATE inbox_items SET state='open', closed_at=NULL, closed_by=NULL, updated_at=?"
+            " WHERE id=? AND state='closed' AND closed_by=?",
+            (now, item_id, CLOSED_BY_ISSUES)).rowcount or 0)
+    for item_id in sorted(closing):
+        closed += int(conn.execute(
+            "UPDATE inbox_items SET state='closed', closed_at=?, closed_by=?, updated_at=?"
+            " WHERE id=? AND state='open' AND source IN ('voice','typed')"
+            " AND NOT EXISTS (SELECT 1 FROM inbox_issues i"
+            "   WHERE i.item_id = inbox_items.id AND i.state != 'closed')",
+            (now, CLOSED_BY_ISSUES, now, item_id)).rowcount or 0)
+    return closed, reopened
 
 
 def mark_issues_closed(conn: sqlite3.Connection, repo: str,

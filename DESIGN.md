@@ -268,10 +268,10 @@ button today.
 
 | source | becomes closed | becomes archived | reopens | who |
 |---|---|---|---|---|
-| `voice` | (1) by hand; (2) the ISSUES rule: every linked GitHub issue is closed, checked on each complete scan of a repo it links to (`closed_by='issues'`); (3) the BACKLOG rule: it was filed to backlog.txt and, over one complete push, its `(voice <id8>)` line(s) went from open to removed or ✅ DONE (`closed_by='backlog'`) | never | by hand; or automatically, ONLY by the rule that closed it: `issues` when any linked issue is open again, `backlog` when a tagged line is live and open again. A note closed by hand is never reopened automatically | (1) by hand, (2)(3) automatic |
+| `voice` | (1) by hand; (2) the ISSUES rule: a complete scan moves its LAST open linked issue to closed (edge-triggered: the stored `inbox_issues.state` before vs after the scan; `closed_by='issues'`); (3) the BACKLOG rule: it was filed to backlog.txt and, over one complete push, its `(voice <id8>)` line(s) went from open to removed or ✅ DONE (`closed_by='backlog'`) | never | by hand; or automatically, ONLY by the rule that closed it: `issues` when a scan moves any linked issue from closed to open, `backlog` when a tagged line is live and open again. A note closed by hand is never reopened automatically, and a hand reopen sticks until the next real change upstream | (1) by hand, (2)(3) automatic |
 | `typed` | the same as `voice` | never | the same as `voice` | the same as `voice` |
-| `github` (mirrored issue) | automatically, when a complete open-issue scan of its repo no longer lists it (closed, transferred or deleted upstream); also by hand | never | automatically, on every complete scan that lists it as open; also by hand | automatic, and it wins: a hand close of an issue still open upstream is undone on the next complete scan, and a hand reopen of one closed upstream is re-closed |
-| `backlog` (mirrored line) | automatically, when its What: line carries ✅ DONE (`inbox_db.BACKLOG_DONE_MARKER`, matched case-insensitively on the first line of the text): the state is set from the text on EVERY upsert, complete push or not, so a hand close lasts only until the next push | automatically, when a COMPLETE push no longer has that exact What: line — removed, or edited: any What: edit (adding or removing ✅ DONE or ⭐ included) is a new key, so the old row archives and a new one appears | by the text: taking ✅ DONE off posts the unmarked line again, which un-archives its earlier open row (or creates a new one); a hand close is undone by the next push unless the line is marked done | automatic: the text wins |
+| `github` (mirrored issue) | automatically, when a complete open-issue scan of its repo no longer lists it (closed, transferred or deleted upstream); a hand close lasts only until the next complete scan | never | automatically, on every complete scan that lists it as open | automatic, on EVERY scan, by design: the row is a VIEW of the issue, so upstream always wins (act on it on GitHub — the row links there; it has no Delete) |
+| `backlog` (mirrored line), also a VIEW of upstream (no Delete; edit backlog.txt) | automatically, when its What: line carries ✅ DONE (`inbox_db.BACKLOG_DONE_MARKER`, matched case-insensitively on the first line of the text): the state is set from the text on EVERY upsert, complete push or not, so a hand close lasts only until the next push | automatically, when a COMPLETE push no longer has that exact What: line — removed, or edited: any What: edit (adding or removing ✅ DONE or ⭐ included) is a new key, so the old row archives and a new one appears | by the text: taking ✅ DONE off posts the unmarked line again, which un-archives its earlier open row (or creates a new one); a hand close is undone by the next push unless the line is marked done | automatic: the text wins |
 
 Removal is ARCHIVE, not close, for a backlog row: the file is the only record, and "removed" and "done"
 are different facts (the ✅ DONE convention keeps done entries in the file, but a shipped entry is often
@@ -284,10 +284,13 @@ live view of work that is still open in the file.
 
 The backlog rule acts on the TRANSITION over a whole push (status of the note's tagged lines at the start
 vs the end), so a note Graham reopens by hand stays open while its line stays gone or done, and an edit
-that swaps keys within one push never flaps it. The issues rule and the GitHub mirror are state-based: a
-hand reopen of a note whose linked issues are all closed is closed again by the next complete scan of that
-repo (a 304 "nothing changed" answer is not a scan), and the mirror overrides hand changes to `github` rows
-the same way.
+that swaps keys within one push never flaps it. The issues rule is edge-triggered the same way, per scan
+(`inbox_db.apply_issue_transitions`, fed the stored `inbox_issues` states from before the scan): a hand
+reopen of a note whose issues are all closed sticks until an issue next changes upstream, and a change
+that happened during a mirror outage is caught by the first good scan, because it compares stored state,
+not the previous scan's answer (a 304 "nothing changed" answer is not a scan and changes nothing).
+Mirrored rows are the opposite on purpose: `github` and `backlog` rows are views of upstream, so every
+scan or push re-applies what upstream says and a hand change to them does not stick.
 
 ### Three credentials, and why it is three and not one
 
@@ -585,7 +588,7 @@ otherwise open). Then, ONLY for a COMPLETE push and only after all of it — eve
 An open, filed note whose tag went from open (or never seen) to `done`/`gone` closes, with
 `closed_by='backlog'`. A note with `closed_by='backlog'` whose tag is `open` again reopens. Nothing else is
 touched: a note closed by hand has `closed_by` NULL (every hand state change clears it) and the issues rule
-writes `issues`. What this means in practice:
+(`apply_issue_transitions`) writes `issues`. What this means in practice:
 
 - a partial (`complete: false`), refused or failed push closes and reopens nothing;
 - a reworded line that keeps the tag, or the tag moving to another entry, closes nothing (the tag is still
