@@ -1675,6 +1675,56 @@ def test_a_hand_close_and_reopen_through_the_route_clear_closed_by(authed, bot):
     assert _state(authed, item)[0] == "closed"             # a hand close: never reopened
 
 
+# --- the action row: two groups, and a closed note is reopened before it is edited --- #
+
+def _actions(html, item):
+    return _row(html, item).split('class="item-actions"', 1)[1].split("</div>", 1)[0]
+
+
+def test_the_action_row_is_two_groups_and_the_second_wraps_as_a_unit(authed, bot):
+    voice = _drafted(authed, bot)
+    actions = _actions(authed.get("/inbox").data.decode(), voice)
+    first, second = actions.split('class="action-group action-end"', 1)
+    assert 'class="action-group"' in first
+    assert "edit-draft" in first and "review-box" in first
+    assert "toggle-state" in second and "delete-item" in second
+    assert second.index("toggle-state") < second.index("delete-item")      # Delete LAST
+    css = _code("dashboard/static/app.css")
+    group = css.split(".item-actions .action-group {", 1)[1].split("}", 1)[0]
+    assert "flex-wrap: nowrap" in group
+    assert "margin-left: auto" in css.split(".item-actions .action-end {", 1)[1].split("}", 1)[0]
+    # Close and Reopen take the same width, so flipping one never reflows the row.
+    toggle = css.split(".item-actions .toggle-state {", 1)[1].split("}", 1)[0]
+    assert "min-width:" in toggle
+
+
+def test_a_closed_note_offers_reopen_and_delete_but_no_edit_or_review(authed, bot):
+    voice = _drafted(authed, bot)
+    authed.patch(f"/api/v1/inbox/items/{voice}", json={"state": "closed"})
+    actions = _actions(authed.get("/inbox").data.decode(), voice)
+    assert "edit-draft" not in actions and "review-box" not in actions
+    assert ">Reopen<" in actions and "delete-item" in actions
+    authed.patch(f"/api/v1/inbox/items/{voice}", json={"state": "open"})
+    actions = _actions(authed.get("/inbox").data.decode(), voice)
+    assert "edit-draft" in actions and "review-box" in actions
+
+
+def test_the_delete_button_says_whether_the_note_still_has_its_recording(authed, bot, settings):
+    import os
+    from dashboard import inbox_audio as audio_mod
+    live = _voice_note(authed)["id"]
+    lost = _voice_note(authed)["id"]
+    os.remove(os.path.join(settings.inbox_audio_dir, _audio_path(settings, lost)))
+    audio_mod.prune_audio(settings)
+    html = authed.get("/inbox").data.decode()
+
+    def button(item):
+        return _row(html, item).split('class="delete-item"', 1)[1].split(">", 1)[0]
+    assert 'data-has-audio="1"' in button(live)
+    assert "data-has-audio" not in button(lost) and "data-drive-path" in button(lost)
+    assert 'title="Delete this note"' in button(lost)
+
+
 # --- ?state=archived: rows whose upstream is gone are findable (B-03) --------- #
 
 def test_the_archived_state_filter_lists_archived_rows_with_their_badge(authed, bot):
@@ -2316,7 +2366,9 @@ def test_the_phone_layout_css_rules():
     css = _code("dashboard/static/app.css")
     delete = css.split(".item-actions button.delete-item {", 1)[1].split("}", 1)[0]
     assert "background: transparent" in delete and "var(--fail)" in delete
-    assert "min-height: 44px" in delete and "margin-left: auto" in delete
+    assert "min-height: 44px" in delete
+    # Right-aligned as the second group's end, not by the button itself.
+    assert "margin-left: auto" in css.split(".item-actions .action-end {", 1)[1].split("}", 1)[0]
     review = css.split(".item-actions .review {", 1)[1].split("}", 1)[0]
     assert "min-height: 44px" in review and "border-radius: 999px" in review
     assert "min-height: 44px" in css.split(".item-actions .edit-draft {", 1)[1].split("}", 1)[0]

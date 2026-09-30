@@ -518,8 +518,9 @@
             });
           }
           if (!response.ok) { throw new Error('save failed'); }
-          var row = document.getElementById('item-' + id);
-          if (row) { row.setAttribute('data-reviewed', wanted ? '1' : '0'); }
+          /* Reload, like Close/Reopen: the badge, the Needs review tile and the Hub
+             counts are all server-rendered (BR-04). */
+          window.location.reload();
         }).catch(function () {
           /* Put the box back and SAY so. A checkbox that silently un-ticks
              itself on the next page load is how a review decision gets lost. */
@@ -659,10 +660,15 @@
            there is no undo. `confirm` is deliberate: a bespoke modal would be
            more DOM for no more safety. It names what Delete does NOT reach: the
            Drive backup of the recording is add-only. */
+        /* "and its recording" only while the note still has one HERE (an expired or
+           missing recording is already gone) — but its Drive copy may still exist. */
+        var hasAudio = btn.getAttribute('data-has-audio') === '1';
         var question = drivePath
-          ? 'Delete this note and its recording from the Hub? This cannot be undone.\n\n' +
-            'A copy already backed up stays in Google Drive (' + drivePath + ' in the ' +
-            'backup folder) until you remove it there by hand.'
+          ? (hasAudio ? 'Delete this note and its recording from the Hub?'
+                      : 'Delete this note from the Hub?') +
+            ' This cannot be undone.\n\n' +
+            'A copy of its recording already backed up stays in Google Drive (' +
+            drivePath + ' in the backup folder) until you remove it there by hand.'
           : 'Delete this note? This cannot be undone.';
         if (!window.confirm(question)) { return; }
         btn.disabled = true;

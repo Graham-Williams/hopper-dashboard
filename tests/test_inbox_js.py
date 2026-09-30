@@ -438,6 +438,30 @@ function refused() { return Promise.resolve({ok: false, status: 400, json: funct
                    checked: box.checked, disabled: box.disabled};
   }
 
+  /* A successful tick reloads too (BR-04): the badge and the tiles are server-rendered. */
+  {
+    const box = el('input', {'class': 'review-box', 'data-id': 'f'.repeat(32)});
+    box.checked = true;
+    let reloads3 = 0;
+    const win3 = {
+      fetch: function () { return Promise.resolve({ok: true, status: 200,
+                                                   json: function () { return Promise.resolve({}); }}); },
+      setInterval: function () { return 0; }, clearInterval: function () {},
+      setTimeout: function (fn) { fn(); return 0; },
+      confirm: function () { return false; }, addEventListener: function () {},
+      location: {reload: function () { reloads3 += 1; }}
+    };
+    const doc3 = {
+      getElementById: function () { return null; },
+      querySelectorAll: function (sel) { return sel === '.review-box' ? [box] : []; }
+    };
+    vm.runInNewContext(SRC, {document: doc3, window: win3, navigator: {}, console: console,
+                             Blob: function () {}, FormData: function () {}});
+    box.fire('change');
+    await settle();
+    out.tickOk = {reloads: reloads3};
+  }
+
   process.stdout.write(JSON.stringify(out));
 })().catch(function (err) {
   process.stderr.write(String((err && err.stack) || err));
@@ -576,11 +600,15 @@ function answer(status, body) {
   await settle();
   out.offline = {error: w.err.textContent, reloads: w.reloads(), disabled: w.btn.disabled};
 
-  /* Delete's confirmation names the Drive copy that Delete does NOT remove. */
+  /* Delete's confirmation names the Drive copy that Delete does NOT remove, and only says
+     "and its recording" while the note still has one here. */
   out.confirms = [];
-  for (const path of ['audio/2026/09/' + 'd'.repeat(32) + '.*', null]) {
+  for (const [path, hasAudio] of [['audio/2026/09/' + 'd'.repeat(32) + '.*', true],
+                                  [null, false],
+                                  ['audio/2026/09/' + 'e'.repeat(32) + '.*', false]]) {
     const del = el({'class': 'delete-item', 'data-id': 'd'.repeat(32)});
     if (path) { del.setAttribute('data-drive-path', path); }
+    if (hasAudio) { del.setAttribute('data-has-audio', '1'); }
     const asked = [];
     const win = {
       fetch: function () { asked.push('fetched'); return Promise.resolve({ok: true, status: 200}); },
@@ -643,9 +671,17 @@ def test_a_failed_close_says_so_and_gives_the_button_back(toggled):
 
 
 def test_the_delete_confirmation_names_the_drive_copy_it_leaves(toggled):
-    with_audio, without = toggled["confirms"]
+    with_audio, without, expired = toggled["confirms"]
+    # A note whose recording is already gone here (expired or missing): not "and its
+    # recording", but its Drive copy may still exist, so that sentence stays.
+    assert len(expired) == 1 and "and its recording" not in expired[0]
+    assert "Delete this note from the Hub?" in expired[0] and "Google Drive" in expired[0]
     assert len(with_audio) == 1 and len(without) == 1          # confirm only: declined, no fetch
     msg = with_audio[0]
     assert "cannot be undone" in msg and "Google Drive" in msg
     assert "audio/2026/09/" + "d" * 32 + ".*" in msg and "by hand" in msg
     assert "Google Drive" not in without[0] and "cannot be undone" in without[0]
+
+
+def test_a_successful_reviewed_tick_reloads_the_page(edited):
+    assert edited["tickOk"] == {"reloads": 1}
