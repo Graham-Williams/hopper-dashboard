@@ -290,10 +290,10 @@ session. A hand change clears `closed_by`, so it sticks until the next upstream 
 
 | source | becomes closed | becomes archived | reopens | who |
 |---|---|---|---|---|
-| `voice` | (1) by hand; (2) the ISSUES rule: a complete scan moves its LAST open linked issue to closed (edge-triggered: the stored `inbox_issues.state` before vs after the scan; `closed_by='issues'`); (3) the BACKLOG rule: it was filed to backlog.txt and its `(voice <id8>)` line was marked ✅ DONE/RESOLVED (closes on that push) or has been missing from 2 consecutive COMPLETE pushes (`backlog_absent_pushes`; `closed_by='backlog'`) | never | by hand; or automatically, ONLY by the rule that closed it: `issues` when a scan moves any linked issue from closed to open, `backlog` when a tagged What: line is live and open again. A note closed by hand is never reopened automatically, and a hand reopen sticks until the next real change upstream | (1) by hand, (2)(3) automatic |
+| `voice` | (1) by hand; (2) the ISSUES rule: a complete scan moves its LAST open linked issue to closed (edge-triggered: the stored `inbox_issues.state` before vs after the scan; `closed_by='issues'`; every note linking that issue follows it — many notes may link one issue); (3) the BACKLOG rule: it was filed to backlog.txt and its `(voice <id8>)` line was marked ✅ DONE/RESOLVED (closes on that push) or has been missing from 2 consecutive COMPLETE pushes (`backlog_absent_pushes`; `closed_by='backlog'`) | never | by hand; or automatically, ONLY by the rule that closed it: `issues` when a scan moves any linked issue from closed to open, `backlog` when a tagged What: line is live and open again. A note closed by hand is never reopened automatically, and a hand reopen sticks until the next real change upstream | (1) by hand, (2)(3) automatic |
 | `typed` | the same as `voice` | never | the same as `voice` | the same as `voice` |
-| `github` (mirrored issue) | automatically, when a complete open-issue scan of its repo no longer lists it (closed, transferred or deleted upstream); a hand close lasts only until the next complete scan | automatically: (a) when a note LINKS its issue (`POST /issues`, G-19 — the note represents it now); (b) when its repo is no longer in `INBOX_GITHUB_REPOS` (G-22, on every sync, even one with no repos) | automatically, on every complete scan that lists it as open; un-archived on a complete scan of its (again watched) repo once no note links it | automatic, on EVERY scan, by design: the row is a VIEW of the issue, so upstream always wins (act on it on GitHub — the row links there; it has no Delete) |
-| `backlog` (mirrored line), also a VIEW of upstream (no Delete; edit backlog.txt) | automatically, when its What: line carries a done marker anywhere (`inbox_db.BACKLOG_DONE_RE`: `✅️?\s*(DONE\|RESOLVED)\b`, case-insensitive — "✅ DONE 2026-08-21 — …", "… — ✅ DONE 2026-07-08 via …", "✅ RESOLVED"): the state is set from the text on EVERY upsert, complete push or not (and `closed_by` cleared), so a hand close lasts only until the next push | automatically, when a COMPLETE push no longer has that exact What: line — removed, or edited: any What: edit (adding or removing ✅ DONE or ⭐ included) is a new key, so the old row archives and a new one appears | by the text: taking ✅ DONE off posts the unmarked line again, which un-archives its earlier open row (or creates a new one); a hand close is undone by the next push unless the line is marked done | automatic: the text wins |
+| `github` (mirrored issue) | automatically, when a complete open-issue scan of its repo no longer lists it (closed, transferred or deleted upstream); the page offers no Close, and an API close lasts only until the next complete scan | automatically: (a) when a note LINKS its issue (`POST /issues`, G-19 — the note represents it now); (b) when its repo is no longer in `INBOX_GITHUB_REPOS` (G-22, on every sync, even one with no repos) | automatically, on every complete scan that lists it as open; un-archived on a complete scan of its (again watched) repo once no note links it | automatic, on EVERY scan, by design: the row is a VIEW of the issue, so upstream always wins (act on it on GitHub — the row links there; it has no Delete) |
+| `backlog` (mirrored line), also a VIEW of upstream (no Delete; edit backlog.txt) | automatically, when its What: line carries a done marker anywhere (`inbox_db.BACKLOG_DONE_RE`: `✅️?\s*(DONE\|RESOLVED)\b`, case-insensitive — "✅ DONE 2026-08-21 — …", "… — ✅ DONE 2026-07-08 via …", "✅ RESOLVED"): the state is set from the text on EVERY upsert, complete push or not (and `closed_by` cleared); the page offers no Close, and an API close lasts only until the next push | automatically, when a COMPLETE push no longer has that exact What: line — removed, or edited: any What: edit (adding or removing ✅ DONE or ⭐ included) is a new key, so the old row archives and a new one appears | by the text: taking ✅ DONE off posts the unmarked line again, which un-archives its earlier open row (or creates a new one); a hand close is undone by the next push unless the line is marked done | automatic: the text wins |
 
 Removal is ARCHIVE, not close, for a backlog row: the file is the only record, and "removed" and "done"
 are different facts (the ✅ DONE convention keeps done entries in the file, but a shipped entry is often
@@ -316,6 +316,19 @@ that happened during a mirror outage is caught by the first good scan, because i
 not the previous scan's answer (a 304 "nothing changed" answer is not a scan and changes nothing).
 Mirrored rows are the opposite on purpose: `github` and `backlog` rows are views of upstream, so every
 scan or push re-applies what upstream says and a hand change to them does not stick.
+
+**Known limits, documented rather than fixed:**
+
+- **G-25 — a change on page 2+ of a big repo waits for page 1.** A scan sends `If-None-Match` with the
+  FIRST page's ETag, and a 304 ends it. In a repo with more than 100 open issues, an old issue that closes
+  (it lives on page 2+) does not change page 1, so the scan is a 304 and the close is picked up only by the
+  first scan after something on page 1 changes. Every watched repo is far below 100 open issues today. The
+  fix, if one ever is: send `If-None-Match` only when the previous listing fit on one page (or keep
+  per-page ETags).
+- **X-05 — the tag is 8 hex characters of a uuid4.** Two FILED notes whose ids share the first 8 would
+  share one backlog line: only one reports it as its copy, the copy stays hidden while either exists, and
+  both follow that line. The chance is about n²/2³³ over n filed notes (≈1e-4 at a thousand). Negligible;
+  the fix, if it ever matters, is a longer tag.
 
 ### Three credentials, and why it is three and not one
 
