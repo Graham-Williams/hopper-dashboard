@@ -979,9 +979,11 @@ def mirror_backlog():
     ``{"complete": true, "items": [{"key": …, "text": …, "project": …}]}``
 
     ``complete`` is the caller asserting it read the entire file; only then may
-    keys that are absent be archived — and only then may a note filed to
-    backlog.txt whose tagged line was just archived be CLOSED
-    (``closed_by='backlog'``). A line that is back reopens such a note on any sync. An EMPTY list is refused outright unless
+    keys that are absent be archived, and only then does the filed-note rule
+    run (``inbox_db.apply_filed_backlog_rule``: a note filed to backlog.txt
+    closes when its line is removed or marked ✅ DONE, and reopens if the rule
+    closed it and the line is open again). Every upsert, complete or not, sets
+    a backlog row's state from its What: line (``backlog_is_done``). An EMPTY list is refused outright unless
     ``allow_empty`` is set, because "the file was unreadable" and "Graham
     emptied the backlog" arrive looking identical and one of them must not
     archive every row.
@@ -1007,6 +1009,8 @@ def mirror_backlog():
     conn = _conn()
     try:
         with conn:
+            # Taken BEFORE any upsert: the filed-note rule acts on what this whole push changed.
+            before = inbox_db.filed_line_status(conn) if complete else {}
             for raw in items:
                 if not isinstance(raw, dict):
                     return _err("each item must be an object")
@@ -1021,23 +1025,21 @@ def mirror_backlog():
                     project = clean_project(raw.get("project"))
                 except ValueError as exc:
                     return _err(str(exc))
+                # A backlog row's state IS its What: line: ✅ DONE → closed, else open.
                 inbox_db.upsert_mirror_item(
                     conn, mirror_key=key, source="backlog",
                     title=inbox_db.derive_title(text), body=text,
-                    project=project, now=now)
+                    project=project, now=now,
+                    state="closed" if inbox_db.backlog_is_done(text) else "open")
                 seen.append(key)
-            # A line that is present again reopens the note the backlog rule closed
-            # (positive evidence, so any sync may do it). Closing needs a COMPLETE sync.
-            reopened = inbox_db.reopen_filed_notes_whose_lines_returned(conn, now=now)
-            archived = closed = 0
+            archived = closed = reopened = 0
             if complete:
-                # Before the archive: the rule needs to see which tagged rows it is about
-                # to archive.
-                closed = inbox_db.close_filed_notes_whose_lines_left(
-                    conn, seen_keys=seen, now=now)
                 archived = inbox_db.archive_missing(
                     conn, prefix=inbox_db.MIRROR_BACKLOG + ":",
                     seen_keys=seen, now=now)
+                # After the WHOLE push (upserts + archive), never per row.
+                closed, reopened = inbox_db.apply_filed_backlog_rule(
+                    conn, before=before, now=now)
         return jsonify({"synced": len(seen), "archived": archived,
                         "complete": complete, "closed_notes": closed,
                         "reopened_notes": reopened})

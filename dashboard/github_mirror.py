@@ -355,6 +355,8 @@ def _sync_repo(conn, repo: str, *, now: float, fetch, token: str) -> dict:
                                                     now=now_text)
         closed_items = inbox_db.close_items_whose_issues_all_closed(
             conn, repo, now=now_text)
+        # And back: an item that rule closed reopens when a linked issue is open again.
+        reopened_items = inbox_db.reopen_items_closed_by_issues(conn, repo, now=now_text)
         inbox_db.set_mirror_state(
             conn, key, etag=new_etag or etag, last_sync_at=now_text,
             last_status="ok", last_error=None, backoff_until=None,
@@ -362,7 +364,7 @@ def _sync_repo(conn, repo: str, *, now: float, fetch, token: str) -> dict:
     return {"repo": repo, "status": "ok", "issues": len(issues),
             "mirrored": mirrored, "already_linked": linked,
             "closed_mirrored": closed_rows, "closed_issues": closed_issues,
-            "closed_items": closed_items}
+            "closed_items": closed_items, "reopened_items": reopened_items}
 
 
 def _int_or_none(value):

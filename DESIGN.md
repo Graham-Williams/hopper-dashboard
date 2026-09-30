@@ -268,20 +268,26 @@ button today.
 
 | source | becomes closed | becomes archived | reopens | who |
 |---|---|---|---|---|
-| `voice` | (1) by hand; (2) when EVERY linked GitHub issue is closed, checked on each complete scan of a repo it links to; (3) when filed to backlog.txt (`filed_backlog_at`) and its `(voice <id8>)` line is removed from the file — on the complete sync that archives the line, never on a partial or failed one; `closed_by='backlog'` | never | by hand; or, only if the backlog rule closed it, when its line is back in backlog.txt (any sync). A note closed by hand, or by the issues rule, is never reopened automatically — not even when a linked issue reopens | (1) by hand, (2)(3) automatic |
+| `voice` | (1) by hand; (2) the ISSUES rule: every linked GitHub issue is closed, checked on each complete scan of a repo it links to (`closed_by='issues'`); (3) the BACKLOG rule: it was filed to backlog.txt and, over one complete push, its `(voice <id8>)` line(s) went from open to removed or ✅ DONE (`closed_by='backlog'`) | never | by hand; or automatically, ONLY by the rule that closed it: `issues` when any linked issue is open again, `backlog` when a tagged line is live and open again. A note closed by hand is never reopened automatically | (1) by hand, (2)(3) automatic |
 | `typed` | the same as `voice` | never | the same as `voice` | the same as `voice` |
 | `github` (mirrored issue) | automatically, when a complete open-issue scan of its repo no longer lists it (closed, transferred or deleted upstream); also by hand | never | automatically, on every complete scan that lists it as open; also by hand | automatic, and it wins: a hand close of an issue still open upstream is undone on the next complete scan, and a hand reopen of one closed upstream is re-closed |
-| `backlog` (mirrored line) | by hand only | automatically, when a COMPLETE sync of backlog.txt no longer has the line (removed, or reworded — a reworded line is a new row) | un-archived automatically when the same line is posted again (any sync); `state` is never touched by the mirror | archive automatic, close by hand |
+| `backlog` (mirrored line) | automatically, when its What: line carries ✅ DONE (`inbox_db.BACKLOG_DONE_MARKER`, matched case-insensitively on the first line of the text): the state is set from the text on EVERY upsert, complete push or not, so a hand close lasts only until the next push | automatically, when a COMPLETE push no longer has that exact What: line — removed, or edited: any What: edit (adding or removing ✅ DONE or ⭐ included) is a new key, so the old row archives and a new one appears | by the text: taking ✅ DONE off posts the unmarked line again, which un-archives its earlier open row (or creates a new one); a hand close is undone by the next push unless the line is marked done | automatic: the text wins |
 
-A backlog row that carries a filed note's tag is also HIDDEN from the default list and the counts while that
-note is not closed (see "Filing to backlog.txt" below); the close rule keeps this consistent, because the
-note only closes when that row is archived, and only reopens when it is live again.
+Removal is ARCHIVE, not close, for a backlog row: the file is the only record, and "removed" and "done"
+are different facts (the ✅ DONE convention keeps done entries in the file, but a shipped entry is often
+just deleted). For a FILED NOTE both mean done, and both close it.
 
-The backlog close rule acts on the TRANSITION (a tagged row this sync is about to archive, and no tagged row
-still in the file), not on the resulting state, so a note Graham reopens by hand stays open while the line
-stays gone. The issues rule and the GitHub mirror are state-based: a hand reopen of a note whose linked issues are all
-closed is closed again by the next complete scan of that repo (a 304 "nothing changed" answer is not a
-scan), and the mirror overrides hand changes to `github` rows the same way.
+A backlog row that carries a filed note's tag is HIDDEN from the default list and the counts while that
+note is open or was closed by the backlog rule (see "Filing to backlog.txt" below) — it is the same piece
+of work. It shows again when the note was closed by hand or by its issues, where the line may be the only
+live view of work that is still open in the file.
+
+The backlog rule acts on the TRANSITION over a whole push (status of the note's tagged lines at the start
+vs the end), so a note Graham reopens by hand stays open while its line stays gone or done, and an edit
+that swaps keys within one push never flaps it. The issues rule and the GitHub mirror are state-based: a
+hand reopen of a note whose linked issues are all closed is closed again by the next complete scan of that
+repo (a 304 "nothing changed" answer is not a scan), and the mirror overrides hand changes to `github` rows
+the same way.
 
 ### Three credentials, and why it is three and not one
 
@@ -571,17 +577,28 @@ whichever arrives first) is **hidden from the default list and the counts while 
 or archived** (shown again once it is) — the simpler of hiding or
 nesting — and linked as `filed_backlog.mirror_key` on the note. `?source=backlog` still lists it.
 
-**Removing the line closes the note** (the backlog twin of "all linked issues closed → close"). A COMPLETE
-backlog sync that is about to archive a live row carrying a filed note's tag, while no row still in the file
-carries it, closes that note (`state='closed'`, `closed_at`, `closed_by='backlog'`) before archiving —
-`inbox_db.close_filed_notes_whose_lines_left`. A partial (`complete: false`), refused or failed sync closes
-nothing; a reworded line (new key, same tag) closes nothing; a filed note whose line has not reached the
-mirror yet closes nothing. If the line comes back (any sync un-archives it), a note with
-`closed_by='backlog'` reopens (`reopen_filed_notes_whose_lines_returned`); a note closed by hand never
-does, because every hand state change clears `closed_by`. Why a column rather than inferring it from
-timestamps: it is the one fact the reopen needs ("did the rule close this?"), and a hand close in the
-same second as a sync would otherwise be indistinguishable. The sync response adds `closed_notes` and
-`reopened_notes`.
+**Removing the line, or marking it ✅ DONE, closes the note** (the backlog twin of "all linked issues
+closed → close"). Every backlog push first sets each row's state from its What: line (✅ DONE → closed,
+otherwise open). Then, ONLY for a COMPLETE push and only after all of it — every upsert and the archive —
+`inbox_db.apply_filed_backlog_rule` compares each tag's status at the start of the push with the end:
+`open` (some live tagged row is open), `done` (live tagged rows, all closed) or `gone` (only archived ones).
+An open, filed note whose tag went from open (or never seen) to `done`/`gone` closes, with
+`closed_by='backlog'`. A note with `closed_by='backlog'` whose tag is `open` again reopens. Nothing else is
+touched: a note closed by hand has `closed_by` NULL (every hand state change clears it) and the issues rule
+writes `issues`. What this means in practice:
+
+- a partial (`complete: false`), refused or failed push closes and reopens nothing;
+- a reworded line that keeps the tag, or the tag moving to another entry, closes nothing (the tag is still
+  on a live open row at the end of the push);
+- two lines with the same tag, one done and one open, keep the note open; both done closes it;
+- a filed note whose line has never reached the mirror is not closed — deliberately NOT "no tagged row =
+  close", because Hopper's filing call and the next hourly push of the file can land in either order.
+
+Why a column (`closed_by`) rather than inferring from timestamps: it is the one fact each reopen needs
+("did this rule close it?"), and a hand close in the same second as a push would otherwise be
+indistinguishable. The push response adds `closed_notes` and `reopened_notes`; the GitHub sync result
+adds `reopened_items`. Rows closed before the column existed have `closed_by` NULL, so they are treated as
+closed by hand: no rule reopens them.
 
 **The `claude -p` call** is locked down: `--safe-mode --setting-sources "" --tools "" --strict-mcp-config
 --no-session-persistence --disable-slash-commands --output-format json --json-schema … --model sonnet

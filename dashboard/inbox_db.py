@@ -217,9 +217,10 @@ INBOX_COLUMNS: tuple[tuple[str, str], ...] = (
     # When a review first copied the draft into title/project. A re-tick copies the draft
     # project again only if this is NULL (``reviewed_at`` cannot say it: an untick clears it).
     ("draft_copied_at", "TEXT"),
-    # WHO closed the row, when a rule did: 'backlog' = its backlog.txt line was removed
-    # (``close_filed_notes_whose_lines_left``). NULL for a hand close or any other rule, and
-    # cleared by every hand state change — so the reopen rule can only undo its own close.
+    # WHO closed the row, when a rule did: 'backlog' = its backlog.txt line was removed or
+    # marked ✅ DONE (``apply_filed_backlog_rule``); 'issues' = every linked issue closed
+    # (``close_items_whose_issues_all_closed``). NULL for a hand close; cleared by every hand
+    # state change — so each rule's reopen can only undo its own close.
     ("closed_by", "TEXT"),
 )
 
@@ -752,12 +753,14 @@ def link_issue(conn: sqlite3.Connection, item_id: str, *, repo: str,
 def upsert_mirror_item(conn: sqlite3.Connection, *, mirror_key: str,
                        source: str, title: str, body: str = "",
                        project: str | None = None, url: str | None = None,
-                       now: str | None = None) -> str:
+                       now: str | None = None, state: str | None = None) -> str:
     """Insert-or-refresh a mirrored row, keyed on ``mirror_key``.
 
-    Refreshing deliberately does NOT touch ``reviewed`` or ``state``: those are
-    Graham's, and a re-sync that un-ticked a reviewed row would be the mirror
-    overwriting a decision.
+    Refreshing deliberately does NOT touch ``reviewed``: that is Graham's, and a
+    re-sync that un-ticked a reviewed row would be the mirror overwriting a
+    decision. ``state`` is left alone too UNLESS the caller passes one — the
+    backlog mirror does, because a backlog row's state IS its text (✅ DONE,
+    :func:`backlog_is_done`); the GitHub mirror has its own close/reopen passes.
     """
     now = now or now_iso()
     row = conn.execute("SELECT id, title_source FROM inbox_items WHERE mirror_key=?",
@@ -774,12 +777,20 @@ def upsert_mirror_item(conn: sqlite3.Connection, *, mirror_key: str,
         if project is not None:
             sets.append("project=?")
             args.append(project)
+        if state in ITEM_STATES:
+            sets += ["state=?",
+                     "closed_at=CASE WHEN ?='closed' THEN COALESCE(closed_at, ?) ELSE NULL END"]
+            args += [state, state, now]
         args.append(row["id"])
         conn.execute(f"UPDATE inbox_items SET {', '.join(sets)} WHERE id=?", args)
         return row["id"]
-    return create_item(conn, source=source, text=body, title=title,
-                       title_source="derived", project=project, now=now,
-                       mirror_key=mirror_key, mirror_url=url)
+    item_id = create_item(conn, source=source, text=body, title=title,
+                          title_source="derived", project=project, now=now,
+                          mirror_key=mirror_key, mirror_url=url)
+    if state == "closed":
+        conn.execute("UPDATE inbox_items SET state='closed', closed_at=? WHERE id=?",
+                     (now, item_id))
+    return item_id
 
 
 #: SQLite's compile-time SQLITE_MAX_VARIABLE_NUMBER is 999 on older builds and
@@ -855,58 +866,75 @@ def close_missing_mirror_items(conn: sqlite3.Connection, *, prefix: str,
     return int(conn.execute(sql, args).rowcount or 0)
 
 
-#: A backlog-mirror row ``b`` that carries note ``inbox_items``'s ``(voice <id8>)`` tag.
-_TAGGED_LINE_SQL = ("b.source = 'backlog' AND instr(b.body, '(voice ' ||"
-                    " substr(inbox_items.id, 1, 8) || ')') > 0")
 CLOSED_BY_BACKLOG = "backlog"
+CLOSED_BY_ISSUES = "issues"
+
+#: A backlog.txt entry is DONE when its ``What:`` line carries this marker — the file's own
+#: convention (``probes/backlog.py``): done entries stay in the file as ``✅ DONE <date> — …``.
+#: Matched on the FIRST line of the mirrored text (which is the What: line), case-insensitive,
+#: any whitespace between the emoji and the word: ``_BACKLOG_DONE_RE``.
+BACKLOG_DONE_MARKER = "✅ DONE"
+_BACKLOG_DONE_RE = re.compile(r"✅\s*DONE\b", re.IGNORECASE)
 
 
-def close_filed_notes_whose_lines_left(conn: sqlite3.Connection, *,
-                                       seen_keys: Iterable[str],
-                                       now: str | None = None) -> int:
-    """Close notes filed to backlog.txt whose line is about to be archived.
+def backlog_is_done(text: str | None) -> bool:
+    """True when a backlog entry's What: line (the first line of its text) is marked done."""
+    first = (text or "").split("\n", 1)[0]
+    return bool(_BACKLOG_DONE_RE.search(first))
 
-    The backlog-file twin of :func:`close_items_whose_issues_all_closed`: a note filed as a
-    ``(voice <id8>)`` line is done when the line is gone. Call ONLY inside a COMPLETE sync,
-    after the upserts and BEFORE :func:`archive_missing`, with the same ``seen_keys``. A note
-    closes when a live tagged row is missing from ``seen_keys`` (so THIS sync archives it —
-    the transition, so a note Graham reopened by hand is not re-closed by every later sync)
-    and NO tagged row is in ``seen_keys`` (a reworded line comes back under a new key, still
-    tagged, and must close nothing). Matched in Python over the few tagged rows, like
-    :func:`backlog_copies`, so no timestamp coincidence can stand in for the transition.
-    Marks ``closed_by='backlog'`` so :func:`reopen_filed_notes_whose_lines_returned` can
-    undo exactly this and nothing else.
+
+def filed_line_status(conn: sqlite3.Connection) -> dict[str, str]:
+    """For every ``(voice <id8>)`` tag carried by any backlog-mirror row: ``open`` (some live
+    tagged row is open), ``done`` (live tagged rows exist and all are closed — ✅ DONE), or
+    ``gone`` (only archived tagged rows: the line was removed). A tag no row has ever carried
+    is absent. Matched in Python over the few tagged rows, like :func:`backlog_copies`."""
+    status: dict[str, str] = {}
+    for row in conn.execute(
+            "SELECT state, archived_at, body FROM inbox_items WHERE source = 'backlog'"
+            " AND body LIKE '%(voice %'"):
+        for tag in set(VOICE_TAG_RE.findall(row["body"] or "")):
+            cur = status.get(tag, "gone")
+            if row["archived_at"] is None:
+                cur = "open" if (row["state"] == "open" or cur == "open") else "done"
+            status[tag] = cur
+    return status
+
+
+def apply_filed_backlog_rule(conn: sqlite3.Connection, *, before: dict[str, str],
+                             now: str | None = None) -> tuple[int, int]:
+    """Close / reopen notes filed to backlog.txt from the state of their line(s).
+
+    The backlog twin of the issues rule. Call ONLY at the end of a COMPLETE backlog push —
+    after every upsert AND the archive — with ``before`` = :func:`filed_line_status` taken at
+    the start of that push. Evaluating the whole push at once is what keeps an edit (old key
+    archived, new key created, same tag) from ever flapping the note.
+
+    - CLOSE an open, filed note when its tagged lines went from open (or never seen) to
+      ``done`` or ``gone`` in this push. On the TRANSITION, so a note Graham reopens by hand
+      is not re-closed by every later push while the line stays gone. A note whose line has
+      never reached the mirror is not closed (the filing call can land before the line does).
+      Marks ``closed_by='backlog'``.
+    - REOPEN a note ONLY if this rule closed it (``closed_by='backlog'``), when a tagged line
+      is live and open again (a removed line put back, or ✅ DONE taken off).
+
+    A note closed by hand or by its issues is never touched: hand changes clear
+    ``closed_by``, and the issues rule writes its own value. Returns ``(closed, reopened)``.
     """
     now = now or now_iso()
-    seen = set(seen_keys)
-    leaving: set[str] = set()
-    staying: set[str] = set()
-    for row in conn.execute(
-            "SELECT mirror_key, body FROM inbox_items WHERE source = 'backlog'"
-            " AND archived_at IS NULL AND body LIKE '%(voice %'"):
-        tags = set(VOICE_TAG_RE.findall(row["body"] or ""))
-        (staying if row["mirror_key"] in seen else leaving).update(tags)
-    closed = 0
-    for tag in sorted(leaving - staying):
-        closed += int(conn.execute(
-            "UPDATE inbox_items SET state='closed', closed_at=?, closed_by=?, updated_at=? "
-            "WHERE substr(id, 1, 8) = ? AND source IN ('voice','typed')"
-            " AND filed_backlog_at IS NOT NULL AND state='open' AND archived_at IS NULL",
-            (now, CLOSED_BY_BACKLOG, now, tag)).rowcount or 0)
-    return closed
-
-
-def reopen_filed_notes_whose_lines_returned(conn: sqlite3.Connection,
-                                            now: str | None = None) -> int:
-    """Reopen a note the backlog rule closed, once its tagged line is live in the mirror
-    again. Only ``closed_by='backlog'``: a note Graham closed by hand stays closed."""
-    now = now or now_iso()
-    return int(conn.execute(
-        "UPDATE inbox_items SET state='open', closed_at=NULL, closed_by=NULL, updated_at=? "
-        "WHERE state='closed' AND closed_by=?"
-        f" AND EXISTS (SELECT 1 FROM inbox_items b WHERE {_TAGGED_LINE_SQL}"
-        "   AND b.archived_at IS NULL)",
-        (now, CLOSED_BY_BACKLOG)).rowcount or 0)
+    closed = reopened = 0
+    for tag, status in filed_line_status(conn).items():
+        if status in ("done", "gone") and before.get(tag) in (None, "open"):
+            closed += int(conn.execute(
+                "UPDATE inbox_items SET state='closed', closed_at=?, closed_by=?, updated_at=?"
+                " WHERE substr(id, 1, 8) = ? AND source IN ('voice','typed')"
+                " AND filed_backlog_at IS NOT NULL AND state='open' AND archived_at IS NULL",
+                (now, CLOSED_BY_BACKLOG, now, tag)).rowcount or 0)
+        elif status == "open":
+            reopened += int(conn.execute(
+                "UPDATE inbox_items SET state='open', closed_at=NULL, closed_by=NULL,"
+                " updated_at=? WHERE substr(id, 1, 8) = ? AND state='closed' AND closed_by=?",
+                (now, tag, CLOSED_BY_BACKLOG)).rowcount or 0)
+    return closed, reopened
 
 
 def reopen_mirror_item(conn: sqlite3.Connection, mirror_key: str,
@@ -954,14 +982,28 @@ def close_items_whose_issues_all_closed(conn: sqlite3.Connection,
     """
     now = now or now_iso()
     return int(conn.execute(
-        "UPDATE inbox_items SET state='closed', closed_at=?, updated_at=? "
+        "UPDATE inbox_items SET state='closed', closed_at=?, closed_by=?, updated_at=? "
         "WHERE state='open' AND EXISTS ("
         "   SELECT 1 FROM inbox_issues i WHERE i.item_id = inbox_items.id"
         "     AND i.repo = ?)"
         " AND NOT EXISTS ("
         "   SELECT 1 FROM inbox_issues i WHERE i.item_id = inbox_items.id"
         "     AND i.state != 'closed')",
-        (now, now, repo)).rowcount or 0)
+        (now, CLOSED_BY_ISSUES, now, repo)).rowcount or 0)
+
+
+def reopen_items_closed_by_issues(conn: sqlite3.Connection, repo: str,
+                                  now: str | None = None) -> int:
+    """The reverse of :func:`close_items_whose_issues_all_closed`: an item that rule closed
+    (``closed_by='issues'``) reopens when any of its linked issues in ``repo`` is open again.
+    An item closed by hand (``closed_by`` NULL) or by the backlog rule is never touched."""
+    now = now or now_iso()
+    return int(conn.execute(
+        "UPDATE inbox_items SET state='open', closed_at=NULL, closed_by=NULL, updated_at=? "
+        "WHERE state='closed' AND closed_by=? AND EXISTS ("
+        "   SELECT 1 FROM inbox_issues i WHERE i.item_id = inbox_items.id"
+        "     AND i.repo = ? AND i.state = 'open')",
+        (now, CLOSED_BY_ISSUES, repo)).rowcount or 0)
 
 
 def mark_issues_closed(conn: sqlite3.Connection, repo: str,
@@ -1131,11 +1173,13 @@ _NEEDS_REVIEW_SQL = (
 
 # A backlog-mirror row that IS a filed note's line (it carries the note's voice tag). Hidden
 # from the default list and the counts, so a note filed to backlog.txt does not show twice;
-# still listed when the source filter is explicitly `backlog`.
+# still listed when the source filter is explicitly `backlog`. Shown again only when Graham
+# closed the note by hand (or the issues rule did) — then the line may be the only live view
+# of the work; a note the BACKLOG rule closed is the same work as its (done/removed) line.
 _FILED_COPY_SQL = (
     "(source = 'backlog' AND EXISTS (SELECT 1 FROM inbox_items n"
     " WHERE n.filed_backlog_at IS NOT NULL AND n.source IN ('voice','typed')"
-    " AND n.state != 'closed' AND n.archived_at IS NULL"
+    " AND (n.state != 'closed' OR n.closed_by = 'backlog') AND n.archived_at IS NULL"
     " AND instr(inbox_items.body, '(voice ' || substr(n.id, 1, 8) || ')') > 0))")
 
 MAX_LIMIT = 500

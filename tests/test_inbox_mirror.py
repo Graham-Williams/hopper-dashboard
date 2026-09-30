@@ -272,6 +272,35 @@ def test_a_voice_item_closes_only_when_every_linked_issue_is_closed(conn):
     assert inbox_db.get_item(conn, spoken)["state"] == "closed"
 
 
+def test_an_item_closed_by_its_issues_reopens_when_one_reopens_upstream(conn):
+    spoken = inbox_db.create_item(conn, source="voice", text="the wheel sticks",
+                                  now="2026-09-01T00:00:00Z")
+    with conn:
+        inbox_db.link_issue(conn, spoken, repo=REPO, number=7, url="u7")
+    github_mirror.sync(conn, [REPO], now=NOW, fetch=FakeGitHub([ok([issue(7)])]))
+    github_mirror.sync(conn, [REPO], now=NOW + 900,
+                       fetch=FakeGitHub([ok([], etag='W/"e2"')]))       # #7 closed
+    row = inbox_db.get_item(conn, spoken)
+    assert row["state"] == "closed" and row["closed_by"] == "issues"
+    result = github_mirror.sync(conn, [REPO], now=NOW + 1800,
+                                fetch=FakeGitHub([ok([issue(7)], etag='W/"e3"')]))  # reopened
+    row = inbox_db.get_item(conn, spoken)
+    assert row["state"] == "open" and row["closed_at"] is None and row["closed_by"] is None
+    assert result["results"][0]["reopened_items"] == 1
+
+
+def test_an_item_closed_by_hand_stays_closed_when_its_issue_reopens(conn):
+    spoken = inbox_db.create_item(conn, source="voice", text="the wheel sticks",
+                                  now="2026-09-01T00:00:00Z")
+    with conn:
+        inbox_db.link_issue(conn, spoken, repo=REPO, number=7, url="u7")
+        inbox_db.update_item(conn, spoken, {"state": "closed"})
+    github_mirror.sync(conn, [REPO], now=NOW, fetch=FakeGitHub([ok([], etag='W/"e1"')]))
+    github_mirror.sync(conn, [REPO], now=NOW + 900,
+                       fetch=FakeGitHub([ok([issue(7)], etag='W/"e2"')]))
+    assert inbox_db.get_item(conn, spoken)["state"] == "closed"
+
+
 # --------------------------------------------------------------------------- #
 # Untrusted text
 # --------------------------------------------------------------------------- #

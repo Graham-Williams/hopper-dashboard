@@ -1510,7 +1510,7 @@ def test_the_backlog_line_cap_is_pinned():
     assert len(inbox_db.clean_text(line, inbox_db.MAX_BACKLOG_LINE)) == 500
 
 
-# --- a filed note closes when its backlog.txt line is removed ------------------ #
+# --- a filed note closes when its backlog.txt line is removed or marked done -- #
 
 def _sync_backlog(bot, *texts, complete=True):
     return bot.post("/api/v1/inbox/mirror/backlog", headers=machine(), json={
@@ -1518,15 +1518,15 @@ def _sync_backlog(bot, *texts, complete=True):
 
 
 def _state(authed, item):
-    row = next(i for i in authed.get("/api/v1/inbox/items?state=closed").get_json()["items"]
-               + authed.get("/api/v1/inbox/items?state=open").get_json()["items"]
-               if i["id"] == item)
+    rows = (authed.get("/api/v1/inbox/items?state=closed").get_json()["items"]
+            + authed.get("/api/v1/inbox/items?state=open").get_json()["items"])
+    row = next(i for i in rows if i["id"] == item)
     return row["state"], row["closed_at"]
 
 
-def _filed_with_line(authed, bot):
+def _filed_with_line(authed, bot, what="Fix the Mac fan noise"):
     item = _reviewed_voice(authed, bot)
-    line = f"Fix the Mac fan noise (voice {item[:8]})"
+    line = f"{what} (voice {item[:8]})"
     assert _file(bot, item, line=line).status_code == 200
     assert _sync_backlog(bot, line, "Unrelated chore").status_code == 200
     return item, line
@@ -1539,48 +1539,107 @@ def test_a_filed_note_closes_when_its_line_leaves_backlog_txt(authed, bot):
     assert r.status_code == 200 and r.get_json()["closed_notes"] == 1
     state, closed_at = _state(authed, item)
     assert state == "closed" and closed_at
-    # A repeat sync changes nothing (the close is on the transition).
-    assert _sync_backlog(bot, "Unrelated chore").get_json()["closed_notes"] == 0
 
 
-def test_a_partial_or_failed_sync_never_closes_a_filed_note(authed, bot):
-    item, _ = _filed_with_line(authed, bot)
+def test_the_rule_is_idempotent_across_repeated_pushes(authed, bot):
+    item, line = _filed_with_line(authed, bot)
+    for _ in range(3):                                   # line present: nothing happens
+        r = _sync_backlog(bot, line, "Unrelated chore").get_json()
+        assert (r["closed_notes"], r["reopened_notes"]) == (0, 0)
+    _sync_backlog(bot, "Unrelated chore")
+    closed_at = _state(authed, item)[1]
+    for _ in range(3):                                   # line gone: closed once, stays put
+        r = _sync_backlog(bot, "Unrelated chore").get_json()
+        assert (r["closed_notes"], r["reopened_notes"]) == (0, 0)
+    assert _state(authed, item) == ("closed", closed_at)
+
+
+def test_marking_the_line_done_closes_the_note_and_unmarking_reopens_it(authed, bot):
+    item, line = _filed_with_line(authed, bot)
+    done = "✅ DONE 2026-09-29 — " + line
+    r = _sync_backlog(bot, done, "Unrelated chore").get_json()
+    assert r["closed_notes"] == 1 and r["archived"] == 1          # the key changed with the text
+    assert _state(authed, item)[0] == "closed"
+    # The done line is a CLOSED backlog row, and it is not shown beside the closed note.
+    listed = authed.get("/api/v1/inbox/items").get_json()
+    assert sorted((i["source"], i["state"]) for i in listed["items"]) == [
+        ("backlog", "open"), ("voice", "closed")]
+    r = _sync_backlog(bot, line, "Unrelated chore").get_json()     # un-marked
+    assert r["reopened_notes"] == 1
+    assert _state(authed, item) == ("open", None)
+
+
+def test_a_backlog_rows_state_follows_its_done_marker(authed, bot):
+    _sync_backlog(bot, "✅ DONE 2026-09-12 — Landing page", "Open chore",
+                  "✅done lowercase-ish counts too", "Mentions ✅ DONE only later\nWhy: x")
+    rows = {i["title"]: i for i in
+            authed.get("/api/v1/inbox/items?source=backlog").get_json()["items"]}
+    states = {t[:12]: r["state"] for t, r in rows.items()}
+    assert states == {"✅ DONE 2026-": "closed", "Open chore": "open",
+                      "✅done lowerc": "closed", "Mentions ✅ D": "closed"}
+    # Done rows are not open: not in the Open count (the Inbox tile and the Hub card read it),
+    # not under the open filter; they are still listed, as closed.
+    listing = authed.get("/api/v1/inbox/items").get_json()
+    assert listing["counts"]["open"] == 1 and listing["counts"]["total"] == 4
+    assert [i["title"] for i in authed.get("/api/v1/inbox/items?state=open")
+            .get_json()["items"]] == ["Open chore"]
+    assert "1 open item<" in authed.get("/").data.decode().replace("\n", "")
+    # Only the WHAT line decides: a later line saying it does not.
+    _sync_backlog(bot, "Plain entry\nWhy: ✅ DONE is mentioned here")
+    plain = authed.get("/api/v1/inbox/items?source=backlog&state=open").get_json()["items"]
+    assert [i["title"] for i in plain] == ["Plain entry"]
+
+
+def test_a_reworded_line_keeping_the_tag_never_flaps_the_note(authed, bot):
+    item, line = _filed_with_line(authed, bot)
+    tag = f"(voice {item[:8]})"
+    r = _sync_backlog(bot, f"Fix the loud fan on the Mac {tag}", "Unrelated chore").get_json()
+    assert r["archived"] == 1 and (r["closed_notes"], r["reopened_notes"]) == (0, 0)
+    assert _state(authed, item) == ("open", None)
+
+
+def test_the_tag_moving_to_a_different_entry_keeps_the_note_open(authed, bot):
+    item, line = _filed_with_line(authed, bot)
+    tag = f"(voice {item[:8]})"
+    r = _sync_backlog(bot, "Fix the Mac fan noise", f"Unrelated chore {tag}").get_json()
+    assert r["closed_notes"] == 0 and _state(authed, item) == ("open", None)
+    # ...and when that entry goes, the note closes.
+    assert _sync_backlog(bot, "Fix the Mac fan noise").get_json()["closed_notes"] == 1
+
+
+def test_two_lines_with_the_same_tag_one_done_keep_the_note_open(authed, bot):
+    item, line = _filed_with_line(authed, bot)
+    tag = f"(voice {item[:8]})"
+    # Both orders: the verdict must not depend on which row the scan meets last.
+    for both in ([f"✅ DONE — part one {tag}", f"Part two {tag}"],
+                 [f"Part three {tag}", f"✅ DONE — part four {tag}"]):
+        assert _sync_backlog(bot, *both).get_json()["closed_notes"] == 0
+        assert _state(authed, item) == ("open", None)
+    r = _sync_backlog(bot, f"✅ DONE — part one {tag}", f"✅ DONE — part two {tag}")
+    assert r.get_json()["closed_notes"] == 1
+
+
+def test_a_partial_or_refused_push_changes_nothing(authed, bot):
+    item, line = _filed_with_line(authed, bot)
     assert _sync_backlog(bot, "Unrelated chore", complete=False).status_code == 200
     assert _sync_backlog(bot, complete=True).status_code == 400          # empty: refused
     bad = bot.post("/api/v1/inbox/mirror/backlog", headers=machine(), json={
         "complete": True, "items": [{"text": "Unrelated chore"}, "not an object"]})
     assert bad.status_code == 400
     assert _state(authed, item) == ("open", None)
-
-
-def test_a_filed_note_waits_for_its_line_and_an_edited_line_keeps_it_open(authed, bot):
-    item = _reviewed_voice(authed, bot)
-    tag = f"(voice {item[:8]})"
-    _file(bot, item, line=f"Fix the fan {tag}")
-    # Filed, but the line has not reached the mirror yet: nothing to close on.
-    _sync_backlog(bot, "Unrelated chore")
-    assert _state(authed, item) == ("open", None)
-    _sync_backlog(bot, f"Fix the fan {tag}")
-    # Hopper rewords the line: the old key archives, the new one still carries the tag.
-    r = _sync_backlog(bot, f"Fix the loud fan on the Mac {tag}")
-    assert r.get_json()["archived"] == 1 and r.get_json()["closed_notes"] == 0
-    assert _state(authed, item) == ("open", None)
-
-
-def test_a_line_that_comes_back_reopens_the_note_and_hides_the_copy_again(authed, bot):
-    item, line = _filed_with_line(authed, bot)
+    # And the other way: a partial push with the line back does not reopen.
     _sync_backlog(bot, "Unrelated chore")
     assert _state(authed, item)[0] == "closed"
-    # Closed and its line archived: the default list shows the note, no copy.
-    listed = authed.get("/api/v1/inbox/items").get_json()["items"]
-    assert [i["title"] for i in listed if i["source"] == "backlog"] == ["Unrelated chore"]
-    r = _sync_backlog(bot, line, "Unrelated chore", complete=False)   # any sync may reopen
-    assert r.get_json()["reopened_notes"] == 1
+    r = _sync_backlog(bot, line, complete=False).get_json()
+    assert r["reopened_notes"] == 0 and _state(authed, item)[0] == "closed"
+
+
+def test_a_filed_note_waits_for_its_line_to_reach_the_mirror(authed, bot):
+    item = _reviewed_voice(authed, bot)
+    _file(bot, item, line=f"Fix the fan (voice {item[:8]})")
+    # Filed, but the push read the file before the line was written: nothing to close on.
+    assert _sync_backlog(bot, "Unrelated chore").get_json()["closed_notes"] == 0
     assert _state(authed, item) == ("open", None)
-    after = authed.get("/api/v1/inbox/items").get_json()
-    assert sorted(i["source"] for i in after["items"]) == ["backlog", "voice"]
-    assert after["counts"]["total"] == 2                      # the tagged copy is hidden again
-    assert next(i for i in after["items"] if i["id"] == item)["filed_backlog"]["mirror_key"]
 
 
 def test_a_note_closed_by_hand_is_never_reopened_by_the_backlog_rule(authed, bot):
@@ -1590,8 +1649,12 @@ def test_a_note_closed_by_hand_is_never_reopened_by_the_backlog_rule(authed, bot
     _sync_backlog(bot, "Unrelated chore")
     _sync_backlog(bot, line, "Unrelated chore")
     assert _state(authed, item)[0] == "closed"
-    # And one the rule closed, then Graham re-closed by hand, is his now.
-    item2, line2 = _filed_with_line(authed, bot)
+    # Closed by hand while the line is still open: the line is its only live view, so the
+    # copy is listed again.
+    assert any(i["source"] == "backlog" and "(voice" in i["title"]
+               for i in authed.get("/api/v1/inbox/items").get_json()["items"])
+    # One the rule closed and Graham then re-closed by hand is his now.
+    item2, line2 = _filed_with_line(authed, bot, what="Tidy the box")
     _sync_backlog(bot, line, "Unrelated chore")
     assert _state(authed, item2)[0] == "closed"
     authed.patch(f"/api/v1/inbox/items/{item2}", json={"state": "open"})
