@@ -1301,12 +1301,36 @@ print(f"{len(rows)} note(s) already filed to backlog.txt — do NOT file these a
 PY
 ```
 
-`closed_by` (added with the backlog and issues close/reopen rules) is additive in the same way. An older
-image ignores it: notes the rules closed stay closed and are not reopened while it runs, and ✅ DONE backlog
-rows are not closed by it (they read as open until the newer image's next push). Once the newer image is
-back, the next complete push reopens what should reopen. The gap: a line REMOVED or marked done while the
-old image ran does not close its note afterwards (the rule acts on the change within a push) — close it by
-hand.
+`closed_by` (added with the backlog and issues close/reopen rules) and `backlog_absent_pushes` are
+additive in the same way, and so is the issue-link index change (many notes per issue): the unique index
+keeps its old NAME, so the older image's `CREATE UNIQUE INDEX IF NOT EXISTS` is a no-op and it starts
+fine even with two notes linked to one issue (it just reports the first link, as it always did). While
+the older image runs, notes the rules closed stay closed and are not reopened, and a line marked ✅ DONE
+creates an OPEN row (the old image does not read the marker).
+
+**Roll-forward step — run it right after the newer image is back, before its first push or scan.** The
+older image never clears `closed_by`, so a note Graham closed or reopened by hand during the rollback can
+still carry `closed_by='backlog'`/`'issues'`, and a rule would later reopen (or keep) what he decided by
+hand. Treat every row changed during the rollback as changed by hand:
+
+```bash
+# ROLLBACK_AT = when the older image started, FORWARD_AT = when this one came back (UTC, stored format).
+docker exec -u 10001 -i hopper-dashboard python3 - <<'PY'
+import sqlite3
+ROLLBACK_AT, FORWARD_AT = "2026-10-01T09:00:00Z", "2026-10-01T12:00:00Z"   # ← edit both
+c = sqlite3.connect("/app/data/inbox.db")
+n = c.execute("UPDATE inbox_items SET closed_by = NULL WHERE closed_by IS NOT NULL"
+              " AND updated_at >= ? AND updated_at < ?", (ROLLBACK_AT, FORWARD_AT)).rowcount
+c.commit()
+print(f"closed_by cleared on {n} row(s) changed during the rollback")
+PY
+```
+
+What the rules still catch afterwards, with no step needed: a backlog line marked ✅ DONE while the older
+image ran closes its note on the FIRST push (the old image left that row open, so the push sees it become
+done), and a line REMOVED while it ran closes its note after TWO pushes (the absence count starts from
+zero). A GitHub issue that closed or reopened while it ran is caught on the first complete scan (the
+stored link state is compared, not the previous scan).
 
 The hostname move rolls back separately: restore the `.env` backup from §3a (an older image has no legacy
 redirect, so with `APP_HOST=hub…` the old `dashboard…` name would 403), and put the Mac's `INBOX_URL` back.

@@ -395,6 +395,80 @@ def test_mirrored_github_rows_keep_following_upstream_every_scan(conn):
     assert inbox_db.get_item(conn, row["id"])["state"] == "open"
 
 
+# --- one issue, many notes; linked issues are not mirrored twice (G-19, G-20) ---- #
+
+def test_two_notes_can_link_the_same_issue_and_both_follow_it(conn):
+    a, b = _note_linked_to(conn, 7), _note_linked_to(conn, 7)
+    links = inbox_db.issues_for(conn, [a, b])
+    assert len(links[a]) == 1 and len(links[b]) == 1
+    _scan(conn, 7)
+    r = _scan(conn, at=900)
+    assert r["closed_items"] == 2
+    assert _state(conn, a) == _state(conn, b) == ("closed", "issues")
+    r = _scan(conn, 7, at=1800)
+    assert r["reopened_items"] == 2
+    assert _state(conn, a) == _state(conn, b) == ("open", None)
+
+
+def test_linking_an_already_mirrored_issue_archives_its_mirror_row(conn):
+    """G-19: the note now represents that issue. Its mirror row goes (archived, never
+    deleted), stays gone across later scans, and never claims the open issue is closed."""
+    _scan(conn, 7)
+    mirror = inbox_db.get_item_by_mirror_key(conn, inbox_db.github_key(REPO, 7))["id"]
+    note = _note_linked_to(conn, 7)
+    assert inbox_db.get_item(conn, mirror)["archived_at"] is not None
+    for i in range(2):
+        _scan(conn, 7, at=900 + i * 900)                  # still open upstream
+    row = inbox_db.get_item(conn, mirror)
+    assert row["archived_at"] is not None and row["state"] == "open"
+    assert [r["id"] for r in inbox_db.list_items(conn)] == [note]
+    # If the note is deleted, the issue is a mirrored row again on the next complete scan.
+    with conn:
+        inbox_db.delete_item(conn, note)
+    _scan(conn, 7, at=2700)
+    row = inbox_db.get_item(conn, mirror)
+    assert row["archived_at"] is None and row["state"] == "open"
+
+
+# --- a repo that is no longer watched stops claiming open work (G-22) ------------- #
+OTHER = "Graham-Williams/taste-twin"
+
+
+def test_rows_of_an_unwatched_repo_are_archived_and_come_back_when_it_is_readded(conn):
+    fetch = FakeGitHub([ok([issue(1), issue(2)]), ok([issue(9)], etag='W/"o1"')])
+    github_mirror.sync(conn, [REPO, OTHER], now=NOW, fetch=fetch)
+    github_mirror.sync(conn, [REPO, OTHER], now=NOW + 900, fetch=FakeGitHub(
+        [ok([issue(1)], etag='W/"r2"'), ok([issue(9)], etag='W/"o2"')]))    # REPO#2 closes
+    github_mirror.sync(conn, [OTHER], now=NOW + 1800,                      # REPO removed
+                       fetch=FakeGitHub([ok([issue(9)], etag='W/"o3"')]))
+    live = {r["mirror_key"] for r in inbox_db.list_items(conn)}
+    assert live == {inbox_db.github_key(OTHER, 9)}
+    assert inbox_db.counts(conn)["open"] == 1
+    github_mirror.sync(conn, [REPO, OTHER], now=NOW + 2700, fetch=FakeGitHub(
+        [ok([issue(1)], etag='W/"r3"'), ok([issue(9)], etag='W/"o3"')]))    # re-added
+    by_key = {r["mirror_key"]: r for r in inbox_db.list_items(conn)}
+    assert by_key[inbox_db.github_key(REPO, 1)]["state"] == "open"
+    assert by_key[inbox_db.github_key(REPO, 2)]["state"] == "closed"      # back, as it was
+
+
+# --- a no-op sync writes nothing (item 11) --------------------------------------- #
+
+def test_an_unchanged_sync_writes_nothing(conn):
+    """No checked_at / updated_at / last_sync_at churn: an unchanged sync must leave
+    inbox.db byte-identical, or the 5-minute backup re-snapshots it and re-uploads it."""
+    note = _note_linked_to(conn, 7)
+    github_mirror.sync(conn, [REPO], now=NOW, fetch=FakeGitHub(
+        [ok([issue(7), issue(8, "Mirrored")], etag='W/"same"')]))
+    before = conn.total_changes
+    github_mirror.sync(conn, [REPO], now=NOW + 900, fetch=FakeGitHub(
+        [github_mirror.MirrorResponse(status=304, headers={"ETag": 'W/"same"'})]))
+    assert conn.total_changes == before, "a 304 wrote to inbox.db"
+    github_mirror.sync(conn, [REPO], now=NOW + 1800, fetch=FakeGitHub(
+        [ok([issue(7), issue(8, "Mirrored")], etag='W/"same"')]))
+    assert conn.total_changes == before, "an unchanged 200 wrote to inbox.db"
+    assert _state(conn, note) == ("open", None)
+
+
 # --------------------------------------------------------------------------- #
 # Untrusted text
 # --------------------------------------------------------------------------- #

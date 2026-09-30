@@ -351,6 +351,18 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
 - `github_mirror.py` — `sync(conn, repos, now, fetch)` with `fetch` injected for tests. ETag-conditional,
   skips anything with a `pull_request` key, honours `X-RateLimit-Reset`/`Retry-After` into `backoff_until`,
   and closes items ONLY after a complete, error-free repo fetch (a partial page must never close anything).
+  A complete scan is ONE `inbox_db.transaction`. Every sync first archives rows of repos no longer in
+  `INBOX_GITHUB_REPOS` (`archive_unwatched`, G-22 — Core runs it even with no repos); a complete scan
+  un-archives its repo's archived rows that no note links (`unarchive_unlinked_github`). An UNCHANGED
+  sync (a 304, or a 200 with the same answer) writes NOTHING: `upsert_mirror_item`, `refresh_issue` and
+  `set_mirror_state` write only a real change (so `mirror_seen_at`, `checked_at` and `last_sync_at` mean
+  "last changed"; a 304 is stored as `ok`) — otherwise the backup re-uploads `inbox.db` every cycle.
+- **`POST /api/v1/inbox/items/<id>/issues`** has filed-backlog's 409s (voice/typed only; reviewed, open,
+  not archived) plus `NOT_WATCHED` for a repo outside `INBOX_GITHUB_REPOS` (the link would never be
+  refreshed, so the note could never close). The repo is stored under the WATCHED spelling (matched
+  case-insensitively). Many notes may link one issue (`UNIQUE(item_id, repo, number)`, same index name
+  as the old `UNIQUE(repo, number)` — keep it, it is what makes a rollback safe); linking an issue that
+  had a mirror row archives that row (G-19).
 - `templates/inbox.html`, `static/inbox.js` — see the JS convention above. Rows are ONE column at every
   width (phone-first): badges, draft title/body, Transcript `<details>`, the player, one action row
   (Edit draft · the Reviewed pill toggle · Delete as a quiet danger text button, all ≥44px), then the meta

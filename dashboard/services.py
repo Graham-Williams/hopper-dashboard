@@ -451,6 +451,13 @@ class Core:
         if not repos:
             summary = {"repos": 0, "ok": 0, "failed": 0, "issues": 0,
                        "results": []}
+            # Nothing to scan, but rows mirrored from repos that USED to be watched must
+            # still stop claiming to be open (G-22).
+            conn = self.inbox_connect()
+            try:
+                github_mirror.archive_unwatched(conn, (), now=now)
+            finally:
+                conn.close()
         else:
             conn = self.inbox_connect()
             try:

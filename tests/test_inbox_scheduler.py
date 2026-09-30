@@ -177,6 +177,25 @@ def test_no_repos_configured_still_heartbeats_ok(core):
     assert db.last_run(core.connect(), INBOX_GITHUB_JOB_ID)["status"] == "ok"
 
 
+def test_emptying_the_repo_list_archives_every_mirrored_issue_row(core):
+    """G-22 at the edge: with no repo watched at all, no mirrored issue may go on claiming
+    to be open work for ever. (Re-adding the repo brings its rows back on the first scan.)"""
+    conn = core.inbox_connect()
+    try:
+        row = inbox_db.upsert_mirror_item(conn, mirror_key=inbox_db.github_key("a/b", 1),
+                                          source="github", title="An issue")
+    finally:
+        conn.close()
+    core.settings.inbox_github_repos = ()
+    summary = core.sync_inbox_github(now=NOW)
+    assert summary == {"repos": 0, "ok": 0, "failed": 0, "issues": 0, "results": []}
+    conn = core.inbox_connect()
+    try:
+        assert inbox_db.get_item(conn, row)["archived_at"] is not None
+    finally:
+        conn.close()
+
+
 def test_a_missing_job_in_jobs_yml_warns_once_and_never_crashes(settings, caplog):
     """jobs.yml is gitignored, so merging this feature ships the schema and
     never the values: on a box whose file has not been edited yet, the mirror

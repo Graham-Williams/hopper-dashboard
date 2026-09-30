@@ -180,17 +180,18 @@ def test_a_resync_never_untickets_a_reviewed_row(conn):
     assert row["reviewed"] == 1 and row["state"] == "closed"
 
 
-def test_repo_number_uniqueness_stops_a_duplicate_item(conn):
-    """The rule that stops the repo scan cloning a voice row Hopper already
-    filed: an issue belongs to exactly ONE item."""
+def test_one_link_per_note_and_issue_but_many_notes_per_issue(conn):
+    """G-20: two notes about the same bug can both link it. What stays unique is one link
+    per (note, issue) — and the scan's "is it linked at all?" lookup finds either."""
     voice = inbox_db.create_item(conn, source="voice", text="spoken", now=NOW)
     other = inbox_db.create_item(conn, source="voice", text="also spoken", now=NOW)
     inbox_db.link_issue(conn, voice, repo="a/b", number=7,
                         url="https://github.com/a/b/issues/7", now=NOW)
     again = inbox_db.link_issue(conn, other, repo="a/b", number=7,
                                 url="https://github.com/a/b/issues/7", now=NOW)
-    assert again["item_id"] == voice                   # still the first item
-    assert conn.execute("SELECT COUNT(*) FROM inbox_issues").fetchone()[0] == 1
+    assert again["item_id"] == other
+    assert conn.execute("SELECT COUNT(*) FROM inbox_issues").fetchone()[0] == 2
+    assert inbox_db.linked_issue(conn, "a/b", 7) is not None
     with pytest.raises(Exception):
         conn.execute("INSERT INTO inbox_issues (item_id, repo, number, url,"
                      " linked_at) VALUES (?,?,?,?,?)",
@@ -775,3 +776,37 @@ def test_a_backlog_push_is_atomic(conn, monkeypatch):
         inbox_db.apply_backlog_push(conn, _entries("Two", "✅ DONE — One"), complete=True,
                                     now=NOW)
     assert [dict(r) for r in conn.execute("SELECT * FROM inbox_items ORDER BY id")] == before
+
+
+def _index_columns(c, name):
+    return [r["name"] for r in c.execute(f"PRAGMA index_info({name})")]
+
+
+def test_the_issue_link_index_migrates_to_one_link_per_note_and_survives_a_rollback(tmp_path):
+    """G-20 lets many notes link one issue: unique on (item_id, repo, number), not (repo,
+    number). The index KEEPS ITS OLD NAME on purpose — an older image's start-up runs
+    `CREATE UNIQUE INDEX IF NOT EXISTS inbox_issues_repo_number ON inbox_issues (repo, number)`,
+    which is a no-op while that name exists. Under a new name it would try to build the old
+    index over duplicate links, fail, and restart-loop the rolled-back container."""
+    import sqlite3
+    path = str(tmp_path / "inbox.db")
+    old = sqlite3.connect(path)
+    old.executescript(inbox_db.INBOX_SCHEMA.replace(
+        "inbox_issues_repo_number\n    ON inbox_issues (item_id, repo, number)",
+        "inbox_issues_repo_number\n    ON inbox_issues (repo, number)"))
+    old.close()
+    c = inbox_db.connect(path)
+    assert _index_columns(c, "inbox_issues_repo_number") == ["repo", "number"]   # the old one
+    inbox_db.init_inbox_schema(c)
+    inbox_db.init_inbox_schema(c)                         # idempotent
+    assert _index_columns(c, "inbox_issues_repo_number") == ["item_id", "repo", "number"]
+    a = inbox_db.create_item(c, source="typed", text="one", now=NOW)
+    b = inbox_db.create_item(c, source="typed", text="two", now=NOW)
+    inbox_db.link_issue(c, a, repo="a/b", number=1, url="u", now=NOW)
+    inbox_db.link_issue(c, b, repo="a/b", number=1, url="u", now=NOW)
+    inbox_db.link_issue(c, b, repo="a/b", number=1, url="u", now=NOW)   # still idempotent
+    assert c.execute("SELECT COUNT(*) FROM inbox_issues").fetchone()[0] == 2
+    # The rollback: the older image's schema statement must not fail over the duplicates.
+    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS inbox_issues_repo_number"
+              " ON inbox_issues (repo, number)")
+    c.close()

@@ -234,7 +234,8 @@ inbox_items(id TEXT PK,                     -- uuid4 hex; opaque, appears in URL
   draft_model, draft_src_sha, draft_edited_at,
   filed_backlog_at, filed_backlog_line,       -- issue #33
   draft_copied_at,
-  closed_by)                                  -- 'backlog' when the backlog rule closed it, else NULL
+  closed_by,                                  -- 'backlog' | 'issues' when that rule closed it, else NULL
+  backlog_absent_pushes)                      -- a filed note: consecutive complete pushes without its tag
 inbox_issues(id INTEGER PK, item_id → inbox_items(id), repo, number, url, title,
   state, linked_at, checked_at, closed_at)
 inbox_mirror_state(key PK, etag, last_sync_at, last_status, last_error,
@@ -252,8 +253,14 @@ Two unique indexes carry most of the correctness:
   `probes/` is stdlib-only and cannot import Flask — and `tests/test_backlog_mirror.py` imports both and
   pins their agreement. Drift there is not cosmetic: it would archive every mirrored row on the next sync
   and re-create it under a new key, losing its reviewed tick and its linked issues.
-- `UNIQUE(repo, number)` on `inbox_issues` — one GitHub issue belongs to exactly ONE row. This is what stops
-  the repo mirror cloning a voice note Hopper has already filed as an issue.
+- `UNIQUE(item_id, repo, number)` on `inbox_issues` — one LINK per (note, issue); several notes may link
+  the same issue (G-20: two notes about one bug), and each closes and reopens with it. What stops the repo
+  mirror cloning a note Hopper has already filed as an issue is the scan's lookup (`linked_issue`, on a
+  plain `(repo, number)` index): a linked issue is never mirrored, and linking one that already had a
+  mirror row archives that row (G-19). The unique index KEEPS the name it had when it was
+  `UNIQUE(repo, number)` (`inbox_issues_repo_number`; the migration swaps the definition once): an older
+  image's start-up `CREATE UNIQUE INDEX IF NOT EXISTS inbox_issues_repo_number ON (repo, number)` is then
+  a no-op, instead of failing over duplicate links and restart-looping a rolled-back container.
 
 `transcript_status` has **five** values, not two: `pending` (audio, nothing transcribed yet) · `whisper` ·
 `typed` · `failed` (Whisper gave up after 3 attempts) · `live` (legacy; no longer produced — see the privacy
@@ -278,7 +285,7 @@ button today.
 |---|---|---|---|---|
 | `voice` | (1) by hand; (2) the ISSUES rule: a complete scan moves its LAST open linked issue to closed (edge-triggered: the stored `inbox_issues.state` before vs after the scan; `closed_by='issues'`); (3) the BACKLOG rule: it was filed to backlog.txt and its `(voice <id8>)` line was marked ✅ DONE/RESOLVED (closes on that push) or has been missing from 2 consecutive COMPLETE pushes (`backlog_absent_pushes`; `closed_by='backlog'`) | never | by hand; or automatically, ONLY by the rule that closed it: `issues` when a scan moves any linked issue from closed to open, `backlog` when a tagged What: line is live and open again. A note closed by hand is never reopened automatically, and a hand reopen sticks until the next real change upstream | (1) by hand, (2)(3) automatic |
 | `typed` | the same as `voice` | never | the same as `voice` | the same as `voice` |
-| `github` (mirrored issue) | automatically, when a complete open-issue scan of its repo no longer lists it (closed, transferred or deleted upstream); a hand close lasts only until the next complete scan | never | automatically, on every complete scan that lists it as open | automatic, on EVERY scan, by design: the row is a VIEW of the issue, so upstream always wins (act on it on GitHub — the row links there; it has no Delete) |
+| `github` (mirrored issue) | automatically, when a complete open-issue scan of its repo no longer lists it (closed, transferred or deleted upstream); a hand close lasts only until the next complete scan | automatically: (a) when a note LINKS its issue (`POST /issues`, G-19 — the note represents it now); (b) when its repo is no longer in `INBOX_GITHUB_REPOS` (G-22, on every sync, even one with no repos) | automatically, on every complete scan that lists it as open; un-archived on a complete scan of its (again watched) repo once no note links it | automatic, on EVERY scan, by design: the row is a VIEW of the issue, so upstream always wins (act on it on GitHub — the row links there; it has no Delete) |
 | `backlog` (mirrored line), also a VIEW of upstream (no Delete; edit backlog.txt) | automatically, when its What: line carries a done marker anywhere (`inbox_db.BACKLOG_DONE_RE`: `✅️?\s*(DONE\|RESOLVED)\b`, case-insensitive — "✅ DONE 2026-08-21 — …", "… — ✅ DONE 2026-07-08 via …", "✅ RESOLVED"): the state is set from the text on EVERY upsert, complete push or not (and `closed_by` cleared), so a hand close lasts only until the next push | automatically, when a COMPLETE push no longer has that exact What: line — removed, or edited: any What: edit (adding or removing ✅ DONE or ⭐ included) is a new key, so the old row archives and a new one appears | by the text: taking ✅ DONE off posts the unmarked line again, which un-archives its earlier open row (or creates a new one); a hand close is undone by the next push unless the line is marked done | automatic: the text wins |
 
 Removal is ARCHIVE, not close, for a backlog row: the file is the only record, and "removed" and "done"

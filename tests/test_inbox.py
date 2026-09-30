@@ -19,6 +19,8 @@ M4A = b"\x00\x00\x00\x20" + b"ftyp" + b"M4A " + b"\x00" * 4096
 @pytest.fixture
 def settings(settings):
     settings.inbox_token = INBOX_TOKEN
+    # POST /issues refuses a repo the mirror does not watch (the note could never close).
+    settings.inbox_github_repos = ("a/b", "Graham-Williams/km-tracker")
     return settings
 
 
@@ -974,6 +976,58 @@ def test_the_board_offers_a_delete_control_per_row(authed):
     item = post_note(authed).get_json()["id"]
     html = authed.get("/inbox").data.decode()
     assert f'class="delete-item" data-id="{item}"' in html
+
+
+# --- POST /issues: the filed-backlog gate, a watched repo, many notes per issue --- #
+
+LINK = {"repo": "a/b", "number": 1, "url": "https://github.com/a/b/issues/1"}
+
+
+def _link(bot, item, **over):
+    return bot.post(f"/api/v1/inbox/items/{item}/issues", json={**LINK, **over},
+                    headers=machine())
+
+
+def test_linking_an_issue_needs_a_reviewed_open_note(authed, bot, settings):
+    unreviewed = _transcribed(authed, bot)                 # voice, NOT reviewed (R-08)
+    r = _link(bot, unreviewed)
+    assert r.status_code == 409 and "reviewed, open" in r.get_json()["error"]
+    closed = post_note(authed).get_json()["id"]
+    authed.patch(f"/api/v1/inbox/items/{closed}", json={"state": "closed"})
+    assert _link(bot, closed).status_code == 409
+    for mirrored in (_github_row(settings), _backlog_row(authed, bot)):    # R-09
+        r = _link(bot, mirrored)
+        assert r.status_code == 409 and "voice or typed" in r.get_json()["error"]
+    assert inbox_db.linked_issue(inbox_db.connect(settings.inbox_db_path), "a/b", 1) is None
+    fine = post_note(authed).get_json()["id"]
+    assert _link(bot, fine).status_code == 201
+
+
+def test_linking_an_issue_in_a_repo_the_mirror_does_not_watch_is_refused(authed, bot,
+                                                                        settings):
+    item = post_note(authed).get_json()["id"]
+    r = _link(bot, item, repo="a/unwatched", url="https://github.com/a/unwatched/issues/1")
+    assert r.status_code == 409
+    assert r.get_json()["error"] == ("not watched — add it to INBOX_GITHUB_REPOS or the note "
+                                     "can never close")
+    # GitHub names are case-insensitive; the link is stored under the WATCHED spelling, or
+    # the scans (which match on it exactly) would never see it.
+    r = _link(bot, item, repo="graham-williams/KM-TRACKER", number=5,
+              url="https://github.com/graham-williams/KM-TRACKER/issues/5")
+    assert r.status_code == 201
+    assert r.get_json()["issue"]["repo"] == "Graham-Williams/km-tracker"
+
+
+def test_two_notes_can_be_linked_to_the_same_issue(authed, bot):
+    """G-20: two notes about the same bug. Both link; neither is left awaiting filing."""
+    a = post_note(authed, text="the wheel sticks").get_json()["id"]
+    b = post_note(authed, text="wheel is sticky again").get_json()["id"]
+    for item in (a, b):
+        r = _link(bot, item)
+        assert r.status_code == 201
+        assert [(i["repo"], i["number"]) for i in r.get_json()["item"]["issues"]] == [("a/b", 1)]
+    filing = authed.get("/api/v1/inbox/items?awaiting=filing").get_json()["items"]
+    assert filing == []
 
 
 # --- mirrored rows have no Delete: they would only come back ------------------ #

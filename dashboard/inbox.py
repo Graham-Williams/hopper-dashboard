@@ -925,11 +925,31 @@ def post_draft(item_id: str):
         conn.close()
 
 
+#: POST /issues for a repo the GitHub mirror does not scan: the link would never be
+#: refreshed, so the note could never close by itself (G-18). Pinned by tests/test_inbox.py.
+NOT_WATCHED = "not watched — add it to INBOX_GITHUB_REPOS or the note can never close"
+
+
+def watched_repo(repo: str) -> str | None:
+    """The WATCHED spelling of ``repo`` (GitHub names are case-insensitive, but the scans
+    match links on the configured spelling exactly), or None if the mirror does not scan it."""
+    for configured in _settings().inbox_github_repos or ():
+        if configured.lower() == repo.lower():
+            return configured
+    return None
+
+
 @bp.post("/api/v1/inbox/items/<item_id>/issues")
 def post_issues(item_id: str):
-    """Hopper records the issue it filed for a reviewed row. Idempotent on
-    ``(repo, number)`` — which is also what stops the GitHub mirror later
-    cloning this same issue as a fresh row."""
+    """Hopper records the issue it filed for a reviewed note. Idempotent on
+    ``(item, repo, number)``; several notes may link the same issue (G-20), and
+    each closes and reopens with it. A mirror row the issue already had is
+    archived (G-19) — the note represents it now.
+
+    The same 409s as ``filed-backlog``: only a voice or typed note, and only a
+    reviewed, open one. And a repo the mirror does not watch is a 409 too
+    (``NOT_WATCHED``): nothing would ever refresh the link, so the note could
+    never close by itself."""
     denied = _require_inbox_token()
     if denied is not None:
         return denied
@@ -945,10 +965,18 @@ def post_issues(item_id: str):
     title = inbox_db.clean_text(doc.get("title"), inbox_db.MAX_TITLE) or None
     conn = _conn()
     try:
-        if inbox_db.get_item(conn, item_id) is None:
+        row = inbox_db.get_item(conn, item_id)
+        if row is None:
             return _err("no such item", 404)
-        with conn:
-            issue = inbox_db.link_issue(conn, item_id, repo=repo, number=number,
+        if row["source"] not in inbox_db.LOCAL_SOURCES:
+            return _err("only a voice or typed note can be filed", 409)
+        if not row["reviewed"] or row["state"] != "open" or row["archived_at"]:
+            return _err("only a reviewed, open note can be filed", 409)
+        watched = watched_repo(repo)
+        if watched is None:
+            return _err(NOT_WATCHED, 409)
+        with inbox_db.transaction(conn):
+            issue = inbox_db.link_issue(conn, item_id, repo=watched, number=number,
                                         url=url, title=title)
         row = inbox_db.get_item(conn, item_id)
         issues = inbox_db.issues_for(conn, [item_id]).get(item_id, [])
