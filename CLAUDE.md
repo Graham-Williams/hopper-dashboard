@@ -339,7 +339,8 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   (`closed_by='issues'`) only when the scan moves its LAST open issue to closed, and reopens only if that
   rule closed it and the scan moved an issue closed → open. Mirrored github/backlog rows are VIEWS and
   follow upstream every scan/push. Every hand state change clears `closed_by`.
-- `?state=archived` (`inbox_db.ARCHIVED_FILTER`) lists archived rows with their badge; it is a FILTER
+- `?state=archived` (`inbox_db.ARCHIVED_FILTER`) lists archived rows with their badge — on the page and
+  in `GET /api/v1/inbox/items`, which `READ_TOKEN` can read like the rest of the list; it is a FILTER
   value only (PATCH still takes open/closed), and counts stay live-only.
 - **Item lifecycle** — what closed/archived/reopen mean per source (voice, typed, github, backlog), and which
   of them is automatic: the table in DESIGN.md "Item lifecycle". One table (`inbox_items`), `state`
@@ -706,11 +707,16 @@ there is no default URL in the code, by design.
     error envelope still says `subtype: "success"` — decide on `is_error` + `api_error_status`, never
     `subtype`. The TRANSCRIPT and TITLE go to Anthropic, plus the optional SETUP BRIEF
     (`INBOX_DRAFT_CONTEXT_FILE`, a `context` field on stdin, capped at `MAX_CONTEXT` = 6000 chars, read fresh
-    each run by `read_context` — O_NOFOLLOW + fstat, owner = this user, not group/world-writable, never the
-    token file (st_dev/st_ino), NULs stripped before the cap, bad UTF-8 replaced not refused; a refused brief
+    each run by `read_context` — O_NOFOLLOW + fstat, owner = this user, not group/world-writable, one hard
+    link only, never the token file or the worker's own env file (st_dev/st_ino), never a brief whose TEXT
+    holds INBOX_TOKEN/INGEST_TOKEN/the claude token (compared in memory, never logged), NULs stripped before
+    the cap, bad UTF-8 replaced not refused; a refused brief
     = no brief + one log warning, never systemic; its
     text never reaches the log or heartbeat; example `deploy/mac/draft-context.example.md`); the audio never does. Tests run a FAKE `claude`
     executable (argv, stdin, cwd and env are observed, not assumed).
+  - The worker sweeps `hopper-inbox-*` temp recordings older than an hour at start (a killed run's), and
+    turns SIGTERM (launchd stopping the agent) into SystemExit so the `finally` that removes the one being
+    transcribed still runs; the previous handler is restored on exit.
   - `INBOX_URL` must be the Hub host. The probe HTTP client refuses cross-host redirects
     (`common._SameOriginRedirects`), so an old `dashboard…` URL fails every run instead of following the
     legacy 307.

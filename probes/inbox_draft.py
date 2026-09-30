@@ -192,7 +192,8 @@ def build_stdin(item: Dict[str, object], known_projects: List[str],
     return json.dumps(doc, ensure_ascii=False)
 
 
-def read_context(path: str, token_path: str = "") -> Tuple[Optional[str], Optional[str]]:
+def read_context(path: str, token_path: str = "", env_path: str = "",
+                 secrets: Tuple[str, ...] = ()) -> Tuple[Optional[str], Optional[str]]:
     """The setup brief from ``INBOX_DRAFT_CONTEXT_FILE``: ``(text or None, warning or None)``.
 
     Optional and never fatal: anything wrong with it gives no brief and a one-line warning
@@ -205,8 +206,12 @@ def read_context(path: str, token_path: str = "") -> Tuple[Optional[str], Option
     * a file this user does not own, or one that is group/world WRITABLE — anyone who can
       write it can put words in front of the model on every draft (no tools, but it could
       steer every title). Readable-by-others (0644) is fine: the brief is not a secret;
-    * the claude TOKEN file itself (same ``st_dev``/``st_ino``, so a hard link is caught
-      too) — the one file that must never be sent to Anthropic;
+    * a file with more than one hard link (another name could change what is sent without
+      this path moving — and a hard link to a secret file is exactly how one would be sent);
+    * the claude TOKEN file or the worker's own ENV file (same ``st_dev``/``st_ino``) — files
+      that must never be sent to Anthropic;
+    * a brief whose CONTENT contains any of ``secrets`` (the INBOX_TOKEN, the claude token,
+      the ingest token): compared in memory, never logged;
     * an empty file.
 
     Content rules: at most ``MAX_CONTEXT_BYTES`` are read; NULs are stripped BEFORE the cap
@@ -238,13 +243,18 @@ def read_context(path: str, token_path: str = "") -> Tuple[Optional[str], Option
         if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
             return refuse("is group/world writable (mode %o) — ignored; chmod 644 or 600 it"
                           % (st.st_mode & 0o777))
-        if token_path:
+        if st.st_nlink > 1:
+            return refuse("has %d hard links (refused: keep it as one file)" % st.st_nlink)
+        for other, what in ((token_path, "the claude token file"),
+                            (env_path, "the worker's env file")):
+            if not other:
+                continue
             try:
-                tok = os.stat(os.path.expanduser(token_path))
+                ost = os.stat(os.path.expanduser(other))
             except OSError:
-                tok = None
-            if tok is not None and (tok.st_dev, tok.st_ino) == (st.st_dev, st.st_ino):
-                return refuse("is the claude token file (refused: it must never be sent)")
+                continue
+            if (ost.st_dev, ost.st_ino) == (st.st_dev, st.st_ino):
+                return refuse("is %s (refused: it must never be sent)" % what)
         chunks = []
         got = 0
         while got <= MAX_CONTEXT_BYTES:
@@ -262,6 +272,9 @@ def read_context(path: str, token_path: str = "") -> Tuple[Optional[str], Option
     text = raw[:MAX_CONTEXT_BYTES].replace(b"\x00", b"").decode("utf-8", errors="replace")
     if not text.strip():
         return refuse("is empty")
+    # In memory only: the warning says THAT a credential was found, never which or where.
+    if any(secret and len(secret) >= 8 and secret in text for secret in secrets):
+        return refuse("contains a credential (a token from the env or token file) — refused")
     if cut or len(text) > MAX_CONTEXT:
         text = text[:MAX_CONTEXT] + CONTEXT_TRUNCATED
     return text, None

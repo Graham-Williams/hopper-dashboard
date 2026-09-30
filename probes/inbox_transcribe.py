@@ -60,6 +60,8 @@ import argparse
 import json
 import os
 import re
+import signal
+import stat
 import sys
 import tempfile
 import time
@@ -210,6 +212,9 @@ def load_settings(env_path: str) -> Dict[str, str]:
     }
     for k, v in defaults.items():
         cfg.setdefault(k, v)
+    # Where the settings came from — the brief reader refuses to send this very file. A
+    # leading underscore: no env-file key or INBOX_* override can set it.
+    cfg["_ENV_FILE"] = env_path
     return cfg
 
 
@@ -596,7 +601,10 @@ def run_drafting(cfg: Dict[str, str], log: Logger, dry_run: bool,
             # warning (path + reason) and a character count.
             context, warning = inbox_draft.read_context(
                 cfg.get("INBOX_DRAFT_CONTEXT_FILE") or "",
-                token_path=cfg.get("INBOX_CLAUDE_TOKEN_FILE") or "")
+                token_path=cfg.get("INBOX_CLAUDE_TOKEN_FILE") or "",
+                env_path=cfg.get("_ENV_FILE") or "",
+                secrets=tuple(v for v in (token, cfg.get("INBOX_TOKEN"),
+                                          cfg.get("INGEST_TOKEN")) if v))
             if warning:
                 log.log("warning: %s" % flatten_for_log(warning, 300))
             elif context:
@@ -695,6 +703,52 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     cfg = load_settings(args.env)
     log = Logger(cfg["INBOX_TRANSCRIBE_LOG"], echo=not args.quiet)
+    # launchd stops the agent with SIGTERM: make it a SystemExit so every `finally` runs —
+    # above all handle_item's, which removes the downloaded recording. Restored on the way out.
+    previous = signal.signal(signal.SIGTERM, _on_sigterm)
+    try:
+        return _run(cfg, log, args)
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+def _on_sigterm(signum, frame):
+    raise SystemExit(128 + signum)
+
+
+#: A downloaded recording lives in the temp dir only while it is transcribed. One older than
+#: this belongs to a run that was killed before its `finally` (a crash, SIGKILL, a reboot).
+STALE_TEMP_S = 3600
+
+
+def sweep_stale_temp(log: Logger, now: Optional[float] = None) -> int:
+    """Remove ``hopper-inbox-*`` recordings older than STALE_TEMP_S from the temp dir — the
+    only copy of a voice note this Mac should hold is the one being transcribed right now."""
+    now = time.time() if now is None else now
+    removed = 0
+    tmp = tempfile.gettempdir()
+    try:
+        names = os.listdir(tmp)
+    except OSError:
+        return 0
+    for name in names:
+        if not name.startswith("hopper-inbox-"):
+            continue
+        full = os.path.join(tmp, name)
+        try:
+            st = os.lstat(full)
+            if stat.S_ISREG(st.st_mode) and now - st.st_mtime > STALE_TEMP_S:
+                os.unlink(full)
+                removed += 1
+        except OSError:
+            pass
+    if removed:
+        log.log("removed %d stale temp recording(s) left by a killed run" % removed)
+    return removed
+
+
+def _run(cfg: Dict[str, str], log: Logger, args) -> int:
+    sweep_stale_temp(log)
     started = now_iso()
     t0 = time.time()
     limit = args.limit if args.limit is not None else _int(cfg, "INBOX_TRANSCRIBE_LIMIT",

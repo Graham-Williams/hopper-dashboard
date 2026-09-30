@@ -41,7 +41,9 @@ is no path from a stored string to markup.
 **Audio never goes to Anthropic or any speech service: it lives on this box, on the Mac
 only while it is being transcribed, and add-only in the Google Drive backup (kept there
 after Delete or the retention prune until removed by hand). The transcript and title are
-sent from the Mac to Anthropic (Claude) to draft the item.** Audio is
+sent from the Mac to Anthropic (Claude) to draft the item, with the optional setup brief
+(``INBOX_DRAFT_CONTEXT_FILE``, a page describing Graham's projects that lives on the Mac).**
+Audio is
 uploaded to this origin, stored as a file on the data volume, and transcribed
 locally by Whisper on Graham's Mac; the Mac then drafts a title and description
 from the transcript with ``claude -p`` (``probes/inbox_draft.py``) and posts the
@@ -872,7 +874,8 @@ def draft_queue():
     whose transcript changed since their draft (stale ``sha``).
 
     ``transcript`` is the note's body, and it is the ONLY note text that leaves
-    for Anthropic — the audio never does. ``sha`` must be echoed back on POST so
+    for Anthropic (with the title, and the Mac's own setup brief beside it) — the
+    audio never does. ``sha`` must be echoed back on POST so
     a draft made from an old transcript is refused rather than stored.
     """
     denied = _require_inbox_token()

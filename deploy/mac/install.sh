@@ -115,7 +115,8 @@ fi
 
 # --- 1c. Drafting keys (opt-in, with --inbox) ------------------------------------
 # The worker's second phase runs `claude -p` on each new transcript. The TRANSCRIPT and TITLE
-# are sent to Anthropic; the audio never is. Empty INBOX_CLAUDE_BIN = drafting stays off.
+# are sent to Anthropic, with the optional setup brief (INBOX_DRAFT_CONTEXT_FILE, below); the
+# audio never is. Empty INBOX_CLAUDE_BIN = drafting stays off.
 # The credential is an OAuth token from `claude setup-token`, in a 0600 FILE — never in the
 # env file and never on a command line. (Not `claude --bare`: it ignores OAuth.)
 if [[ -n "$WANT_INBOX" ]] && ! grep -q '^INBOX_CLAUDE_BIN=' "$ENV_FILE"; then
@@ -141,7 +142,8 @@ if [[ -n "$WANT_INBOX" ]] && ! grep -q '^INBOX_CLAUDE_BIN=' "$ENV_FILE"; then
   {
     echo
     echo "# --- Inbox drafting (phase two of com.hopper.inbox-transcribe) ---"
-    echo "# The transcript and title (not the audio) go to Anthropic (Claude) to draft each note."
+    echo "# The transcript, the title and the optional setup brief (not the audio) go to"
+    echo "# Anthropic (Claude) to draft each note."
     echo "# Empty INBOX_CLAUDE_BIN = drafting off. The token file is made once with"
     echo "# 'claude setup-token' and must be chmod 600."
     echo "INBOX_CLAUDE_BIN=$CLAUDE_BIN"

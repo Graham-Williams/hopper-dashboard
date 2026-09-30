@@ -178,8 +178,9 @@ Outputs:
   most 256 KiB, NULs stripped BEFORE the 6000-character cap, decoded with `errors="replace"` (a bad byte
   or a cut character never drops the brief), and marked only when something was cut. Refused, with no
   brief and one log line (not systemic, burns nothing): missing, unreadable, a symlink, not a regular
-  file, not owned by the worker's user, group/world-WRITABLE, empty, or the claude TOKEN file itself
-  (same `st_dev`/`st_ino`, so a hard link is caught too). Writable-by-others is refused because anyone who
+  file, not owned by the worker's user, group/world-WRITABLE, more than one hard link, empty, the claude
+  TOKEN file or the worker's own ENV file (same `st_dev`/`st_ino`), or a brief whose text contains a
+  credential (INBOX_TOKEN, INGEST_TOKEN or the claude token — compared in memory, never logged). Writable-by-others is refused because anyone who
   can write it can steer every draft; readable-by-others (0644) is allowed because, unlike the OAuth
   token, it is not a secret. Its text never reaches the log or the heartbeat — only a character count or
   the warning's path and reason. The browser still talks to nothing but this origin. The browser uploads audio to the box and does
@@ -279,7 +280,8 @@ Every kind of item is a row in ONE table, `inbox_items`, and they share two inde
 the row stays on the board with a badge (the state filter shows it). **Archived** means the thing it
 mirrored no longer exists upstream (or a note now represents it); archived rows are left out of the
 default list and every count, and the State filter's `archived` option (`?state=archived`) lists them with
-their "archived upstream" badge. Nothing is ever deleted except by Delete — which
+their "archived upstream" badge — in the API too, so `GET /api/v1/inbox/items?state=archived` is readable
+with `READ_TOKEN`, like the rest of the list. Nothing is ever deleted except by Delete — which
 exists for voice and typed notes only: on a `github` or `backlog` row the page shows no Delete and the
 server answers 409 with where to act instead ("This mirrors GitHub — close the issue there" / "This
 mirrors backlog.txt — remove or ✅ DONE the line there"), because deleting a view cannot touch what it

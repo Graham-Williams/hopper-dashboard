@@ -1038,7 +1038,9 @@ def test_an_over_long_setup_brief_is_capped_with_a_marker(tmp_path, monkeypatch)
 
 @pytest.mark.parametrize("case", ["missing", "group_writable", "world_writable",
                                   "directory", "empty", "symlink", "not_mine",
-                                  "is_the_token_file", "hard_link_to_the_token"])
+                                  "is_the_token_file", "hard_link_to_the_token",
+                                  "hard_linked", "is_the_env_file", "holds_the_inbox_token",
+                                  "holds_the_claude_token"])
 def test_a_bad_setup_brief_means_no_brief_and_one_warning_never_a_failure(
         tmp_path, monkeypatch, case):
     exe = _fake_claude(tmp_path, ["ok"])
@@ -1066,13 +1068,29 @@ def test_a_bad_setup_brief_means_no_brief_and_one_warning_never_a_failure(
     elif case == "hard_link_to_the_token":
         path = str(tmp_path / "brief.md")
         os.link(token, path)
+    elif case == "hard_linked":
+        # More than one name: another path can change what is sent without this one moving.
+        path = _brief(tmp_path, "SECRET BRIEF TEXT\n")
+        os.link(path, str(tmp_path / "another-name.md"))
+    elif case == "is_the_env_file":
+        path = "ENV"                         # replaced below, once the env file exists
+    elif case == "holds_the_inbox_token":
+        path = _brief(tmp_path, "SECRET BRIEF TEXT, pasted: inbox-tok\n")
+    elif case == "holds_the_claude_token":
+        path = _brief(tmp_path, "SECRET BRIEF TEXT sk-ant-oat01-FAKE-TOKEN\n")
     else:
         path = _brief(tmp_path, "  \n")
     api = DraftApi([_ditem(ID_A)])
     sent = _wire(monkeypatch, api)
-    assert it.main(["--env", _denv(tmp_path, exe, INBOX_DRAFT_CONTEXT_FILE=path,
-                                   INBOX_CLAUDE_TOKEN_FILE=token),
-                    "--quiet"]) == 0
+    env = _denv(tmp_path, exe, INBOX_DRAFT_CONTEXT_FILE=path, INBOX_CLAUDE_TOKEN_FILE=token)
+    if case == "is_the_env_file":
+        # The worker's own env file (INBOX_TOKEN and INGEST_TOKEN in it), named as the brief.
+        with open(env) as fh:
+            body = fh.read().replace("INBOX_DRAFT_CONTEXT_FILE=ENV",
+                                     "INBOX_DRAFT_CONTEXT_FILE=" + env)
+        with open(env, "w") as fh:
+            fh.write(body)
+    assert it.main(["--env", env, "--quiet"]) == 0
     (call,) = _calls(exe)
     doc = json.loads(call["stdin"])
     assert "context" not in doc and "context_note" not in doc
@@ -1085,6 +1103,7 @@ def test_a_bad_setup_brief_means_no_brief_and_one_warning_never_a_failure(
     assert len(warnings) == 1 and "warning:" in warnings[0]
     assert "SECRET" not in log
     assert "FAKE-TOKEN" not in json.dumps(doc) and "FAKE-TOKEN" not in log
+    assert "inbox-tok" not in json.dumps(doc) and "inbox-tok" not in log
 
 
 def _brief_bytes(tmp_path, data, name="draft-context.md"):
@@ -1128,3 +1147,62 @@ def test_no_setup_brief_configured_means_no_context_field_and_no_warning(tmp_pat
     assert it.main(["--env", _denv(tmp_path, exe), "--quiet"]) == 0
     assert "context" not in json.loads(_calls(exe)[0]["stdin"])
     assert "INBOX_DRAFT_CONTEXT_FILE" not in (tmp_path / "worker.log").read_text()
+
+
+
+# --- the worker's own temp files: swept when stale, removed on SIGTERM ------------
+def test_stale_temp_recordings_are_swept_at_start_and_fresh_ones_kept(tmp_path, monkeypatch):
+    import tempfile
+    import time as _time
+    scratch = tmp_path / "tmp"
+    scratch.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+    old, fresh, other = (scratch / "hopper-inbox-old.webm", scratch / "hopper-inbox-new.webm",
+                         scratch / "someone-else.webm")
+    for f in (old, fresh, other):
+        f.write_bytes(b"a recording")
+    two_hours_ago = _time.time() - 7200
+    os.utime(str(old), (two_hours_ago, two_hours_ago))
+    os.utime(str(other), (two_hours_ago, two_hours_ago))
+    _wire(monkeypatch, FakeApi([]))
+    assert it.main(["--env", _env(tmp_path), "--quiet"]) == 0
+    assert not old.exists(), "a killed run's copy of a recording was left in the temp dir"
+    assert fresh.exists() and other.exists()
+    assert "stale temp recording" in (tmp_path / "worker.log").read_text()
+
+
+_SIGTERM_CHILD = r"""
+import os, signal, sys, tempfile
+sys.path.insert(0, sys.argv[1])
+from probes import inbox_transcribe as it
+from tests.test_probes_inbox_transcribe import FakeApi, _queue, ID_A
+tempfile.tempdir = sys.argv[2]
+api = FakeApi(_queue(ID_A))
+it.api_json, it.api_request = api.api_json, api.api_request
+it.preflight = lambda cfg: None
+it.send_ping = lambda *a, **kw: (200, "{}")
+
+def killed(cfg, path):
+    assert os.path.exists(path)
+    os.kill(os.getpid(), signal.SIGTERM)
+    import time
+    time.sleep(5)
+    sys.exit(99)                         # not reached if SIGTERM became SystemExit(143)
+it.transcribe_file = killed
+it.main(["--env", sys.argv[3], "--quiet"])
+sys.exit(0)
+"""
+
+
+def test_sigterm_mid_transcription_still_removes_the_temp_recording(tmp_path):
+    """launchd stops the agent with SIGTERM. The worker turns it into SystemExit, so the
+    `finally` that removes the downloaded recording still runs. (A child process: SIGTERM
+    in the test process itself would take pytest down.)"""
+    import subprocess
+    scratch = tmp_path / "tmp"
+    scratch.mkdir()
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    proc = subprocess.run([sys.executable, "-c", _SIGTERM_CHILD, repo, str(scratch),
+                           _env(tmp_path)], capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 143, proc.stderr[-2000:]
+    assert [n for n in os.listdir(str(scratch)) if n.startswith("hopper-inbox-")] == []
