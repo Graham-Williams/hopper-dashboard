@@ -726,13 +726,16 @@ there is no default URL in the code, by design.
   `docker exec` (WAL sidecars are uid 10001; a host-side online backup fails "attempt to write a readonly
   database"), sha256-dedupes, keeps a local ring + a `daily/` tier, and pushes with **`rclone copy`, never
   `sync`** for the two DBs. **The audio tree is ADD-ONLY by default too: `BACKUP_AUDIO_MODE=copy`**
-  (Graham's call 2026-09-29, reversing 2026-09-19): `rclone copy --immutable --exclude '*.part'` only,
-  never a remote delete — a note deleted in the Hub loses its recording from the Hub at once and from the
-  box copy at the next run, but Drive keeps it until removed by hand, and the Inbox page says so. The box
-  copy is not replaced by a tree that shrank past `AUDIO_MAX_DROP_PCT`/`AUDIO_MAX_DROP_FILES` (the run
-  fails instead; `AUDIO_ALLOW_MASS_DELETE=<n>` for a real purge), and stale `.audio.*` staging dirs (>30
-  min) are swept at every start. The copy-mode RETURN trap resets itself (`trap '…; trap - RETURN'
-  RETURN`) — a RETURN trap set in a function outlives it. `BACKUP_AUDIO_MODE=mirror` keeps the old behaviour:
+  (Graham's call 2026-09-29, reversing 2026-09-19): `rclone copy --immutable --exclude '*.part'` straight
+  from a staging dir that is removed after — never a remote delete, and NO copy of the audio on the box
+  (so no shrink brake and no false alarms). A note deleted in the Hub loses its recording from the Hub at
+  once; Drive keeps it until removed by hand, and the Inbox page says so. A fully successful copy run
+  removes mirror mode's leftover box copy and brake state. Every run holds `flock -n` on
+  `state/backup.lock` (a second run exits 0, "another run in progress") and, under it, sweeps ALL
+  `.audio.*` staging dirs; mirror mode first restores a box copy left as `audio.old` by a killed swap.
+  DB snapshots have an age cap (`SNAPSHOT_MAX_AGE_DAYS`, 30) on top of the count caps in every tier,
+  keeping each tier's newest. The copy-mode RETURN trap resets itself (`trap '…; trap - RETURN' RETURN`)
+  — a RETURN trap set in a function outlives it. `BACKUP_AUDIO_MODE=mirror` keeps the old behaviour:
   it MIRRORS deletions (copy, then an explicit logged delete pass for remote extras) so that Delete and the
   unconditional privacy ceiling reach the off-box copy. Any other value dies before the run. Mirror mode is
   guarded against mirroring a wipe by THREE independent brakes, any one of which refuses and fails the run
@@ -750,8 +753,8 @@ there is no default URL in the code, by design.
   **one-shot by construction**: it carries the exact resulting count (`AUDIO_ALLOW_MASS_DELETE=7`), so a
   value left in `.env.backup` cannot authorise a later, different purge. Only a clean mirror advances the
   stored count. ⚠️ **In mirror mode Delete removes the row and the recording everywhere (Drive included,
-  within one 5-minute cycle); in copy mode Drive keeps the recording. Either way the transcript TEXT stays in the `inbox_*.db` snapshots already on Drive for up to
-  30 days (`DAILY_RETENTION`)** — rewriting historical snapshots would not be a backup, so the claim is
+  within one 5-minute cycle); in copy mode Drive keeps the recording. Either way the transcript TEXT stays in the `inbox_*.db` snapshots already taken for about
+  30 days (`SNAPSHOT_MAX_AGE_DAYS`), then possibly in Drive's trash for up to 30 more** — rewriting historical snapshots would not be a backup, so the claim is
   documented honestly instead. All of this is pinned by a real behavioural harness in
   `tests/test_deploy_backup.py` (fake `docker`/`rclone` on PATH, the real script, assertions on the
   resulting fake remote and, via `FAKE_RCLONE_LOG`, on every rclone verb issued) — the string-matching

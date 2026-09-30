@@ -25,8 +25,8 @@
 #
 # THE AUDIO TREE IS ADD-ONLY TOO, BY DEFAULT (BACKUP_AUDIO_MODE=copy). Graham's decision
 # 2026-09-29: recordings on Drive are add-only, and a note deleted in the Hub must NOT delete
-# its recording from Drive. Delete removes it from the Hub and the box; a copy already backed
-# up stays in Drive until removed there by hand. That REVERSES the 2026-09-19 decision, which
+# its recording from Drive. Delete removes it from the Hub; copy mode keeps no copy of the
+# audio on the box at all; a copy already backed up stays in Drive until removed there by hand. That REVERSES the 2026-09-19 decision, which
 # made the recordings MIRROR the container, deletions included, so Delete and the 180-day
 # privacy ceiling would reach Drive. That behaviour is still here as BACKUP_AUDIO_MODE=mirror,
 # guarded by three independent refuse-a-mass-deletion brakes (proportional, absolute,
@@ -128,6 +128,11 @@ RCLONE_DEST="${RCLONE_DEST:-}"                        # e.g. gdrive:hopper-dashb
 LOCAL_RETENTION="${LOCAL_RETENTION:-60}"
 DRIVE_RETENTION="${DRIVE_RETENTION:-30}"
 DAILY_RETENTION="${DAILY_RETENTION:-30}"
+# An AGE cap on every snapshot tier (local ring, Drive ring, daily/), on top of the count
+# caps: a deleted note's words live on in the database snapshots, and this is what makes
+# "removed about 30 days later" true whatever the counts would keep. Each tier's NEWEST
+# snapshot always stays, however old (an unchanged DB is not re-snapshotted).
+SNAPSHOT_MAX_AGE_DAYS="${SNAPSHOT_MAX_AGE_DAYS:-30}"
 DRIVE_PUSH_INTERVAL_MIN="${DRIVE_PUSH_INTERVAL_MIN:-15}"
 ALLOW_EMPTY_SNAPSHOT="${ALLOW_EMPTY_SNAPSHOT:-0}"
 BACKUP_AUDIO="${BACKUP_AUDIO:-1}"
@@ -165,6 +170,7 @@ AUDIO_ALLOW_MASS_DELETE="${AUDIO_ALLOW_MASS_DELETE:-}"
 require_positive_int LOCAL_RETENTION "${LOCAL_RETENTION}"
 require_positive_int DRIVE_RETENTION "${DRIVE_RETENTION}"
 require_positive_int DAILY_RETENTION "${DAILY_RETENTION}"
+require_positive_int SNAPSHOT_MAX_AGE_DAYS "${SNAPSHOT_MAX_AGE_DAYS}"
 # An unknown mode is a typo, and guessing either way is wrong: refuse before anything runs.
 [[ "${BACKUP_AUDIO_MODE}" == "copy" || "${BACKUP_AUDIO_MODE}" == "mirror" ]] \
   || die "BACKUP_AUDIO_MODE='${BACKUP_AUDIO_MODE}' must be copy or mirror"
@@ -181,19 +187,36 @@ AUDIO_DROP_WINDOW_MIN=$((10#${AUDIO_DROP_WINDOW_MIN}))
 # password; the on-box mirror should not be readable by every account on the box.
 install -d -m 0700 "${BACKUP_ROOT}"
 install -d -m 0700 "${LOCAL_BACKUP_DIR}" "${STATE_DIR}"
-# A run killed mid-way (TimeoutStartSec, OOM, a reboot) leaves its audio staging dir behind:
-# a whole copy of the recordings outside the host-mirror swap and every retention rule. Sweep
-# them at the start of every run, in both modes — by AGE, not all of them, so a run started by
-# hand while the timer's is still going does not have its tree pulled out from under it. The
-# unit's TimeoutStartSec is 300 s, so nothing older than this can belong to a live run.
-STAGING_STALE_MIN=30
+# ONE RUN AT A TIME, in both modes. A run started by hand while the timer's is going (or a
+# timer run that finds a hand run) exits 0 without doing anything: the run that holds the
+# lock does the work and reports it, and a skipped overlap is not a failure worth a page. The
+# lock is on fd 9 for the life of the script; the kernel drops it however the script ends.
+command -v flock >/dev/null 2>&1 \
+  || die "flock is not on PATH (util-linux) — it is what keeps two runs from overlapping"
+exec 9>"${STATE_DIR}/backup.lock"
+if ! flock -n 9; then
+  log "another run in progress (${STATE_DIR}/backup.lock is held) — this run exits and does nothing"
+  exit 0
+fi
+# Under the lock, every audio staging dir is a DEAD run's (killed by TimeoutStartSec, OOM, a
+# reboot): a whole copy of the recordings outside every retention rule. Sweep them all.
 find "${BACKUP_ROOT}" -mindepth 1 -maxdepth 1 -type d -name '.audio.*' \
-  -mmin +"${STAGING_STALE_MIN}" -exec rm -rf {} + 2>/dev/null || true
+  -exec rm -rf {} + 2>/dev/null || true
 command -v docker >/dev/null 2>&1 || die "docker not on PATH (the snapshot runs inside the container)"
 [[ "$(docker inspect -f '{{.State.Running}}' "${CONTAINER}" 2>/dev/null || echo false)" == "true" ]] \
   || die "container ${CONTAINER} is not running — cannot snapshot a WAL DB from the host (see the header)"
 
 sha256_of() { sha256sum "$1" | cut -d' ' -f1; }
+
+# The snapshot names carry their UTC stamp (<name>_YYYYMMDDTHHMMSSZ[_N].db), so age is read
+# from the NAME — the same on the box and on Drive, and immune to a copy resetting an mtime.
+stamp_of_epoch() { date -u -d "@$1" +%Y%m%dT%H%M%S 2>/dev/null || date -u -r "$1" +%Y%m%dT%H%M%S; }
+AGE_CUTOFF="$(stamp_of_epoch "$(( $(date +%s) - 10#${SNAPSHOT_MAX_AGE_DAYS} * 86400 ))")"
+too_old() {  # <file name> <prefix> — true when its stamp is older than the age cap
+  local stamp="${1#"$2"}"
+  stamp="${stamp:0:15}"
+  [[ "${stamp}" =~ ^[0-9]{8}T[0-9]{6}$ && "${stamp}" < "${AGE_CUTOFF}" ]]
+}
 
 # --- one DB: snapshot inside the container, verify, dedupe, keep ---------------------
 # Sets SNAPSHOT_PATH / SNAPSHOT_CKSUM for the caller.
@@ -278,6 +301,12 @@ PY
   if (( ${#snaps[@]} > LOCAL_RETENTION )); then
     for old in "${snaps[@]:LOCAL_RETENTION}"; do rm -f "${old}"; log "${name}: pruned ${old##*/}"; done
   fi
+  # The age cap — never the newest (index 0), whatever its age.
+  for old in "${snaps[@]:1}"; do
+    if [[ -e "${old}" ]] && too_old "${old##*/}" "${name}_"; then
+      rm -f "${old}"; log "${name}: pruned ${old##*/} (older than ${SNAPSHOT_MAX_AGE_DAYS} days)"
+    fi
+  done
 }
 
 # --- Drive (throttled, decoupled from the local snapshot) ---------------------------
@@ -298,11 +327,15 @@ prune_remote() {  # <dir> <glob> <keep>
   # --files-only is load-bearing: without it `lsf` also lists the daily/ SUBDIR, which
   # reverse-sorts last and lands in the delete slice on every run once the listing exceeds
   # the retention count (harmless, but it logs an rclone ERROR on every push for ever).
-  if (( ${#files[@]} > $3 )); then
-    for old in "${files[@]:$3}"; do
-      rclone deletefile "$1/${old}" && log "pruned ${1##*/}/${old}" || log "WARN: could not prune ${old}"
-    done
-  fi
+  # Past the count cap, or past the age cap — never the tier's newest (index 0). Drive keeps a
+  # deleted file in its trash for up to 30 days more; the docs say so.
+  local i prefix="${2%\*.db}"
+  for (( i = 1; i < ${#files[@]}; i++ )); do
+    if (( i >= $3 )) || too_old "${files[$i]}" "${prefix}"; then
+      rclone deletefile "$1/${files[$i]}" && log "pruned ${1##*/}/${files[$i]}" \
+        || log "WARN: could not prune ${files[$i]}"
+    fi
+  done
 }
 
 push_db() {  # <name> <snapshot path> <checksum>
@@ -416,6 +449,12 @@ push_audio() {
   if [[ "${BACKUP_AUDIO_MODE}" == "copy" ]]; then
     push_audio_copy
     return $?
+  fi
+  # A run killed between the swap's two `mv`s leaves the box copy as `.old` and nothing at
+  # AUDIO_MIRROR_DIR. Put it back first, so it is never the thing a later failure loses.
+  if [[ ! -e "${AUDIO_MIRROR_DIR}" && -d "${AUDIO_MIRROR_DIR}.old" ]]; then
+    mv "${AUDIO_MIRROR_DIR}.old" "${AUDIO_MIRROR_DIR}" \
+      && log "audio: restored the box copy from ${AUDIO_MIRROR_DIR}.old (a run was killed mid-swap)"
   fi
 
   local remote="${RCLONE_DEST}/audio"
@@ -566,20 +605,18 @@ push_audio() {
   return "${rc}"
 }
 
-# BACKUP_AUDIO_MODE=copy: ADD-ONLY. The only remote verb is `rclone copy --immutable --exclude
+# BACKUP_AUDIO_MODE=copy: ADD-ONLY, and NO COPY ON THE BOX. The tree is staged from the
+# container and uploaded straight from the staging dir with `rclone copy --immutable --exclude
 # '*.part'` — it adds and never deletes, a recording that changed on Drive (corruption or
 # tampering: recordings never change once saved) is a loud failure and is never overwritten,
-# and an upload still in flight (`*.part`) is not backed up. No baseline or count file is
-# involved and the mirror-mode state is never touched.
+# and an upload still in flight (`*.part`) is not backed up — then the staging dir goes.
 #
-# The BOX COPY (the host mirror) still follows the container, so a recording deleted in the
-# Hub is gone from the box at the next run — but it is the one local copy that outlives the
-# container volume, so it is NOT replaced by a tree that has shrunk sharply against it. The
-# same thresholds as mirror mode (AUDIO_MAX_DROP_PCT, AUDIO_MAX_DROP_FILES) decide; a refused
-# swap keeps the old box copy, still uploads (add-only, so harmless) and FAILS the run so the
-# heartbeat says so. A real purge names its resulting count once: AUDIO_ALLOW_MASS_DELETE=<n>.
+# There is no host mirror in this mode, so there is no shrink brake to false-alarm (deleting
+# 2 of 3 notes, the prune taking the only one, a prune burst) and no third copy keeping a
+# deleted recording on the box. After a FULLY successful run, a box copy and brake state left
+# by mirror mode are removed (see the end of the script). Mirror mode is unchanged.
 push_audio_copy() {
-  local remote="${RCLONE_DEST}/audio" staged count boxcount=0 swap=1
+  local remote="${RCLONE_DEST}/audio" staged count
   staged="$(mktemp -d "${BACKUP_ROOT}/.audio.XXXXXX")" \
     || { log "ERROR: audio: could not create a staging directory under ${BACKUP_ROOT}"; return 1; }
   # Checked explicitly: errexit is off inside a function called as `push_audio || ...`.
@@ -594,36 +631,11 @@ push_audio_copy() {
     || { log "ERROR: docker cp of the audio tree failed"; return 1; }
   chmod -R go-rwx "${staged}" || log "WARN: audio: could not tighten the staged tree's modes"
   count="$(find "${staged}" -type f ! -name '*.part' 2>/dev/null | wc -l | tr -d ' ')"
-  [[ "${count}" =~ ^[0-9]{1,9}$ ]] || { log "ERROR: audio: could not count the staged tree"; return 1; }
-  if [[ -d "${AUDIO_MIRROR_DIR}" ]]; then
-    boxcount="$(find "${AUDIO_MIRROR_DIR}" -type f ! -name '*.part' 2>/dev/null | wc -l | tr -d ' ')"
-    [[ "${boxcount}" =~ ^[0-9]{1,9}$ ]] || boxcount=0
-  fi
-  if ! audio_drop_allowed "$((10#${boxcount}))" "$((10#${count}))" "the staged tree, against the box copy ${AUDIO_MIRROR_DIR},"; then
-    if purge_authorised "$((10#${count}))"; then
-      log "WARN: audio: replacing the box copy anyway — AUDIO_ALLOW_MASS_DELETE=${count} matches what this run staged"
-    else
-      swap=0
-    fi
-  fi
 
   rclone copy --immutable --exclude '*.part' "${staged}" "${remote}" \
     || { log "ERROR: rclone copy of the audio tree failed (a recording that changed on the remote is refused, never overwritten — check ${remote})"; return 1; }
-
-  if (( ! swap )); then
-    log "ERROR: audio: NOT replacing the box copy (${boxcount} recording(s)) with a tree of ${count} — it is kept as it was, and ${remote} is untouched (add-only). If the drop is real, re-run ONCE with AUDIO_ALLOW_MASS_DELETE=${count}"
-    return 1
-  fi
-  rm -rf "${AUDIO_MIRROR_DIR}.old"
-  if [[ -e "${AUDIO_MIRROR_DIR}" ]]; then
-    mv "${AUDIO_MIRROR_DIR}" "${AUDIO_MIRROR_DIR}.old" \
-      || { log "ERROR: audio: could not rotate the host mirror aside; leaving it as it was"; return 1; }
-  fi
-  mv "${staged}" "${AUDIO_MIRROR_DIR}" \
-    || { log "ERROR: audio: could not swap the staged tree in as the host mirror (Drive is unaffected)"; return 1; }
-  staged=""
-  rm -rf "${AUDIO_MIRROR_DIR}.old"
-  log "audio: ${count} recording(s) copied to ${remote} (add-only: nothing is deleted off-box)"
+  AUDIO_COPY_DONE=1
+  log "audio: ${count} recording(s) copied to ${remote} (add-only: nothing is deleted off-box; no copy is kept on the box)"
   return 0
 }
 
@@ -714,5 +726,16 @@ fi
 if (( PUSH_RC != 0 )); then
   log "Drive push did not complete (rc=${PUSH_RC}); local snapshots are unaffected"
   exit "${PUSH_RC}"
+fi
+# Copy mode keeps no copy on the box. After a FULLY successful run, remove what mirror mode
+# left there — its box copy and its brake state (a later switch back to mirror takes its
+# baseline from the Drive listing again).
+if [[ "${AUDIO_COPY_DONE:-0}" == "1" ]]; then
+  if [[ -e "${AUDIO_MIRROR_DIR}" || -e "${AUDIO_MIRROR_DIR}.old" \
+        || -e "${STATE_DIR}/last_audio_count" || -e "${STATE_DIR}/audio_high_water" ]]; then
+    rm -rf "${AUDIO_MIRROR_DIR}" "${AUDIO_MIRROR_DIR}.old"
+    rm -f "${STATE_DIR}/last_audio_count" "${STATE_DIR}/audio_high_water"
+    log "audio: removed the box copy and brake state left by mirror mode (copy mode keeps no copy on the box)"
+  fi
 fi
 log "done (${SNAPSHOTS} DB snapshot(s))"

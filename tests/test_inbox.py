@@ -1567,9 +1567,14 @@ def test_the_capture_note_says_what_delete_and_the_prune_reach(authed):
     html = " ".join(authed.get("/inbox").data.decode().split())
     assert "including the off-box backup" not in html and "at once. The" not in html
     assert "Audio is deleted from this box once" in html
-    assert ("Delete removes a note and its recording from the Hub at once, and from this box's "
-            "backup copy at the next backup run; a copy already in Google Drive stays there "
-            "until you remove it by hand.") in html
+    # Copy mode keeps no copy of the audio on the box, so Delete has nothing else to reach
+    # there; the text in database backups goes with the backups' own 30-day age cap.
+    assert ("Delete removes a note and its recording from the Hub at once; the box keeps no "
+            "other copy of the audio, and a copy already in Google Drive stays there until you "
+            "remove it by hand.") in html
+    assert ("Database backups already taken still hold the transcript text; they are removed "
+            "about 30 days later, and may then sit in Google Drive's trash for up to 30 more "
+            "days.") in html
 
 
 def test_the_delete_button_carries_the_drive_path_of_a_recording(authed, bot):

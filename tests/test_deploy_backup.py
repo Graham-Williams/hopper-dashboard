@@ -329,6 +329,20 @@ _MKTEMP_SHIM = "\n".join([
     "",
 ])
 
+# util-linux `flock` is on the box; macOS has none. The shim locks the INHERITED descriptor,
+# which is the same open file description the script holds, so the lock outlives the shim.
+_FLOCK_SHIM = "\n".join([
+    "#!/usr/bin/env python3",
+    "import fcntl, sys",
+    "args = sys.argv[1:]",
+    "fd = int([a for a in args if not a.startswith('-')][-1])",
+    "try:",
+    "    fcntl.flock(fd, fcntl.LOCK_EX | (fcntl.LOCK_NB if '-n' in args else 0))",
+    "except OSError:",
+    "    sys.exit(1)",
+    "",
+])
+
 _SHA256_SHIM = "\n".join([
     "#!/usr/bin/env python3",
     "import hashlib, sys",
@@ -369,6 +383,7 @@ class Box:
         self._shim("rclone", os.path.join(FAKES, "fake_rclone.py"))
         self._write_exec(os.path.join(self.bin, "mktemp"), _MKTEMP_SHIM)
         self._write_exec(os.path.join(self.bin, "sha256sum"), _SHA256_SHIM)
+        self._write_exec(os.path.join(self.bin, "flock"), _FLOCK_SHIM)
 
         for name in ("dashboard", "inbox"):
             self._make_db(os.path.join(self.container, "app", "data", name + ".db"), name)
@@ -875,8 +890,9 @@ def test_the_default_audio_mode_is_add_only(box):
     rc, out = box.run(expect=0, BACKUP_AUDIO_MODE=None)
     assert box.remote_audio() == ["a.webm", "b.webm", "c.webm"]
     assert "add-only" in out and "deleted b.webm" not in out
-    # Deleted from the box, though: the host mirror is the fresh staged tree.
-    assert box.host_mirror() == ["a.webm", "c.webm"]
+    # No box copy at all in copy mode: nothing keeps a deleted recording on the box.
+    assert box.host_mirror() == []
+    assert not any(n.startswith(".audio.") for n in os.listdir(box.backup_root))
     calls = box.rclone_calls()
     assert any(c[0] == "copy" and c[-1].endswith("/audio") for c in calls)
     assert not any(c[0] in ("sync", "bisync", "delete", "purge") for c in calls), calls
@@ -884,34 +900,33 @@ def test_the_default_audio_mode_is_add_only(box):
 
 
 @audio_harness
-def test_copy_mode_never_removes_and_keeps_the_box_copy_when_the_container_is_wiped(box):
-    """The shape every brake exists for. Copy mode deletes nothing off-box, AND it will not
-    replace the box copy with a tree that shrank sharply: that copy is the one local copy that
-    outlives the container volume. The run fails, so the heartbeat does."""
+@pytest.mark.parametrize("keep", [1, 0])
+def test_copy_mode_has_no_shrink_brake_to_false_alarm(box, keep):
+    """No box copy, so nothing to brake: deleting 2 of 3 notes, or the prune taking the last
+    one (or a burst over 25), is an ordinary run — and Drive keeps every recording."""
     box.audio_mode = "copy"
-    box.add_audio_n(40)
+    box.add_audio_n(3)
     box.run(expect=0)
-    box.keep_only(0)
+    box.keep_only(keep)
     rc, out = box.run()
-    assert rc == 1 and "NOT replacing the box copy" in out
-    assert len(box.remote_audio()) == 40 and len(box.host_mirror()) == 40
-    assert _audio_removals(box) == []
-    assert box.stored_count() is None                  # mirror-mode state is never touched
-    assert len(box.remote_dbs()) == 2
-    # A deliberate purge names the count it leaves behind, once; Drive still keeps all 40.
-    rc, out = box.run(AUDIO_ALLOW_MASS_DELETE=0)
-    assert rc == 0 and box.host_mirror() == [] and len(box.remote_audio()) == 40
+    assert rc == 0 and "REFUSING" not in out and "NOT replacing" not in out
+    assert len(box.remote_audio()) == 3 and _audio_removals(box) == []
+    assert box.stored_count() is None
 
 
 @audio_harness
-def test_copy_mode_follows_a_normal_delete_on_the_box_copy(box):
+def test_a_fully_successful_copy_run_clears_a_leftover_mirror_mode_box_copy(box):
+    box.add_audio("a.webm", "b.webm")
+    box.run(expect=0, BACKUP_AUDIO_MODE="mirror")             # leaves a box copy + brake state
+    state = os.path.join(box.backup_root, "state")
+    assert box.host_mirror() == ["a.webm", "b.webm"] and box.stored_count() == "2"
     box.audio_mode = "copy"
-    names = box.add_audio_n(10)
-    box.run(expect=0)
-    box.remove_audio(names[0])                         # one note deleted in the Hub
-    box.run(expect=0)
-    assert names[0] not in box.host_mirror() and len(box.host_mirror()) == 9
-    assert len(box.remote_audio()) == 10               # Drive keeps it (add-only)
+    rc, out = box.run(FAKE_RCLONE_COPY_FAIL="/audio")         # a FAILED run clears nothing
+    assert rc == 1 and box.host_mirror() == ["a.webm", "b.webm"]
+    rc, out = box.run(expect=0)
+    assert box.host_mirror() == [] and not os.path.exists(box.backup_root + "/audio.old")
+    assert box.stored_count() is None
+    assert not os.path.exists(os.path.join(state, "audio_high_water"))
 
 
 @audio_harness
@@ -942,21 +957,46 @@ def test_in_flight_part_files_are_never_uploaded_in_copy_mode(box):
 
 @audio_harness
 @pytest.mark.parametrize("mode", ["copy", "mirror"])
-def test_a_killed_runs_staging_dir_is_swept_at_the_next_start(box, mode):
+def test_every_leftover_staging_dir_is_swept_under_the_run_lock(box, mode):
+    """The lock makes every `.audio.*` dir at start a dead run's, however fresh."""
     box.audio_mode = mode
     box.add_audio("a.webm")
     os.makedirs(box.backup_root, exist_ok=True)
-    stale = os.path.join(box.backup_root, ".audio.KILLED1")
-    fresh = os.path.join(box.backup_root, ".audio.INFLIGHT")
-    for d in (stale, fresh):
+    for name in (".audio.KILLED1", ".audio.JUSTNOW"):
+        d = os.path.join(box.backup_root, name)
         os.makedirs(d)
         with open(os.path.join(d, "rec.webm"), "w", encoding="utf-8") as fh:
             fh.write("a copy of a recording")
-    old = time.time() - 2 * 3600
-    os.utime(stale, (old, old))
     box.run(expect=0)
-    assert not os.path.exists(stale), "a killed run's copy of the recordings was left behind"
-    assert os.path.exists(fresh), "a run still in progress had its staging dir swept away"
+    assert not any(n.startswith(".audio.") for n in os.listdir(box.backup_root))
+
+
+@audio_harness
+@pytest.mark.parametrize("mode", ["copy", "mirror"])
+def test_a_second_run_while_one_holds_the_lock_exits_0_and_does_nothing(box, mode):
+    import fcntl
+    box.audio_mode = mode
+    box.add_audio("a.webm")
+    state = os.path.join(box.backup_root, "state")
+    os.makedirs(state, exist_ok=True)
+    with open(os.path.join(state, "backup.lock"), "w") as held:
+        fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+        rc, out = box.run()
+    assert rc == 0 and "another run in progress" in out
+    assert box.remote_audio() == [] and box.remote_dbs() == [] and box.rclone_calls() == []
+    assert not os.listdir(os.path.join(box.backup_root, "snapshots")) if os.path.isdir(
+        os.path.join(box.backup_root, "snapshots")) else True
+
+
+@audio_harness
+def test_mirror_mode_restores_a_box_copy_left_as_old_by_a_killed_swap(box):
+    box.add_audio("a.webm", "b.webm")
+    box.run(expect=0, BACKUP_AUDIO_MODE="mirror")
+    mirror = os.path.join(box.backup_root, "audio")
+    os.rename(mirror, mirror + ".old")                        # killed between the two mv's
+    rc, out = box.run(BACKUP_AUDIO_MODE="mirror", FAKE_RCLONE_COPY_FAIL="/audio")
+    assert rc == 1 and "restored" in out
+    assert box.host_mirror() == ["a.webm", "b.webm"] and not os.path.exists(mirror + ".old")
 
 
 @audio_harness
@@ -974,7 +1014,7 @@ def test_switching_copy_to_mirror_deletes_within_the_brakes_and_refuses_beyond(b
     # Beyond the brakes: refused until the purge is named.
     box.audio_mode = "copy"
     box.remove_audio(*names[3:33])                     # 30 more, in copy mode
-    box.run(AUDIO_ALLOW_MASS_DELETE=7)                 # the box copy follows (named purge)
+    box.run(expect=0)
     rc, out = box.run(BACKUP_AUDIO_MODE="mirror")
     assert rc == 1 and len(box.remote_audio()) == 37 and "REFUSING" in out
     rc, out = box.run(BACKUP_AUDIO_MODE="mirror", AUDIO_ALLOW_MASS_DELETE=7)
@@ -1010,3 +1050,39 @@ def test_an_unknown_audio_mode_is_refused_before_anything_runs(box, bad):
         return
     assert rc != 0 and "must be copy or mirror" in out
     assert box.remote_audio() == [] and box.rclone_calls() == []
+
+
+# --- DB snapshots: an age cap on top of the count caps, in every tier ------------------
+def _touch_db(path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("an old snapshot")
+
+
+@audio_harness
+def test_db_snapshots_older_than_30_days_go_in_every_tier_but_never_a_tiers_newest(box):
+    """A deleted note's words live on in the database snapshots: the age cap is what makes
+    "gone about 30 days later" true, whatever the count caps would keep."""
+    box.run(expect=0)
+    local = os.path.join(box.backup_root, "snapshots")
+    remote = os.path.join(box.remote, "hopper-dashboard-backups")
+    # The newest local snapshot of an UNCHANGED db is old: it must be kept as the newest.
+    newest = sorted(n for n in os.listdir(local) if n.startswith("dashboard_"))[-1]
+    os.rename(os.path.join(local, newest), os.path.join(local, "dashboard_20200101T000000Z.db"))
+    for path in (os.path.join(local, "dashboard_20190101T000000Z.db"),
+                 os.path.join(remote, "inbox_20190101T000000Z.db"),
+                 os.path.join(remote, "daily", "dashboard_20190101T000000Z.db")):
+        _touch_db(path)
+    # Make the next run push again, so the Drive ring and the daily tier are pruned.
+    for n in os.listdir(os.path.join(box.backup_root, "state")):
+        if n.startswith("last_drive_"):
+            os.remove(os.path.join(box.backup_root, "state", n))
+    for n in os.listdir(os.path.join(remote, "daily")):
+        if not n.startswith(("dashboard_2019", "inbox_2019")):
+            os.remove(os.path.join(remote, "daily", n))
+    rc, out = box.run(expect=0)
+    assert "dashboard_20200101T000000Z.db" in os.listdir(local)        # a tier's newest stays
+    assert "dashboard_20190101T000000Z.db" not in os.listdir(local)
+    assert "inbox_20190101T000000Z.db" not in os.listdir(remote)
+    assert "dashboard_20190101T000000Z.db" not in os.listdir(os.path.join(remote, "daily"))
+    assert box.remote_dbs() and box.remote_daily()

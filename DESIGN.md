@@ -418,14 +418,15 @@ snapshot leaves Drive only when enough newer ones have replaced it. Nothing that
 can remove an off-box DB snapshot.
 
 **The audio tree is ADD-ONLY by default (`BACKUP_AUDIO_MODE=copy`, Graham's decision 2026-09-29).**
-Recordings on Drive are only ever added (`rclone copy --immutable --exclude '*.part'`: a recording that
-differs on Drive is refused, never overwritten; an in-flight upload is skipped): a note deleted in the Hub
-(or aged out by the prune) loses its recording from the Hub at once and from the box copy at the next
-successful run, but a copy already backed up stays in Drive until removed there by hand. That reverses
-the 2026-09-19 decision below, which is kept as `BACKUP_AUDIO_MODE=mirror`. Copy mode never deletes
-off-box, so the Drive brakes described next are mirror mode's; copy mode reuses two of their thresholds
-(`AUDIO_MAX_DROP_PCT`, `AUDIO_MAX_DROP_FILES`) for one thing only — it will not replace the box copy with
-a staged tree that shrank sharply against it (it keeps the old one and fails the run). The rest of this
+Recordings on Drive are only ever added (`rclone copy --immutable --exclude '*.part'` straight from a
+staging dir that is removed after: a recording that differs on Drive is refused, never overwritten; an
+in-flight upload is skipped), and the box keeps NO copy of the audio: a note deleted in the Hub (or aged
+out by the prune) loses its recording from the Hub at once, and a copy already backed up stays in Drive
+until removed there by hand. With no box copy there is nothing for a shrink brake to guard, so none can
+false-alarm; a successful copy-mode run removes a box copy and brake state left by mirror mode. That
+reverses the 2026-09-19 decision below, which is kept as `BACKUP_AUDIO_MODE=mirror`, and the brakes
+described next are mirror mode's. Every run holds `flock -n` on `state/backup.lock` (an overlapping run
+exits 0 and does nothing) and, under it, sweeps every leftover `.audio.*` staging dir. The rest of this
 section up to "What Delete does" describes mirror mode.
 
 **Mirror mode: the recordings MIRROR the container, deletions included.** Graham's
@@ -464,18 +465,22 @@ the exact count the purge should leave behind (`AUDIO_ALLOW_MASS_DELETE=7`), so 
 mirror updates the remembered count. Details and the restore procedure in DEPLOY.md §2b.
 
 **What Delete does and does not reach.** Delete removes the note and its recording from the Hub (the
-container's store) immediately, and from the box's backup copy (the host mirror) at the next successful
-backup run. In the default copy mode **a recording already backed up stays in Drive** until removed there by
-hand (in mirror mode it is gone from Drive within one backup cycle, ≤5 min). The page says: "Delete removes a
-note and its recording from the Hub at once, and from this box's backup copy at the next backup run; a copy
+container's store) immediately; in the default copy mode the box keeps no other copy of the audio, and
+**a recording already backed up stays in Drive** until removed there by hand (in mirror mode it is gone
+from Drive, and from mirror mode's box copy, at the next successful backup run). The page says: "Delete
+removes a note and its recording from the Hub at once; the box keeps no other copy of the audio, and a copy
 already in Google Drive stays there until you remove it by hand." The Delete confirmation names the file:
 `…/audio/<yyyy>/<mm>/<note id>.*` in the backup folder. **The
-transcript TEXT is not retracted from backups already taken.** Every `inbox_*.db` snapshot on Drive — the ring plus the `daily/` tier —
-still contains whatever was said, and those age out on `DAILY_RETENTION`, i.e. **up to 30 days**. That is
+transcript TEXT is not retracted from backups already taken.** Every `inbox_*.db` snapshot — the local ring,
+the Drive ring and the `daily/` tier — still contains whatever was said. Each tier has an age cap on top of
+its count cap (`SNAPSHOT_MAX_AGE_DAYS`, 30; a tier's newest snapshot always stays), so those snapshots are
+**removed about 30 days later**, and a removed Drive file may then sit in Drive's trash for up to 30 more
+days. The page says: "Database backups already taken still hold the transcript text; they are removed about
+30 days later, and may then sit in Google Drive's trash for up to 30 more days." That is
 the correct trade: rewriting historical database snapshots to erase a row would mean a backup that can be
 edited after the fact, which is not a backup. But the claim has to be stated honestly rather than sold as
-"deleted everywhere" — the words persist for up to 30 days in dated database backups, and (in copy mode)
-the recording persists in Drive until removed by hand.
+"deleted everywhere" — the words persist for about 30 days in dated database backups (plus Drive's
+trash), and (in copy mode) the recording persists in Drive until removed by hand.
 
 ### What the Inbox adds to the board
 
