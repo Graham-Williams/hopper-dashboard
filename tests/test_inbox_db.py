@@ -883,9 +883,32 @@ def test_the_migration_archives_a_live_mirror_row_whose_issue_a_note_links(tmp_p
     old.close()
     c = inbox_db.connect(path)
     inbox_db.init_inbox_schema(c)
+    inbox_db.startup_repairs(c, ("a/b",))
     assert inbox_db.get_item(c, "a" * 32)["archived_at"] is not None
     assert inbox_db.get_item(c, "c" * 32)["archived_at"] is None
     c.close()
+
+
+def test_canonicalisation_runs_before_the_duplicate_repair(conn):
+    """A link stored under another spelling cannot match its mirror row's key until it is
+    canonicalised — so the repair must come second, or the duplicate survives."""
+    dup = inbox_db.upsert_mirror_item(conn, mirror_key=inbox_db.github_key("Owner/km-tracker", 7),
+                                      source="github", title="dup")
+    note = inbox_db.create_item(conn, source="voice", text="x", now=NOW)
+    conn.execute("INSERT INTO inbox_issues (item_id, repo, number, url, linked_at)"
+                 " VALUES (?, 'owner/KM-tracker', 7, 'u', ?)", (note, NOW))
+    inbox_db.startup_repairs(conn, ("Owner/km-tracker",))
+    assert conn.execute("SELECT repo FROM inbox_issues").fetchone()[0] == "Owner/km-tracker"
+    assert inbox_db.get_item(conn, dup)["archived_at"] is not None
+
+
+def test_boot_forgets_every_stored_github_etag(conn):
+    """Changes made while an older image ran (a rollback window) must be seen: the first
+    scan after every boot is a full one."""
+    inbox_db.set_mirror_state(conn, "github:a/b", etag='W/"x"', last_status="ok")
+    inbox_db.set_mirror_state(conn, "github:c/d", etag='W/"y"', last_status="ok")
+    inbox_db.startup_repairs(conn, ("a/b", "c/d"))
+    assert [r["etag"] for r in conn.execute("SELECT etag FROM inbox_mirror_state")] == [None, None]
 
 
 def test_link_repo_spellings_are_canonicalised_to_the_watched_one(conn):
@@ -902,9 +925,12 @@ def test_link_repo_spellings_are_canonicalised_to_the_watched_one(conn):
                  " VALUES (?, 'OWNER/km-tracker', 4, 'u', ?)", (b, NOW))
     conn.execute("INSERT INTO inbox_issues (item_id, repo, number, url, linked_at)"
                  " VALUES (?, 'someone/else', 5, 'u', ?)", (a, NOW))
+    conn.execute("UPDATE inbox_issues SET state='closed' WHERE repo='Owner/km-tracker'")
     assert inbox_db.canonicalise_issue_repos(conn, ("Owner/km-tracker",)) == 2
-    got = {(r["item_id"], r["repo"], r["number"]) for r in
-           conn.execute("SELECT item_id, repo, number FROM inbox_issues")}
-    assert got == {(a, "Owner/km-tracker", 3), (a, "someone/else", 5),
-                   (b, "Owner/km-tracker", 4)}
+    got = {(r["item_id"], r["repo"], r["number"], r["state"]) for r in
+           conn.execute("SELECT item_id, repo, number, state FROM inbox_issues")}
+    # The MERGED link is open again: the forced full scan must see the real state and fire
+    # the transition (keeping the old 'closed' would hide it for ever).
+    assert got == {(a, "Owner/km-tracker", 3, "open"), (a, "someone/else", 5, "open"),
+                   (b, "Owner/km-tracker", 4, "open")}
     assert inbox_db.canonicalise_issue_repos(conn, ("Owner/km-tracker",)) == 0   # idempotent

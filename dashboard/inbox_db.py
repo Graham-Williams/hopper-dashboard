@@ -326,12 +326,6 @@ def init_inbox_schema(conn: sqlite3.Connection) -> None:
                      " AND audio_path IS NULL AND audio_pruned_at IS NULL")
         conn.execute("UPDATE inbox_items SET transcript_status = 'failed' WHERE source ="
                      " 'voice' AND transcript_status = 'pending' AND audio_path IS NULL")
-        # Old duplicates: a live mirror row for an issue a note links (made before linking
-        # archived it, or by a race). The note represents that issue; archive the row. Only
-        # live rows match, so after the first run this changes nothing.
-        conn.execute("UPDATE inbox_items SET archived_at = updated_at WHERE source = 'github'"
-                     " AND archived_at IS NULL AND mirror_key IN (SELECT 'github:' || repo"
-                     " || '#' || number FROM inbox_issues)")
         # G-20: UNIQUE(repo, number) → UNIQUE(item_id, repo, number), same index NAME (see
         # INBOX_SCHEMA). Only when the old definition is found, so it runs once, and it
         # cannot fail: no (item_id, repo, number) duplicate can exist under the old rule.
@@ -868,11 +862,51 @@ def canonicalise_issue_repos(conn: sqlite3.Connection, repos: Iterable[str]) -> 
                                                   row["number"])).fetchone()
             if twin is not None:
                 conn.execute("DELETE FROM inbox_issues WHERE id=?", (row["id"],))
+                # The merged link is OPEN again: one of the two was never refreshed (a scan
+                # matches the watched spelling only), so neither's state can be trusted. The
+                # forced full scan then compares 'open' with the real state and fires the
+                # transition — a kept 'closed' would hide a close for ever.
+                conn.execute("UPDATE inbox_issues SET state='open', closed_at=NULL WHERE id=?",
+                             (twin["id"],))
             else:
                 conn.execute("UPDATE inbox_issues SET repo=? WHERE id=?", (watched, row["id"]))
             forget_etag(conn, watched)
             changed += 1
     return changed
+
+
+def repair_linked_duplicates(conn: sqlite3.Connection) -> int:
+    """Archive every LIVE mirror row of an issue a note links (a duplicate made before
+    linking archived it, or by a race): the note represents that issue. Only live rows
+    match, so once repaired this changes nothing. Run at start-up, AFTER
+    :func:`canonicalise_issue_repos` — a link under another spelling cannot match its
+    mirror row's key until it is canonicalised."""
+    with transaction(conn):
+        repaired = int(conn.execute(
+            "UPDATE inbox_items SET archived_at = updated_at WHERE source = 'github'"
+            " AND archived_at IS NULL AND mirror_key IN (SELECT 'github:' || repo || '#'"
+            " || number FROM inbox_issues)").rowcount or 0)
+    return repaired
+
+
+def forget_all_etags(conn: sqlite3.Connection) -> int:
+    """At every boot: the first scan of every repo is then a full one, so a change made while
+    an older image ran (a rollback window, when this image's rules were not being applied)
+    is seen. Costs one full listing per repo per boot, and the conditional writes make the
+    scan store nothing but the new ETags when nothing changed."""
+    with transaction(conn):
+        forgotten = int(conn.execute("UPDATE inbox_mirror_state SET etag=NULL"
+                                     " WHERE etag IS NOT NULL").rowcount or 0)
+    return forgotten
+
+
+def startup_repairs(conn: sqlite3.Connection, repos: Iterable[str]) -> None:
+    """What every boot runs after the schema migration, IN THIS ORDER: canonicalise link
+    spellings, THEN repair duplicates (it matches on the canonical spelling), then forget
+    every stored ETag."""
+    canonicalise_issue_repos(conn, repos)
+    repair_linked_duplicates(conn)
+    forget_all_etags(conn)
 
 
 def upsert_mirror_item(conn: sqlite3.Connection, *, mirror_key: str,

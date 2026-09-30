@@ -518,6 +518,73 @@ def test_a_live_mirror_row_of_a_linked_issue_is_archived_by_the_scan(conn):
     assert inbox_db.get_item(conn, mirror)["archived_at"] is not None
 
 
+# --- boot: canonicalise, repair, forget every ETag ------------------------------ #
+
+def _seed_with_origin_main(tmp_path, script):
+    """Run ``script`` against a DB using origin/main's OWN code (the old schema, the old
+    link rules), in a subprocess so its `dashboard` package never meets this one."""
+    import subprocess
+    import sys
+    import tarfile
+    root = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True,
+                          text=True).stdout.strip()
+    archive = tmp_path / "main.tar"
+    got = subprocess.run(["git", "-C", root, "archive", "-o", str(archive), "origin/main",
+                          "dashboard"], capture_output=True)
+    if got.returncode != 0:
+        pytest.skip("origin/main is not available in this checkout")
+    tree = tmp_path / "main"
+    tree.mkdir()
+    with tarfile.open(archive) as tar:
+        tar.extractall(tree, filter="data")
+    proc = subprocess.run([sys.executable, "-c", script], cwd=str(tree), capture_output=True,
+                          text=True, env={**__import__("os").environ, "PYTHONPATH": str(tree)})
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    return proc.stdout.strip()
+
+
+def test_a_merged_link_seeded_by_origin_main_closes_its_note_on_the_first_scan(tmp_path):
+    path = str(tmp_path / "inbox.db")
+    note = _seed_with_origin_main(tmp_path, f"""
+from dashboard import inbox_db
+c = inbox_db.connect({path!r}); inbox_db.init_inbox_schema(c)
+n = inbox_db.create_item(c, source="voice", text="the wheel", now="2026-09-01T00:00:00Z")
+inbox_db.link_issue(c, n, repo="{REPO}", number=4, url="u")
+inbox_db.link_issue(c, n, repo="{REPO.upper()}", number=4, url="u")
+c.execute("UPDATE inbox_issues SET state='closed' WHERE repo=?", ("{REPO}",))
+inbox_db.set_mirror_state(c, "github:{REPO}", etag='W/"steady"', last_status="ok")
+c.commit(); print(n)
+""")
+    conn = inbox_db.connect(path)
+    try:
+        inbox_db.init_inbox_schema(conn)
+        inbox_db.startup_repairs(conn, (REPO,))
+        # Upstream: #4 is closed and nothing has changed since the stored ETag.
+        out = github_mirror.sync(conn, [REPO], now=NOW,
+                                 fetch=FakeGitHub([ok([], etag='W/"steady"')]))
+        assert out["results"][0]["status"] == "ok"            # a full scan, not a 304
+        assert _state(conn, note) == ("closed", "issues")
+    finally:
+        conn.close()
+
+
+def test_a_steady_state_boot_then_sync_writes_nothing_but_the_etags(conn):
+    note = _note_linked_to(conn, 7)
+    body = [issue(7), issue(8, "Mirrored")]
+    github_mirror.sync(conn, [REPO], now=NOW, fetch=FakeGitHub([ok(body, etag='W/"s"')]))
+    items = [dict(r) for r in conn.execute("SELECT * FROM inbox_items ORDER BY id")]
+    links = [dict(r) for r in conn.execute("SELECT * FROM inbox_issues ORDER BY id")]
+    inbox_db.startup_repairs(conn, (REPO,))                    # a boot
+    before = conn.total_changes
+    out = github_mirror.sync(conn, [REPO], now=NOW + 900,
+                             fetch=FakeGitHub([ok(body, etag='W/"s"')]))
+    assert out["results"][0]["status"] == "ok"                 # full: the ETag was forgotten
+    assert conn.total_changes - before == 1                    # the ETag row, nothing else
+    assert [dict(r) for r in conn.execute("SELECT * FROM inbox_items ORDER BY id")] == items
+    assert [dict(r) for r in conn.execute("SELECT * FROM inbox_issues ORDER BY id")] == links
+    assert _state(conn, note) == ("open", None)
+
+
 # --- a no-op sync writes nothing (item 11) --------------------------------------- #
 
 def test_an_unchanged_sync_writes_nothing(conn):

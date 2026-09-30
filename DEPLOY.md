@@ -1341,7 +1341,8 @@ print(f"closed_by cleared on {n} row(s) changed during the rollback")
 PY
 ```
 
-What the rules still catch afterwards, with no step needed: a backlog line marked ✅ DONE while the older
+Every boot also forgets every stored GitHub ETag, so the first scan of each repo after the roll-forward is a
+full one. What the rules still catch afterwards, with no step needed: a backlog line marked ✅ DONE while the older
 image ran closes its note on the FIRST push (the old image left that row open, so the push sees it become
 done), and a line REMOVED while it ran closes its note after TWO pushes (the absence count starts from
 zero). A GitHub issue that closed or reopened while it ran is caught on the first complete scan (the
