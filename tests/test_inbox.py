@@ -1513,6 +1513,60 @@ def test_known_projects_feed_the_datalist(authed, settings):
     assert '<option value="km-tracker">' in datalist
 
 
+# --- a voice note whose recording went before it was transcribed (P-12/P-14/W-04) --- #
+
+def _audio_path(settings, item):
+    conn = inbox_db.connect(settings.inbox_db_path)
+    try:
+        return inbox_db.get_item(conn, item)["audio_path"]
+    finally:
+        conn.close()
+
+
+def _listed(authed, item):
+    return next(i for i in authed.get("/api/v1/inbox/items").get_json()["items"]
+                if i["id"] == item)
+
+
+def test_a_recording_pruned_before_it_was_transcribed_lands_in_needs_review(
+        authed, bot, settings):
+    from dashboard import inbox_audio as audio_mod
+    item = _voice_note(authed)["id"]                        # Whisper never ran (P-12)
+    conn = inbox_db.connect(settings.inbox_db_path)
+    with conn:
+        conn.execute("UPDATE inbox_items SET created_at='2020-01-01T00:00:00Z' WHERE id=?",
+                     (item,))
+    conn.close()
+    assert audio_mod.prune_audio(settings)["pruned"] == 1    # the privacy ceiling
+    row = _listed(authed, item)
+    assert row["transcript_status"] == "failed" and row["needs_review"] is True
+    assert item not in [i["id"] for i in
+                        bot.get("/api/v1/inbox/transcribe/queue", headers=machine())
+                        .get_json()["items"]]
+    html = _row(authed.get("/inbox").data.decode(), item)
+    assert "Recording expired before it was transcribed" in html
+    assert "<audio" not in html and "the audio is still here" not in html
+
+
+def test_a_missing_recording_is_labelled_and_never_offers_a_dead_player(
+        authed, bot, settings):
+    import os
+    from dashboard import inbox_audio as audio_mod
+    item = _voice_note(authed)["id"]
+    os.remove(os.path.join(settings.inbox_audio_dir, _audio_path(settings, item)))
+    # Before the hourly sweep (W-04): no player that would only 410, and a clear label.
+    html = _row(authed.get("/inbox").data.decode(), item)
+    assert "Recording missing" in html and "<audio" not in html
+    # The sweep records it on the row (P-14), and the note lands in Needs review.
+    assert audio_mod.prune_audio(settings)["cleared"] == 1
+    row = _listed(authed, item)
+    assert row["audio_missing_at"] and row["transcript_status"] == "failed"
+    assert row["needs_review"] is True and row["has_audio"] is False
+    html = _row(authed.get("/inbox").data.decode(), item)
+    assert "Recording missing" in html and "<audio" not in html
+    assert "Recording expired" not in html
+
+
 # --- R-03: a voice note can be ticked Reviewed only once there is a draft ---- #
 
 def test_a_voice_note_cannot_be_reviewed_before_it_has_a_draft(authed, bot):

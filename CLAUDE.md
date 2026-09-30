@@ -295,7 +295,10 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   the two together — change both or neither.
 - `inbox_audio.py` — the audio file store (mime allow-list + a MAGIC-BYTE check, sha256, path built from the
   server-generated id only, never the client filename) and the scheduler's prune + orphan reconcile. The
-  prune needs ALL THREE of `transcript_status='whisper'`, `reviewed=1`, and older than the retention. It
+  prune needs ALL THREE of `transcript_status='whisper'`, `reviewed=1`, and older than the retention (or the
+  2x ceiling). A prune, or the sweep finding a file gone (`audio_missing_at`), turns a `pending` transcript
+  into `failed` → Needs review, labelled "Recording expired…"/"Recording missing"; the board `stat`s each
+  listed recording so it never renders a dead player. It
   lives here rather than in `inbox.py` because `inbox.py` imports `web` → `views` → `services`, and the
   scheduler importing that would close a cycle.
 - **Drafts (2026-09-28).** Voice notes get an AI draft in `draft_*` columns (the first real

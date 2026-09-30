@@ -172,7 +172,12 @@
             it is reviewed; the review copies the draft title across, so after
             that `title` is the same text. The transcript is one tap away. -#}
         <h3 class="item-title">{{ d.title if (d.title and not it.reviewed) else it.title }}</h3>
-        {% if it.transcript_status == 'failed' and not it.reviewed and not d.body %}
+        {#- No recording AND no transcript: nothing to play, nothing to draft from (P-12/P-14). -#}
+        {% if it.audio_missing and not it.body and not it.reviewed and not d.body %}
+        <p class="draft-state draft-failed small"><span aria-hidden="true">✕</span> Recording missing — write the draft from memory, or delete the note</p>
+        {% elif it.audio_pruned_at and not it.body and not it.reviewed and not d.body %}
+        <p class="draft-state draft-failed small"><span aria-hidden="true">✕</span> Recording expired before it was transcribed — write the draft from memory, or delete the note</p>
+        {% elif it.transcript_status == 'failed' and not it.reviewed and not d.body %}
         <p class="draft-state draft-failed small"><span aria-hidden="true">✕</span> Whisper couldn't transcribe this — play it and write the draft</p>
         {% elif d.status == 'pending' and not it.reviewed %}
         <p class="draft-state draft-pending small">Drafting…</p>
@@ -198,7 +203,7 @@
         <p class="item-body">{{ it.body }}</p>
         {% endif %}
         {% endif %}
-        {% if it.has_audio %}
+        {% if it.has_audio and not it.audio_missing %}
         {# Right under the transcript it transcribes. Played back from the SERVER
            URL, never a blob: — a blob would need media-src blob: in the CSP and
            the CSP is not being loosened. #}
@@ -263,8 +268,9 @@
         <p class="item-meta muted small">
           {{ when(it.created_at, now) }}
           {% if it.transcript_status %} · transcript: <span class="ts ts-{{ it.transcript_status }}">{{ it.transcript_status }}</span>{% endif %}
-          {% if it.transcript_status == 'failed' %} <span class="muted">(Whisper gave up after {{ it.transcribe_attempts }} attempt{{ '' if it.transcribe_attempts == 1 else 's' }} — the audio is still here)</span>{% endif %}
+          {% if it.transcript_status == 'failed' and it.has_audio and not it.audio_missing %} <span class="muted">(Whisper gave up after {{ it.transcribe_attempts }} attempt{{ '' if it.transcribe_attempts == 1 else 's' }} — the audio is still here)</span>{% endif %}
           {% if it.audio_pruned_at %} · audio pruned {{ when(it.audio_pruned_at, now) }}{% endif %}
+          {% if it.audio_missing %} · recording missing{% endif %}
         </p>
         {% if it.issues %}
         <p class="item-issues small">

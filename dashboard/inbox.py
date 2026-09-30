@@ -333,6 +333,7 @@ def item_json(row: dict, issues: list[dict] | None = None,
         "transcribe_attempts": int(row["transcribe_attempts"] or 0),
         "has_audio": bool(row["audio_path"]),
         "audio_pruned_at": row["audio_pruned_at"],
+        "audio_missing_at": row.get("audio_missing_at"),
         "audio_secs": row["audio_secs"],
         "audio_bytes": row["audio_bytes"],
         "mirror_key": row["mirror_key"],
@@ -413,8 +414,17 @@ def board():
     try:
         page = _load_page(conn, _list_args(request.args))
         page["projects"] = known_projects(conn)     # the datalists' suggestions
+        # W-04: a file can vanish before the hourly sweep notices. Never render a player
+        # that would only 410 — say "Recording missing" instead (a stat per recording).
+        audio_dir = _settings().inbox_audio_dir
+        paths = {r["id"]: r["audio_path"] for r in conn.execute(
+            "SELECT id, audio_path FROM inbox_items WHERE audio_path IS NOT NULL")}
     finally:
         conn.close()
+    for it in page["items"]:
+        it["audio_missing"] = bool(it.get("audio_missing_at")) or bool(
+            it["has_audio"] and inbox_audio.open_path(audio_dir, paths.get(it["id"], ""))
+            is None)
     return render_template("inbox.html", page=page, now=time.time(),
                            filters=_list_args(request.args),
                            audio_max_bytes=_settings().inbox_audio_max_bytes,

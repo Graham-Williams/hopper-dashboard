@@ -264,6 +264,10 @@ INBOX_COLUMNS: tuple[tuple[str, str], ...] = (
     # tag (capped at BACKLOG_ABSENT_PUSHES). "Removed" needs two in a row, so one truncated
     # read of the file (or a filing call that beat the line into the file) closes nothing.
     ("backlog_absent_pushes", "INTEGER NOT NULL DEFAULT 0"),
+    # The hourly sweep found the recording's FILE gone (a disk fault, a restore from an old
+    # backup) and cleared audio_path — so the page can say "Recording missing" rather than
+    # showing no trace of it. Pruning stamps audio_pruned_at instead.
+    ("audio_missing_at", "TEXT"),
 )
 
 
@@ -306,6 +310,14 @@ def init_inbox_schema(conn: sqlite3.Connection) -> None:
         conn.execute("UPDATE inbox_items SET draft_copied_at = reviewed_at"
                      " WHERE source = 'voice' AND reviewed = 1"
                      " AND draft_copied_at IS NULL AND reviewed_at IS NOT NULL")
+        # A voice note whose recording went before Whisper ran can never be transcribed: send
+        # it to Needs review (transcript 'failed') instead of 'pending' for ever — see
+        # mark_audio_pruned / clear_audio_path. Idempotent; stamps a missing file's row.
+        conn.execute("UPDATE inbox_items SET audio_missing_at = COALESCE(audio_missing_at,"
+                     " updated_at) WHERE source = 'voice' AND transcript_status = 'pending'"
+                     " AND audio_path IS NULL AND audio_pruned_at IS NULL")
+        conn.execute("UPDATE inbox_items SET transcript_status = 'failed' WHERE source ="
+                     " 'voice' AND transcript_status = 'pending' AND audio_path IS NULL")
         # G-20: UNIQUE(repo, number) → UNIQUE(item_id, repo, number), same index NAME (see
         # INBOX_SCHEMA). Only when the old definition is found, so it runs once, and it
         # cannot fail: no (item_id, repo, number) duplicate can exist under the old rule.
@@ -1289,8 +1301,13 @@ def mark_audio_pruned(conn: sqlite3.Connection, item_id: str,
     purpose — "there was a 41 s recording and it was deleted on this date" is a
     better answer than a row that looks as if it never had audio."""
     now = now or now_iso()
-    conn.execute("UPDATE inbox_items SET audio_path=NULL, audio_pruned_at=?, "
-                 "updated_at=? WHERE id=?", (now, now, item_id))
+    # A transcript still PENDING can never happen now (P-12): the note goes to Needs review
+    # as 'failed', labelled "Recording expired before it was transcribed", not 'pending'
+    # for ever in no queue.
+    conn.execute("UPDATE inbox_items SET audio_path=NULL, audio_pruned_at=?, updated_at=?,"
+                 " transcript_status = CASE WHEN transcript_status = ? THEN ?"
+                 " ELSE transcript_status END WHERE id=?",
+                 (now, now, TRANSCRIPT_PENDING, TRANSCRIPT_FAILED, item_id))
 
 
 def audio_bytes_total(conn: sqlite3.Connection) -> int:
@@ -1326,8 +1343,12 @@ def clear_audio_path(conn: sqlite3.Connection, item_id: str,
     """The file is gone but the row still pointed at it — a 404 waiting to
     happen on the one control Graham taps to check a transcript."""
     now = now or now_iso()
-    conn.execute("UPDATE inbox_items SET audio_path=NULL, updated_at=? "
-                 "WHERE id=?", (now, item_id))
+    # Recorded on the row (P-14): "Recording missing" on the page, and a transcript that can
+    # no longer happen goes to Needs review as 'failed' instead of 'pending' for ever.
+    conn.execute("UPDATE inbox_items SET audio_path=NULL, audio_missing_at=?, updated_at=?,"
+                 " transcript_status = CASE WHEN transcript_status = ? THEN ?"
+                 " ELSE transcript_status END WHERE id=?",
+                 (now, now, TRANSCRIPT_PENDING, TRANSCRIPT_FAILED, item_id))
 
 
 # --------------------------------------------------------------------------- #

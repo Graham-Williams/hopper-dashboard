@@ -371,6 +371,14 @@ forever — the setting would read like a maximum and behave like a minimum.
 (Both rules act on the box. Since 2026-09-29 the Drive backup of the audio is add-only by default, so a
 recording already backed up outlives both on Drive until removed by hand — see "Mirror mode" below.)
 
+**A recording that goes before it was transcribed** can never be transcribed, so the note must not sit
+at "pending" in no queue for ever (P-12/P-14). Pruning it (the ceiling) or the hourly sweep finding its
+FILE gone flips a `pending` transcript to `failed`, which puts the note in Needs review; the sweep also
+stamps `audio_missing_at`. The row says which: "Recording expired before it was transcribed" (pruned) or
+"Recording missing" (lost) — write the draft from memory, or delete it. The page never renders a player
+for a file that is gone: before the sweep has noticed, the board `stat`s each recording it lists (W-04).
+The migration applies the same rule to notes already stranded that way.
+
 `DELETE /api/v1/inbox/items/<id>` (session only, Origin-pinned, write-limited) removes a note and its
 audio immediately (voice and typed notes only; a mirrored row is a 409 — see "Item lifecycle"; the item
 JSON carries `deletable`). It exists because the one class of data here that is unambiguously personal is the one

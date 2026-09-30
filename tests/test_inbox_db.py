@@ -810,3 +810,28 @@ def test_the_issue_link_index_migrates_to_one_link_per_note_and_survives_a_rollb
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS inbox_issues_repo_number"
               " ON inbox_issues (repo, number)")
     c.close()
+
+
+def test_the_migration_sends_stranded_pending_notes_to_needs_review(tmp_path):
+    """Voice notes left 'pending' for ever by the old prune/sweep (their recording went
+    before Whisper ran) are marked failed — and a lost file is recorded as missing."""
+    import sqlite3
+    path = str(tmp_path / "inbox.db")
+    old = sqlite3.connect(path)
+    old.executescript(inbox_db.INBOX_SCHEMA)
+    rows = [("a" * 32, None, NOW),                       # pruned before transcription
+            ("b" * 32, None, None),                      # file lost, path cleared
+            ("c" * 32, "2026/09/" + "c" * 32 + ".webm", None)]   # still has its audio
+    for i, audio_path, pruned in rows:
+        old.execute("INSERT INTO inbox_items (id, source, title, created_at, updated_at,"
+                    " transcript_status, audio_path, audio_pruned_at, audio_bytes)"
+                    " VALUES (?, 'voice', 't', ?, ?, 'pending', ?, ?, 100)",
+                    (i, NOW, NOW, audio_path, pruned))
+    old.commit()
+    old.close()
+    c = inbox_db.connect(path)
+    inbox_db.init_inbox_schema(c)
+    got = {r["id"][0]: (r["transcript_status"], r["audio_missing_at"]) for r in
+           c.execute("SELECT id, transcript_status, audio_missing_at FROM inbox_items")}
+    assert got == {"a": ("failed", None), "b": ("failed", NOW), "c": ("pending", None)}
+    c.close()
