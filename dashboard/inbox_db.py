@@ -150,10 +150,15 @@ def transaction(conn: sqlite3.Connection):
     conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn
+        # Inside the try: a COMMIT that fails (a deferred constraint, SQLITE_BUSY) must roll
+        # back too, or the connection is left mid-transaction and every later BEGIN fails.
+        conn.execute("COMMIT")
     except BaseException:
-        conn.execute("ROLLBACK")
+        # Only if one is still open: some SQLite errors roll back by themselves, and a
+        # ROLLBACK then would raise and hide the error that actually happened.
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
         raise
-    conn.execute("COMMIT")
 
 
 INBOX_SCHEMA = """

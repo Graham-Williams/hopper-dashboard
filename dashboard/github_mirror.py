@@ -399,7 +399,13 @@ def sync(conn, repos, *, now: float | None = None, fetch=None,
     now = time.time() if now is None else now
     fetch = fetch or default_fetch
     results = []
-    archive_unwatched(conn, repos, now=now)
+    try:
+        archive_unwatched(conn, repos, now=now)
+    except Exception as exc:                              # noqa: BLE001
+        # A locked DB here must not cost the repos their scan, or the cycle its heartbeat:
+        # the archive is re-tried by the next sync.
+        log.error("inbox github mirror: archiving unwatched repos failed: %s: %s",
+                  type(exc).__name__, str(exc)[:200])
     for repo in repos:
         if not GITHUB_REPO_RE.match(str(repo or "")):
             results.append({"repo": str(repo), "status": "invalid"})

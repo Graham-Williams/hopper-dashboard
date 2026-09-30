@@ -456,6 +456,10 @@ class Core:
             conn = self.inbox_connect()
             try:
                 github_mirror.archive_unwatched(conn, (), now=now)
+            except Exception as exc:                      # noqa: BLE001
+                # Never at the heartbeat's expense; the next sync tries again.
+                log.error("inbox github mirror: archiving unwatched repos failed: %s: %s",
+                          type(exc).__name__, str(exc)[:200])
             finally:
                 conn.close()
         else:

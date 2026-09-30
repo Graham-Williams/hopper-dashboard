@@ -835,3 +835,27 @@ def test_the_migration_sends_stranded_pending_notes_to_needs_review(tmp_path):
            c.execute("SELECT id, transcript_status, audio_missing_at FROM inbox_items")}
     assert got == {"a": ("failed", None), "b": ("failed", NOW), "c": ("pending", None)}
     c.close()
+
+
+def test_a_transaction_whose_commit_fails_is_rolled_back_not_left_open(conn):
+    """COMMIT inside the try: a COMMIT that fails (here a deferred foreign key) must roll
+    back, or the connection is left mid-transaction and every later BEGIN fails."""
+    conn.execute("CREATE TABLE p (id INTEGER PRIMARY KEY)")
+    conn.execute("CREATE TABLE c (pid INTEGER REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)")
+    with pytest.raises(Exception):
+        with inbox_db.transaction(conn):
+            conn.execute("INSERT INTO c (pid) VALUES (99)")
+    assert conn.in_transaction is False
+    with inbox_db.transaction(conn):
+        conn.execute("INSERT INTO p (id) VALUES (1)")
+    assert conn.execute("SELECT COUNT(*) FROM c").fetchone()[0] == 0
+
+
+def test_a_transaction_never_masks_the_real_error_with_a_rollback_error(conn):
+    class Boom(Exception):
+        pass
+    with pytest.raises(Boom):
+        with inbox_db.transaction(conn):
+            conn.execute("ROLLBACK")          # already gone, as some SQLite errors do
+            raise Boom()
+    assert conn.in_transaction is False

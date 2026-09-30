@@ -196,6 +196,22 @@ def test_emptying_the_repo_list_archives_every_mirrored_issue_row(core):
         conn.close()
 
 
+@pytest.mark.parametrize("repos", [("a/b",), ()])
+def test_a_locked_db_while_archiving_unwatched_repos_never_skips_the_heartbeat(
+        core, monkeypatch, repos):
+    import sqlite3
+
+    def locked(*a, **kw):
+        raise sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(inbox_db, "archive_unwatched_github", locked)
+    monkeypatch.setattr(github_mirror, "default_fetch",
+                        lambda url, headers: github_mirror.MirrorResponse(
+                            status=200, headers={"ETag": 'W/"x"'}, body=[]))
+    core.settings.inbox_github_repos = repos
+    core.sync_inbox_github(now=NOW)
+    assert db.last_run(core.connect(), INBOX_GITHUB_JOB_ID) is not None
+
+
 def test_a_missing_job_in_jobs_yml_warns_once_and_never_crashes(settings, caplog):
     """jobs.yml is gitignored, so merging this feature ships the schema and
     never the values: on a box whose file has not been edited yet, the mirror
