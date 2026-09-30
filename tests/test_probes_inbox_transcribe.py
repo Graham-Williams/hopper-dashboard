@@ -1206,3 +1206,6 @@ def test_sigterm_mid_transcription_still_removes_the_temp_recording(tmp_path):
                            _env(tmp_path)], capture_output=True, text=True, timeout=60)
     assert proc.returncode == 143, proc.stderr[-2000:]
     assert [n for n in os.listdir(str(scratch)) if n.startswith("hopper-inbox-")] == []
+    # ...and it says so, once, in the worker's own log.
+    lines = [ln for ln in (tmp_path / "worker.log").read_text().splitlines() if "SIGTERM" in ln]
+    assert len(lines) == 1

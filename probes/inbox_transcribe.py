@@ -705,14 +705,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     log = Logger(cfg["INBOX_TRANSCRIBE_LOG"], echo=not args.quiet)
     # launchd stops the agent with SIGTERM: make it a SystemExit so every `finally` runs —
     # above all handle_item's, which removes the downloaded recording. Restored on the way out.
-    previous = signal.signal(signal.SIGTERM, _on_sigterm)
+    previous = signal.signal(signal.SIGTERM,
+                             lambda signum, frame: _on_sigterm(log, signum))
     try:
         return _run(cfg, log, args)
     finally:
         signal.signal(signal.SIGTERM, previous)
 
 
-def _on_sigterm(signum, frame):
+def _on_sigterm(log: Logger, signum: int) -> None:
+    """One line, then out through every `finally` (the temp recording goes with it)."""
+    log.log("stopped by SIGTERM — exiting; the recording being transcribed is removed on the "
+            "way out")
     raise SystemExit(128 + signum)
 
 
