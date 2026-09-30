@@ -344,6 +344,9 @@ def _sync_repo(conn, repo: str, *, now: float, fetch, token: str) -> dict:
                 # board. Refresh its label; do not mirror it as a second row.
                 inbox_db.refresh_issue(conn, repo, number, title=title or None,
                                        url=url, state="open", now=now_text)
+                # The note(s) represent it: a live mirror row of it is a duplicate (G-19),
+                # including old ones made before linking archived them.
+                inbox_db.archive_mirror_row_of_linked_issue(conn, repo, number, now=now_text)
                 linked += 1
                 continue
             item_key = inbox_db.github_key(repo, number)

@@ -212,6 +212,23 @@ def test_a_locked_db_while_archiving_unwatched_repos_never_skips_the_heartbeat(
     assert db.last_run(core.connect(), INBOX_GITHUB_JOB_ID) is not None
 
 
+def test_the_store_init_canonicalises_link_repo_spellings(core):
+    conn = core.inbox_connect()
+    try:
+        item = inbox_db.create_item(conn, source="typed", text="a")
+        conn.execute("INSERT INTO inbox_issues (item_id, repo, number, url, linked_at)"
+                     " VALUES (?, 'A/B', 1, 'u', '2026-09-01T00:00:00Z')", (item,))
+    finally:
+        conn.close()
+    core.settings.inbox_github_repos = ("a/b",)
+    core.init_inbox_store()
+    conn = core.inbox_connect()
+    try:
+        assert conn.execute("SELECT repo FROM inbox_issues").fetchone()[0] == "a/b"
+    finally:
+        conn.close()
+
+
 def test_a_missing_job_in_jobs_yml_warns_once_and_never_crashes(settings, caplog):
     """jobs.yml is gitignored, so merging this feature ships the schema and
     never the values: on a box whose file has not been edited yet, the mirror

@@ -326,6 +326,12 @@ def init_inbox_schema(conn: sqlite3.Connection) -> None:
                      " AND audio_path IS NULL AND audio_pruned_at IS NULL")
         conn.execute("UPDATE inbox_items SET transcript_status = 'failed' WHERE source ="
                      " 'voice' AND transcript_status = 'pending' AND audio_path IS NULL")
+        # Old duplicates: a live mirror row for an issue a note links (made before linking
+        # archived it, or by a race). The note represents that issue; archive the row. Only
+        # live rows match, so after the first run this changes nothing.
+        conn.execute("UPDATE inbox_items SET archived_at = updated_at WHERE source = 'github'"
+                     " AND archived_at IS NULL AND mirror_key IN (SELECT 'github:' || repo"
+                     " || '#' || number FROM inbox_issues)")
         # G-20: UNIQUE(repo, number) → UNIQUE(item_id, repo, number), same index NAME (see
         # INBOX_SCHEMA). Only when the old definition is found, so it runs once, and it
         # cannot fail: no (item_id, repo, number) duplicate can exist under the old rule.
@@ -816,12 +822,57 @@ def link_issue(conn: sqlite3.Connection, item_id: str, *, repo: str,
             " linked_at, checked_at) VALUES (?,?,?,?,?, 'open', ?, ?)",
             (item_id, repo, int(number), url, title, now, now))
         conn.execute("UPDATE inbox_items SET updated_at=? WHERE id=?", (now, item_id))
-    conn.execute("UPDATE inbox_items SET archived_at=?, updated_at=?"
-                 " WHERE mirror_key=? AND archived_at IS NULL",
-                 (now, now, github_key(repo, number)))
+        # The link starts 'open'; if the issue is closed already, only a FULL scan can say
+        # so — a 304 against the old ETag would leave the note open for ever.
+        forget_etag(conn, repo)
+    archive_mirror_row_of_linked_issue(conn, repo, number, now=now)
     return row_to_dict(conn.execute(
         "SELECT * FROM inbox_issues WHERE item_id=? AND repo=? AND number=?",
         (item_id, repo, int(number))).fetchone())
+
+
+def forget_etag(conn: sqlite3.Connection, repo: str) -> None:
+    """Drop ``repo``'s stored ETag, so its next scan is a full 200 rather than a 304. Called
+    whenever what the board should show for that repo changes LOCALLY — a link made, a
+    linking note deleted, the repo unwatched — because only a full scan re-applies it, and
+    GitHub answers 304 for as long as nothing changed upstream."""
+    conn.execute("UPDATE inbox_mirror_state SET etag=NULL WHERE key=? AND etag IS NOT NULL",
+                 (f"{MIRROR_GITHUB}:{repo}",))
+
+
+def archive_mirror_row_of_linked_issue(conn: sqlite3.Connection, repo: str, number: int,
+                                       now: str | None = None) -> int:
+    """G-19: an issue a note links is represented by the note — its own mirror row, if it has
+    a live one, is archived (never deleted). Called when the link is made AND by every scan
+    that meets a linked issue, which also repairs duplicates made before this rule."""
+    now = now or now_iso()
+    return int(conn.execute("UPDATE inbox_items SET archived_at=?, updated_at=?"
+                            " WHERE mirror_key=? AND archived_at IS NULL",
+                            (now, now, github_key(repo, number))).rowcount or 0)
+
+
+def canonicalise_issue_repos(conn: sqlite3.Connection, repos: Iterable[str]) -> int:
+    """Rewrite each link's repo to the WATCHED spelling (``INBOX_GITHUB_REPOS``; GitHub names
+    are case-insensitive, the scans are not), merging a note's two links to one issue into
+    one. Run at start-up; returns how many link rows changed. Idempotent."""
+    by_lower = {r.lower(): r for r in repos}
+    changed = 0
+    with transaction(conn):
+        for row in conn.execute("SELECT id, item_id, repo, number FROM inbox_issues"
+                                " ORDER BY id").fetchall():
+            watched = by_lower.get(row["repo"].lower())
+            if watched is None or watched == row["repo"]:
+                continue
+            twin = conn.execute("SELECT id FROM inbox_issues WHERE item_id=? AND repo=?"
+                                " AND number=?", (row["item_id"], watched,
+                                                  row["number"])).fetchone()
+            if twin is not None:
+                conn.execute("DELETE FROM inbox_issues WHERE id=?", (row["id"],))
+            else:
+                conn.execute("UPDATE inbox_issues SET repo=? WHERE id=?", (watched, row["id"]))
+            forget_etag(conn, watched)
+            changed += 1
+    return changed
 
 
 def upsert_mirror_item(conn: sqlite3.Connection, *, mirror_key: str,
@@ -1098,6 +1149,12 @@ def archive_unwatched_github(conn: sqlite3.Connection, repos: Iterable[str],
     for item_id in gone:
         conn.execute("UPDATE inbox_items SET archived_at=?, updated_at=? WHERE id=?",
                      (now, now, item_id))
+    # Forget the ETag of every repo no longer watched: if it is watched again, its first
+    # scan must be a full one (a 304 would skip the un-archive and strand its rows).
+    for r in conn.execute("SELECT key FROM inbox_mirror_state WHERE key LIKE 'github:%'"
+                          " AND etag IS NOT NULL").fetchall():
+        if r["key"][len(MIRROR_GITHUB) + 1:] not in watched:
+            conn.execute("UPDATE inbox_mirror_state SET etag=NULL WHERE key=?", (r["key"],))
     return len(gone)
 
 
@@ -1299,7 +1356,13 @@ def delete_item(conn: sqlite3.Connection, item_id: str) -> dict | None:
     row = get_item(conn, item_id)
     if row is None:
         return None
+    repos = [r["repo"] for r in conn.execute(
+        "SELECT DISTINCT repo FROM inbox_issues WHERE item_id=?", (item_id,))]
     conn.execute("DELETE FROM inbox_items WHERE id=?", (item_id,))
+    # Its links go with it (ON DELETE CASCADE), so an issue it linked may be a mirrored row
+    # again — which only a FULL scan can bring back.
+    for repo in repos:
+        forget_etag(conn, repo)
     return row
 
 

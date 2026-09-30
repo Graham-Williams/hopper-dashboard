@@ -148,6 +148,12 @@ def _env_github_repos(name: str) -> tuple[str, ...]:
             continue
         if not GITHUB_REPO_RE.match(part):
             raise ValueError(f"{name}: {part!r} is not a valid owner/repo")
+        twin = next((o for o in out if o.lower() == part.lower() and o != part), None)
+        if twin is not None:
+            # GitHub names are case-insensitive, the mirror's keys are not: two spellings
+            # would mirror one repo twice and split its links.
+            raise ValueError(f"{name}: {twin!r} and {part!r} differ only in case — "
+                             "list the repo once")
         if part not in out:
             out.append(part)
     if len(out) > MAX_GITHUB_REPOS:

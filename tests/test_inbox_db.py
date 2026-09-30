@@ -859,3 +859,52 @@ def test_a_transaction_never_masks_the_real_error_with_a_rollback_error(conn):
             conn.execute("ROLLBACK")          # already gone, as some SQLite errors do
             raise Boom()
     assert conn.in_transaction is False
+
+
+def test_the_migration_archives_a_live_mirror_row_whose_issue_a_note_links(tmp_path):
+    """Old duplicates (made before linking archived the mirror row) are repaired once."""
+    import sqlite3
+    path = str(tmp_path / "inbox.db")
+    old = sqlite3.connect(path)
+    old.executescript(inbox_db.INBOX_SCHEMA.replace(
+        "inbox_issues_repo_number\n    ON inbox_issues (item_id, repo, number)",
+        "inbox_issues_repo_number\n    ON inbox_issues (repo, number)"))
+    old.execute("INSERT INTO inbox_items (id, source, title, created_at, updated_at,"
+                " mirror_key) VALUES (?, 'github', 'dup', ?, ?, ?)",
+                ("a" * 32, NOW, NOW, inbox_db.github_key("a/b", 7)))
+    old.execute("INSERT INTO inbox_items (id, source, title, created_at, updated_at)"
+                " VALUES (?, 'voice', 'note', ?, ?)", ("b" * 32, NOW, NOW))
+    old.execute("INSERT INTO inbox_items (id, source, title, created_at, updated_at,"
+                " mirror_key) VALUES (?, 'github', 'unlinked', ?, ?, ?)",
+                ("c" * 32, NOW, NOW, inbox_db.github_key("a/b", 8)))
+    old.execute("INSERT INTO inbox_issues (item_id, repo, number, url, linked_at)"
+                " VALUES (?, 'a/b', 7, 'u', ?)", ("b" * 32, NOW))
+    old.commit()
+    old.close()
+    c = inbox_db.connect(path)
+    inbox_db.init_inbox_schema(c)
+    assert inbox_db.get_item(c, "a" * 32)["archived_at"] is not None
+    assert inbox_db.get_item(c, "c" * 32)["archived_at"] is None
+    c.close()
+
+
+def test_link_repo_spellings_are_canonicalised_to_the_watched_one(conn):
+    """Links stored under another spelling of a watched repo were never refreshed (the scan
+    matches the configured spelling exactly). Canonicalised at start-up, merging a note's
+    two links to one issue into one."""
+    a = inbox_db.create_item(conn, source="typed", text="a", now=NOW)
+    b = inbox_db.create_item(conn, source="typed", text="b", now=NOW)
+    conn.execute("INSERT INTO inbox_issues (item_id, repo, number, url, linked_at)"
+                 " VALUES (?, 'owner/KM-tracker', 3, 'u', ?)", (a, NOW))
+    conn.execute("INSERT INTO inbox_issues (item_id, repo, number, url, linked_at)"
+                 " VALUES (?, 'Owner/km-tracker', 4, 'u', ?)", (b, NOW))
+    conn.execute("INSERT INTO inbox_issues (item_id, repo, number, url, linked_at)"
+                 " VALUES (?, 'OWNER/km-tracker', 4, 'u', ?)", (b, NOW))
+    conn.execute("INSERT INTO inbox_issues (item_id, repo, number, url, linked_at)"
+                 " VALUES (?, 'someone/else', 5, 'u', ?)", (a, NOW))
+    assert inbox_db.canonicalise_issue_repos(conn, ("Owner/km-tracker",)) == 2
+    got = {(r["item_id"], r["repo"], r["number"]) for r in
+           conn.execute("SELECT item_id, repo, number FROM inbox_issues")}
+    assert got == {(a, "Owner/km-tracker", 3), (a, "someone/else", 5),
+                   (b, "Owner/km-tracker", 4)}
+    assert inbox_db.canonicalise_issue_repos(conn, ("Owner/km-tracker",)) == 0   # idempotent

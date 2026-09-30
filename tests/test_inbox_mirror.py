@@ -31,17 +31,26 @@ def issue(number, title="An issue", body="", **extra):
 
 
 class FakeGitHub:
-    """Records every call and answers from a scripted list of responses."""
+    """Records every call and answers from a scripted list of responses — like GitHub, it
+    answers 304 when the request's If-None-Match equals the ETag of the answer it would give
+    (so a test can SEE a sync that never looked). ``honour_etag=False`` models a proxy that
+    ignores conditional requests."""
 
-    def __init__(self, pages=None):
+    def __init__(self, pages=None, honour_etag=True):
         self.pages = list(pages or [])
         self.calls: list[tuple[str, dict]] = []
+        self.honour_etag = honour_etag
 
     def __call__(self, url, headers):
         self.calls.append((url, headers))
         if not self.pages:
             return github_mirror.MirrorResponse(status=200, body=[])
-        return self.pages.pop(0)
+        resp = self.pages.pop(0)
+        sent = (headers or {}).get("If-None-Match")
+        if (self.honour_etag and sent and resp.status == 200
+                and resp.header("ETag") == sent):
+            return github_mirror.MirrorResponse(status=304, headers={"ETag": sent})
+        return resp
 
 
 def ok(items, etag='W/"etag-1"', **headers):
@@ -77,8 +86,10 @@ def test_a_clean_scan_mirrors_open_issues_and_skips_pull_requests(conn):
 
 
 def test_a_resync_is_idempotent(conn):
+    # A changed answer comes with a changed ETag, as it does on GitHub (the fake answers a
+    # matching If-None-Match with a 304).
     fetch = FakeGitHub([ok([issue(1, "Wheel spins twice")]),
-                        ok([issue(1, "Wheel spins twice (retitled)")])])
+                        ok([issue(1, "Wheel spins twice (retitled)")], etag='W/"etag-2"')])
     github_mirror.sync(conn, [REPO], now=NOW, fetch=fetch)
     github_mirror.sync(conn, [REPO], now=NOW + 900, fetch=fetch)
     rows = inbox_db.list_items(conn)
@@ -165,7 +176,8 @@ def test_a_failure_on_a_later_page_closes_nothing_either(conn):
     github_mirror.sync(conn, [REPO], now=NOW, fetch=fetch)
     assert len(inbox_db.list_items(conn, limit=500)) == github_mirror.PER_PAGE + 1
     # Page 1 is short this time, so it does not page again — reset the script.
-    fetch.pages = [ok(full), github_mirror.MirrorResponse(status=500, error="boom")]
+    fetch.pages = [ok(full, etag='W/"etag-3"'),
+                   github_mirror.MirrorResponse(status=500, error="boom")]
     out = github_mirror.sync(conn, [REPO], now=NOW + 900, fetch=fetch)
     assert out["results"][0]["status"] == "error"
     assert {r["state"] for r in inbox_db.list_items(conn, limit=500)} == {"open"}
@@ -451,6 +463,61 @@ def test_rows_of_an_unwatched_repo_are_archived_and_come_back_when_it_is_readded
     assert by_key[inbox_db.github_key(REPO, 2)]["state"] == "closed"      # back, as it was
 
 
+# --- a 304 can never strand an archived row (the ETag is forgotten on local change) -- #
+
+def test_a_rewatched_repo_comes_back_even_though_github_would_answer_304(conn):
+    body = [issue(9, "Still open")]
+    github_mirror.sync(conn, [REPO, OTHER], now=NOW, fetch=FakeGitHub(
+        [ok([], etag='W/"r1"'), ok(body, etag='W/"o1"')]))
+    github_mirror.sync(conn, [REPO], now=NOW + 900,                 # OTHER unwatched
+                       fetch=FakeGitHub([ok([], etag='W/"r1"')]))
+    assert inbox_db.list_items(conn) == []
+    # Re-watched, and nothing changed on GitHub: the old ETag would get a 304 and skip the
+    # scan that un-archives the rows. It was forgotten when the repo was unwatched.
+    out = github_mirror.sync(conn, [REPO, OTHER], now=NOW + 1800, fetch=FakeGitHub(
+        [ok([], etag='W/"r1"'), ok(body, etag='W/"o1"')]))
+    assert [r["status"] for r in out["results"]] == ["unchanged", "ok"]
+    assert [r["title"] for r in inbox_db.list_items(conn)] == ["Still open"]
+
+
+def test_deleting_a_linked_note_brings_its_open_issue_back_even_without_upstream_change(conn):
+    _scan(conn, 7)                                         # a mirrored row for #7
+    note = _note_linked_to(conn, 7)                        # linked: that row is archived
+    fetch = FakeGitHub([ok([issue(7)], etag='W/"steady"')])
+    github_mirror.sync(conn, [REPO], now=NOW + 900, fetch=fetch)
+    assert [r["id"] for r in inbox_db.list_items(conn)] == [note]
+    with conn:
+        inbox_db.delete_item(conn, note)
+    # Upstream is unchanged (same ETag), but the deletion forgot it: a full scan, not a 304.
+    out = github_mirror.sync(conn, [REPO], now=NOW + 1800,
+                             fetch=FakeGitHub([ok([issue(7)], etag='W/"steady"')]))
+    assert out["results"][0]["status"] == "ok"
+    assert [r["mirror_key"] for r in inbox_db.list_items(conn)] == [
+        inbox_db.github_key(REPO, 7)]
+
+
+def test_linking_an_issue_that_is_already_closed_closes_the_note_on_the_next_scan(conn):
+    github_mirror.sync(conn, [REPO], now=NOW,
+                       fetch=FakeGitHub([ok([issue(1)], etag='W/"steady"')]))
+    note = _note_linked_to(conn, 5)                        # #5 is closed upstream already
+    out = github_mirror.sync(conn, [REPO], now=NOW + 900,
+                             fetch=FakeGitHub([ok([issue(1)], etag='W/"steady"')]))
+    assert out["results"][0]["status"] == "ok"             # the link forgot the ETag
+    assert _state(conn, note) == ("closed", "issues")
+
+
+def test_a_live_mirror_row_of_a_linked_issue_is_archived_by_the_scan(conn):
+    """Duplicates made before linking archived the mirror row (or by a race) are repaired."""
+    _scan(conn, 7)
+    mirror = inbox_db.get_item_by_mirror_key(conn, inbox_db.github_key(REPO, 7))["id"]
+    note = inbox_db.create_item(conn, source="voice", text="x", now="2026-09-01T00:00:00Z")
+    conn.execute("INSERT INTO inbox_issues (item_id, repo, number, url, linked_at)"
+                 " VALUES (?, ?, 7, 'u', '2026-09-01T00:00:00Z')", (note, REPO))
+    assert inbox_db.get_item(conn, mirror)["archived_at"] is None      # the old duplicate
+    _scan(conn, 7, at=900)
+    assert inbox_db.get_item(conn, mirror)["archived_at"] is not None
+
+
 # --- a no-op sync writes nothing (item 11) --------------------------------------- #
 
 def test_an_unchanged_sync_writes_nothing(conn):
@@ -464,7 +531,7 @@ def test_an_unchanged_sync_writes_nothing(conn):
         [github_mirror.MirrorResponse(status=304, headers={"ETag": 'W/"same"'})]))
     assert conn.total_changes == before, "a 304 wrote to inbox.db"
     github_mirror.sync(conn, [REPO], now=NOW + 1800, fetch=FakeGitHub(
-        [ok([issue(7), issue(8, "Mirrored")], etag='W/"same"')]))
+        [ok([issue(7), issue(8, "Mirrored")], etag='W/"same"')], honour_etag=False))
     assert conn.total_changes == before, "an unchanged 200 wrote to inbox.db"
     assert _state(conn, note) == ("open", None)
 

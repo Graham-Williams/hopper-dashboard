@@ -362,7 +362,13 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   and closes items ONLY after a complete, error-free repo fetch (a partial page must never close anything).
   A complete scan is ONE `inbox_db.transaction`. Every sync first archives rows of repos no longer in
   `INBOX_GITHUB_REPOS` (`archive_unwatched`, G-22 — Core runs it even with no repos); a complete scan
-  un-archives its repo's archived rows that no note links (`unarchive_unlinked_github`). An UNCHANGED
+  un-archives its repo's archived rows that no note links (`unarchive_unlinked_github`), and archives a
+  LIVE mirror row of any linked issue it meets (old duplicates; a start-up migration repairs existing
+  ones). Anything that changes a repo LOCALLY — unwatching it, a new link, deleting a linking note —
+  `forget_etag`s it: a 304 against the old ETag would skip exactly the scan that applies the change. The
+  test fake answers a matching If-None-Match with a 304, like GitHub. Link repo spellings are
+  canonicalised to the watched spelling at start-up (`canonicalise_issue_repos`), and two spellings of
+  one repo in `INBOX_GITHUB_REPOS` fail config load. An UNCHANGED
   sync (a 304, or a 200 with the same answer) writes NOTHING: `upsert_mirror_item`, `refresh_issue` and
   `set_mirror_state` write only a real change (so `mirror_seen_at`, `checked_at` and `last_sync_at` mean
   "last changed"; a 304 is stored as `ok`) — otherwise the backup re-uploads `inbox.db` every cycle.

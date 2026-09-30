@@ -427,6 +427,8 @@ class Core:
         conn = inbox_db.connect(self.settings.inbox_db_path)
         try:
             inbox_db.init_inbox_schema(conn)
+            # Links stored under another spelling of a watched repo would never be refreshed.
+            inbox_db.canonicalise_issue_repos(conn, self.settings.inbox_github_repos)
         finally:
             conn.close()
 

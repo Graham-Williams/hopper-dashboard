@@ -198,6 +198,11 @@ def test_inbox_github_repos_are_validated_at_startup(monkeypatch):
     monkeypatch.setenv("INBOX_GITHUB_REPOS", ",".join(f"a/r{i}" for i in range(51)))
     with pytest.raises(ValueError, match="over the 50 maximum"):
         Settings.from_env()
+    # GitHub names are case-insensitive, but the mirror keys and link rows use the spelling
+    # given: two spellings of one repo would mirror it twice. Refused at boot.
+    monkeypatch.setenv("INBOX_GITHUB_REPOS", "Graham-Williams/km-tracker, graham-williams/KM-Tracker")
+    with pytest.raises(ValueError, match="differ only in case"):
+        Settings.from_env()
 
 
 def test_app_legacy_hosts_are_validated_at_startup(monkeypatch, tmp_path):
