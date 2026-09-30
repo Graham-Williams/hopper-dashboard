@@ -634,6 +634,9 @@ rclone listremotes | grep -qx 'gdrive:' || echo "STOP: no writer remote; the loc
 # hopper-dashboard backup config (gitignored, 0600). Every key is optional; these are the ones
 # that differ from the defaults in deploy/box/backup.sh.
 RCLONE_DEST=gdrive:hopper-dashboard-backups
+# Recordings on Drive are ADD-ONLY (Graham, 2026-09-29): copy never deletes off-box. The default;
+# written out so the choice is visible on the box. `mirror` = the old guarded delete pass.
+BACKUP_AUDIO_MODE=copy
 EOF
 )
 # Run it once by hand before trusting the timer. Expect two "saved …" lines and a Drive push.
@@ -652,17 +655,27 @@ What it does, and the two things that are non-negotiable about how:
   with *"attempt to write a readonly database"* even when the source is opened `mode=ro`. The finished file
   is integrity-checked in the container, `docker cp`'d out, and **re-verified on the host** (a truncated copy
   would otherwise reach Drive undetected, since everything downstream only sha256s the host file).
-- **The DB snapshots are additive; the AUDIO TREE IS A MIRROR.** The two databases go up with
-  `rclone copy` into a ring plus a `daily/` tier: the upload never deletes, and a snapshot leaves Drive
-  only when enough newer ones have pushed it out by retention count. Nothing that happens to the live DB
-  can remove an off-box DB snapshot.
-  The **audio tree is the deliberate exception** (Graham's decision, 2026-09-19): it mirrors the
-  container, deletions included, because an additive audio backup defeats both the Inbox's Delete control
-  — sold as the way to retract "a password read aloud" — and its 180-day privacy ceiling. Each run
-  `docker cp`s the tree into a **fresh** staging directory (copying into a persistent one would resurrect
-  deleted files, since `docker cp` only adds) and then `rclone copy`s it up and deletes the remote files
-  the container no longer has, one at a time, logged.
-- **The brakes on that mirror — three of them, and each can refuse on its own.** A mass deletion is far
+- **The DB snapshots are additive, and so is the AUDIO TREE by default (`BACKUP_AUDIO_MODE=copy`).** The
+  two databases go up with `rclone copy` into a ring plus a `daily/` tier: the upload never deletes, and a
+  snapshot leaves Drive only when enough newer ones have pushed it out by retention count. Nothing that
+  happens to the live DB can remove an off-box DB snapshot.
+  **Audio, `BACKUP_AUDIO_MODE=copy` (the default — Graham's decision 2026-09-29):** recordings on Drive
+  are add-only. Each run `docker cp`s the tree into a fresh staging directory, `rclone copy`s it up, and
+  swaps it in as the host mirror. Nothing on Drive is ever deleted, so a recording deleted in the Hub (or
+  aged out by the retention prune) is gone from the Hub and the box but **stays in
+  `gdrive:hopper-dashboard-backups/audio/` until removed there by hand**. The brakes below do not apply
+  and no brake state is written. To remove one recording from Drive by hand:
+  `rclone deletefile gdrive:hopper-dashboard-backups/audio/<file>` (the file name is the item's audio path).
+  **Audio, `BACKUP_AUDIO_MODE=mirror`:** the 2026-09-19 behaviour, kept available. It mirrors the
+  container, deletions included, so Delete and the 180-day privacy ceiling reach Drive. Each run `docker
+  cp`s the tree into a **fresh** staging directory (copying into a persistent one would resurrect deleted
+  files, since `docker cp` only adds) and then `rclone copy`s it up and deletes the remote files the
+  container no longer has, one at a time, logged. **Switching copy → mirror** after copy has been running:
+  Drive will hold every recording deleted since, so the first mirror run is likely to trip the brakes
+  below; review `rclone lsf …/audio` against the container and authorise the purge with
+  `AUDIO_ALLOW_MASS_DELETE=<count>` if it is really wanted. Any other value of `BACKUP_AUDIO_MODE` is
+  refused before the run starts.
+- **The brakes on MIRROR mode — three of them, and each can refuse on its own.** A mass deletion is far
   likelier to be a wiped volume or a mis-set path than an intentional purge, so the run REFUSES to
   propagate one and exits non-zero (the heartbeat goes `fail`, the board pages after the job's threshold):
 

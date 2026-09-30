@@ -12,6 +12,10 @@ Fault injection, opt-in:
   FAKE_RCLONE_LSF_FAIL=<substr>     any `lsf` whose remote path contains substr exits 3
   FAKE_RCLONE_DELETE_FAIL=<substr>  any `deletefile` whose path contains substr exits 1
   FAKE_RCLONE_COPY_FAIL=<substr>    any `copy` whose destination contains substr exits 1
+
+Observation, opt-in:
+  FAKE_RCLONE_LOG=<file>            every invocation's argv is appended as one JSON line,
+                                    so a test can assert which verbs were (never) issued
 """
 import os
 import shutil
@@ -48,6 +52,11 @@ def walk_files(root):
 
 
 def main(argv):
+    log = os.environ.get("FAKE_RCLONE_LOG")
+    if log:
+        import json
+        with open(log, "a") as fh:
+            fh.write(json.dumps(argv) + "\n")
     if not argv:
         return 2
     cmd, rest = argv[0], argv[1:]

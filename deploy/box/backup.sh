@@ -23,12 +23,15 @@
 #      retention count, via prune_remote; "copy never deletes" describes the upload, not the
 #      whole script.)
 #
-# ⚠️ THE AUDIO TREE IS THE EXCEPTION, AND IT IS DELIBERATE. Graham's decision 2026-09-19: the
-# recordings MIRROR the container, deletions included, because an additive audio backup
-# silently defeats the Inbox's own Delete control and its 180-day privacy ceiling — the point
-# of Delete is that a password read aloud stops existing. Guarded by three independent
-# refuse-a-mass-deletion brakes (proportional, absolute, windowed) measured against what the
-# REMOTE actually holds; see push_audio. The two DATABASES are untouched and stay additive.
+# THE AUDIO TREE IS ADD-ONLY TOO, BY DEFAULT (BACKUP_AUDIO_MODE=copy). Graham's decision
+# 2026-09-29: recordings on Drive are add-only, and a note deleted in the Hub must NOT delete
+# its recording from Drive. Delete removes it from the Hub and the box; a copy already backed
+# up stays in Drive until removed there by hand. That REVERSES the 2026-09-19 decision, which
+# made the recordings MIRROR the container, deletions included, so Delete and the 180-day
+# privacy ceiling would reach Drive. That behaviour is still here as BACKUP_AUDIO_MODE=mirror,
+# guarded by three independent refuse-a-mass-deletion brakes (proportional, absolute,
+# windowed) measured against what the REMOTE actually holds; see push_audio. In copy mode the
+# brakes have nothing to guard and are skipped. The two DATABASES stay additive either way.
 #
 # RESTORING IS NOT A `cp`. The stale -wal/-shm sidecars must be deleted and the file re-owned
 # to 10001 first, or SQLite replays the old WAL over the restored image and silently hands
@@ -128,9 +131,12 @@ DAILY_RETENTION="${DAILY_RETENTION:-30}"
 DRIVE_PUSH_INTERVAL_MIN="${DRIVE_PUSH_INTERVAL_MIN:-15}"
 ALLOW_EMPTY_SNAPSHOT="${ALLOW_EMPTY_SNAPSHOT:-0}"
 BACKUP_AUDIO="${BACKUP_AUDIO:-1}"
+# copy (the default since 2026-09-29): `rclone copy` only — never a deletion on the remote.
+# mirror: the 2026-09-19 behaviour — copy, then a guarded, logged delete pass (see push_audio).
+BACKUP_AUDIO_MODE="${BACKUP_AUDIO_MODE:-copy}"
 # --- the audio brakes. THREE of them, and each can refuse on its own -------------------
 #
-# The audio tree MIRRORS deletions (see push_audio), so these are the only thing standing
+# In BACKUP_AUDIO_MODE=mirror the audio tree MIRRORS deletions (see push_audio), so these are the only thing standing
 # between a bug and the sole copy of Graham's recordings. They are deliberately independent:
 #
 #   PROPORTIONAL (AUDIO_MAX_DROP_PCT) — refuse when the count falls by more than this share.
@@ -159,6 +165,9 @@ AUDIO_ALLOW_MASS_DELETE="${AUDIO_ALLOW_MASS_DELETE:-}"
 require_positive_int LOCAL_RETENTION "${LOCAL_RETENTION}"
 require_positive_int DRIVE_RETENTION "${DRIVE_RETENTION}"
 require_positive_int DAILY_RETENTION "${DAILY_RETENTION}"
+# An unknown mode is a typo, and guessing either way is wrong: refuse before anything runs.
+[[ "${BACKUP_AUDIO_MODE}" == "copy" || "${BACKUP_AUDIO_MODE}" == "mirror" ]] \
+  || die "BACKUP_AUDIO_MODE='${BACKUP_AUDIO_MODE}' must be copy or mirror"
 require_percent AUDIO_MAX_DROP_PCT "${AUDIO_MAX_DROP_PCT}"
 require_positive_int AUDIO_MAX_DROP_FILES "${AUDIO_MAX_DROP_FILES}"
 require_positive_int AUDIO_DROP_WINDOW_MIN "${AUDIO_DROP_WINDOW_MIN}"
@@ -308,13 +317,18 @@ push_db() {  # <name> <snapshot path> <checksum>
   printf '%s\n' "${cksum}" > "${ck_file}"
 }
 
-# --- the audio tree: a MIRROR, deletions included ------------------------------------
+# --- the audio tree: add-only by default, or a MIRROR with deletions ------------------
 #
 # The audio tree is NOT in the DB (files on disk, by design — blobs would make every snapshot
 # byte-unique and defeat the sha256 dedupe above), so it needs its own path off-box.
 #
-# ⚠️ IT IS THE ONE THING HERE THAT PROPAGATES DELETIONS, DELIBERATELY. Graham's decision,
-# 2026-09-19: an additive audio backup quietly defeats both the Inbox's Delete control and its
+# BACKUP_AUDIO_MODE=copy (the default, Graham's decision 2026-09-29) is push_audio_copy below:
+# stage the tree, `rclone copy` it up, swap it in as the host mirror. Nothing on the remote is
+# ever deleted, so none of the brakes below apply. Everything from here to push_audio_copy is
+# BACKUP_AUDIO_MODE=mirror, kept as it was.
+#
+# ⚠️ MIRROR MODE PROPAGATES DELETIONS, DELIBERATELY. Graham's decision,
+# 2026-09-19 (reversed as the default on 2026-09-29, still available): an additive audio backup quietly defeats both the Inbox's Delete control and its
 # 180-day privacy ceiling — a recording he deletes (DESIGN.md sells Delete as the retraction
 # for "a password read aloud") would sit on Drive for ever. So Delete means deleted
 # everywhere, for AUDIO ONLY. The two DATABASES stay additive (`rclone copy` + the ring +
@@ -391,6 +405,10 @@ push_audio() {
     log "WARN: audio: ${CONTAINER_AUDIO_DIR} is not present in ${CONTAINER} — SKIPPING the audio sync entirely. A missing tree is never propagated as a deletion (fresh volume? wrong CONTAINER_AUDIO_DIR? wrong container?)"
     return 0
   }
+  if [[ "${BACKUP_AUDIO_MODE}" == "copy" ]]; then
+    push_audio_copy
+    return $?
+  fi
 
   local remote="${RCLONE_DEST}/audio"
   local count prev="" deletions_allowed=1 rc=0 count_file="${STATE_DIR}/last_audio_count"
@@ -538,6 +556,43 @@ push_audio() {
     log "WARN: audio: ${mirrored} recording(s) uploaded, but this run was not a clean mirror — ${remote} may still hold recordings the container no longer has, and the remembered count is unchanged"
   fi
   return "${rc}"
+}
+
+# BACKUP_AUDIO_MODE=copy: ADD-ONLY. The only remote verb is `rclone copy` (adds and updates,
+# never deletes), so no brake, baseline or count file is involved and none is touched — the
+# mirror-mode state stays exactly as the last mirror run left it. The HOST mirror still gets
+# the fresh staged tree swapped in, so a recording deleted in the Hub is gone from the box.
+push_audio_copy() {
+  local remote="${RCLONE_DEST}/audio" staged count
+  staged="$(mktemp -d "${BACKUP_ROOT}/.audio.XXXXXX")" \
+    || { log "ERROR: audio: could not create a staging directory under ${BACKUP_ROOT}"; return 1; }
+  # Checked explicitly: errexit is off inside a function called as `push_audio || ...`.
+  [[ -n "${staged}" && -d "${staged}" ]] \
+    || { log "ERROR: audio: staging directory is not usable"; return 1; }
+  # A RETURN trap outlives the function that set it, so it clears itself and tolerates an
+  # unset ${staged} (it can fire again as push_audio returns, where that local is gone).
+  cleanup_audio_copy() { [[ -z "${staged:-}" ]] || rm -rf "${staged}"; trap - RETURN; return 0; }
+  trap cleanup_audio_copy RETURN
+
+  docker cp "${CONTAINER}:${CONTAINER_AUDIO_DIR}/." "${staged}/" \
+    || { log "ERROR: docker cp of the audio tree failed"; return 1; }
+  chmod -R go-rwx "${staged}" || log "WARN: audio: could not tighten the staged tree's modes"
+  count="$(find "${staged}" -type f 2>/dev/null | wc -l | tr -d ' ')"
+
+  rclone copy "${staged}" "${remote}" \
+    || { log "ERROR: rclone copy of the audio tree failed"; return 1; }
+
+  rm -rf "${AUDIO_MIRROR_DIR}.old"
+  if [[ -e "${AUDIO_MIRROR_DIR}" ]]; then
+    mv "${AUDIO_MIRROR_DIR}" "${AUDIO_MIRROR_DIR}.old" \
+      || { log "ERROR: audio: could not rotate the host mirror aside; leaving it as it was"; return 1; }
+  fi
+  mv "${staged}" "${AUDIO_MIRROR_DIR}" \
+    || { log "ERROR: audio: could not swap the staged tree in as the host mirror (Drive is unaffected)"; return 1; }
+  staged=""
+  rm -rf "${AUDIO_MIRROR_DIR}.old"
+  log "audio: ${count} recording(s) copied to ${remote} (add-only: nothing is deleted off-box)"
+  return 0
 }
 
 # Delete files under <remote dir> that <local dir> no longer has. The mirroring half of

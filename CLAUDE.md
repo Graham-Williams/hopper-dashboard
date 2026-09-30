@@ -665,11 +665,13 @@ there is no default URL in the code, by design.
   this repo exists to catch). Snapshots `dashboard.db` AND `inbox.db` from INSIDE the container via
   `docker exec` (WAL sidecars are uid 10001; a host-side online backup fails "attempt to write a readonly
   database"), sha256-dedupes, keeps a local ring + a `daily/` tier, and pushes with **`rclone copy`, never
-  `sync`** for the two DBs. The audio tree is the deliberate EXCEPTION: it MIRRORS deletions (copy, then an
-  explicit logged delete pass for remote extras) so that Delete and the unconditional privacy ceiling
-  actually reach the off-box copy — Graham's call 2026-09-19, because DESIGN.md sells Delete as the way to
-  retract a recording that caught something private, and an additive backup silently broke that promise.
-  Guarded against mirroring a wipe by THREE independent brakes, any one of which refuses and fails the run
+  `sync`** for the two DBs. **The audio tree is ADD-ONLY by default too: `BACKUP_AUDIO_MODE=copy`**
+  (Graham's call 2026-09-29, reversing 2026-09-19): `rclone copy` only, never a remote delete, no brakes
+  involved — a note deleted in the Hub loses its recording from the Hub and the box, but Drive keeps it
+  until removed by hand, and the Inbox page says so. `BACKUP_AUDIO_MODE=mirror` keeps the old behaviour:
+  it MIRRORS deletions (copy, then an explicit logged delete pass for remote extras) so that Delete and the
+  unconditional privacy ceiling reach the off-box copy. Any other value dies before the run. Mirror mode is
+  guarded against mirroring a wipe by THREE independent brakes, any one of which refuses and fails the run
   loudly: proportional (`AUDIO_MAX_DROP_PCT`, default 50, **validated 1–99** — `require_positive_int` was
   the wrong validator, since 100 makes the comparison never true and silently disables the brake, 200
   inverts it, and a leading zero would be read as octal), absolute (`AUDIO_MAX_DROP_FILES`, default 25 —
@@ -683,12 +685,14 @@ there is no default URL in the code, by design.
   run that cannot list the remote deletes nothing and records no baseline. `AUDIO_ALLOW_MASS_DELETE` is
   **one-shot by construction**: it carries the exact resulting count (`AUDIO_ALLOW_MASS_DELETE=7`), so a
   value left in `.env.backup` cannot authorise a later, different purge. Only a clean mirror advances the
-  stored count. ⚠️ **Delete removes the row and the recording everywhere (Drive included, within one
-  5-minute cycle), but the transcript TEXT stays in the `inbox_*.db` snapshots already on Drive for up to
+  stored count. ⚠️ **In mirror mode Delete removes the row and the recording everywhere (Drive included,
+  within one 5-minute cycle); in copy mode Drive keeps the recording. Either way the transcript TEXT stays in the `inbox_*.db` snapshots already on Drive for up to
   30 days (`DAILY_RETENTION`)** — rewriting historical snapshots would not be a backup, so the claim is
   documented honestly instead. All of this is pinned by a real behavioural harness in
   `tests/test_deploy_backup.py` (fake `docker`/`rclone` on PATH, the real script, assertions on the
-  resulting fake remote) — the string-matching tests it replaced caught none of these.
+  resulting fake remote and, via `FAKE_RCLONE_LOG`, on every rclone verb issued) — the string-matching
+  tests it replaced caught none of these. The harness runs in MIRROR mode unless a test sets
+  `box.audio_mode`/`BACKUP_AUDIO_MODE` (None = unset, the script default).
   `deploy/box/verify_snapshot.py` holds the all-empty-snapshot guard (rc 3) so it is testable in
   Python rather than only in bash.
 - Manual jobs: `probes/ping.sh <job_id> <ok|fail|skipped> [note]`. `minecraft-offload` needs one seed ping

@@ -352,6 +352,8 @@ class Box:
         self.bin = os.path.join(self.root, "bin")
         self.box = os.path.join(self.root, "box")
         self.audio = os.path.join(self.container, "app", "data", "inbox", "audio")
+        self.rclone_log = os.path.join(self.root, "rclone-calls.jsonl")
+        self.audio_mode = "mirror"
         for d in (self.audio, self.remote, self.bin, self.box):
             os.makedirs(d, exist_ok=True)
 
@@ -429,6 +431,17 @@ class Box:
         d = os.path.join(self.remote, "hopper-dashboard-backups", "daily")
         return sorted(os.listdir(d)) if os.path.isdir(d) else []
 
+    def rclone_calls(self):
+        import json
+        if not os.path.isfile(self.rclone_log):
+            return []
+        with open(self.rclone_log, encoding="utf-8") as fh:
+            return [json.loads(line) for line in fh]
+
+    def host_mirror(self):
+        d = os.path.join(self.backup_root, "audio")
+        return sorted(os.listdir(d)) if os.path.isdir(d) else []
+
     def stored_count(self):
         p = os.path.join(self.backup_root, "state", "last_audio_count")
         if not os.path.isfile(p):
@@ -449,7 +462,8 @@ class Box:
     def run(self, expect=None, **env):
         e = dict(os.environ)
         for stray in ("AUDIO_ALLOW_MASS_DELETE", "AUDIO_MAX_DROP_PCT",
-                      "AUDIO_MAX_DROP_FILES", "AUDIO_DROP_WINDOW_MIN", "BACKUP_AUDIO"):
+                      "AUDIO_MAX_DROP_FILES", "AUDIO_DROP_WINDOW_MIN", "BACKUP_AUDIO",
+                      "BACKUP_AUDIO_MODE"):
             e.pop(stray, None)
         e.update({
             "PATH": self.bin + os.pathsep + e.get("PATH", "/usr/bin:/bin"),
@@ -461,9 +475,16 @@ class Box:
             "BACKUP_ROOT": self.backup_root,
             "RCLONE_DEST": "gdrive:hopper-dashboard-backups",
             "DRIVE_PUSH_INTERVAL_MIN": "1",
+            "FAKE_RCLONE_LOG": self.rclone_log,
         })
+        # The deletion guards below are MIRROR-mode behaviour, so the harness runs in mirror
+        # mode unless a test says otherwise; None means "leave it unset" (the script default).
+        env.setdefault("BACKUP_AUDIO_MODE", self.audio_mode)
         for k, v in env.items():
-            e[k] = str(v)
+            if v is None:
+                e.pop(k, None)
+            else:
+                e[k] = str(v)
         # The 15-minute Drive throttle is real and deliberate, and it is not what any of
         # these tests are about: without this, a second run in the same minute would be a
         # no-op and every multi-run scenario below would be asserting on nothing.
@@ -830,3 +851,79 @@ def test_no_blunt_whole_tree_mirror_verb_exists_anywhere_in_the_script():
     assert len(calls) == 2, calls           # prune_remote's, and delete_remote_extras' own
     before_audio = body[:body.index("push_audio()")]
     assert "delete_remote_extras " not in before_audio
+
+
+# --- BACKUP_AUDIO_MODE=copy: add-only, the default since 2026-09-29 -----------------
+# Graham reversed the mirror decision: a note deleted in the Hub must NOT delete its
+# recording from Drive. So the default run may ADD to the remote audio tree and never take
+# anything away, by any verb, whatever the container looks like.
+_REMOVING_VERBS = {"sync", "bisync", "move", "moveto", "delete", "deletefile", "purge",
+                   "rmdir", "rmdirs", "cleanup"}
+
+
+def _audio_removals(box):
+    return [c for c in box.rclone_calls()
+            if c and c[0] in _REMOVING_VERBS and any("/audio" in a for a in c[1:])]
+
+
+@audio_harness
+def test_the_default_audio_mode_is_add_only(box):
+    box.add_audio("a.webm", "b.webm", "c.webm")
+    box.run(expect=0, BACKUP_AUDIO_MODE=None)                 # unset: the script's default
+    box.remove_audio("b.webm")
+    rc, out = box.run(expect=0, BACKUP_AUDIO_MODE=None)
+    assert box.remote_audio() == ["a.webm", "b.webm", "c.webm"]
+    assert "add-only" in out and "deleted b.webm" not in out
+    # Deleted from the box, though: the host mirror is the fresh staged tree.
+    assert box.host_mirror() == ["a.webm", "c.webm"]
+    calls = box.rclone_calls()
+    assert any(c[0] == "copy" and c[-1].endswith("/audio") for c in calls)
+    assert not any(c[0] in ("sync", "bisync", "delete", "purge") for c in calls), calls
+    assert _audio_removals(box) == []
+
+
+@audio_harness
+def test_copy_mode_never_removes_even_when_the_container_is_wiped(box):
+    """The shape every mirror-mode brake exists for. In copy mode there is nothing to brake:
+    the run succeeds, the remote keeps every recording, and no brake state is written."""
+    box.audio_mode = "copy"
+    box.add_audio_n(40)
+    box.run(expect=0)
+    box.keep_only(0)
+    rc, out = box.run(expect=0)
+    assert len(box.remote_audio()) == 40
+    assert "REFUSING" not in out and "AUDIO_ALLOW_MASS_DELETE" not in out
+    assert _audio_removals(box) == []
+    assert box.stored_count() is None
+    assert len(box.remote_dbs()) == 2
+
+
+@audio_harness
+def test_copy_mode_still_fails_loudly_when_the_upload_fails(box):
+    box.audio_mode = "copy"
+    box.add_audio("a.webm")
+    rc, out = box.run(FAKE_RCLONE_COPY_FAIL="/audio")
+    assert rc == 1 and "rclone copy of the audio tree failed" in out
+
+
+@audio_harness
+def test_mirror_mode_is_still_there_and_still_deletes(box):
+    box.add_audio("a.webm", "b.webm")
+    box.run(expect=0, BACKUP_AUDIO_MODE="mirror")
+    box.remove_audio("b.webm")
+    rc, out = box.run(expect=0, BACKUP_AUDIO_MODE="mirror")
+    assert box.remote_audio() == ["a.webm"] and "deleted b.webm" in out
+    assert [c[0] for c in _audio_removals(box)].count("deletefile") == 1
+
+
+@audio_harness
+@pytest.mark.parametrize("bad", ["Copy", "sync", "", " mirror"])
+def test_an_unknown_audio_mode_is_refused_before_anything_runs(box, bad):
+    box.add_audio("a.webm")
+    rc, out = box.run(BACKUP_AUDIO_MODE=bad)
+    if bad == "":
+        # Empty is "unset" to ${VAR:-copy}: the default, not an error.
+        assert rc == 0 and box.remote_audio() == ["a.webm"]
+        return
+    assert rc != 0 and "must be copy or mirror" in out
+    assert box.remote_audio() == [] and box.rclone_calls() == []

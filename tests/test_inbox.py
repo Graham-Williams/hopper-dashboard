@@ -1386,6 +1386,15 @@ def test_the_privacy_note_says_the_transcript_goes_to_anthropic(authed):
     assert "Recordings never leave this box" not in html
 
 
+def test_the_capture_note_says_delete_leaves_the_drive_copy(authed):
+    # The audio backup is add-only (2026-09-29): Delete must not promise to reach Drive.
+    html = " ".join(authed.get("/inbox").data.decode().split())
+    assert "including the off-box backup" not in html
+    assert ("Delete removes a row and its recording from the Hub and this box at once. The "
+            "Drive backup only ever adds, so a recording already backed up stays in Drive "
+            "until you remove it there by hand.") in html
+
+
 def test_known_projects_feed_the_datalist(authed, settings):
     settings.inbox_github_repos = ("Owner/km-tracker",)
     html = authed.get("/inbox").data.decode()

@@ -341,6 +341,8 @@ tolerable at all. The **privacy ceiling** then deletes any audio at TWICE that a
 That second rule is not redundant: the first one is satisfiable only by Graham's own action, so a note he
 never reviews, or one Whisper failed three times on, would otherwise keep its recording of his voice
 forever — the setting would read like a maximum and behave like a minimum.
+(Both rules act on the box. Since 2026-09-29 the Drive backup of the audio is add-only by default, so a
+recording already backed up outlives both on Drive until removed by hand — see "Mirror mode" below.)
 
 `DELETE /api/v1/inbox/items/<id>` (session only, Origin-pinned, write-limited) removes a row and its
 audio immediately. It exists because the one class of data here that is unambiguously personal is the one
@@ -358,8 +360,15 @@ tier. The upload itself never deletes; the ring and the daily tier prune by COUN
 snapshot leaves Drive only when enough newer ones have replaced it. Nothing that happens to the live DB
 can remove an off-box DB snapshot.
 
-**The audio tree is the deliberate exception: it MIRRORS the container, deletions included.** Graham's
-decision, 2026-09-19, after a reviewer pointed out that an additive audio backup quietly defeats both
+**The audio tree is ADD-ONLY by default (`BACKUP_AUDIO_MODE=copy`, Graham's decision 2026-09-29).**
+Recordings on Drive are only ever added: a note deleted in the Hub (or aged out by the prune) loses its
+recording from the Hub and the box, but a copy already backed up stays in Drive until removed there by
+hand. That reverses the 2026-09-19 decision below, which is kept as `BACKUP_AUDIO_MODE=mirror`; the
+brakes described next guard mirror mode only, since copy mode never deletes. The rest of this section
+up to "What Delete does" describes mirror mode.
+
+**Mirror mode: the recordings MIRROR the container, deletions included.** Graham's
+decision, 2026-09-19 (no longer the default), after a reviewer pointed out that an additive audio backup quietly defeats both
 controls above — Delete is sold here as the way to retract "a password read aloud", and the privacy
 ceiling is sold as a maximum age, and neither is true if every recording lives on Drive forever. So both
 hops mirror: each run `docker cp`s the tree into a FRESH staging directory (an additive `docker cp` into a
@@ -393,14 +402,17 @@ the exact count the purge should leave behind (`AUDIO_ALLOW_MASS_DELETE=7`), so 
 `.env.backup` authorises a state that has already happened — which is to say, nothing. Only a clean
 mirror updates the remembered count. Details and the restore procedure in DEPLOY.md §2b.
 
-**What Delete does and does not reach.** Delete removes the row and the recording immediately, and the
-recording is gone from Drive within one backup cycle (≤5 min). **The transcript TEXT is not retracted
-from backups already taken.** Every `inbox_*.db` snapshot on Drive — the ring plus the `daily/` tier —
+**What Delete does and does not reach.** Delete removes the row and the recording from the Hub and the
+box immediately. In the default copy mode **a recording already backed up stays in Drive** until removed
+there by hand (in mirror mode it is gone from Drive within one backup cycle, ≤5 min). The page says:
+"Delete removes a row and its recording from the Hub and this box at once. The Drive backup only ever
+adds, so a recording already backed up stays in Drive until you remove it there by hand." **The
+transcript TEXT is not retracted from backups already taken.** Every `inbox_*.db` snapshot on Drive — the ring plus the `daily/` tier —
 still contains whatever was said, and those age out on `DAILY_RETENTION`, i.e. **up to 30 days**. That is
 the correct trade: rewriting historical database snapshots to erase a row would mean a backup that can be
 edited after the fact, which is not a backup. But the claim has to be stated honestly rather than sold as
-"deleted everywhere" — the audio is deleted everywhere; the words persist for up to 30 days in dated
-database backups.
+"deleted everywhere" — the words persist for up to 30 days in dated database backups, and (in copy mode)
+the recording persists in Drive until removed by hand.
 
 ### What the Inbox adds to the board
 
