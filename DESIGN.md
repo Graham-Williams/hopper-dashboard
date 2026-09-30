@@ -160,11 +160,16 @@ Outputs:
   board).
 - ntfy (a third party) receives only `job_id: FROM → TO` — never the free-text reason (container names,
   client notes, rclone stderr stay on the board).
-- **A voice note's AUDIO never reaches a third party; its TRANSCRIPT and TITLE go to Anthropic, with the
-  setup brief.** (Changed 2026-09-28 with drafting — see "Drafts, Needs review and the Hub"; the brief was
-  added 2026-09-29.) The page says: "Audio stays on this box, your Mac and the Drive backup. The
-  transcript, the title and a short brief of your setup (not the audio) are sent from the Mac to Anthropic
-  (Claude) to draft the item." (Also sent: the project hint and the list of project names.) The setup
+- **A voice note's AUDIO never goes to Anthropic or any speech service; its TRANSCRIPT and TITLE go to
+  Anthropic, with the setup brief.** (Changed 2026-09-28 with drafting — see "Drafts, Needs review and the
+  Hub"; the brief was added 2026-09-29.) The audio lives on the box, on the Mac only while it is being
+  transcribed (a temp file, removed after), and add-only in Graham's Google Drive backup, where it is kept
+  even after Delete or the retention prune until removed by hand. The page says: "Audio never goes to
+  Anthropic or any speech service. It lives on this box, on your Mac only while it is being transcribed, and
+  in the Google Drive backup, which only ever adds: a recording stays there after Delete or the retention
+  prune until you remove it by hand. The transcript, the title and a short brief of your setup are sent from
+  the Mac to Anthropic (Claude) to draft the item." (Also sent: the project hint and the list of project
+  names.) The setup
   brief is `INBOX_DRAFT_CONTEXT_FILE` on the Mac — a page Graham (or Hopper) keeps describing his projects
   and their nicknames, so the drafter can tell what "the backup thing" means. It rides stdin as a
   `context` field marked as reference data, never argv; the system prompt says to use it to pick the
@@ -444,11 +449,13 @@ the exact count the purge should leave behind (`AUDIO_ALLOW_MASS_DELETE=7`), so 
 `.env.backup` authorises a state that has already happened — which is to say, nothing. Only a clean
 mirror updates the remembered count. Details and the restore procedure in DEPLOY.md §2b.
 
-**What Delete does and does not reach.** Delete removes the row and the recording from the Hub and the
-box immediately. In the default copy mode **a recording already backed up stays in Drive** until removed
-there by hand (in mirror mode it is gone from Drive within one backup cycle, ≤5 min). The page says:
-"Delete removes a row and its recording from the Hub and this box at once. The Drive backup only ever
-adds, so a recording already backed up stays in Drive until you remove it there by hand." **The
+**What Delete does and does not reach.** Delete removes the note and its recording from the Hub (the
+container's store) immediately, and from the box's backup copy (the host mirror) at the next successful
+backup run. In the default copy mode **a recording already backed up stays in Drive** until removed there by
+hand (in mirror mode it is gone from Drive within one backup cycle, ≤5 min). The page says: "Delete removes a
+note and its recording from the Hub at once, and from this box's backup copy at the next backup run; a copy
+already in Google Drive stays there until you remove it by hand." The Delete confirmation names the file:
+`…/audio/<yyyy>/<mm>/<note id>.*` in the backup folder. **The
 transcript TEXT is not retracted from backups already taken.** Every `inbox_*.db` snapshot on Drive — the ring plus the `daily/` tier —
 still contains whatever was said, and those age out on `DAILY_RETENTION`, i.e. **up to 30 days**. That is
 the correct trade: rewriting historical database snapshots to erase a row would mean a backup that can be

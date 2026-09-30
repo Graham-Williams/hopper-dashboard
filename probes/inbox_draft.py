@@ -11,9 +11,11 @@ and edits it on /inbox, and ticking Reviewed copies it into the note.
 PRIVACY: the TRANSCRIPT and the TITLE (a manual title, when Graham typed one) are sent to
 Anthropic (Claude) by this module, together with the SETUP BRIEF when one is configured
 (``INBOX_DRAFT_CONTEXT_FILE``: a short plain-text description of Graham's projects that lives on
-this Mac, so the model can tell what "the backup thing" means). The audio never is — it stays on
-the box and this Mac. Nothing else about the note is sent beyond its project hint and the list
-of project names.
+this Mac, so the model can tell what "the backup thing" means). The audio never is — audio never
+goes to Anthropic or any speech service: it lives on the box, on this Mac only while it is being
+transcribed, and add-only in the Google Drive backup (kept there even after Delete or the retention
+prune until removed by hand). Nothing else about the note is sent beyond its project hint and the
+list of project names.
 
   GET  /api/v1/inbox/draft/queue          → items to draft + known_projects
   POST /api/v1/inbox/items/<id>/draft     → {"title","body","project","src_sha","model"}

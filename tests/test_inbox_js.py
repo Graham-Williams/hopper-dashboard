@@ -576,6 +576,30 @@ function answer(status, body) {
   await settle();
   out.offline = {error: w.err.textContent, reloads: w.reloads(), disabled: w.btn.disabled};
 
+  /* Delete's confirmation names the Drive copy that Delete does NOT remove. */
+  out.confirms = [];
+  for (const path of ['audio/2026/09/' + 'd'.repeat(32) + '.*', null]) {
+    const del = el({'class': 'delete-item', 'data-id': 'd'.repeat(32)});
+    if (path) { del.setAttribute('data-drive-path', path); }
+    const asked = [];
+    const win = {
+      fetch: function () { asked.push('fetched'); return Promise.resolve({ok: true, status: 200}); },
+      setInterval: function () { return 0; }, clearInterval: function () {},
+      setTimeout: function () { return 0; },
+      confirm: function (msg) { asked.push(msg); return false; }, addEventListener: function () {},
+      location: {reload: function () {}}
+    };
+    const doc = {
+      getElementById: function () { return null; },
+      querySelectorAll: function (sel) { return sel === '.delete-item' ? [del] : []; }
+    };
+    vm.runInNewContext(SRC, {document: doc, window: win, navigator: {}, console: console,
+                             Blob: function () {}, FormData: function () {}});
+    del.fire('click');
+    await settle();
+    out.confirms.push(asked);
+  }
+
   process.stdout.write(JSON.stringify(out));
 })().catch(function (err) {
   process.stderr.write(String((err && err.stack) || err));
@@ -616,3 +640,12 @@ def test_a_failed_close_says_so_and_gives_the_button_back(toggled):
     o = toggled["offline"]
     assert o["error"].startswith("Could not close that item")
     assert o["reloads"] == 0 and o["disabled"] is False
+
+
+def test_the_delete_confirmation_names_the_drive_copy_it_leaves(toggled):
+    with_audio, without = toggled["confirms"]
+    assert len(with_audio) == 1 and len(without) == 1          # confirm only: declined, no fetch
+    msg = with_audio[0]
+    assert "cannot be undone" in msg and "Google Drive" in msg
+    assert "audio/2026/09/" + "d" * 32 + ".*" in msg and "by hand" in msg
+    assert "Google Drive" not in without[0] and "cannot be undone" in without[0]

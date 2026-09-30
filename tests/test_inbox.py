@@ -1489,21 +1489,37 @@ def test_needs_review_tile_and_filter_replace_waiting_on(authed, bot):
     assert "checked" in filtered.split('id="filter-review"', 1)[1].split(">", 1)[0]
 
 
-def test_the_privacy_note_says_the_transcript_goes_to_anthropic(authed):
-    html = " ".join(authed.get("/inbox").data.decode().split())
-    assert ("Audio stays on this box, your Mac and the Drive backup. The transcript, the "
-            "title and a short brief of your setup (not the audio) are sent from the Mac to "
-            "Anthropic (Claude) to draft the item.") in html
-    assert "Recordings never leave this box" not in html
+AUDIO_PRIVACY = ("Audio never goes to Anthropic or any speech service. It lives on this box, "
+                 "on your Mac only while it is being transcribed, and in the Google Drive "
+                 "backup, which only ever adds: a recording stays there after Delete or the "
+                 "retention prune until you remove it by hand.")
 
 
-def test_the_capture_note_says_delete_leaves_the_drive_copy(authed):
-    # The audio backup is add-only (2026-09-29): Delete must not promise to reach Drive.
+def test_the_privacy_note_says_where_audio_lives_and_what_goes_to_anthropic(authed):
     html = " ".join(authed.get("/inbox").data.decode().split())
-    assert "including the off-box backup" not in html
-    assert ("Delete removes a row and its recording from the Hub and this box at once. The "
-            "Drive backup only ever adds, so a recording already backed up stays in Drive "
-            "until you remove it there by hand.") in html
+    assert AUDIO_PRIVACY in html
+    assert ("The transcript, the title and a short brief of your setup are sent from the Mac "
+            "to Anthropic (Claude) to draft the item.") in html
+    assert "Recordings never leave this box" not in html and "Audio stays on" not in html
+
+
+def test_the_capture_note_says_what_delete_and_the_prune_reach(authed):
+    html = " ".join(authed.get("/inbox").data.decode().split())
+    assert "including the off-box backup" not in html and "at once. The" not in html
+    assert "Audio is deleted from this box once" in html
+    assert ("Delete removes a note and its recording from the Hub at once, and from this box's "
+            "backup copy at the next backup run; a copy already in Google Drive stays there "
+            "until you remove it by hand.") in html
+
+
+def test_the_delete_button_carries_the_drive_path_of_a_recording(authed, bot):
+    voice = _voice_note(authed)
+    typed = post_note(authed).get_json()["id"]
+    html = authed.get("/inbox").data.decode()
+    button = _row(html, voice["id"]).split('class="delete-item"', 1)[1].split(">", 1)[0]
+    stamp = voice["created_at"]
+    assert f'data-drive-path="audio/{stamp[:4]}/{stamp[5:7]}/{voice["id"]}.*"' in button
+    assert "data-drive-path" not in _row(html, typed)       # no recording, nothing in Drive
 
 
 def test_known_projects_feed_the_datalist(authed, settings):
@@ -2210,7 +2226,7 @@ def test_the_capture_notes_are_one_collapsed_details(authed):
     html = authed.get("/inbox").data.decode()
     block = html.split('<details class="about-recordings">', 1)[1].split("</details>", 1)[0]
     assert "<summary>About recordings and privacy</summary>" in block
-    assert "Audio stays on this box, your Mac and the Drive backup." in block
+    assert AUDIO_PRIVACY in " ".join(block.split())
     assert "minutes of speech" in block and "about 30 days" in block
     assert " open" not in html.split('<details class="about-recordings"', 1)[1].split(">", 1)[0]
 

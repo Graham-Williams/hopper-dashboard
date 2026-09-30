@@ -654,11 +654,17 @@
       btn.hidden = false;          // only shown once it actually works
       btn.addEventListener('click', function () {
         var id = btn.getAttribute('data-id');
+        var drivePath = btn.getAttribute('data-drive-path');
         /* A confirm step, because this destroys the row AND its audio and
            there is no undo. `confirm` is deliberate: a bespoke modal would be
-           more DOM for no more safety. */
-        if (!window.confirm('Delete this item and its recording? This cannot ' +
-                            'be undone.')) { return; }
+           more DOM for no more safety. It names what Delete does NOT reach: the
+           Drive backup of the recording is add-only. */
+        var question = drivePath
+          ? 'Delete this note and its recording from the Hub? This cannot be undone.\n\n' +
+            'A copy already backed up stays in Google Drive (' + drivePath + ' in the ' +
+            'backup folder) until you remove it there by hand.'
+          : 'Delete this note? This cannot be undone.';
+        if (!window.confirm(question)) { return; }
         btn.disabled = true;
         window.fetch('/api/v1/inbox/items/' + encodeURIComponent(id), {
           method: 'DELETE',

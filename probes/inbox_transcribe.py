@@ -19,7 +19,10 @@ transcription it drafts up to INBOX_DRAFT_LIMIT (5) notes with `claude -p`:
                                    ...or  {"failed": true, "error", "src_sha"}
 
 The TRANSCRIPT and TITLE go to Anthropic in that phase, plus the optional setup brief
-(INBOX_DRAFT_CONTEXT_FILE, read fresh each run); the audio never leaves the box and this Mac. A systemic drafting failure (claude missing, not logged in, limit, 5xx) fails the heartbeat
+(INBOX_DRAFT_CONTEXT_FILE, read fresh each run). The audio never goes to Anthropic or any speech
+service: it lives on the box, on this Mac only while it is being transcribed (a temp file this
+worker removes), and add-only in the Google Drive backup, kept there even after Delete or the
+retention prune until removed by hand. A systemic drafting failure (claude missing, not logged in, limit, 5xx) fails the heartbeat
 and burns no note's attempt; a circuit breaker and a two-run timeout rule sit on top — see
 run_drafting and inbox_draft's docstring.
 

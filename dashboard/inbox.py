@@ -38,7 +38,9 @@ GitHub, lines from backlog.txt. It is escaped at render (Jinja autoescape for
 HTML, ``jsonify`` for JSON) and the page's JS uses ``textContent`` only — there
 is no path from a stored string to markup.
 
-**Audio stays on this box and your Mac. The transcript and title (not the audio) are
+**Audio never goes to Anthropic or any speech service: it lives on this box, on the Mac
+only while it is being transcribed, and add-only in the Google Drive backup (kept there
+after Delete or the retention prune until removed by hand). The transcript and title are
 sent from the Mac to Anthropic (Claude) to draft the item.** Audio is
 uploaded to this origin, stored as a file on the data volume, and transcribed
 locally by Whisper on Graham's Mac; the Mac then drafts a title and description

@@ -997,10 +997,12 @@ item is intact, and the next run picks it up — but nobody can read or search w
 That is why it is on a 5-minute `StartInterval` and not the probe's hour.
 
 It also has a privacy consequence worth stating: because transcription happens here, on Graham's own Mac,
-**the audio of a voice note never leaves his own machines.** It goes browser → the box, and box → this Mac.
-No third party is ever sent the audio. **The transcript and title are**: with drafting on (§4c) the worker
-sends each new transcript (and a title Graham typed, if any), plus the optional setup brief, from this Mac
-to Anthropic (Claude) to draft the item. The page says so in the same words.
+**the audio of a voice note never goes to Anthropic or any speech service.** It goes browser → the box, box →
+this Mac (a temp file, only while it is being transcribed), and box → Graham's Google Drive backup, which is
+add-only: a recording is kept there even after Delete or the retention prune until removed by hand (§2b).
+**The transcript and title do go to a third party**: with drafting on (§4c) the worker sends each new
+transcript (and a title Graham typed, if any), plus the optional setup brief, from this Mac to Anthropic
+(Claude) to draft the item. The page says so.
 
 **Prerequisites on the Mac**, both of which the installer only WARNS about (it cannot fix them for you):
 
