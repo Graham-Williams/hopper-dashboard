@@ -379,11 +379,15 @@ snapshot leaves Drive only when enough newer ones have replaced it. Nothing that
 can remove an off-box DB snapshot.
 
 **The audio tree is ADD-ONLY by default (`BACKUP_AUDIO_MODE=copy`, Graham's decision 2026-09-29).**
-Recordings on Drive are only ever added: a note deleted in the Hub (or aged out by the prune) loses its
-recording from the Hub and the box, but a copy already backed up stays in Drive until removed there by
-hand. That reverses the 2026-09-19 decision below, which is kept as `BACKUP_AUDIO_MODE=mirror`; the
-brakes described next guard mirror mode only, since copy mode never deletes. The rest of this section
-up to "What Delete does" describes mirror mode.
+Recordings on Drive are only ever added (`rclone copy --immutable --exclude '*.part'`: a recording that
+differs on Drive is refused, never overwritten; an in-flight upload is skipped): a note deleted in the Hub
+(or aged out by the prune) loses its recording from the Hub at once and from the box copy at the next
+successful run, but a copy already backed up stays in Drive until removed there by hand. That reverses
+the 2026-09-19 decision below, which is kept as `BACKUP_AUDIO_MODE=mirror`. Copy mode never deletes
+off-box, so the Drive brakes described next are mirror mode's; copy mode reuses two of their thresholds
+(`AUDIO_MAX_DROP_PCT`, `AUDIO_MAX_DROP_FILES`) for one thing only — it will not replace the box copy with
+a staged tree that shrank sharply against it (it keeps the old one and fails the run). The rest of this
+section up to "What Delete does" describes mirror mode.
 
 **Mirror mode: the recordings MIRROR the container, deletions included.** Graham's
 decision, 2026-09-19 (no longer the default), after a reviewer pointed out that an additive audio backup quietly defeats both

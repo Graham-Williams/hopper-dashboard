@@ -181,6 +181,14 @@ AUDIO_DROP_WINDOW_MIN=$((10#${AUDIO_DROP_WINDOW_MIN}))
 # password; the on-box mirror should not be readable by every account on the box.
 install -d -m 0700 "${BACKUP_ROOT}"
 install -d -m 0700 "${LOCAL_BACKUP_DIR}" "${STATE_DIR}"
+# A run killed mid-way (TimeoutStartSec, OOM, a reboot) leaves its audio staging dir behind:
+# a whole copy of the recordings outside the host-mirror swap and every retention rule. Sweep
+# them at the start of every run, in both modes — by AGE, not all of them, so a run started by
+# hand while the timer's is still going does not have its tree pulled out from under it. The
+# unit's TimeoutStartSec is 300 s, so nothing older than this can belong to a live run.
+STAGING_STALE_MIN=30
+find "${BACKUP_ROOT}" -mindepth 1 -maxdepth 1 -type d -name '.audio.*' \
+  -mmin +"${STAGING_STALE_MIN}" -exec rm -rf {} + 2>/dev/null || true
 command -v docker >/dev/null 2>&1 || die "docker not on PATH (the snapshot runs inside the container)"
 [[ "$(docker inspect -f '{{.State.Running}}' "${CONTAINER}" 2>/dev/null || echo false)" == "true" ]] \
   || die "container ${CONTAINER} is not running — cannot snapshot a WAL DB from the host (see the header)"
@@ -558,30 +566,54 @@ push_audio() {
   return "${rc}"
 }
 
-# BACKUP_AUDIO_MODE=copy: ADD-ONLY. The only remote verb is `rclone copy` (adds and updates,
-# never deletes), so no brake, baseline or count file is involved and none is touched — the
-# mirror-mode state stays exactly as the last mirror run left it. The HOST mirror still gets
-# the fresh staged tree swapped in, so a recording deleted in the Hub is gone from the box.
+# BACKUP_AUDIO_MODE=copy: ADD-ONLY. The only remote verb is `rclone copy --immutable --exclude
+# '*.part'` — it adds and never deletes, a recording that changed on Drive (corruption or
+# tampering: recordings never change once saved) is a loud failure and is never overwritten,
+# and an upload still in flight (`*.part`) is not backed up. No baseline or count file is
+# involved and the mirror-mode state is never touched.
+#
+# The BOX COPY (the host mirror) still follows the container, so a recording deleted in the
+# Hub is gone from the box at the next run — but it is the one local copy that outlives the
+# container volume, so it is NOT replaced by a tree that has shrunk sharply against it. The
+# same thresholds as mirror mode (AUDIO_MAX_DROP_PCT, AUDIO_MAX_DROP_FILES) decide; a refused
+# swap keeps the old box copy, still uploads (add-only, so harmless) and FAILS the run so the
+# heartbeat says so. A real purge names its resulting count once: AUDIO_ALLOW_MASS_DELETE=<n>.
 push_audio_copy() {
-  local remote="${RCLONE_DEST}/audio" staged count
+  local remote="${RCLONE_DEST}/audio" staged count boxcount=0 swap=1
   staged="$(mktemp -d "${BACKUP_ROOT}/.audio.XXXXXX")" \
     || { log "ERROR: audio: could not create a staging directory under ${BACKUP_ROOT}"; return 1; }
   # Checked explicitly: errexit is off inside a function called as `push_audio || ...`.
   [[ -n "${staged}" && -d "${staged}" ]] \
     || { log "ERROR: audio: staging directory is not usable"; return 1; }
-  # A RETURN trap outlives the function that set it, so it clears itself and tolerates an
-  # unset ${staged} (it can fire again as push_audio returns, where that local is gone).
-  cleanup_audio_copy() { [[ -z "${staged:-}" ]] || rm -rf "${staged}"; trap - RETURN; return 0; }
-  trap cleanup_audio_copy RETURN
+  cleanup_audio_copy() { [[ -z "${staged:-}" ]] || rm -rf "${staged}"; return 0; }
+  # The trap resets ITSELF: a RETURN trap set in a function outlives it, and would otherwise
+  # fire again as push_audio returns, where this function's locals are gone.
+  trap 'cleanup_audio_copy; trap - RETURN' RETURN
 
   docker cp "${CONTAINER}:${CONTAINER_AUDIO_DIR}/." "${staged}/" \
     || { log "ERROR: docker cp of the audio tree failed"; return 1; }
   chmod -R go-rwx "${staged}" || log "WARN: audio: could not tighten the staged tree's modes"
-  count="$(find "${staged}" -type f 2>/dev/null | wc -l | tr -d ' ')"
+  count="$(find "${staged}" -type f ! -name '*.part' 2>/dev/null | wc -l | tr -d ' ')"
+  [[ "${count}" =~ ^[0-9]{1,9}$ ]] || { log "ERROR: audio: could not count the staged tree"; return 1; }
+  if [[ -d "${AUDIO_MIRROR_DIR}" ]]; then
+    boxcount="$(find "${AUDIO_MIRROR_DIR}" -type f ! -name '*.part' 2>/dev/null | wc -l | tr -d ' ')"
+    [[ "${boxcount}" =~ ^[0-9]{1,9}$ ]] || boxcount=0
+  fi
+  if ! audio_drop_allowed "$((10#${boxcount}))" "$((10#${count}))" "the staged tree, against the box copy ${AUDIO_MIRROR_DIR},"; then
+    if purge_authorised "$((10#${count}))"; then
+      log "WARN: audio: replacing the box copy anyway — AUDIO_ALLOW_MASS_DELETE=${count} matches what this run staged"
+    else
+      swap=0
+    fi
+  fi
 
-  rclone copy "${staged}" "${remote}" \
-    || { log "ERROR: rclone copy of the audio tree failed"; return 1; }
+  rclone copy --immutable --exclude '*.part' "${staged}" "${remote}" \
+    || { log "ERROR: rclone copy of the audio tree failed (a recording that changed on the remote is refused, never overwritten — check ${remote})"; return 1; }
 
+  if (( ! swap )); then
+    log "ERROR: audio: NOT replacing the box copy (${boxcount} recording(s)) with a tree of ${count} — it is kept as it was, and ${remote} is untouched (add-only). If the drop is real, re-run ONCE with AUDIO_ALLOW_MASS_DELETE=${count}"
+    return 1
+  fi
   rm -rf "${AUDIO_MIRROR_DIR}.old"
   if [[ -e "${AUDIO_MIRROR_DIR}" ]]; then
     mv "${AUDIO_MIRROR_DIR}" "${AUDIO_MIRROR_DIR}.old" \

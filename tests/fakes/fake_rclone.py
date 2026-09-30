@@ -13,6 +13,10 @@ Fault injection, opt-in:
   FAKE_RCLONE_DELETE_FAIL=<substr>  any `deletefile` whose path contains substr exits 1
   FAKE_RCLONE_COPY_FAIL=<substr>    any `copy` whose destination contains substr exits 1
 
+Modelled flags: ``--immutable`` (an existing destination file whose content differs is
+NOT overwritten; the copy carries on and exits 1 at the end, as the real one does) and
+``--exclude <pattern>`` (matched against each file's name, like rclone's unanchored glob).
+
 Observation, opt-in:
   FAKE_RCLONE_LOG=<file>            every invocation's argv is appended as one JSON line,
                                     so a test can assert which verbs were (never) issued
@@ -67,16 +71,19 @@ def main(argv):
         if skip:
             skip = False
             continue
-        if a == "--include":
+        if a in ("--include", "--exclude"):
             skip = True
             continue
         if a.startswith("--"):
             continue
         pos.append(a)
     include = None
+    excludes = []
     for idx, a in enumerate(rest):
         if a == "--include" and idx + 1 < len(rest):
             include = rest[idx + 1]
+        if a == "--exclude" and idx + 1 < len(rest):
+            excludes.append(rest[idx + 1])
 
     if cmd == "listremotes":
         print("%s:" % REMOTE_NAME)
@@ -116,13 +123,27 @@ def main(argv):
         if injected("FAKE_RCLONE_COPY_FAIL", dstspec):
             sys.stderr.write("fake rclone: injected copy failure\n")
             return 1
+        import fnmatch
         dst = local_path(dstspec)
         os.makedirs(dst, exist_ok=True)
+        immutable = "--immutable" in flags
+        refused = []
         if os.path.isdir(src):
             for rel in walk_files(src):
+                if any(fnmatch.fnmatch(os.path.basename(rel), x) for x in excludes):
+                    continue
                 out = os.path.join(dst, rel)
+                if immutable and os.path.isfile(out):
+                    with open(os.path.join(src, rel), "rb") as a, open(out, "rb") as b:
+                        if a.read() != b.read():
+                            refused.append(rel)
+                            continue
                 os.makedirs(os.path.dirname(out), exist_ok=True)
                 shutil.copy2(os.path.join(src, rel), out)
+            if refused:
+                sys.stderr.write("fake rclone: immutable file modified: %s\n"
+                                 % ", ".join(refused))
+                return 1
         elif os.path.isfile(src):
             shutil.copy2(src, os.path.join(dst, os.path.basename(src)))
         else:

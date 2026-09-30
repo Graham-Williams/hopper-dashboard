@@ -660,21 +660,35 @@ What it does, and the two things that are non-negotiable about how:
   snapshot leaves Drive only when enough newer ones have pushed it out by retention count. Nothing that
   happens to the live DB can remove an off-box DB snapshot.
   **Audio, `BACKUP_AUDIO_MODE=copy` (the default — Graham's decision 2026-09-29):** recordings on Drive
-  are add-only. Each run `docker cp`s the tree into a fresh staging directory, `rclone copy`s it up, and
-  swaps it in as the host mirror. Nothing on Drive is ever deleted, so a recording deleted in the Hub (or
-  aged out by the retention prune) is gone from the Hub and the box but **stays in
-  `gdrive:hopper-dashboard-backups/audio/` until removed there by hand**. The brakes below do not apply
-  and no brake state is written. To remove one recording from Drive by hand:
-  `rclone deletefile gdrive:hopper-dashboard-backups/audio/<file>` (the file name is the item's audio path).
+  are add-only. Each run `docker cp`s the tree into a fresh staging directory, uploads it with
+  **`rclone copy --immutable --exclude '*.part'`**, and swaps it in as the box copy (the host mirror,
+  `~/hopper-dashboard-backups/audio`). Nothing on Drive is ever deleted, so a recording deleted in the Hub
+  (or aged out by the retention prune) is gone from the Hub at once and from the box copy at the next
+  successful run, but **stays in `gdrive:hopper-dashboard-backups/audio/<yyyy>/<mm>/<note id>.<ext>`
+  until removed there by hand** (`rclone deletefile gdrive:hopper-dashboard-backups/audio/<yyyy>/<mm>/<note
+  id>.<ext>`). `--immutable`: a recording never changes once saved, so one that DIFFERS on Drive is
+  corruption or tampering — the run fails loudly and never overwrites it. `--exclude '*.part'`: an upload
+  still in flight is not backed up. **The box copy has a brake too:** a staged tree that has shrunk against
+  the box copy by more than `AUDIO_MAX_DROP_PCT` or `AUDIO_MAX_DROP_FILES` (a wiped volume, a wrong path)
+  does NOT replace it — the old box copy is kept, the upload still runs (add-only, harmless) and the run
+  FAILS, so the heartbeat does. A real purge is named once: `AUDIO_ALLOW_MASS_DELETE=<count it leaves>`.
+  Mirror mode's count and high-water state are never read or written in copy mode.
   **Audio, `BACKUP_AUDIO_MODE=mirror`:** the 2026-09-19 behaviour, kept available. It mirrors the
   container, deletions included, so Delete and the 180-day privacy ceiling reach Drive. Each run `docker
   cp`s the tree into a **fresh** staging directory (copying into a persistent one would resurrect deleted
   files, since `docker cp` only adds) and then `rclone copy`s it up and deletes the remote files the
   container no longer has, one at a time, logged. **Switching copy → mirror** after copy has been running:
-  Drive will hold every recording deleted since, so the first mirror run is likely to trip the brakes
-  below; review `rclone lsf …/audio` against the container and authorise the purge with
-  `AUDIO_ALLOW_MASS_DELETE=<count>` if it is really wanted. Any other value of `BACKUP_AUDIO_MODE` is
+  Drive still holds every recording deleted from the box meanwhile, and **the first mirror run deletes
+  them from Drive** — without asking while that is within the brakes below (at most
+  `AUDIO_MAX_DROP_FILES` files and `AUDIO_MAX_DROP_PCT` of the baseline; measured: 3 of 40 went, logged
+  one by one); beyond them it refuses and needs `AUDIO_ALLOW_MASS_DELETE=<count it leaves>`. If that is
+  not what you want, list first: `rclone lsf gdrive:hopper-dashboard-backups/audio --recursive` against
+  the box copy. The baseline may be a count left from an earlier mirror period (`state/last_audio_count`);
+  delete that file to make the run take it from Drive instead. Any other value of `BACKUP_AUDIO_MODE` is
   refused before the run starts.
+- **A killed run's staging directory** (`~/hopper-dashboard-backups/.audio.*` — a whole copy of the
+  recordings) is swept at the start of the next run in either mode, once it is older than 30 minutes (the
+  unit's `TimeoutStartSec` is 300 s, so nothing that old belongs to a live run).
 - **The brakes on MIRROR mode — three of them, and each can refuse on its own.** A mass deletion is far
   likelier to be a wiped volume or a mis-set path than an intentional purge, so the run REFUSES to
   propagate one and exits non-zero (the heartbeat goes `fail`, the board pages after the job's threshold):

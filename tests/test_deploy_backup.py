@@ -19,6 +19,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -883,19 +884,101 @@ def test_the_default_audio_mode_is_add_only(box):
 
 
 @audio_harness
-def test_copy_mode_never_removes_even_when_the_container_is_wiped(box):
-    """The shape every mirror-mode brake exists for. In copy mode there is nothing to brake:
-    the run succeeds, the remote keeps every recording, and no brake state is written."""
+def test_copy_mode_never_removes_and_keeps_the_box_copy_when_the_container_is_wiped(box):
+    """The shape every brake exists for. Copy mode deletes nothing off-box, AND it will not
+    replace the box copy with a tree that shrank sharply: that copy is the one local copy that
+    outlives the container volume. The run fails, so the heartbeat does."""
     box.audio_mode = "copy"
     box.add_audio_n(40)
     box.run(expect=0)
     box.keep_only(0)
-    rc, out = box.run(expect=0)
-    assert len(box.remote_audio()) == 40
-    assert "REFUSING" not in out and "AUDIO_ALLOW_MASS_DELETE" not in out
+    rc, out = box.run()
+    assert rc == 1 and "NOT replacing the box copy" in out
+    assert len(box.remote_audio()) == 40 and len(box.host_mirror()) == 40
     assert _audio_removals(box) == []
-    assert box.stored_count() is None
+    assert box.stored_count() is None                  # mirror-mode state is never touched
     assert len(box.remote_dbs()) == 2
+    # A deliberate purge names the count it leaves behind, once; Drive still keeps all 40.
+    rc, out = box.run(AUDIO_ALLOW_MASS_DELETE=0)
+    assert rc == 0 and box.host_mirror() == [] and len(box.remote_audio()) == 40
+
+
+@audio_harness
+def test_copy_mode_follows_a_normal_delete_on_the_box_copy(box):
+    box.audio_mode = "copy"
+    names = box.add_audio_n(10)
+    box.run(expect=0)
+    box.remove_audio(names[0])                         # one note deleted in the Hub
+    box.run(expect=0)
+    assert names[0] not in box.host_mirror() and len(box.host_mirror()) == 9
+    assert len(box.remote_audio()) == 10               # Drive keeps it (add-only)
+
+
+@audio_harness
+def test_a_changed_remote_recording_fails_loudly_and_is_never_overwritten(box):
+    """--immutable: a recording never changes after it is saved, so a remote copy that
+    differs is corruption or tampering — say so, and never overwrite it."""
+    box.audio_mode = "copy"
+    box.add_audio("a.webm", "b.webm")
+    box.seed_remote_audio("a.webm")
+    remote_a = os.path.join(box.remote, "hopper-dashboard-backups", "audio", "a.webm")
+    with open(remote_a, "w", encoding="utf-8") as fh:
+        fh.write("something else entirely")
+    rc, out = box.run()
+    assert rc == 1 and "rclone copy of the audio tree failed" in out
+    with open(remote_a, encoding="utf-8") as fh:
+        assert fh.read() == "something else entirely"
+    assert "b.webm" in box.remote_audio()              # the rest still went up
+    assert any(c[0] == "copy" and "--immutable" in c for c in box.rclone_calls())
+
+
+@audio_harness
+def test_in_flight_part_files_are_never_uploaded_in_copy_mode(box):
+    box.audio_mode = "copy"
+    box.add_audio("a.webm", "b.webm.part")
+    box.run(expect=0)
+    assert box.remote_audio() == ["a.webm"]
+
+
+@audio_harness
+@pytest.mark.parametrize("mode", ["copy", "mirror"])
+def test_a_killed_runs_staging_dir_is_swept_at_the_next_start(box, mode):
+    box.audio_mode = mode
+    box.add_audio("a.webm")
+    os.makedirs(box.backup_root, exist_ok=True)
+    stale = os.path.join(box.backup_root, ".audio.KILLED1")
+    fresh = os.path.join(box.backup_root, ".audio.INFLIGHT")
+    for d in (stale, fresh):
+        os.makedirs(d)
+        with open(os.path.join(d, "rec.webm"), "w", encoding="utf-8") as fh:
+            fh.write("a copy of a recording")
+    old = time.time() - 2 * 3600
+    os.utime(stale, (old, old))
+    box.run(expect=0)
+    assert not os.path.exists(stale), "a killed run's copy of the recordings was left behind"
+    assert os.path.exists(fresh), "a run still in progress had its staging dir swept away"
+
+
+@audio_harness
+def test_switching_copy_to_mirror_deletes_within_the_brakes_and_refuses_beyond(box):
+    """What DEPLOY.md §2b promises about switching modes, driven for real."""
+    box.audio_mode = "copy"
+    names = box.add_audio_n(40)
+    box.run(expect=0)
+    box.remove_audio(*names[:3])                       # 3 notes deleted while in copy mode
+    box.run(expect=0)
+    assert len(box.remote_audio()) == 40
+    rc, out = box.run(BACKUP_AUDIO_MODE="mirror")     # within both brakes: deleted, logged
+    assert rc == 0 and len(box.remote_audio()) == 37
+    assert out.count("deleted rec00") == 3
+    # Beyond the brakes: refused until the purge is named.
+    box.audio_mode = "copy"
+    box.remove_audio(*names[3:33])                     # 30 more, in copy mode
+    box.run(AUDIO_ALLOW_MASS_DELETE=7)                 # the box copy follows (named purge)
+    rc, out = box.run(BACKUP_AUDIO_MODE="mirror")
+    assert rc == 1 and len(box.remote_audio()) == 37 and "REFUSING" in out
+    rc, out = box.run(BACKUP_AUDIO_MODE="mirror", AUDIO_ALLOW_MASS_DELETE=7)
+    assert rc == 0 and len(box.remote_audio()) == 7
 
 
 @audio_harness

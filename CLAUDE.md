@@ -682,9 +682,13 @@ there is no default URL in the code, by design.
   `docker exec` (WAL sidecars are uid 10001; a host-side online backup fails "attempt to write a readonly
   database"), sha256-dedupes, keeps a local ring + a `daily/` tier, and pushes with **`rclone copy`, never
   `sync`** for the two DBs. **The audio tree is ADD-ONLY by default too: `BACKUP_AUDIO_MODE=copy`**
-  (Graham's call 2026-09-29, reversing 2026-09-19): `rclone copy` only, never a remote delete, no brakes
-  involved — a note deleted in the Hub loses its recording from the Hub and the box, but Drive keeps it
-  until removed by hand, and the Inbox page says so. `BACKUP_AUDIO_MODE=mirror` keeps the old behaviour:
+  (Graham's call 2026-09-29, reversing 2026-09-19): `rclone copy --immutable --exclude '*.part'` only,
+  never a remote delete — a note deleted in the Hub loses its recording from the Hub at once and from the
+  box copy at the next run, but Drive keeps it until removed by hand, and the Inbox page says so. The box
+  copy is not replaced by a tree that shrank past `AUDIO_MAX_DROP_PCT`/`AUDIO_MAX_DROP_FILES` (the run
+  fails instead; `AUDIO_ALLOW_MASS_DELETE=<n>` for a real purge), and stale `.audio.*` staging dirs (>30
+  min) are swept at every start. The copy-mode RETURN trap resets itself (`trap '…; trap - RETURN'
+  RETURN`) — a RETURN trap set in a function outlives it. `BACKUP_AUDIO_MODE=mirror` keeps the old behaviour:
   it MIRRORS deletions (copy, then an explicit logged delete pass for remote extras) so that Delete and the
   unconditional privacy ceiling reach the off-box copy. Any other value dies before the run. Mirror mode is
   guarded against mirroring a wipe by THREE independent brakes, any one of which refuses and fails the run
