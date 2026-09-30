@@ -345,8 +345,9 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
 - **Item lifecycle** — what closed/archived/reopen mean per source (voice, typed, github, backlog), and which
   of them is automatic: the table in DESIGN.md "Item lifecycle". One table (`inbox_items`), `state`
   open/closed plus `archived_at`. Update the table when any close/archive/reopen rule changes. Its "Known
-  limits" (G-25: a page-2 change in a repo with >100 open issues waits for page 1; X-05: an 8-hex tag
-  collision) are documented, not fixed.
+  limits" (G-25 page-2 changes in a >100-issue repo wait for page 1; X-05 an 8-hex tag collision; B-05 a
+  What: edit is a new row; B-14 a truncated read archives rows for an hour; G-26 >1000 open issues mirror
+  nothing) are documented, not fixed. A backlog tag counts anywhere in the What: line (B-29, accepted).
 - **`with conn:` is NOT a transaction here.** Both stores connect with `isolation_level=None`
   (autocommit), so every statement commits as it runs and `with conn:` rolls nothing back. Validate the
   whole request before the first write (the backlog push does: a 400 on one item used to keep the items
