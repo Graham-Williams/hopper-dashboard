@@ -497,3 +497,122 @@ def test_a_409_on_the_reviewed_tick_says_why_and_reloads(edited):
     assert t["error"] == "the item changed while saving — reload and try again"
     assert t["errHidden"] is False and t["reloads"] == 1
     assert t["checked"] is False and t["disabled"] is False
+
+
+# --------------------------------------------------------------------------- #
+# Close / Reopen on a note — actually executed.
+# --------------------------------------------------------------------------- #
+
+STATE_HARNESS = r"""
+'use strict';
+const fs = require('fs');
+const vm = require('vm');
+const SRC = fs.readFileSync(process.argv[2], 'utf8');
+
+function el(attrs) {
+  return {
+    hidden: false, disabled: false, textContent: '', _attrs: Object.assign({}, attrs || {}),
+    _listeners: {},
+    classList: {toggle: function () {}, add: function () {}, remove: function () {}},
+    addEventListener: function (t, fn) { (this._listeners[t] = this._listeners[t] || []).push(fn); },
+    setAttribute: function (k, v) { this._attrs[k] = String(v); },
+    getAttribute: function (k) {
+      return Object.prototype.hasOwnProperty.call(this._attrs, k) ? this._attrs[k] : null;
+    },
+    fire: function (t) { (this._listeners[t] || []).forEach(function (fn) { fn.call(this, {}); }, this); }
+  };
+}
+
+function world(fetchImpl, to) {
+  const btn = el({'class': 'toggle-state', 'data-id': 'c'.repeat(32), 'data-to': to});
+  btn.hidden = true;
+  const err = el({id: 'capture-error'});
+  const calls = [];
+  let reloads = 0;
+  const win = {
+    fetch: function (url, opts) { calls.push({url: url, opts: opts}); return fetchImpl(); },
+    setInterval: function () { return 0; }, clearInterval: function () {},
+    setTimeout: function (fn) { fn(); return 0; },
+    confirm: function () { return false; }, addEventListener: function () {},
+    location: {reload: function () { reloads += 1; }}
+  };
+  const doc = {
+    getElementById: function (i) { return i === 'capture-error' ? err : null; },
+    querySelectorAll: function (sel) { return sel === '.toggle-state' ? [btn] : []; }
+  };
+  vm.runInNewContext(SRC, {document: doc, window: win, navigator: {}, console: console,
+                           Blob: function () {}, FormData: function () {}});
+  return {btn: btn, err: err, calls: calls, reloads: function () { return reloads; }};
+}
+
+function tick() { return new Promise(function (r) { setImmediate(r); }); }
+async function settle() { for (let i = 0; i < 6; i++) { await tick(); } }
+function answer(status, body) {
+  return function () {
+    return Promise.resolve({ok: status < 300, status: status,
+                            json: function () { return Promise.resolve(body || {}); }});
+  };
+}
+
+(async function () {
+  const out = {};
+  let w = world(answer(200), 'closed');
+  out.wired = !w.btn.hidden;
+  w.btn.fire('click');
+  await settle();
+  const c = w.calls[0];
+  out.close = {calls: w.calls.length, url: c.url, method: c.opts.method,
+               credentials: c.opts.credentials, body: JSON.parse(c.opts.body),
+               reloads: w.reloads()};
+
+  w = world(answer(409, {error: 'the item changed while saving — reload and try again'}), 'open');
+  w.btn.fire('click');
+  await settle();
+  out.conflict = {error: w.err.textContent, reloads: w.reloads(), disabled: w.btn.disabled,
+                  body: JSON.parse(w.calls[0].opts.body)};
+
+  w = world(function () { return Promise.reject(new Error('offline')); }, 'closed');
+  w.btn.fire('click');
+  await settle();
+  out.offline = {error: w.err.textContent, reloads: w.reloads(), disabled: w.btn.disabled};
+
+  process.stdout.write(JSON.stringify(out));
+})().catch(function (err) {
+  process.stderr.write(String((err && err.stack) || err));
+  process.exit(1);
+});
+"""
+
+
+@pytest.fixture(scope="module")
+def toggled(tmp_path_factory):
+    node = shutil.which("node")
+    if node is None:                                       # pragma: no cover
+        pytest.skip("node is not installed")
+    harness = tmp_path_factory.mktemp("js") / "state_harness.js"
+    harness.write_text(STATE_HARNESS, encoding="utf-8")
+    proc = subprocess.run([node, str(harness), str(INBOX_JS)],
+                          capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+def test_close_appears_once_wired_and_patches_the_state_then_reloads(toggled):
+    assert toggled["wired"] is True
+    close = toggled["close"]
+    assert close["calls"] == 1 and close["url"] == "/api/v1/inbox/items/" + "c" * 32
+    assert close["method"] == "PATCH" and close["credentials"] == "same-origin"
+    assert close["body"] == {"state": "closed"} and close["reloads"] == 1
+
+
+def test_a_409_on_close_or_reopen_says_why_and_reloads(toggled):
+    c = toggled["conflict"]
+    assert c["body"] == {"state": "open"}
+    assert c["error"] == "the item changed while saving — reload and try again"
+    assert c["reloads"] == 1
+
+
+def test_a_failed_close_says_so_and_gives_the_button_back(toggled):
+    o = toggled["offline"]
+    assert o["error"].startswith("Could not close that item")
+    assert o["reloads"] == 0 and o["disabled"] is False

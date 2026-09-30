@@ -271,6 +271,7 @@ details.about-recordings summary { min-height: 44px; display: flex; align-items:
 .item-actions { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem;
                 margin-top: .6rem; }
 .item-actions .edit-draft { min-height: 44px; padding: 0 1rem; }
+.item-actions .toggle-state { min-height: 44px; padding: 0 1rem; }
 /* Reviewed reads as a TOGGLE: a pill that fills in when ticked. The whole pill is
    the 44px tap target; the checkbox inside it stays a real checkbox. */
 .item-actions .review { display: inline-flex; align-items: center; gap: .45rem;

@@ -279,8 +279,9 @@ exists for voice and typed notes only: on a `github` or `backlog` row the page s
 server answers 409 with where to act instead ("This mirrors GitHub — close the issue there" / "This
 mirrors backlog.txt — remove or ✅ DONE the line there"), because deleting a view cannot touch what it
 mirrors and the row would come back on a later sync. "By hand"
-below means `PATCH /api/v1/inbox/items/<id> {"state": …}` with a session; the page has no close or reopen
-button today.
+below means the Close / Reopen button every voice and typed note has in its action row (C-12; mirrored
+rows have none — they follow upstream), which is `PATCH /api/v1/inbox/items/<id> {"state": …}` with a
+session. A hand change clears `closed_by`, so it sticks until the next upstream change.
 
 | source | becomes closed | becomes archived | reopens | who |
 |---|---|---|---|---|

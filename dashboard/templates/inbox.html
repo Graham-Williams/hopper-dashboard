@@ -231,6 +231,14 @@
             <span>Reviewed</span>
           </label>
           {% endif %}
+          {#- Close / Reopen, notes only (C-12): the existing PATCH state. A hand change
+              clears closed_by, so it sticks until the next upstream change. Hidden
+              until inbox.js wires it, like Delete. A mirrored row has neither: it
+              follows GitHub / backlog.txt. -#}
+          {% if it.deletable %}
+          <button type="button" class="toggle-state secondary" data-id="{{ it.id }}"
+                  data-to="{{ 'open' if it.state == 'closed' else 'closed' }}" hidden>{{ 'Reopen' if it.state == 'closed' else 'Close' }}</button>
+          {% endif %}
           {# Needs JS (it is a DELETE), so it is hidden until inbox.js wires it and
              is never a button that does nothing. Notes only: the server refuses it
              on a mirrored row, which would come back on the next sync anyway. #}

@@ -372,8 +372,9 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   had a mirror row archives that row (G-19).
 - `templates/inbox.html`, `static/inbox.js` — see the JS convention above. Rows are ONE column at every
   width (phone-first): badges, draft title/body, Transcript `<details>`, the player, one action row
-  (Edit draft · the Reviewed pill toggle · Delete as a quiet danger text button, all ≥44px), then the meta
-  line. Delete is for NOTES only (`inbox.deletable`, `item_json["deletable"]`): a github or backlog row
+  (Edit draft · the Reviewed pill toggle · Close/Reopen · Delete as a quiet danger text button LAST, all
+  ≥44px), then the meta line. Close/Reopen (`.toggle-state`, notes only) PATCHes `state` and reloads; a
+  409 shows the server's reason and reloads, like the Reviewed tick. Delete is for NOTES only (`inbox.deletable`, `item_json["deletable"]`): a github or backlog row
   renders no action row at all, the server 409s a DELETE on one with where to act
   (`MIRROR_DELETE_REFUSALS`), a github row links its issue ("owner/repo#n on GitHub") and a backlog row
   says "Lives in backlog.txt". The two capture notes sit in one collapsed "About recordings and privacy" `<details>`. Needs

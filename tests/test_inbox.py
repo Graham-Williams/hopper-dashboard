@@ -1567,6 +1567,38 @@ def test_a_missing_recording_is_labelled_and_never_offers_a_dead_player(
     assert "Recording expired" not in html
 
 
+# --- Close / Reopen on notes (C-12) ------------------------------------------ #
+
+def test_notes_get_a_close_or_reopen_button_and_mirrored_rows_do_not(authed, bot, settings):
+    voice = _drafted(authed, bot)
+    typed = post_note(authed, "typed row").get_json()["id"]
+    authed.patch(f"/api/v1/inbox/items/{typed}", json={"state": "closed"})
+    gh, bl = _github_row(settings), _backlog_row(authed, bot)
+    html = authed.get("/inbox").data.decode()
+    close = _row(html, voice).split('class="toggle-state', 1)[1].split("</button>", 1)[0]
+    assert 'data-to="closed"' in close and "hidden" in close and close.endswith(">Close")
+    reopen = _row(html, typed).split('class="toggle-state', 1)[1].split("</button>", 1)[0]
+    assert 'data-to="open"' in reopen and reopen.endswith(">Reopen")
+    for mirrored in (gh, bl):
+        assert "toggle-state" not in _row(html, mirrored)
+    # Delete stays LAST in the action row.
+    actions = _row(html, voice).split('class="item-actions"', 1)[1].split("</div>", 1)[0]
+    assert (actions.index('class="review"') < actions.index('class="toggle-state')
+            < actions.index('class="delete-item"'))
+
+
+def test_a_hand_close_and_reopen_through_the_route_clear_closed_by(authed, bot):
+    item, _ = _filed_with_line(authed, bot)
+    _gone_twice(bot, "Unrelated chore")
+    assert _state(authed, item)[0] == "closed"             # closed by the backlog rule
+    r = authed.patch(f"/api/v1/inbox/items/{item}", json={"state": "open"})
+    assert r.status_code == 200 and r.get_json()["state"] == "open"
+    r = authed.patch(f"/api/v1/inbox/items/{item}", json={"state": "closed"})
+    assert r.status_code == 200 and r.get_json()["closed_at"]
+    _sync_backlog(bot, f"Fix the Mac fan noise (voice {item[:8]})", "Unrelated chore")
+    assert _state(authed, item)[0] == "closed"             # a hand close: never reopened
+
+
 # --- ?state=archived: rows whose upstream is gone are findable (B-03) --------- #
 
 def test_the_archived_state_filter_lists_archived_rows_with_their_badge(authed, bot):
@@ -2168,9 +2200,9 @@ def test_a_voice_row_is_one_column_in_the_designed_order(authed, bot):
                                     'class="item-meta muted small"')]
     assert order == sorted(order), order
     actions = row.split('class="item-actions"', 1)[1].split("</div>", 1)[0]
-    # Edit draft, the Reviewed toggle, then Delete LAST, all in the one row.
+    # Edit draft, the Reviewed toggle, Close, then Delete LAST, all in the one row.
     assert (actions.index('class="edit-draft') < actions.index('class="review"')
-            < actions.index('class="delete-item"'))
+            < actions.index('class="toggle-state') < actions.index('class="delete-item"'))
     assert "item-controls" not in row
 
 

@@ -533,6 +533,45 @@
   }
 
   /* ------------------------------------------------------------------ */
+  /* Close / Reopen a note                                              */
+  /* ------------------------------------------------------------------ */
+
+  /* The existing PATCH state. On success the page reloads: the badge, the
+     tiles, the filters and which rows are hidden are all server-rendered. */
+  var toggles = document.querySelectorAll('.toggle-state');
+  for (var tg = 0; tg < toggles.length; tg++) {
+    (function (btn) {
+      btn.hidden = false;          // only shown once it actually works
+      btn.addEventListener('click', function () {
+        var id = btn.getAttribute('data-id');
+        var to = btn.getAttribute('data-to') === 'open' ? 'open' : 'closed';
+        btn.disabled = true;
+        fail('');
+        window.fetch('/api/v1/inbox/items/' + encodeURIComponent(id), {
+          method: 'PATCH',
+          credentials: 'same-origin',
+          headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
+          body: JSON.stringify({state: to})
+        }).then(function (response) {
+          if (response.status === 409) {
+            /* The server wrote nothing: say why, then show what is really there. */
+            return response.json().catch(function () { return {}; }).then(function (body) {
+              fail(body.error || 'That item changed — reloading.');
+              window.setTimeout(function () { window.location.reload(); }, 1500);
+            });
+          }
+          if (!response.ok) { throw new Error('save failed'); }
+          window.location.reload();
+        }).catch(function () {
+          btn.disabled = false;
+          fail('Could not ' + (to === 'closed' ? 'close' : 'reopen') +
+               ' that item — check your connection.');
+        });
+      });
+    })(toggles[tg]);
+  }
+
+  /* ------------------------------------------------------------------ */
   /* Edit a voice note's draft                                          */
   /* ------------------------------------------------------------------ */
 
