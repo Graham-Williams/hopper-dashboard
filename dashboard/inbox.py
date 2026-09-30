@@ -241,6 +241,20 @@ def reviewable(row: dict) -> bool:
     return row["source"] == "typed" and row["reviewed_at"] != row["created_at"]
 
 
+#: Mirrored rows are VIEWS of something upstream, so Delete is refused on them: it could not
+#: remove the issue or the backlog.txt line, and the row would come back on the next sync.
+#: Each message says where to act instead. Voice and typed notes stay deletable.
+MIRROR_DELETE_REFUSALS = {
+    inbox_db.MIRROR_GITHUB: "This mirrors GitHub — close the issue there",
+    inbox_db.MIRROR_BACKLOG: "This mirrors backlog.txt — remove or ✅ DONE the line there",
+}
+
+
+def deletable(row: dict) -> bool:
+    """Only a note authored here can be deleted; see ``MIRROR_DELETE_REFUSALS``."""
+    return row["source"] in inbox_db.LOCAL_SOURCES
+
+
 def item_json(row: dict, issues: list[dict] | None = None,
               backlog_copy: dict | None = None) -> dict:
     """One row, as both the JSON API and the template see it.
@@ -278,6 +292,7 @@ def item_json(row: dict, issues: list[dict] | None = None,
         "updated_at": row["updated_at"],
         "reviewed": bool(row["reviewed"]),
         "reviewable": reviewable(row),
+        "deletable": deletable(row),
         "reviewed_at": row["reviewed_at"],
         "state": row["state"],
         "closed_at": row["closed_at"],
@@ -618,9 +633,12 @@ def delete_item(item_id: str):
     the two) the file is an orphan, and the scheduler's existing sweep collects
     orphans — whereas a file deleted before its row would leave a row pointing
     at nothing until the reconcile noticed. Linked issues go with the row via
-    ``ON DELETE CASCADE``; the GitHub issues themselves are untouched, and a
-    mirrored row simply comes back on the next sync, which is correct — the
-    board mirrors GitHub, it does not own it.
+    ``ON DELETE CASCADE``; the GitHub issues themselves are untouched.
+
+    A MIRRORED row (github, backlog) is refused with a 409 that says where to act
+    (``MIRROR_DELETE_REFUSALS``): deleting it could not touch the issue or the
+    backlog.txt line, and the row would simply come back on a later sync — to
+    the person pressing Delete, a button that "does nothing".
     """
     denied = require_session()
     if denied is not None:
@@ -630,6 +648,12 @@ def delete_item(item_id: str):
     settings = _settings()
     conn = _conn()
     try:
+        current = inbox_db.get_item(conn, item_id)
+        if current is None:
+            return _err("no such item", 404)
+        if not deletable(current):
+            return _err(MIRROR_DELETE_REFUSALS.get(
+                current["source"], "only a voice or typed note can be deleted"), 409)
         with conn:
             row = inbox_db.delete_item(conn, item_id)
     finally:

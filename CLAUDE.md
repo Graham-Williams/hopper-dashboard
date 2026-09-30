@@ -348,7 +348,10 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
 - `templates/inbox.html`, `static/inbox.js` — see the JS convention above. Rows are ONE column at every
   width (phone-first): badges, draft title/body, Transcript `<details>`, the player, one action row
   (Edit draft · the Reviewed pill toggle · Delete as a quiet danger text button, all ≥44px), then the meta
-  line. The two capture notes sit in one collapsed "About recordings and privacy" `<details>`. Needs
+  line. Delete is for NOTES only (`inbox.deletable`, `item_json["deletable"]`): a github or backlog row
+  renders no action row at all, the server 409s a DELETE on one with where to act
+  (`MIRROR_DELETE_REFUSALS`), a github row links its issue ("owner/repo#n on GitHub") and a backlog row
+  says "Lives in backlog.txt". The two capture notes sit in one collapsed "About recordings and privacy" `<details>`. Needs
   review links go to `/inbox?awaiting=review#items`; `#items`/`.item` carry `scroll-margin-top` for the
   sticky nav. Check phone layout with a real 390px viewport, not a narrowed desktop window.
 - Scheduler: `Scheduler.step()` carries `last_github` and `last_prune`, each re-armed from its own END clock

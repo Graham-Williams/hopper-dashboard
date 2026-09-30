@@ -207,7 +207,10 @@
         {% endif %}
         {#- ONE action row: Edit draft and the Reviewed toggle side by side (each
             >= 44px), and Delete last as a quiet text button — it destroys the
-            row and the recording, so it must never look like the main action. -#}
+            row and the recording, so it must never look like the main action.
+            A mirrored row (github, backlog) has none of the three, so it gets no
+            row at all: it is acted on upstream (see the link/hint below). -#}
+        {% if voice or it.reviewable or it.deletable %}
         <div class="item-actions">
           {% if voice %}
           <button type="button" class="edit-draft secondary" data-id="{{ it.id }}" hidden>Edit draft</button>
@@ -222,10 +225,14 @@
           </label>
           {% endif %}
           {# Needs JS (it is a DELETE), so it is hidden until inbox.js wires it and
-             is never a button that does nothing. #}
+             is never a button that does nothing. Notes only: the server refuses it
+             on a mirrored row, which would come back on the next sync anyway. #}
+          {% if it.deletable %}
           <button type="button" class="delete-item" data-id="{{ it.id }}" hidden
                   title="Delete this item and its recording">Delete</button>
+          {% endif %}
         </div>
+        {% endif %}
         {% if voice %}
         {#- The edit form is rendered HERE, hidden; inbox.js only shows/hides it
             and PATCHes the three fields with fetch. It never builds markup. -#}
@@ -269,10 +276,13 @@
           <span class="badge badge-backlog">filed to backlog.txt</span>
           <span class="muted">{{ it.filed_backlog.line }}</span>
         </p>
-        {% elif it.mirror_url %}
+        {% elif it.source == 'github' and it.mirror_url %}
+        {#- The way to act on a mirrored issue: close or edit it on GitHub. -#}
         <p class="item-issues small">
-          <a class="issue" href="{{ it.mirror_url }}" rel="noopener noreferrer" target="_blank">{{ it.mirror_key }}</a>
+          <a class="issue" href="{{ it.mirror_url }}" rel="noopener noreferrer" target="_blank">{{ it.mirror_key|replace('github:', '', 1) }} on GitHub</a>
         </p>
+        {% elif it.source == 'backlog' %}
+        <p class="item-issues small muted">Lives in backlog.txt</p>
         {% endif %}
       </div>
     </li>

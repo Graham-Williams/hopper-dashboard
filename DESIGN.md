@@ -262,7 +262,11 @@ Every kind of item is a row in ONE table, `inbox_items`, and they share two inde
 (`open` | `closed`, with `closed_at`) and `archived_at` (NULL = live). **Closed** means the work is done and
 the row stays on the board with a badge (the state filter shows it). **Archived** means the thing it
 mirrored no longer exists upstream; archived rows are left out of every list and count (`list_items` has an
-`include_archived` switch, but no route uses it), and nothing is ever deleted except by Delete. "By hand"
+`include_archived` switch, but no route uses it), and nothing is ever deleted except by Delete — which
+exists for voice and typed notes only: on a `github` or `backlog` row the page shows no Delete and the
+server answers 409 with where to act instead ("This mirrors GitHub — close the issue there" / "This
+mirrors backlog.txt — remove or ✅ DONE the line there"), because deleting a view cannot touch what it
+mirrors and the row would come back on a later sync. "By hand"
 below means `PATCH /api/v1/inbox/items/<id> {"state": …}` with a session; the page has no close or reopen
 button today.
 
@@ -353,8 +357,9 @@ forever — the setting would read like a maximum and behave like a minimum.
 (Both rules act on the box. Since 2026-09-29 the Drive backup of the audio is add-only by default, so a
 recording already backed up outlives both on Drive until removed by hand — see "Mirror mode" below.)
 
-`DELETE /api/v1/inbox/items/<id>` (session only, Origin-pinned, write-limited) removes a row and its
-audio immediately. It exists because the one class of data here that is unambiguously personal is the one
+`DELETE /api/v1/inbox/items/<id>` (session only, Origin-pinned, write-limited) removes a note and its
+audio immediately (voice and typed notes only; a mirrored row is a 409 — see "Item lifecycle"; the item
+JSON carries `deletable`). It exists because the one class of data here that is unambiguously personal is the one
 class a user must be able to retract without `docker exec` and hand-written SQL — a recording that caught
 a background conversation, or a password read aloud. The row goes first and the file second; the orphan
 sweep makes that ordering safe.

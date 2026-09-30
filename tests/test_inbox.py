@@ -976,6 +976,60 @@ def test_the_board_offers_a_delete_control_per_row(authed):
     assert f'class="delete-item" data-id="{item}"' in html
 
 
+# --- mirrored rows have no Delete: they would only come back ------------------ #
+
+GH_URL = "https://github.com/Owner/km-tracker/issues/12"
+
+
+def _github_row(settings):
+    conn = inbox_db.connect(settings.inbox_db_path)
+    try:
+        with conn:
+            return inbox_db.upsert_mirror_item(
+                conn, mirror_key=inbox_db.github_key("Owner/km-tracker", 12),
+                source="github", title="Wheel spins twice", body="on iOS only",
+                url=GH_URL)
+    finally:
+        conn.close()
+
+
+def _backlog_row(authed, bot):
+    assert bot.post("/api/v1/inbox/mirror/backlog", headers=machine(), json={
+        "complete": True, "items": [{"text": "Tidy the box"}]}).status_code == 200
+    return authed.get("/api/v1/inbox/items?source=backlog").get_json()["items"][0]["id"]
+
+
+def test_delete_is_refused_on_mirrored_rows_and_says_where_to_act(authed, bot, settings):
+    gh, bl = _github_row(settings), _backlog_row(authed, bot)
+    r = authed.delete(f"/api/v1/inbox/items/{gh}")
+    assert r.status_code == 409
+    assert r.get_json()["error"] == "This mirrors GitHub — close the issue there"
+    r = authed.delete(f"/api/v1/inbox/items/{bl}")
+    assert r.status_code == 409
+    assert r.get_json()["error"] == "This mirrors backlog.txt — remove or ✅ DONE the line there"
+    listed = {i["id"]: i for i in authed.get("/api/v1/inbox/items").get_json()["items"]}
+    assert gh in listed and bl in listed                   # both untouched
+    assert listed[gh]["deletable"] is False and listed[bl]["deletable"] is False
+    note = post_note(authed).get_json()
+    assert note["deletable"] is True                       # notes are unchanged
+    assert authed.delete(f"/api/v1/inbox/items/{note['id']}").status_code == 200
+
+
+def test_mirrored_rows_have_no_delete_button_and_say_where_they_live(authed, bot, settings):
+    gh, bl = _github_row(settings), _backlog_row(authed, bot)
+    note = post_note(authed).get_json()["id"]
+    html = authed.get("/inbox").data.decode()
+    gh_row, bl_row = _row(html, gh), _row(html, bl)
+    for row in (gh_row, bl_row):
+        assert "delete-item" not in row
+        assert 'class="item-actions"' not in row           # no empty action row either
+    # The GitHub row's way to act on it: the issue, linked and labelled as such.
+    link = gh_row.split(f'href="{GH_URL}"', 1)[1].split("</a>", 1)[0]
+    assert "Owner/km-tracker#12 on GitHub" in link
+    assert "Lives in backlog.txt" in bl_row
+    assert 'class="delete-item"' in _row(html, note)       # a note keeps its Delete
+
+
 # --------------------------------------------------------------------------- #
 # Aggregate storage cap
 # --------------------------------------------------------------------------- #
