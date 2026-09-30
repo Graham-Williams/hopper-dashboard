@@ -56,9 +56,14 @@ function el(id) {
 function world(maxBytes) {
   const els = {};
   ['capture-form', 'capture-text', 'record-btn', 'record-status',
-   'capture-error', 'capture-submit', 'record-level'].forEach(function (id) {
+   'capture-error', 'capture-submit', 'record-level', 'action-status'].forEach(function (id) {
     els[id] = el(id);
   });
+  /* A note's Close button, to act while a take is still waiting to be added. */
+  const toggle = el('toggle');
+  toggle.setAttribute('data-id', 'c'.repeat(32));
+  toggle.setAttribute('data-to', 'closed');
+  let reloads = 0;
   els['capture-form'].setAttribute('data-audio-max-bytes', maxBytes);
 
   const streams = [];
@@ -106,16 +111,16 @@ function world(maxBytes) {
     setInterval: function (fn) { tid += 1; timers.set(tid, fn); return tid; },
     clearInterval: function (id) { timers.delete(id); },
     setTimeout: function () { return 0; },
-    fetch: function () { return Promise.resolve({ok: true, json: function () { return Promise.resolve({}); }}); },
+    fetch: function () { return Promise.resolve({ok: true, status: 200, json: function () { return Promise.resolve({}); }}); },
     FormData: FakeFormData,
     confirm: function () { return false; },
     addEventListener: function () {},
-    location: {reload: function () {}}
+    location: {reload: function () { reloads += 1; }}
   };
   const nav = {mediaDevices: {getUserMedia: function () { return Promise.resolve(makeStream()); }}};
   const doc = {
     getElementById: function (id) { return els[id] || null; },
-    querySelectorAll: function () { return []; }
+    querySelectorAll: function (sel) { return sel === '.toggle-state' ? [toggle] : []; }
   };
   function FakeBlob(parts, opts) {
     this.parts = parts;
@@ -125,7 +130,8 @@ function world(maxBytes) {
   const sandbox = {document: doc, window: win, navigator: nav, Blob: FakeBlob,
                    FormData: FakeFormData, console: console};
   return {
-    els: els, streams: streams, recorders: recorders,
+    els: els, streams: streams, recorders: recorders, toggle: toggle,
+    reloads: function () { return reloads; },
     run: function () { vm.runInNewContext(SRC, sandbox); },
     click: function () { els['record-btn'].fire('click'); },
     status: function () { return els['record-status'].textContent; },
@@ -210,8 +216,23 @@ async function superseded() {
   };
 }
 
+/* 4. A take recorded but not yet added survives any other action's reload. */
+async function takeThenAct() {
+  const w = world(1000000);
+  w.run();
+  w.click();
+  await grant();
+  w.recorders[0].emit(500);
+  w.click();                             // Stop: the take is held, not yet added
+  await grant();
+  w.toggle.fire('click');                // Close some other note meanwhile
+  for (let i = 0; i < 6; i++) { await tick(); }
+  return {reloads: w.reloads(), status: w.els['action-status'].textContent};
+}
+
 (async function () {
   const out = {};
+  out.takeThenAct = await takeThenAct();
   out.autoStop = await autoStop();
   out.stopThrows = await stopThrows();
   out.superseded = await superseded();
@@ -258,6 +279,11 @@ def test_the_recorder_stops_itself_before_the_size_cap_and_keeps_the_take(ran):
     assert out["button"] == "● Record" and out["micsOff"] is True
     # ...and the fill bar was tracking it, so the ending is not a surprise.
     assert out["level"] == {"value": 900, "max": 1000, "hidden": False}
+
+
+def test_a_recorded_take_not_yet_added_survives_another_actions_reload(ran):
+    assert ran["takeThenAct"] == {"reloads": 0,
+                                  "status": "Saved — refresh to update the counts"}
 
 
 def test_a_throwing_stop_still_releases_the_microphone(ran):
@@ -459,7 +485,7 @@ function refused() { return Promise.resolve({ok: false, status: 400, json: funct
                              Blob: function () {}, FormData: function () {}});
     box.fire('change');
     await settle();
-    out.tickOk = {reloads: reloads3};
+    out.tickOk = {reloads: reloads3, disabled: box.disabled};
   }
 
   process.stdout.write(JSON.stringify(out));
@@ -520,7 +546,8 @@ def test_a_409_on_the_reviewed_tick_says_why_and_reloads(edited):
     t = edited["tick409"]
     assert t["error"] == "the item changed while saving — reload and try again"
     assert t["errHidden"] is False and t["reloads"] == 1
-    assert t["checked"] is False and t["disabled"] is False
+    # Put back, and still disabled: a reload follows, and only a FAILURE re-enables it.
+    assert t["checked"] is False and t["disabled"] is True
 
 
 # --------------------------------------------------------------------------- #
@@ -547,10 +574,21 @@ function el(attrs) {
   };
 }
 
-function world(fetchImpl, to) {
+function world(fetchImpl, to, unsaved) {
   const btn = el({'class': 'toggle-state', 'data-id': 'c'.repeat(32), 'data-to': to});
   btn.hidden = true;
   const err = el({id: 'capture-error'});
+  const status = el({id: 'action-status'});
+  status.hidden = true;
+  const text = el({id: 'capture-text'});
+  text.value = (unsaved && unsaved.text) || '';
+  /* An open Edit-draft form: its fields carry the server-rendered defaultValue. */
+  const field = el({name: 'draft_title'});
+  field.defaultValue = 'Machine title';
+  field.value = (unsaved && unsaved.draft) || 'Machine title';
+  const editForm = el({'class': 'draft-edit'});
+  editForm.hidden = !(unsaved && unsaved.draft);
+  editForm.querySelectorAll = function () { return [field]; };
   const calls = [];
   let reloads = 0;
   const win = {
@@ -560,13 +598,19 @@ function world(fetchImpl, to) {
     confirm: function () { return false; }, addEventListener: function () {},
     location: {reload: function () { reloads += 1; }}
   };
+  const byId = {'capture-error': err, 'action-status': status, 'capture-text': text};
   const doc = {
-    getElementById: function (i) { return i === 'capture-error' ? err : null; },
-    querySelectorAll: function (sel) { return sel === '.toggle-state' ? [btn] : []; }
+    getElementById: function (i) { return byId[i] || null; },
+    querySelectorAll: function (sel) {
+      if (sel === '.toggle-state') { return [btn]; }
+      if (sel === 'form.draft-edit') { return [editForm]; }
+      return [];
+    }
   };
   vm.runInNewContext(SRC, {document: doc, window: win, navigator: {}, console: console,
                            Blob: function () {}, FormData: function () {}});
-  return {btn: btn, err: err, calls: calls, reloads: function () { return reloads; }};
+  return {btn: btn, err: err, status: status, calls: calls,
+          reloads: function () { return reloads; }};
 }
 
 function tick() { return new Promise(function (r) { setImmediate(r); }); }
@@ -599,6 +643,36 @@ function answer(status, body) {
   w.btn.fire('click');
   await settle();
   out.offline = {error: w.err.textContent, reloads: w.reloads(), disabled: w.btn.disabled};
+
+  /* Never lose unsaved input to a reload: text in the capture box, or an open draft editor
+     with changes. The action still saved; the page says so and waits for a manual refresh. */
+  out.unsaved = {};
+  for (const [name, unsaved] of [['text', {text: 'half a thought'}],
+                                 ['draft', {draft: 'Typed but not saved'}]]) {
+    w = world(answer(200), 'closed', unsaved);
+    w.btn.fire('click');
+    await settle();
+    out.unsaved[name] = {reloads: w.reloads(), status: w.status.textContent,
+                         statusHidden: w.status.hidden, disabled: w.btn.disabled};
+  }
+  /* ...and a 409 with unsaved input does not reload either. */
+  w = world(answer(409, {error: 'changed'}), 'closed', {text: 'half a thought'});
+  w.btn.fire('click');
+  await settle();
+  out.unsaved.conflict = {reloads: w.reloads(), error: w.err.textContent};
+
+  /* A double tap sends ONE request: the control stays disabled from the first tap until the
+     reload (success never re-enables it). */
+  let pending;
+  w = world(function () { return new Promise(function (r) { pending = r; }); }, 'closed',
+            {text: 'keeps the page from reloading'});
+  w.btn.fire('click');
+  w.btn.fire('click');
+  pending({ok: true, status: 200, json: function () { return Promise.resolve({}); }});
+  await settle();
+  w.btn.fire('click');
+  await settle();
+  out.doubleTap = {calls: w.calls.length, disabled: w.btn.disabled};
 
   /* Delete's confirmation names the Drive copy that Delete does NOT remove, and only says
      "and its recording" while the note still has one here. */
@@ -664,6 +738,19 @@ def test_a_409_on_close_or_reopen_says_why_and_reloads(toggled):
     assert c["reloads"] == 1
 
 
+def test_an_action_never_reloads_over_unsaved_input(toggled):
+    for name in ("text", "draft"):
+        u = toggled["unsaved"][name]
+        assert u["reloads"] == 0, name
+        assert u["status"] == "Saved — refresh to update the counts" and not u["statusHidden"]
+        assert u["disabled"] is True                       # still disabled until a refresh
+    assert toggled["unsaved"]["conflict"]["reloads"] == 0
+
+
+def test_a_double_tap_sends_one_request_and_success_never_re_enables(toggled):
+    assert toggled["doubleTap"] == {"calls": 1, "disabled": True}
+
+
 def test_a_failed_close_says_so_and_gives_the_button_back(toggled):
     o = toggled["offline"]
     assert o["error"].startswith("Could not close that item")
@@ -675,7 +762,10 @@ def test_the_delete_confirmation_names_the_drive_copy_it_leaves(toggled):
     # A note whose recording is already gone here (expired or missing): not "and its
     # recording", but its Drive copy may still exist, so that sentence stays.
     assert len(expired) == 1 and "and its recording" not in expired[0]
-    assert "Delete this note from the Hub?" in expired[0] and "Google Drive" in expired[0]
+    assert expired[0] == ("Delete this note from the Hub? This cannot be undone.\n\n"
+                          "Any backed-up copy of the recording stays in Google Drive (audio/2026/"
+                          "09/" + "e" * 32 + ".* in the backup folder) until you remove it there "
+                          "by hand.")
     assert len(with_audio) == 1 and len(without) == 1          # confirm only: declined, no fetch
     msg = with_audio[0]
     assert "cannot be undone" in msg and "Google Drive" in msg
@@ -684,4 +774,4 @@ def test_the_delete_confirmation_names_the_drive_copy_it_leaves(toggled):
 
 
 def test_a_successful_reviewed_tick_reloads_the_page(edited):
-    assert edited["tickOk"] == {"reloads": 1}
+    assert edited["tickOk"] == {"reloads": 1, "disabled": True}   # disabled until the reload

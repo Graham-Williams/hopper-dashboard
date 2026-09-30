@@ -396,8 +396,13 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   flip never reflows the row. A CLOSED note shows only the second group (reopen before editing or
   reviewing). Then the meta line. Close/Reopen (`.toggle-state`, notes only) and the Reviewed tick PATCH
   and reload on success (tiles and badges are server-rendered); a 409 shows the server's reason and
-  reloads. Delete's confirmation says "and its recording" only while the note still has one here
-  (`data-has-audio`), and always names the Drive copy (`data-drive-path`) for a voice note. Delete is for NOTES only (`inbox.deletable`, `item_json["deletable"]`): a github or backlog row
+  reloads. EVERY post-action reload goes through `reloadSafely()`: with unsaved input on the page (a take
+  not yet added, text in the capture box, an open draft editor with changes) it does NOT reload but
+  writes "Saved — refresh to update the counts" into `#action-status`. A control stays disabled from the
+  tap until the reload; only a failure re-enables it (a double tap can never send the opposite PATCH).
+  Delete's confirmation says "and its recording" only while the note still has one here
+  (`data-has-audio`; otherwise "Any backed-up copy of the recording stays in Google Drive …"), and always
+  names the Drive copy (`data-drive-path`) for a voice note. Delete is for NOTES only (`inbox.deletable`, `item_json["deletable"]`): a github or backlog row
   renders no action row at all, the server 409s a DELETE on one with where to act
   (`MIRROR_DELETE_REFUSALS`), a github row links its issue ("owner/repo#n on GitHub") and a backlog row
   says "Lives in backlog.txt". The two capture notes sit in one collapsed "About recordings and privacy" `<details>`. Needs

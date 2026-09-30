@@ -149,6 +149,8 @@
 
 <section class="group" aria-labelledby="items-h">
   <h2 id="items-h">Items <span class="muted">{{ page["items"]|length }} shown</span></h2>
+  {#- inbox.js's reloadSafely() writes here instead of reloading over unsaved input. -#}
+  <p id="action-status" class="action-status muted small" role="status" hidden></p>
   {% if not page["items"] %}
   <p class="muted">Nothing here yet. Record a note or type one above.</p>
   {% endif %}

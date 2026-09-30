@@ -73,6 +73,35 @@
     setText(errEl, message);
   }
 
+  /* ONE way to reload after an action (a tick, Close, Reopen, a 409, a saved draft or
+     note), and it never throws away what is on the page but not saved: a recorded take not
+     yet added, text in the capture box, or an open draft editor with changes. Then the
+     action still happened; the page says so and waits for a manual refresh. */
+  var actionStatusEl = document.getElementById('action-status');
+  function unsavedInput() {
+    if (recordedBlob) { return true; }
+    if (textEl && String(textEl.value || '').trim()) { return true; }
+    var editForms = document.querySelectorAll('form.draft-edit');
+    for (var f = 0; f < editForms.length; f++) {
+      var editForm = editForms[f];
+      if (editForm.hidden || !editForm.querySelectorAll) { continue; }
+      var fields = editForm.querySelectorAll('input, textarea');
+      for (var k = 0; k < fields.length; k++) {
+        if (String(fields[k].value || '') !== String(fields[k].defaultValue || '')) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+  function reloadSafely() {
+    if (unsavedInput()) {
+      setText(actionStatusEl, 'Saved — refresh to update the counts');
+      return;
+    }
+    window.location.reload();
+  }
+
   /* ------------------------------------------------------------------ */
   /* Recording                                                          */
   /* ------------------------------------------------------------------ */
@@ -476,11 +505,14 @@
           status(recordedBlob
                  ? 'Saved — transcribing… Whisper picks it up within a few minutes.'
                  : 'Saved.');
+          /* What was just saved is no longer unsaved input. */
+          recordedBlob = null;
+          if (textEl) { textEl.value = ''; }
           /* Reload rather than building a row here: rows are server-rendered,
              and that is the rule that keeps untrusted text out of the DOM by
              any path but Jinja's escaping. The query string (the filters) is
              preserved. */
-          window.setTimeout(function () { window.location.reload(); }, 700);
+          window.setTimeout(reloadSafely, 700);
         });
       }).catch(function (err) {
         if (submitBtn) { submitBtn.disabled = false; }
@@ -498,8 +530,11 @@
   for (var b = 0; b < boxes.length; b++) {
     (function (box) {
       box.addEventListener('change', function () {
+        if (box.disabled) { return; }      // one request per tap
         var id = box.getAttribute('data-id');
         var wanted = box.checked;
+        /* Disabled from here until the reload; only a failure gives it back, so a
+           second tap can never send the opposite PATCH. */
         box.disabled = true;
         window.fetch('/api/v1/inbox/items/' + encodeURIComponent(id), {
           method: 'PATCH',
@@ -514,20 +549,19 @@
             return response.json().catch(function () { return {}; }).then(function (body) {
               box.checked = !wanted;
               fail(body.error || 'That item changed — reloading.');
-              window.setTimeout(function () { window.location.reload(); }, 1500);
+              window.setTimeout(reloadSafely, 1500);
             });
           }
           if (!response.ok) { throw new Error('save failed'); }
           /* Reload, like Close/Reopen: the badge, the Needs review tile and the Hub
              counts are all server-rendered (BR-04). */
-          window.location.reload();
+          reloadSafely();
         }).catch(function () {
           /* Put the box back and SAY so. A checkbox that silently un-ticks
              itself on the next page load is how a review decision gets lost. */
           box.checked = !wanted;
-          fail('Could not save that review tick — check your connection.');
-        }).then(function () {
           box.disabled = false;
+          fail('Could not save that review tick — check your connection.');
         });
       });
     })(boxes[b]);
@@ -544,8 +578,10 @@
     (function (btn) {
       btn.hidden = false;          // only shown once it actually works
       btn.addEventListener('click', function () {
+        if (btn.disabled) { return; }      // one request per tap
         var id = btn.getAttribute('data-id');
         var to = btn.getAttribute('data-to') === 'open' ? 'open' : 'closed';
+        /* Disabled until the reload; only a failure gives it back. */
         btn.disabled = true;
         fail('');
         window.fetch('/api/v1/inbox/items/' + encodeURIComponent(id), {
@@ -558,11 +594,11 @@
             /* The server wrote nothing: say why, then show what is really there. */
             return response.json().catch(function () { return {}; }).then(function (body) {
               fail(body.error || 'That item changed — reloading.');
-              window.setTimeout(function () { window.location.reload(); }, 1500);
+              window.setTimeout(reloadSafely, 1500);
             });
           }
           if (!response.ok) { throw new Error('save failed'); }
-          window.location.reload();
+          reloadSafely();
         }).catch(function () {
           btn.disabled = false;
           fail('Could not ' + (to === 'closed' ? 'close' : 'reopen') +
@@ -616,7 +652,9 @@
       formEl.addEventListener('submit', function (event) {
         event.preventDefault();
         fail('');
+        if (save && save.disabled) { return; }   // one request per tap
         var project = field('draft_project').trim();
+        /* Disabled until the reload; only a failure gives it back. */
         if (save) { save.disabled = true; }
         window.fetch('/api/v1/inbox/items/' + encodeURIComponent(id), {
           method: 'PATCH',
@@ -630,16 +668,18 @@
             if (!response.ok) {
               throw new Error(body.error || ('save failed (' + response.status + ')'));
             }
+            /* Saved: these values are no longer unsaved input. */
+            var saved = formEl.querySelectorAll ? formEl.querySelectorAll('input, textarea') : [];
+            for (var sv = 0; sv < saved.length; sv++) { saved[sv].defaultValue = saved[sv].value; }
             close();
-            window.location.reload();
+            reloadSafely();
           });
         }).catch(function (err) {
           /* Keep the form open with what was typed: an edit is never thrown
              away because the network blinked. */
+          if (save) { save.disabled = false; }
           fail('Could not save that draft — ' +
                (err && err.message ? err.message : 'check your connection.'));
-        }).then(function () {
-          if (save) { save.disabled = false; }
         });
       });
     })(editors[ed]);
@@ -664,10 +704,11 @@
            missing recording is already gone) — but its Drive copy may still exist. */
         var hasAudio = btn.getAttribute('data-has-audio') === '1';
         var question = drivePath
-          ? (hasAudio ? 'Delete this note and its recording from the Hub?'
-                      : 'Delete this note from the Hub?') +
-            ' This cannot be undone.\n\n' +
-            'A copy of its recording already backed up stays in Google Drive (' +
+          ? (hasAudio
+               ? 'Delete this note and its recording from the Hub? This cannot be undone.' +
+                 '\n\nA copy of its recording already backed up stays in Google Drive ('
+               : 'Delete this note from the Hub? This cannot be undone.' +
+                 '\n\nAny backed-up copy of the recording stays in Google Drive (') +
             drivePath + ' in the backup folder) until you remove it there by hand.'
           : 'Delete this note? This cannot be undone.';
         if (!window.confirm(question)) { return; }

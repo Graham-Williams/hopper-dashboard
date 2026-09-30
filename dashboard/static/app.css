@@ -270,6 +270,11 @@ details.about-recordings summary { min-height: 44px; display: flex; align-items:
 .item .player { display: block; width: 100%; height: 40px; margin-top: .5rem; }
 .item-actions { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem;
                 margin-top: .6rem; }
+/* Stays in view while scrolling the list, so the note an action was taken on is not the
+   only place "refresh to update the counts" could be read. */
+.action-status { position: sticky; top: 3.75rem; z-index: 1; margin: 0 0 .5rem;
+  padding: .35rem .6rem; border-radius: 6px; background: var(--panel-2); }
+
 /* Two groups, each kept together; the second (Close/Reopen + Delete) is right-aligned and
    wraps as a unit, so the row never splits a pair at 390 px. */
 .item-actions .action-group { display: inline-flex; flex-wrap: nowrap; align-items: center;
