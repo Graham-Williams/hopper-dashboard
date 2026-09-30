@@ -52,6 +52,9 @@ LOCAL_SOURCES = ("voice", "typed")
 #: Mirrored sources — rows this app did not author and must not re-file.
 MIRROR_SOURCES = ("github", "backlog")
 ITEM_STATES = ("open", "closed")
+#: The list filter's third "state": archived rows (``?state=archived``). Not a state an item
+#: can be SET to — PATCH still takes only ITEM_STATES.
+ARCHIVED_FILTER = "archived"
 ISSUE_STATES = ("open", "closed")
 TITLE_SOURCES = ("derived", "manual")
 
@@ -1409,7 +1412,11 @@ def list_items(conn: sqlite3.Connection, *, q: str | None = None,
     ahead of awaiting-filing."""
     where = []
     args: list[Any] = []
-    if not include_archived:
+    if state == ARCHIVED_FILTER:
+        # Rows whose upstream is gone (a removed backlog line, an unwatched repo, an issue a
+        # note now represents): findable, never counted (`counts` stays live-only).
+        where.append("archived_at IS NOT NULL")
+    elif not include_archived:
         where.append("archived_at IS NULL")
     if source != "backlog":
         where.append(f"NOT {_FILED_COPY_SQL}")

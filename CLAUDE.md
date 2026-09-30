@@ -339,6 +339,8 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   (`closed_by='issues'`) only when the scan moves its LAST open issue to closed, and reopens only if that
   rule closed it and the scan moved an issue closed → open. Mirrored github/backlog rows are VIEWS and
   follow upstream every scan/push. Every hand state change clears `closed_by`.
+- `?state=archived` (`inbox_db.ARCHIVED_FILTER`) lists archived rows with their badge; it is a FILTER
+  value only (PATCH still takes open/closed), and counts stay live-only.
 - **Item lifecycle** — what closed/archived/reopen mean per source (voice, typed, github, backlog), and which
   of them is automatic: the table in DESIGN.md "Item lifecycle". One table (`inbox_items`), `state`
   open/closed plus `archived_at`. Update the table when any close/archive/reopen rule changes.

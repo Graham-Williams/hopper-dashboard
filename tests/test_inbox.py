@@ -1567,6 +1567,22 @@ def test_a_missing_recording_is_labelled_and_never_offers_a_dead_player(
     assert "Recording expired" not in html
 
 
+# --- ?state=archived: rows whose upstream is gone are findable (B-03) --------- #
+
+def test_the_archived_state_filter_lists_archived_rows_with_their_badge(authed, bot):
+    _sync_backlog(bot, "Keep me", "Drop me")
+    _sync_backlog(bot, "Keep me")                          # "Drop me" is archived
+    live = [i["title"] for i in authed.get("/api/v1/inbox/items").get_json()["items"]]
+    assert live == ["Keep me"]
+    body = authed.get("/api/v1/inbox/items?state=archived").get_json()
+    assert [i["title"] for i in body["items"]] == ["Drop me"]
+    assert body["items"][0]["archived_at"] and body["counts"]["total"] == 1   # counts: live only
+    html = authed.get("/inbox?state=archived").data.decode()
+    assert '<option value="archived" selected>archived</option>' in html
+    row = _row(html, body["items"][0]["id"])
+    assert "archived upstream" in row and 'data-state="archived"' in html
+
+
 # --- R-03: a voice note can be ticked Reviewed only once there is a draft ---- #
 
 def test_a_voice_note_cannot_be_reviewed_before_it_has_a_draft(authed, bot):

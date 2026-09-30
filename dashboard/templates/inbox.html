@@ -122,6 +122,7 @@
         <option value="">any</option>
         <option value="open" {% if filters.state == 'open' %}selected{% endif %}>open</option>
         <option value="closed" {% if filters.state == 'closed' %}selected{% endif %}>closed</option>
+        <option value="archived" {% if filters.state == 'archived' %}selected{% endif %}>archived</option>
       </select>
     </label>
     {#- The only "waiting on" filter the page offers. ?awaiting=filing and
@@ -149,7 +150,7 @@
     {%- set d = it.draft -%}
     <li class="item {% if it.needs_review %}item-review{% elif it.awaiting_filing %}item-filing{% endif %} state-{{ it.state }}"
         id="item-{{ it.id }}" data-id="{{ it.id }}"
-        data-source="{{ it.source }}" data-state="{{ it.state }}"
+        data-source="{{ it.source }}" data-state="{{ 'archived' if it.archived_at else it.state }}"
         data-reviewed="{{ 1 if it.reviewed else 0 }}"
         data-awaiting-filing="{{ 1 if it.awaiting_filing else 0 }}"
         data-needs-review="{{ 1 if it.needs_review else 0 }}"

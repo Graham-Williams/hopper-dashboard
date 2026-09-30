@@ -272,8 +272,9 @@ note under Security posture). Without `pending` and `failed` the board cannot te
 Every kind of item is a row in ONE table, `inbox_items`, and they share two independent flags: `state`
 (`open` | `closed`, with `closed_at`) and `archived_at` (NULL = live). **Closed** means the work is done and
 the row stays on the board with a badge (the state filter shows it). **Archived** means the thing it
-mirrored no longer exists upstream; archived rows are left out of every list and count (`list_items` has an
-`include_archived` switch, but no route uses it), and nothing is ever deleted except by Delete — which
+mirrored no longer exists upstream (or a note now represents it); archived rows are left out of the
+default list and every count, and the State filter's `archived` option (`?state=archived`) lists them with
+their "archived upstream" badge. Nothing is ever deleted except by Delete — which
 exists for voice and typed notes only: on a `github` or `backlog` row the page shows no Delete and the
 server answers 409 with where to act instead ("This mirrors GitHub — close the issue there" / "This
 mirrors backlog.txt — remove or ✅ DONE the line there"), because deleting a view cannot touch what it
