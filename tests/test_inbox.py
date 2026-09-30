@@ -779,7 +779,7 @@ def test_the_table_renders_every_row_with_js_off(authed, bot):
            for n in range(5)]
     bot.post("/api/v1/inbox/mirror/backlog",
              json={"complete": True,
-                   "items": [{"key": inbox_db.normalise_backlog_key("mirrored"),
+                   "items": [{"key": inbox_db.normalise_backlog_key("mirrored backlog entry"),
                               "text": "mirrored backlog entry"}]},
              headers=machine())
     html = authed.get("/inbox").data.decode()
@@ -1032,6 +1032,49 @@ def test_two_notes_can_be_linked_to_the_same_issue(authed, bot):
     assert filing == []
 
 
+def test_a_link_stores_the_canonical_issue_url_not_the_clients(authed, bot):
+    item = post_note(authed).get_json()["id"]
+    r = _link(bot, item, repo="graham-williams/KM-TRACKER", number=5,
+              url="https://github.com/graham-williams/KM-TRACKER/issues/555")
+    assert r.status_code == 201
+    assert r.get_json()["issue"]["url"] == "https://github.com/Graham-Williams/km-tracker/issues/5"
+
+
+def test_the_link_checks_and_the_write_are_one_transaction(authed, bot, settings, monkeypatch):
+    """The 409 checks run INSIDE the write transaction: a note closed between the check and
+    the link (by a browser tab, say) must not end up linked anyway."""
+    import sqlite3
+
+    from dashboard import inbox as inbox_mod
+    item = post_note(authed).get_json()["id"]
+    real = inbox_mod.watched_repo
+    seen = {}
+
+    def racing(repo):
+        # Between the checks and the write: another connection closes the note.
+        other = sqlite3.connect(settings.inbox_db_path, timeout=0)
+        try:
+            other.execute("UPDATE inbox_items SET state='closed' WHERE id=?", (item,))
+            other.commit()
+            seen["raced"] = True
+        except sqlite3.OperationalError:
+            seen["raced"] = False                 # blocked: the checks still hold
+        finally:
+            other.close()
+        return real(repo)
+    monkeypatch.setattr(inbox_mod, "watched_repo", racing)
+    assert _link(bot, item).status_code == 201
+    assert seen == {"raced": False}
+
+
+def test_the_item_list_says_which_repos_are_watched(authed, bot, settings):
+    """Hopper's filing loop checks this BEFORE `gh issue create`: the NOT_WATCHED 409 comes
+    after the issue already exists, and a retry would file it twice."""
+    for client, headers in ((authed, {}), (bot, reader())):
+        body = client.get("/api/v1/inbox/items", headers=headers).get_json()
+        assert body["watched_repos"] == ["a/b", "Graham-Williams/km-tracker"]
+
+
 # --- mirrored rows have no Delete: they would only come back ------------------ #
 
 GH_URL = "https://github.com/Owner/km-tracker/issues/12"
@@ -1069,6 +1112,23 @@ def test_delete_is_refused_on_mirrored_rows_and_says_where_to_act(authed, bot, s
     note = post_note(authed).get_json()
     assert note["deletable"] is True                       # notes are unchanged
     assert authed.delete(f"/api/v1/inbox/items/{note['id']}").status_code == 200
+
+
+def test_a_state_change_on_a_mirrored_row_is_refused_and_says_where_to_act(authed, bot,
+                                                                           settings):
+    gh, bl = _github_row(settings), _backlog_row(authed, bot)
+    r = authed.patch(f"/api/v1/inbox/items/{gh}", json={"state": "closed"})
+    assert r.status_code == 409
+    assert r.get_json()["error"] == "This mirrors GitHub — close or reopen the issue there"
+    r = authed.patch(f"/api/v1/inbox/items/{bl}", json={"state": "closed"})
+    assert r.status_code == 409
+    assert r.get_json()["error"] == ("This mirrors backlog.txt — ✅ DONE, remove or restore "
+                                     "the line there")
+    listed = {i["id"]: i for i in authed.get("/api/v1/inbox/items").get_json()["items"]}
+    assert listed[gh]["state"] == listed[bl]["state"] == "open"
+    # Other fields are not the mirror's: they stay editable.
+    assert authed.patch(f"/api/v1/inbox/items/{gh}", json={"project": "km-tracker"}
+                        ).status_code == 200
 
 
 def test_mirrored_rows_have_no_delete_button_and_say_where_they_live(authed, bot, settings):
@@ -2018,6 +2078,26 @@ def test_no_route_returns_from_inside_a_write_transaction():
                 offenders += [f"{path.name}:{n.lineno}" for n in ast.walk(node)
                               if isinstance(n, ast.Return)]
     assert offenders == []
+
+
+def test_the_backlog_key_is_derived_server_side_and_a_wrong_one_is_refused(authed, bot,
+                                                                          settings):
+    _sync_backlog(bot, "Keep me")
+    before = _dump(settings)
+    for bad_key in ("backlog:0000000000000000", "backlog:" + "f" * 5000, 42):
+        r = bot.post("/api/v1/inbox/mirror/backlog", headers=machine(), json={
+            "complete": True, "items": [{"text": "Keep me"},
+                                        {"key": bad_key, "text": "New thing\nWhy: x"}]})
+        assert r.status_code == 400 and "key" in r.get_json()["error"]
+    assert _dump(settings) == before
+    good = inbox_db.normalise_backlog_key("New thing")
+    r = bot.post("/api/v1/inbox/mirror/backlog", headers=machine(), json={
+        "complete": True, "items": [{"text": "Keep me"},
+                                    {"key": good, "text": "New thing\nWhy: x"}]})
+    assert r.status_code == 200
+    keys = {i["mirror_key"] for i in
+            authed.get("/api/v1/inbox/items?source=backlog").get_json()["items"]}
+    assert good in keys
 
 
 def test_a_push_of_only_blank_entries_is_refused_like_an_empty_one(authed, bot, settings):

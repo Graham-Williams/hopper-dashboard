@@ -54,13 +54,19 @@ def test_the_shared_constants_have_not_drifted():
     assert backlog.MIRROR_BACKLOG == inbox_db.MIRROR_BACKLOG
 
 
-def test_the_probe_key_is_the_one_the_endpoint_would_accept():
-    """The endpoint takes the client's key at face value as long as it carries the right
-    prefix, and only falls back to deriving one from the whole body text (which would be a
-    DIFFERENT key). So the prefix check is part of the contract, not a formality."""
-    key = backlog.normalise_backlog_key("Do the thing")
-    assert key.startswith(inbox_db.MIRROR_BACKLOG + ":")
-    assert key != inbox_db.normalise_backlog_key("Do the thing\nWhy: because")
+@pytest.mark.parametrize("sample", [
+    "---\nWhat: Do the thing\nWhy: because\n",
+    "---\nWhat: ⭐ A long What: line that\n  wraps onto a second line (voice abcd1234)\n"
+    "Notes: and a note\n",
+    "---\nWhat: Fix X (voice abcd1234) — ✅ DONE 2026-10-01\n",
+    "---\nWhat: " + "a" * 30000 + "\nWhy: past MAX_TEXT\n",
+])
+def test_the_probe_key_is_the_one_the_endpoint_derives(sample):
+    """The endpoint DERIVES each key from the entry's What: line (the first line of its text)
+    and refuses a client key that differs, so the probe's key must be exactly that — for a
+    wrapped What:, a tagged one, a done one, and one past MAX_TEXT."""
+    entry, = backlog.parse_backlog(sample)
+    assert entry.key == inbox_db.normalise_backlog_key(inbox_db.what_line(entry.text))
 
 
 def test_the_real_backlog_file_round_trips_through_both(tmp_path):
@@ -72,6 +78,7 @@ def test_the_real_backlog_file_round_trips_through_both(tmp_path):
     assert entries
     for entry in entries:
         assert entry.key == inbox_db.normalise_backlog_key(entry.what)
+        assert entry.key == inbox_db.normalise_backlog_key(inbox_db.what_line(entry.text))
 
 
 def test_a_parsed_entry_survives_the_endpoints_own_validation():

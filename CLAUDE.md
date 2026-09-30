@@ -374,8 +374,14 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   "last changed"; a 304 is stored as `ok`) — otherwise the backup re-uploads `inbox.db` every cycle.
 - **`POST /api/v1/inbox/items/<id>/issues`** has filed-backlog's 409s (voice/typed only; reviewed, open,
   not archived) plus `NOT_WATCHED` for a repo outside `INBOX_GITHUB_REPOS` (the link would never be
-  refreshed, so the note could never close). The repo is stored under the WATCHED spelling (matched
-  case-insensitively). Many notes may link one issue (`UNIQUE(item_id, repo, number)`, same index name
+  refreshed, so the note could never close) — all checked INSIDE the write transaction (refusals are
+  raised as `_Refused` and answered outside it). The repo is stored under the WATCHED spelling (matched
+  case-insensitively) and the URL is the canonical one built from it and the number, never the
+  client's. `GET /api/v1/inbox/items` carries `watched_repos` so the filing loop can check BEFORE
+  `gh issue create` (a 409 after it would mean a duplicate issue on retry).
+- PATCH `state` on a github or backlog row is a 409 (`MIRROR_STATE_REFUSALS`, worded like Delete's): a
+  mirrored row's state is upstream's. The backlog push DERIVES each key from the entry's What: line and
+  400s a client key that differs (`tests/test_backlog_mirror.py` pins the probe to the same derivation). Many notes may link one issue (`UNIQUE(item_id, repo, number)`, same index name
   as the old `UNIQUE(repo, number)` — keep it, it is what makes a rollback safe); linking an issue that
   had a mirror row archives that row (G-19).
 - `templates/inbox.html`, `static/inbox.js` — see the JS convention above. Rows are ONE column at every

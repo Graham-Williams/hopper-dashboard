@@ -282,6 +282,14 @@ MIRROR_DELETE_REFUSALS = {
 }
 
 
+#: A mirrored row's STATE is upstream's (a view — see DESIGN "Item lifecycle"): a hand close
+#: would only be undone by the next scan or push, so it is refused, saying where to act.
+MIRROR_STATE_REFUSALS = {
+    inbox_db.MIRROR_GITHUB: "This mirrors GitHub — close or reopen the issue there",
+    inbox_db.MIRROR_BACKLOG: "This mirrors backlog.txt — ✅ DONE, remove or restore the line there",
+}
+
+
 def deletable(row: dict) -> bool:
     """Only a note authored here can be deleted; see ``MIRROR_DELETE_REFUSALS``."""
     return row["source"] in inbox_db.LOCAL_SOURCES
@@ -438,12 +446,18 @@ def board():
 
 @bp.get("/api/v1/inbox/items")
 def list_items():
-    """S | R — Hopper reads this with the same bearer it reads the board with."""
+    """S | R — Hopper reads this with the same bearer it reads the board with.
+
+    ``watched_repos`` is the mirror's repo list (``INBOX_GITHUB_REPOS``): the filing loop
+    checks a repo against it BEFORE `gh issue create`, because POST /issues refuses an
+    unwatched repo only after the issue already exists (and a retry would file it twice)."""
     conn = _conn()
     try:
-        return jsonify(_load_page(conn, _list_args(request.args)))
+        page = _load_page(conn, _list_args(request.args))
     finally:
         conn.close()
+    page["watched_repos"] = list(_settings().inbox_github_repos or ())
+    return jsonify(page)
 
 
 @bp.post("/api/v1/inbox/items")
@@ -653,6 +667,8 @@ def patch_item(item_id: str):
         if (any(k in changes for k in inbox_db.DRAFT_FIELDS)
                 and current["source"] != "voice"):
             return _err("only a voice note has a draft")
+        if "state" in changes and current["source"] in MIRROR_STATE_REFUSALS:
+            return _err(MIRROR_STATE_REFUSALS[current["source"]], 409)
         try:
             with conn:
                 row = inbox_db.update_item(conn, item_id, changes)
@@ -969,6 +985,20 @@ def post_draft(item_id: str):
 NOT_WATCHED = "not watched — add it to INBOX_GITHUB_REPOS or the note can never close"
 
 
+class _Refused(Exception):
+    """Raised inside a write transaction to refuse the request: the transaction rolls back
+    and the route answers ``status`` outside it (never a return from inside one)."""
+
+    def __init__(self, message: str, status: int):
+        super().__init__(message)
+        self.message = message
+        self.status = status
+
+
+def github_mirror_url(repo: str, number: int) -> str:
+    return f"https://github.com/{repo}/issues/{int(number)}"
+
+
 def watched_repo(repo: str) -> str | None:
     """The WATCHED spelling of ``repo`` (GitHub names are case-insensitive, but the scans
     match links on the configured spelling exactly), or None if the mirror does not scan it."""
@@ -1004,19 +1034,27 @@ def post_issues(item_id: str):
     title = inbox_db.clean_text(doc.get("title"), inbox_db.MAX_TITLE) or None
     conn = _conn()
     try:
-        row = inbox_db.get_item(conn, item_id)
-        if row is None:
-            return _err("no such item", 404)
-        if row["source"] not in inbox_db.LOCAL_SOURCES:
-            return _err("only a voice or typed note can be filed", 409)
-        if not row["reviewed"] or row["state"] != "open" or row["archived_at"]:
-            return _err("only a reviewed, open note can be filed", 409)
-        watched = watched_repo(repo)
-        if watched is None:
-            return _err(NOT_WATCHED, 409)
-        with inbox_db.transaction(conn):
-            issue = inbox_db.link_issue(conn, item_id, repo=watched, number=number,
-                                        url=url, title=title)
+        try:
+            # The checks run INSIDE the write transaction (BEGIN IMMEDIATE), so a note closed
+            # between the check and the link — by a browser tab, say — cannot end up linked.
+            with inbox_db.transaction(conn):
+                row = inbox_db.get_item(conn, item_id)
+                if row is None:
+                    raise _Refused("no such item", 404)
+                if row["source"] not in inbox_db.LOCAL_SOURCES:
+                    raise _Refused("only a voice or typed note can be filed", 409)
+                if not row["reviewed"] or row["state"] != "open" or row["archived_at"]:
+                    raise _Refused("only a reviewed, open note can be filed", 409)
+                watched = watched_repo(repo)
+                if watched is None:
+                    raise _Refused(NOT_WATCHED, 409)
+                # The canonical URL, from the watched repo and the number — never the
+                # client's (it was only checked for shape).
+                issue = inbox_db.link_issue(conn, item_id, repo=watched, number=number,
+                                            url=github_mirror_url(watched, number),
+                                            title=title)
+        except _Refused as refused:
+            return _err(refused.message, refused.status)
         row = inbox_db.get_item(conn, item_id)
         issues = inbox_db.issues_for(conn, [item_id]).get(item_id, [])
         return jsonify({"item": item_json(row, issues), "issue": issue}), 201
@@ -1112,10 +1150,12 @@ def mirror_backlog():
         text = inbox_db.clean_text(raw.get("text"), inbox_db.MAX_TEXT)
         if not text:
             continue
-        key = raw.get("key")
-        if not isinstance(key, str) or not key.startswith(inbox_db.MIRROR_BACKLOG + ":"):
-            # The probe's derivation: the key is the What: line's, not the whole entry's.
-            key = inbox_db.normalise_backlog_key(inbox_db.what_line(text))
+        # The key is DERIVED here (the probe's derivation: the What: line's), never trusted:
+        # a client key that is not exactly that is a 400, so no key can be made up or grow
+        # without bound.
+        key = inbox_db.normalise_backlog_key(inbox_db.what_line(text))
+        if "key" in raw and raw.get("key") != key:
+            return _err("key does not match the entry's What: line (it is derived from it)")
         try:
             project = clean_project(raw.get("project"))
         except ValueError as exc:
