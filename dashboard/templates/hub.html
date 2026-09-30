@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}Hub{% endblock %}
+{#
+  Mobile-first. The Inbox card is FIRST in the DOM (it is what the phone is
+  opened for); at >= 640px the two cards sit side by side at equal width.
+  No style= attributes anywhere (CSP style-src 'self'), and no script of its
+  own: Record is a real link to /inbox#capture, so it works with JS off.
+#}
+{% block content %}
+<div class="hub">
+  <section class="hub-card hub-inbox" aria-labelledby="hub-inbox-h">
+    <h2 id="hub-inbox-h">Inbox</h2>
+    <a class="hub-stat {% if not counts.needs_review %}zero{% endif %}"
+       href="{{ url_for('inbox.board', awaiting='review', _anchor='items') }}">
+      <span class="n">{{ counts.needs_review|default(0) }}</span>
+      <span class="l">Needs review</span>
+    </a>
+    <a class="hub-record" href="{{ url_for('inbox.board') }}#capture">
+      <span class="glyph" aria-hidden="true">●</span> Record a note
+    </a>
+    <p class="hub-meta muted">{{ counts.open }} open item{{ '' if counts.open == 1 else 's' }}</p>
+    <a class="hub-open" href="{{ url_for('inbox.board') }}">Open Inbox <span aria-hidden="true">→</span></a>
+  </section>
+
+  <section class="hub-card hub-dashboard" aria-labelledby="hub-dashboard-h">
+    <h2 id="hub-dashboard-h">Dashboard</h2>
+    {#- Problems are coloured only when non-zero, and always carry a glyph and a
+        word: never colour alone. -#}
+    <p class="health" aria-label="Job health">
+      <span class="hs hs-ok{% if not health.ok %} zero{% endif %}"><span class="glyph" aria-hidden="true">●</span> {{ health.ok }} OK</span>
+      <span class="sep" aria-hidden="true">·</span>
+      <span class="hs hs-behind{% if not health.behind %} zero{% endif %}"><span class="glyph" aria-hidden="true">▲</span> {{ health.behind }} behind</span>
+      <span class="sep" aria-hidden="true">·</span>
+      <span class="hs hs-failing{% if not health.failing %} zero{% endif %}"><span class="glyph" aria-hidden="true">✕</span> {{ health.failing }} failing</span>
+      {% if health.unknown %}
+      <span class="sep" aria-hidden="true">·</span>
+      <span class="hs hs-unknown"><span class="glyph" aria-hidden="true">○</span> {{ health.unknown }} unknown</span>
+      {% endif %}
+    </p>
+    {% if scheduler_stale %}
+    <p class="hub-warn"><strong>Scheduler may be stale.</strong> No state recomputed in 5 minutes; LATE will not fire until it recovers.</p>
+    {% endif %}
+    <p class="hub-meta muted">{{ health.total }} job{{ '' if health.total == 1 else 's' }} watched</p>
+    <a class="hub-open" href="{{ url_for('web.board') }}">Open Dashboard <span aria-hidden="true">→</span></a>
+  </section>
+</div>
+{% endblock %}

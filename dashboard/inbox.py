@@ -21,7 +21,10 @@ route                                        auth    notes
 ``GET  /inbox/audio/<id>``                   S | I
 ``GET  /api/v1/inbox/transcribe/queue``      I
 ``POST /api/v1/inbox/items/<id>/transcript`` I
+``GET  /api/v1/inbox/draft/queue``           I
+``POST /api/v1/inbox/items/<id>/draft``      I
 ``POST /api/v1/inbox/items/<id>/issues``     I
+``POST /api/v1/inbox/items/<id>/filed-backlog`` I
 ``POST /api/v1/inbox/mirror/backlog``        I
 ===========================================  ======  =====================
 
@@ -35,15 +38,20 @@ GitHub, lines from backlog.txt. It is escaped at render (Jinja autoescape for
 HTML, ``jsonify`` for JSON) and the page's JS uses ``textContent`` only — there
 is no path from a stored string to markup.
 
-**Voice notes never leave the box.** Audio is uploaded to this origin, stored
-as a file on the data volume, and transcribed locally by Whisper on Graham's
-Mac. The browser speech API that used to produce a live transcript streamed the
-microphone to Google/Apple and was removed for exactly that reason.
+**Audio stays on this box and your Mac. The transcript and title (not the audio) are
+sent from the Mac to Anthropic (Claude) to draft the item.** Audio is
+uploaded to this origin, stored as a file on the data volume, and transcribed
+locally by Whisper on Graham's Mac; the Mac then drafts a title and description
+from the transcript with ``claude -p`` (``probes/inbox_draft.py``) and posts the
+draft back here. The browser speech API that used to produce a live transcript
+streamed the microphone to Google/Apple and was removed for exactly that
+reason; the browser still talks to nothing but this origin.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import time
 
 from flask import (Blueprint, current_app, jsonify, redirect, render_template,
@@ -63,7 +71,10 @@ MACHINE_ENDPOINTS = frozenset({
     "inbox.audio",
     "inbox.transcribe_queue",
     "inbox.post_transcript",
+    "inbox.draft_queue",
+    "inbox.post_draft",
     "inbox.post_issues",
+    "inbox.post_filed_backlog",
     "inbox.mirror_backlog",
 })
 
@@ -88,6 +99,8 @@ MAX_BACKLOG_ITEMS = 2000
 AUDIO_BYTES_PER_SEC = 48000 // 8
 QUEUE_MAX = 50
 TRANSCRIBE_MAX_ATTEMPTS = 3
+DRAFT_QUEUE_MAX = 20
+SHA_RE = re.compile(r"^[0-9a-f]{64}\Z")
 
 
 def _settings():
@@ -214,7 +227,22 @@ def _float_or_none(raw, cap: float = 24 * 3600) -> float | None:
 # View models
 # --------------------------------------------------------------------------- #
 
-def item_json(row: dict, issues: list[dict] | None = None) -> dict:
+def reviewable(row: dict) -> bool:
+    """Whether the Reviewed tick applies: every voice note, and a LEGACY typed note.
+
+    A typed note made since the Hub release is born reviewed in the same INSERT, so its
+    ``reviewed_at`` equals its ``created_at`` to the byte. Anything else — ``reviewed_at``
+    NULL (never ticked, or unticked) or a later time (ticked by hand) — is a note made before
+    that rule, and it keeps its checkbox in BOTH states so an accidental tick can be undone.
+    No flag column and no migration: the two timestamps already say it.
+    """
+    if row["source"] == "voice":
+        return True
+    return row["source"] == "typed" and row["reviewed_at"] != row["created_at"]
+
+
+def item_json(row: dict, issues: list[dict] | None = None,
+              backlog_copy: dict | None = None) -> dict:
     """One row, as both the JSON API and the template see it.
 
     ``has_audio`` rather than a path: the relative path is an internal detail
@@ -232,7 +260,13 @@ def item_json(row: dict, issues: list[dict] | None = None) -> dict:
         and row["transcript_status"] in inbox_db.TRANSCRIBABLE_STATUSES)
     awaiting_filing = bool(
         row["reviewed"] and row["state"] == "open" and not row["archived_at"]
-        and row["source"] in inbox_db.LOCAL_SOURCES and not issues)
+        and row["source"] in inbox_db.LOCAL_SOURCES and not issues
+        and not row.get("filed_backlog_at"))
+    needs_review = bool(
+        row["source"] == "voice" and row["state"] == "open"
+        and not row["archived_at"] and not row["reviewed"]
+        and (row.get("draft_status") in (inbox_db.DRAFT_READY, inbox_db.DRAFT_FAILED)
+             or row["transcript_status"] == inbox_db.TRANSCRIPT_FAILED))
     return {
         "id": row["id"],
         "source": row["source"],
@@ -243,6 +277,7 @@ def item_json(row: dict, issues: list[dict] | None = None) -> dict:
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
         "reviewed": bool(row["reviewed"]),
+        "reviewable": reviewable(row),
         "reviewed_at": row["reviewed_at"],
         "state": row["state"],
         "closed_at": row["closed_at"],
@@ -258,6 +293,25 @@ def item_json(row: dict, issues: list[dict] | None = None) -> dict:
         "mirror_url": row["mirror_url"],
         "awaiting_filing": awaiting_filing,
         "awaiting_transcription": awaiting_transcription,
+        "needs_review": needs_review,
+        # The AI draft (voice notes). Held ALONGSIDE the note: ticking Reviewed
+        # copies title/project across; `body` above stays the transcript.
+        "draft": {
+            "title": row.get("draft_title"),
+            "body": row.get("draft_body"),
+            "project": row.get("draft_project"),
+            "status": row.get("draft_status"),
+            "at": row.get("draft_at"),
+            "attempts": int(row.get("draft_attempts") or 0),
+            "model": row.get("draft_model"),
+            "edited_at": row.get("draft_edited_at"),
+        },
+        # Filed as a backlog.txt line instead of an issue (#33); `mirror_key` is the backlog
+        # row that line came back as, when the mirror has seen it.
+        "filed_backlog": ({"at": row.get("filed_backlog_at"),
+                           "line": row.get("filed_backlog_line"),
+                           "mirror_key": (backlog_copy or {}).get("mirror_key")}
+                          if row.get("filed_backlog_at") else None),
         "issues": [{"repo": i["repo"], "number": i["number"], "url": i["url"],
                     "title": i["title"], "state": i["state"]} for i in issues],
     }
@@ -288,11 +342,14 @@ def _list_args(args) -> dict:
 def _load_page(conn, args: dict) -> dict:
     rows = inbox_db.list_items(conn, **args)
     issues = inbox_db.issues_for(conn, [r["id"] for r in rows])
+    copies = inbox_db.backlog_copies(
+        conn, [r["id"] for r in rows if r.get("filed_backlog_at")])
     return {
         "generated_at": inbox_db.now_iso(),
         "counts": inbox_db.counts(conn),
         "projects": inbox_db.projects(conn),
-        "items": [item_json(r, issues.get(r["id"], [])) for r in rows],
+        "items": [item_json(r, issues.get(r["id"], []), copies.get(r["id"]))
+                  for r in rows],
     }
 
 
@@ -309,6 +366,7 @@ def board():
     conn = _conn()
     try:
         page = _load_page(conn, _list_args(request.args))
+        page["projects"] = known_projects(conn)     # the datalists' suggestions
     finally:
         conn.close()
     return render_template("inbox.html", page=page, now=time.time(),
@@ -390,10 +448,13 @@ def create_item():
     conn = _conn()
     try:
         with conn:
+            # A typed note is born reviewed: typing it WAS the deliberate act
+            # the tick exists for, and Hopper's filing loop reads reviewed=1.
             inbox_db.create_item(conn, source="voice" if data else "typed",
                                  text=text, title=title, project=project,
                                  now=now, item_id=item_id,
-                                 transcript_status=status, audio=audio_row)
+                                 transcript_status=status, audio=audio_row,
+                                 reviewed=not data)
         row = inbox_db.get_item(conn, item_id)
     except Exception:                                    # noqa: BLE001
         # The row is what matters; a file with no row is an orphan the
@@ -479,7 +540,8 @@ def patch_item(item_id: str):
     doc = request.get_json(silent=True)
     if not isinstance(doc, dict):
         return _err("body must be a JSON object")
-    unknown = sorted(set(doc) - {"reviewed", "title", "project", "body", "state"})
+    unknown = sorted(set(doc) - {"reviewed", "title", "project", "body", "state",
+                                 *inbox_db.DRAFT_FIELDS})
     if unknown:
         return _err(f"unknown field(s): {', '.join(unknown)}")
     changes: dict = {}
@@ -504,10 +566,37 @@ def patch_item(item_id: str):
             changes["project"] = clean_project(doc["project"])
         except ValueError as exc:
             return _err(str(exc))
+    for key in ("draft_title", "draft_body"):
+        if key in doc:
+            if not isinstance(doc[key], str):
+                return _err(f"{key} must be a string")
+            changes[key] = doc[key]
+    if "draft_project" in doc:
+        try:
+            changes["draft_project"] = clean_project(doc["draft_project"])
+        except ValueError as exc:
+            return _err(str(exc))
     conn = _conn()
     try:
-        with conn:
-            row = inbox_db.update_item(conn, item_id, changes)
+        current = inbox_db.get_item(conn, item_id)
+        if current is None:
+            return _err("no such item", 404)
+        # Reviewed is a VOICE-note control: it means "I have read the machine's
+        # transcript/draft and it is worth doing". A typed note is reviewed by
+        # being typed — except a LEGACY one, made before that rule, which is still
+        # reviewed=0 and would otherwise be stranded. A mirrored row is already
+        # filed upstream. Unticking stays allowed everywhere.
+        if changes.get("reviewed") is True and not reviewable(current):
+            return _err("only a voice note (or an unticked older typed note) "
+                        "can be marked reviewed")
+        if (any(k in changes for k in inbox_db.DRAFT_FIELDS)
+                and current["source"] != "voice"):
+            return _err("only a voice note has a draft")
+        try:
+            with conn:
+                row = inbox_db.update_item(conn, item_id, changes)
+        except inbox_db.Conflict:
+            return _err("the item changed while saving — reload and try again", 409)
         if row is None:
             return _err("no such item", 404)
         issues = inbox_db.issues_for(conn, [row["id"]]).get(row["id"], [])
@@ -680,6 +769,131 @@ def post_transcript(item_id: str):
         conn.close()
 
 
+def known_projects(conn) -> list[str]:
+    """What the drafter may choose a project from: the repo NAMES of
+    ``INBOX_GITHUB_REPOS`` (the same projection the GitHub mirror uses) plus
+    every project already on the board."""
+    from .github_mirror import _project_for
+    names = {p for p in (_project_for(r) for r in _settings().inbox_github_repos) if p}
+    names.update(inbox_db.projects(conn))
+    return sorted(names)
+
+
+@bp.get("/api/v1/inbox/draft/queue")
+def draft_queue():
+    """I. The Mac's drafting worker asks what to draft. Oldest first; includes
+    the backfill (transcribed notes that have never had a draft) and notes
+    whose transcript changed since their draft (stale ``sha``).
+
+    ``transcript`` is the note's body, and it is the ONLY note text that leaves
+    for Anthropic — the audio never does. ``sha`` must be echoed back on POST so
+    a draft made from an old transcript is refused rather than stored.
+    """
+    denied = _require_inbox_token()
+    if denied is not None:
+        return denied
+    try:
+        limit = int(request.args.get("limit", 5))
+    except (TypeError, ValueError):
+        limit = 5
+    conn = _conn()
+    try:
+        rows = inbox_db.draft_queue(conn, limit=max(1, min(limit, DRAFT_QUEUE_MAX)))
+        projects = known_projects(conn)
+    finally:
+        conn.close()
+    return jsonify({
+        "generated_at": inbox_db.now_iso(),
+        "max_attempts": inbox_db.DRAFT_MAX_ATTEMPTS,
+        "max_title": inbox_db.DRAFT_MAX_TITLE,
+        "max_body": inbox_db.DRAFT_MAX_BODY,
+        "known_projects": projects,
+        "items": [{
+            "id": r["id"],
+            "transcript": r["body"],
+            "manual_title": r["title"] if r["title_source"] == "manual" else None,
+            "project": r["draft_project"] or r["project"],
+            "sha": r["sha"],
+        } for r in rows],
+    })
+
+
+@bp.post("/api/v1/inbox/items/<item_id>/draft")
+def post_draft(item_id: str):
+    """I. The Mac posts a draft, or a failed attempt.
+
+    ``{"title", "body", "project", "src_sha", "model"}`` stores it;
+    ``{"failed": true, "error": "…", "src_sha": …}`` counts one bad result (the
+    note becomes ``failed`` after ``DRAFT_MAX_ATTEMPTS``); ``"final": true`` burns
+    every remaining attempt at once (the worker's breaker giving up). A stale ``src_sha``
+    (the transcript changed since the queue handed it out) is a 409 and burns
+    NO attempt; so are a reviewed note and one whose draft Graham edited —
+    nothing a machine sends may overwrite either.
+
+    Title is capped at DRAFT_MAX_TITLE and made one line, body at
+    DRAFT_MAX_BODY, both through clean_text. A project not in
+    ``known_projects`` becomes NULL rather than inventing a label.
+    """
+    denied = _require_inbox_token()
+    if denied is not None:
+        return denied
+    doc = request.get_json(silent=True)
+    if not isinstance(doc, dict):
+        return _err("body must be a JSON object")
+    src_sha = doc.get("src_sha")
+    if src_sha is not None and (not isinstance(src_sha, str)
+                                or not SHA_RE.match(src_sha)):
+        return _err("src_sha must be 64 lowercase hex characters")
+    conn = _conn()
+    try:
+        row = inbox_db.get_item(conn, item_id)
+        if row is None:
+            return _err("no such item", 404)
+        if row["source"] != "voice":
+            return _err("only a voice note has a draft", 409)
+        if row["reviewed"] or row.get("draft_edited_at"):
+            return _err("the note is reviewed or its draft was edited", 409)
+        if src_sha is not None and src_sha != inbox_db.transcript_sha(row["body"]):
+            return _err("stale: the transcript changed since it was queued", 409)
+        if doc.get("failed"):
+            if src_sha is None:
+                return _err("src_sha is required, so a failure against an old "
+                            "transcript is refused rather than counted")
+            with conn:
+                row = inbox_db.note_draft_attempt(conn, item_id,
+                                                  final=doc.get("final") is True)
+            reason = inbox_db.clean_text(doc.get("error"), 200)
+            reason = reason.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+            log.warning("draft failed for %s: %s", item_id, reason)
+            return jsonify(item_json(row))
+        if src_sha is None:
+            return _err("src_sha is required")
+        title = doc.get("title")
+        body = doc.get("body")
+        if not isinstance(title, str) or not inbox_db.clean_draft_title(title):
+            return _err("title is required (or send failed: true)")
+        if not isinstance(body, str):
+            return _err("body must be a string")
+        project = doc.get("project")
+        try:
+            project = clean_project(project) if isinstance(project, str) else None
+        except ValueError:
+            project = None
+        if project is not None and project not in known_projects(conn):
+            project = None
+        model = doc.get("model") if isinstance(doc.get("model"), str) else None
+        try:
+            with conn:
+                row = inbox_db.set_draft(conn, item_id, title=title, body=body,
+                                         project=project, src_sha=src_sha,
+                                         model=model)
+        except inbox_db.DraftRefused as exc:
+            return _err(f"refused: {exc.reason}", 409)
+        return jsonify(item_json(row))
+    finally:
+        conn.close()
+
+
 @bp.post("/api/v1/inbox/items/<item_id>/issues")
 def post_issues(item_id: str):
     """Hopper records the issue it filed for a reviewed row. Idempotent on
@@ -708,6 +922,52 @@ def post_issues(item_id: str):
         row = inbox_db.get_item(conn, item_id)
         issues = inbox_db.issues_for(conn, [item_id]).get(item_id, [])
         return jsonify({"item": item_json(row, issues), "issue": issue}), 201
+    finally:
+        conn.close()
+
+
+@bp.post("/api/v1/inbox/items/<item_id>/filed-backlog")
+def post_filed_backlog(item_id: str):
+    """I. Hopper filed this note as a ``backlog.txt`` line, not a GitHub issue (issue #33) —
+    it is not repo work (Hopper itself, the Mac or box, a chore).
+
+    ``{"line": "<the backlog.txt line>"}``. The line is one line (a newline is a 400), cleaned
+    with ``clean_text`` and truncated to ``MAX_BACKLOG_LINE``, and must end with — or at least
+    carry — the note's ``(voice <first 8 chars of id>)`` tag: that tag is the only thing that
+    links the note to the backlog-mirror row the line comes back as. Idempotent.
+
+    The note leaves awaiting-filing, and its mirror row is hidden from the default list.
+    """
+    denied = _require_inbox_token()
+    if denied is not None:
+        return denied
+    doc = request.get_json(silent=True)
+    if not isinstance(doc, dict):
+        return _err("body must be a JSON object")
+    raw = doc.get("line")
+    if not isinstance(raw, str):
+        return _err("line must be a string")
+    if "\n" in raw.strip() or "\r" in raw.strip():
+        return _err("line must be a single line")
+    line = inbox_db.clean_text(raw, inbox_db.MAX_BACKLOG_LINE)
+    if not line:
+        return _err("line is required")
+    conn = _conn()
+    try:
+        row = inbox_db.get_item(conn, item_id)
+        if row is None:
+            return _err("no such item", 404)
+        if row["source"] not in inbox_db.LOCAL_SOURCES:
+            return _err("only a voice or typed note can be filed", 409)
+        if not row["reviewed"] or row["state"] != "open" or row["archived_at"]:
+            return _err("only a reviewed, open note can be filed", 409)
+        if inbox_db.voice_tag(item_id) not in line:
+            return _err(f"line must carry the tag {inbox_db.voice_tag(item_id)}")
+        with conn:
+            row = inbox_db.mark_filed_backlog(conn, item_id, line=line)
+        issues = inbox_db.issues_for(conn, [item_id]).get(item_id, [])
+        copy = inbox_db.backlog_copies(conn, [item_id]).get(item_id)
+        return jsonify(item_json(row, issues, copy))
     finally:
         conn.close()
 

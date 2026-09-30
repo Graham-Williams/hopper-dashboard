@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% from "_macros.html" import when %}
-{% block title %}Inbox · Hopper Dashboard{% endblock %}
+{% block title %}Inbox · Hub{% endblock %}
 {#
   EVERY row is rendered here, server-side. static/inbox.js only shows and hides
   rows that already exist in this DOM — it never builds one, never assigns
@@ -11,12 +11,10 @@
 {% block content %}
 {% set c = page.counts %}
 <section class="summary inbox-summary" aria-label="Inbox summary">
-  <div class="tile tile-behind {% if not c.awaiting_filing %}zero{% endif %}">
-    <span class="n">{{ c.awaiting_filing }}</span><span class="l">Awaiting filing</span>
-  </div>
-  <div class="tile tile-late {% if not c.awaiting_transcription %}zero{% endif %}">
-    <span class="n">{{ c.awaiting_transcription }}</span><span class="l">Transcribing</span>
-  </div>
+  <a class="tile tile-behind tile-link {% if not c.needs_review %}zero{% endif %}"
+     href="{{ url_for('inbox.board', awaiting='review', _anchor='items') }}">
+    <span class="n">{{ c.needs_review }}</span><span class="l">Needs review</span>
+  </a>
   <div class="tile tile-ok {% if not c.open %}zero{% endif %}">
     <span class="n">{{ c.open }}</span><span class="l">Open</span>
   </div>
@@ -25,7 +23,7 @@
   </div>
 </section>
 
-<section class="panel capture" aria-labelledby="capture-h">
+<section class="panel capture" id="capture" aria-labelledby="capture-h">
   <h2 id="capture-h">Capture</h2>
   {# A plain multipart form: submitting it with JS off posts a typed note and
      redirects back here. inbox.js upgrades it in place — it attaches the
@@ -72,11 +70,15 @@
       <button type="submit" id="capture-submit">Add to inbox</button>
     </div>
     <p id="capture-error" class="hint bad" hidden></p>
-    <p class="muted small">
-      Recordings never leave this box: the audio is uploaded here and
-      transcribed on the Mac by Whisper, which runs every few minutes — so a
-      new voice note shows <span class="ts ts-pending">pending</span> until it
-      does. Nothing is sent to Google or Apple.
+    {#- One collapsed block, so the list is not pushed a screen down on a phone.
+        The wording inside is unchanged. -#}
+    <details class="about-recordings">
+    <summary>About recordings and privacy</summary>
+    <p class="muted small privacy-note">
+      Audio stays on this box and your Mac. The transcript and title (not the audio) are sent from the Mac to Anthropic (Claude) to draft the item.
+      Whisper on the Mac transcribes every few minutes, so a new voice note
+      shows <span class="ts ts-pending">pending</span> until it does, then
+      “Drafting…” until its draft is ready for your review.
     </p>
     <p class="muted small">
       Up to {{ (audio_max_bytes // 1048576) }} MB per note — roughly
@@ -91,6 +93,7 @@
       different matter: database backups already taken still contain it, and
       those age out after about 30 days.
     </p>
+    </details>
   </form>
 </section>
 
@@ -121,13 +124,13 @@
         <option value="closed" {% if filters.state == 'closed' %}selected{% endif %}>closed</option>
       </select>
     </label>
-    <label class="field">
-      <span>Waiting on</span>
-      <select name="awaiting" id="filter-awaiting">
-        <option value="">anything</option>
-        <option value="filing" {% if filters.awaiting == 'filing' %}selected{% endif %}>filing</option>
-        <option value="transcription" {% if filters.awaiting == 'transcription' %}selected{% endif %}>transcription</option>
-      </select>
+    {#- The only "waiting on" filter the page offers. ?awaiting=filing and
+        ?awaiting=transcription still work in the URL and the API (Hopper's
+        filing loop uses them); they are just not a control any more. -#}
+    <label class="check">
+      <input type="checkbox" name="awaiting" value="review" id="filter-review"
+             {% if filters.awaiting == 'review' %}checked{% endif %}>
+      <span>Needs review</span>
     </label>
     <button type="submit">Apply</button>
     <a class="clear" href="{{ url_for('inbox.board') }}">Clear</a>
@@ -142,27 +145,112 @@
   {% endif %}
   <ul class="items" id="items">
     {% for it in page["items"] %}
-    <li class="item {% if it.awaiting_filing %}item-filing{% endif %} state-{{ it.state }}"
+    {%- set voice = it.source == 'voice' -%}
+    {%- set d = it.draft -%}
+    <li class="item {% if it.needs_review %}item-review{% elif it.awaiting_filing %}item-filing{% endif %} state-{{ it.state }}"
         id="item-{{ it.id }}" data-id="{{ it.id }}"
         data-source="{{ it.source }}" data-state="{{ it.state }}"
         data-reviewed="{{ 1 if it.reviewed else 0 }}"
         data-awaiting-filing="{{ 1 if it.awaiting_filing else 0 }}"
+        data-needs-review="{{ 1 if it.needs_review else 0 }}"
         data-awaiting-transcription="{{ 1 if it.awaiting_transcription else 0 }}"
         data-project="{{ it.project or '' }}"
-        data-text="{{ (it.title ~ ' ' ~ it.body ~ ' ' ~ (it.project or ''))|lower }}">
+        data-text="{{ (it.title ~ ' ' ~ it.body ~ ' ' ~ (it.project or '') ~ ' ' ~ (d.title or '') ~ ' ' ~ (d.body or ''))|lower }}">
       <div class="item-main">
         <div class="item-head">
           <span class="badge badge-{{ it.source }}">{{ it.source }}</span>
           {% if it.project %}<span class="badge badge-project">{{ it.project }}</span>{% endif %}
-          {% if it.awaiting_filing %}<span class="badge badge-filing">awaiting filing</span>{% endif %}
+          {% if it.needs_review %}<span class="badge badge-review">needs review</span>
+          {% elif it.awaiting_filing %}<span class="badge badge-filing">awaiting filing</span>{% endif %}
           {% if it.state == 'closed' %}<span class="badge badge-closed">closed</span>{% endif %}
           {% if it.archived_at %}<span class="badge badge-archived">archived upstream</span>{% endif %}
         </div>
         {# Autoescaped, like everything else here: a transcript containing
            </script> or {{ }} is text, and stays text. #}
+        {% if voice %}
+        {#- A voice note shows its DRAFT (the machine's, or Graham's edit) until
+            it is reviewed; the review copies the draft title across, so after
+            that `title` is the same text. The transcript is one tap away. -#}
+        <h3 class="item-title">{{ d.title if (d.title and not it.reviewed) else it.title }}</h3>
+        {% if it.transcript_status == 'failed' and not it.reviewed and not d.body %}
+        <p class="draft-state draft-failed small"><span aria-hidden="true">✕</span> Whisper couldn't transcribe this — play it and write the draft</p>
+        {% elif d.status == 'pending' and not it.reviewed %}
+        <p class="draft-state draft-pending small">Drafting…</p>
+        {% elif d.status == 'failed' and not d.edited_at %}
+        <p class="draft-state draft-failed small"><span aria-hidden="true">✕</span> Couldn't draft — edit to write one</p>
+        {% endif %}
+        {% if d.body %}
+        {#- pre-line keeps the model's line breaks; still autoescaped, never |safe. -#}
+        <p class="item-body draft-body">{{ d.body }}</p>
+        {% endif %}
+        {% if d.project and d.project != it.project %}
+        <p class="item-meta small">Project: <span class="badge badge-project">{{ d.project }}</span></p>
+        {% endif %}
+        {% if it.body %}
+        <details class="transcript">
+          <summary>Transcript</summary>
+          <p class="item-body">{{ it.body }}</p>
+        </details>
+        {% endif %}
+        {% else %}
         <h3 class="item-title">{{ it.title }}</h3>
         {% if it.body and it.body != it.title %}
         <p class="item-body">{{ it.body }}</p>
+        {% endif %}
+        {% endif %}
+        {% if it.has_audio %}
+        {# Right under the transcript it transcribes. Played back from the SERVER
+           URL, never a blob: — a blob would need media-src blob: in the CSP and
+           the CSP is not being loosened. #}
+        <audio class="player" controls preload="none"
+               src="{{ url_for('inbox.audio', item_id=it.id) }}"></audio>
+        {% endif %}
+        {#- ONE action row: Edit draft and the Reviewed toggle side by side (each
+            >= 44px), and Delete last as a quiet text button — it destroys the
+            row and the recording, so it must never look like the main action. -#}
+        <div class="item-actions">
+          {% if voice %}
+          <button type="button" class="edit-draft secondary" data-id="{{ it.id }}" hidden>Edit draft</button>
+          {% endif %}
+          {#- Voice notes, plus an OLDER typed note (inbox.reviewable); the PATCH
+              applies the same rule. -#}
+          {% if it.reviewable %}
+          <label class="review">
+            <input type="checkbox" class="review-box" data-id="{{ it.id }}"
+                   {% if it.reviewed %}checked{% endif %}>
+            <span>Reviewed</span>
+          </label>
+          {% endif %}
+          {# Needs JS (it is a DELETE), so it is hidden until inbox.js wires it and
+             is never a button that does nothing. #}
+          <button type="button" class="delete-item" data-id="{{ it.id }}" hidden
+                  title="Delete this item and its recording">Delete</button>
+        </div>
+        {% if voice %}
+        {#- The edit form is rendered HERE, hidden; inbox.js only shows/hides it
+            and PATCHes the three fields with fetch. It never builds markup. -#}
+        <form class="draft-edit" id="edit-{{ it.id }}" data-id="{{ it.id }}" hidden>
+          <label class="field">
+            <span>Title</span>
+            <input type="text" name="draft_title" maxlength="120"
+                   value="{{ d.title or '' }}" enterkeyhint="next" autocomplete="off">
+          </label>
+          <label class="field">
+            <span>Description</span>
+            <textarea name="draft_body" rows="4" maxlength="2000"
+                      enterkeyhint="enter">{{ d.body or '' }}</textarea>
+          </label>
+          <label class="field">
+            <span>Project</span>
+            <input type="text" name="draft_project" maxlength="64" list="project-list"
+                   pattern="[A-Za-z0-9._/-]+" value="{{ d.project or '' }}"
+                   enterkeyhint="done" autocomplete="off" autocapitalize="off">
+          </label>
+          <div class="edit-actions">
+            <button type="submit" class="edit-save">Save</button>
+            <button type="button" class="edit-cancel secondary">Cancel</button>
+          </div>
+        </form>
         {% endif %}
         <p class="item-meta muted small">
           {{ when(it.created_at, now) }}
@@ -176,30 +264,16 @@
           <a class="issue issue-{{ i.state }}" href="{{ i.url }}" rel="noopener noreferrer" target="_blank">{{ i.repo }}#{{ i.number }}</a>{% if i.state == 'closed' %}<span class="muted"> closed</span>{% endif %}{% if not loop.last %} · {% endif %}
           {% endfor %}
         </p>
+        {% elif it.filed_backlog %}
+        <p class="item-issues small">
+          <span class="badge badge-backlog">filed to backlog.txt</span>
+          <span class="muted">{{ it.filed_backlog.line }}</span>
+        </p>
         {% elif it.mirror_url %}
         <p class="item-issues small">
           <a class="issue" href="{{ it.mirror_url }}" rel="noopener noreferrer" target="_blank">{{ it.mirror_key }}</a>
         </p>
         {% endif %}
-      </div>
-      <div class="item-controls">
-        <label class="review">
-          <input type="checkbox" class="review-box" data-id="{{ it.id }}"
-                 {% if it.reviewed %}checked{% endif %}>
-          <span>Reviewed</span>
-        </label>
-        {% if it.has_audio %}
-        {# Played back from the SERVER URL, never a blob: — a blob would need
-           media-src blob: in the CSP and the CSP is not being loosened. #}
-        <audio class="player" controls preload="none"
-               src="{{ url_for('inbox.audio', item_id=it.id) }}"></audio>
-        {% endif %}
-        {# The one control that destroys something. Needs JS (it is a DELETE),
-           which is acceptable for a deliberate destructive action in a way it
-           would not be for capture — and it is hidden until inbox.js wires it,
-           so it is never a button that does nothing. #}
-        <button type="button" class="delete-item" data-id="{{ it.id }}" hidden
-                title="Delete this item and its recording">Delete</button>
       </div>
     </li>
     {% endfor %}

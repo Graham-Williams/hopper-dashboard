@@ -106,6 +106,11 @@ MACHINE_CALLS = [
                "url": "https://github.com/a/b/issues/1"}}),
     ("inbox.mirror_backlog", "post", "/api/v1/inbox/mirror/backlog",
      {"json": {"complete": True, "items": [{"text": "a thing"}]}}),
+    ("inbox.draft_queue", "get", "/api/v1/inbox/draft/queue", {}),
+    ("inbox.post_filed_backlog", "post", "/api/v1/inbox/items/{item}/filed-backlog",
+     {"json": {"line": "Do the thing"}}),
+    ("inbox.post_draft", "post", "/api/v1/inbox/items/{item}/draft",
+     {"json": {"title": "t", "body": "b", "src_sha": "0" * 64}}),
 ]
 
 
@@ -189,7 +194,8 @@ def test_the_origin_pin_now_covers_patch(settings, registry, notifier):
     no CSRF pin at all. Widened BEFORE the route existed, not after."""
     client = _pinned_client(settings, registry, notifier)
     base = "https://dash.example.com"
-    created = client.post("/api/v1/inbox/items", data={"text": "hello"},
+    created = client.post("/api/v1/inbox/items",
+                          data={"text": "", "audio": (io_bytes(WEBM), "n", "audio/webm")},
                           content_type="multipart/form-data", base_url=base,
                           headers={"Origin": base, "Accept": "application/json"})
     assert created.status_code == 201
@@ -231,7 +237,8 @@ def test_a_session_plus_a_machine_token_is_still_csrf_pinned(
     app = _pinned_app(settings, registry, notifier)
     client = _pinned_client(settings, registry, notifier, app)
     base = "https://dash.example.com"
-    created = client.post("/api/v1/inbox/items", data={"text": "pin me"},
+    created = client.post("/api/v1/inbox/items",
+                          data={"text": "pin me", "audio": (io_bytes(WEBM), "n", "audio/webm")},
                           content_type="multipart/form-data", base_url=base,
                           headers={"Origin": base, "Accept": "application/json"})
     item = created.get_json()["id"]
@@ -424,7 +431,7 @@ def test_a_bad_project_is_refused(authed):
 
 
 def test_patch_validates_and_rejects_unknown_fields(authed):
-    item = post_note(authed).get_json()["id"]
+    item = _voice_note(authed)["id"]
     assert authed.patch(f"/api/v1/inbox/items/{item}",
                         json={"nope": 1}).status_code == 400
     assert authed.patch(f"/api/v1/inbox/items/{item}",
@@ -468,7 +475,7 @@ def test_the_write_limiter_returns_429(authed, read_app):
     read_app.extensions["inbox_write_limiter"].max_events = 2
     for _ in range(2):
         assert authed.patch(f"/api/v1/inbox/items/{item}",
-                            json={"reviewed": True}).status_code == 200
+                            json={"reviewed": False}).status_code == 200
     assert authed.patch(f"/api/v1/inbox/items/{item}",
                         json={"reviewed": False}).status_code == 429
 
@@ -743,8 +750,8 @@ def test_the_board_still_has_exactly_one_script_and_the_inbox_has_two(authed):
     'self' in script-src — so anything that lands in that block must carry the
     same per-request nonce as the inline localizer."""
     import re
-    board = authed.get("/")
-    assert board.data.decode().count("<script") == 1
+    for path in ("/", "/dashboard"):
+        assert authed.get(path).data.decode().count("<script") == 1, path
     r = authed.get("/inbox")
     html = r.data.decode()
     nonce = re.search(r"script-src 'nonce-([A-Za-z0-9_-]{16,})'",
@@ -946,7 +953,8 @@ def test_delete_is_session_only_and_origin_pinned(bot, authed, settings,
 
     client = _pinned_client(settings, registry, notifier)
     base = "https://dash.example.com"
-    created = client.post("/api/v1/inbox/items", data={"text": "pin me"},
+    created = client.post("/api/v1/inbox/items",
+                          data={"text": "pin me", "audio": (io_bytes(WEBM), "n", "audio/webm")},
                           content_type="multipart/form-data", base_url=base,
                           headers={"Origin": base, "Accept": "application/json"})
     pinned = created.get_json()["id"]
@@ -1078,3 +1086,567 @@ def test_a_repo_with_a_trailing_newline_is_not_a_valid_repo():
     assert not GITHUB_REPO_RE.match("a/b\nc/d")
     assert GITHUB_TOKEN_RE.match("ghp_abc123")
     assert not GITHUB_TOKEN_RE.match("ghp_abc123\n")
+
+
+# --------------------------------------------------------------------------- #
+# Reviewed is a voice-note control; typed notes are born reviewed
+# --------------------------------------------------------------------------- #
+
+def test_a_typed_note_is_created_reviewed_and_awaiting_filing(authed):
+    body = post_note(authed, "typed on purpose").get_json()
+    assert body["reviewed"] is True and body["reviewed_at"]
+    assert body["awaiting_filing"] is True
+
+
+def test_a_voice_note_is_created_unreviewed(authed):
+    body = _voice_note(authed)
+    assert body["reviewed"] is False and body["awaiting_filing"] is False
+
+
+def test_reviewed_true_is_refused_on_a_non_voice_row(authed, settings):
+    typed = post_note(authed).get_json()["id"]
+    r = authed.patch(f"/api/v1/inbox/items/{typed}", json={"reviewed": True})
+    assert r.status_code == 400 and "voice" in r.get_json()["error"]
+    conn = inbox_db.connect(settings.inbox_db_path)
+    with conn:
+        mirrored = inbox_db.upsert_mirror_item(
+            conn, mirror_key="backlog:abc", source="backlog", title="a line")
+    conn.close()
+    assert authed.patch(f"/api/v1/inbox/items/{mirrored}",
+                        json={"reviewed": True}).status_code == 400
+    # Unticking stays allowed everywhere, so a legacy tick can be undone.
+    r = authed.patch(f"/api/v1/inbox/items/{typed}", json={"reviewed": False})
+    assert r.status_code == 200 and r.get_json()["reviewed"] is False
+    voice = _voice_note(authed)["id"]
+    assert authed.patch(f"/api/v1/inbox/items/{voice}",
+                        json={"reviewed": True}).get_json()["reviewed"] is True
+
+
+def test_only_voice_rows_render_a_reviewed_checkbox(authed):
+    typed = post_note(authed, "typed row").get_json()["id"]
+    voice = _voice_note(authed)["id"]
+    html = authed.get("/inbox").data.decode()
+
+    def row(item_id):
+        return html.split(f'id="item-{item_id}"', 1)[1].split("</li>", 1)[0]
+    assert 'class="review-box"' in row(voice)
+    assert 'class="review-box"' not in row(typed)
+
+
+# --------------------------------------------------------------------------- #
+# Drafts: the machine routes and the PATCH fields
+# --------------------------------------------------------------------------- #
+
+def _transcribed(authed, bot, text="the wheel on km tracker sticks", **extra):
+    """A voice note with a Whisper transcript, via the real routes."""
+    data = {"text": "", "audio": (io_bytes(WEBM), "note", "audio/webm")}
+    data.update(extra)
+    item = authed.post("/api/v1/inbox/items", data=data,
+                       content_type="multipart/form-data",
+                       headers={"Accept": "application/json"}).get_json()["id"]
+    assert bot.post(f"/api/v1/inbox/items/{item}/transcript",
+                    json={"text": text, "engine": "whisper"},
+                    headers=machine()).status_code == 200
+    return item
+
+
+def _queue(bot):
+    r = bot.get("/api/v1/inbox/draft/queue", headers=machine())
+    assert r.status_code == 200
+    return r.get_json()
+
+
+def test_draft_routes_refuse_a_session_and_the_read_token(authed, bot):
+    """Machine routes: INBOX_TOKEN only. A logged-in browser is a session (it
+    outranks a bearer), and READ_TOKEN is a read credential for /api/v1/status."""
+    item = _transcribed(authed, bot)
+    body = {"title": "t", "body": "b", "src_sha": "0" * 64}
+    assert authed.get("/api/v1/inbox/draft/queue").status_code == 401
+    assert authed.get("/api/v1/inbox/draft/queue", headers=machine()).status_code == 401
+    assert authed.post(f"/api/v1/inbox/items/{item}/draft", json=body).status_code == 401
+    assert bot.get("/api/v1/inbox/draft/queue", headers=reader()).status_code == 401
+    assert bot.post(f"/api/v1/inbox/items/{item}/draft", json=body,
+                    headers=reader()).status_code == 401
+    assert bot.get("/api/v1/inbox/draft/queue", headers=machine()).status_code == 200
+
+
+def test_the_draft_queue_shape(authed, bot, settings):
+    settings.inbox_github_repos = ("Owner/km-tracker", "Owner/taste-twin")
+    item = _transcribed(authed, bot, title="Typed title", project="jjho")
+    doc = _queue(bot)
+    assert doc["known_projects"] == ["jjho", "km-tracker", "taste-twin"]
+    assert doc["max_title"] == inbox_db.DRAFT_MAX_TITLE
+    (entry,) = doc["items"]
+    assert entry == {"id": item, "transcript": "the wheel on km tracker sticks",
+                     "manual_title": "Typed title", "project": "jjho",
+                     "sha": inbox_db.transcript_sha("the wheel on km tracker sticks")}
+
+
+def test_post_a_draft_then_review_copies_it(authed, bot, settings):
+    settings.inbox_github_repos = ("Owner/km-tracker",)
+    item = _transcribed(authed, bot)
+    sha = _queue(bot)["items"][0]["sha"]
+    r = bot.post(f"/api/v1/inbox/items/{item}/draft", headers=machine(),
+                 json={"title": "Fix the sticky wheel", "body": "It sticks.\nOften.",
+                       "project": "km-tracker", "src_sha": sha, "model": "sonnet"})
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["draft"]["status"] == "ready" and body["needs_review"] is True
+    assert body["body"] == "the wheel on km tracker sticks"      # transcript untouched
+    assert _queue(bot)["items"] == []
+    listed = authed.get("/api/v1/inbox/items?awaiting=review").get_json()
+    assert [i["id"] for i in listed["items"]] == [item]
+    assert listed["counts"]["needs_review"] == 1
+    # Tick Reviewed: the draft becomes the title/project the filing loop reads.
+    done = authed.patch(f"/api/v1/inbox/items/{item}", json={"reviewed": True}).get_json()
+    assert done["title"] == "Fix the sticky wheel" and done["project"] == "km-tracker"
+    assert done["needs_review"] is False and done["awaiting_filing"] is True
+    filing = authed.get("/api/v1/inbox/items?awaiting=filing").get_json()["items"]
+    assert filing[0]["draft"]["body"] == "It sticks.\nOften."
+
+
+def test_a_stale_draft_is_409_and_burns_no_attempt(authed, bot, settings):
+    item = _transcribed(authed, bot)
+    old_sha = _queue(bot)["items"][0]["sha"]
+    bot.post(f"/api/v1/inbox/items/{item}/transcript",
+             json={"text": "a newer transcript", "engine": "whisper"}, headers=machine())
+    for body in ({"title": "t", "body": "b", "src_sha": old_sha},
+                 {"failed": True, "error": "bad", "src_sha": old_sha}):
+        r = bot.post(f"/api/v1/inbox/items/{item}/draft", json=body, headers=machine())
+        assert r.status_code == 409
+    conn = inbox_db.connect(settings.inbox_db_path)
+    assert inbox_db.get_item(conn, item)["draft_attempts"] == 0
+    conn.close()
+
+
+def test_failed_drafts_count_and_then_need_review(authed, bot):
+    item = _transcribed(authed, bot)
+    sha = _queue(bot)["items"][0]["sha"]
+    for n in range(3):
+        r = bot.post(f"/api/v1/inbox/items/{item}/draft", headers=machine(),
+                     json={"failed": True, "error": "invalid\x1b[2J output\nFORGED", "src_sha": sha})
+        assert r.get_json()["draft"]["attempts"] == n + 1
+    body = r.get_json()
+    assert body["draft"]["status"] == "failed" and body["needs_review"] is True
+    assert _queue(bot)["items"] == []
+
+
+def test_post_draft_caps_cleans_and_drops_an_unknown_project(authed, bot, settings):
+    settings.inbox_github_repos = ("Owner/km-tracker",)
+    item = _transcribed(authed, bot)
+    sha = _queue(bot)["items"][0]["sha"]
+    r = bot.post(f"/api/v1/inbox/items/{item}/draft", headers=machine(), json={
+        "title": "line one\nline two " + "x" * 500, "body": "\x00" + "y" * 9000,
+        "project": "not-a-known-project", "src_sha": sha})
+    d = r.get_json()["draft"]
+    assert "\n" not in d["title"] and len(d["title"]) <= 120
+    assert len(d["body"]) <= 2000 and "\x00" not in d["body"]
+    assert d["project"] is None
+
+
+def test_post_draft_validates(authed, bot):
+    item = _transcribed(authed, bot)
+    sha = _queue(bot)["items"][0]["sha"]
+    url = f"/api/v1/inbox/items/{item}/draft"
+    assert bot.post(url, json=[], headers=machine()).status_code == 400
+    assert bot.post(url, json={"title": "t", "body": "b", "src_sha": "XYZ"},
+                    headers=machine()).status_code == 400
+    assert bot.post(url, json={"title": "t", "body": "b"}, headers=machine()).status_code == 400
+    assert bot.post(url, json={"title": "  ", "body": "b", "src_sha": sha},
+                    headers=machine()).status_code == 400
+    assert bot.post("/api/v1/inbox/items/" + "0" * 32 + "/draft",
+                    json={"title": "t", "body": "b", "src_sha": sha},
+                    headers=machine()).status_code == 404
+    typed = post_note(authed).get_json()["id"]
+    assert bot.post(f"/api/v1/inbox/items/{typed}/draft",
+                    json={"title": "t", "body": "b", "src_sha": sha},
+                    headers=machine()).status_code == 409
+
+
+def test_no_machine_draft_after_graham_edits_it(authed, bot):
+    item = _transcribed(authed, bot)
+    sha = _queue(bot)["items"][0]["sha"]
+    r = authed.patch(f"/api/v1/inbox/items/{item}",
+                     json={"draft_title": "Mine", "draft_body": "My words",
+                           "draft_project": "km-tracker"})
+    assert r.status_code == 200
+    d = r.get_json()["draft"]
+    assert d["title"] == "Mine" and d["edited_at"] and d["status"] == "ready"
+    assert bot.post(f"/api/v1/inbox/items/{item}/draft", headers=machine(),
+                    json={"title": "machine", "body": "x", "src_sha": sha}).status_code == 409
+    assert authed.get("/api/v1/inbox/items").get_json()["items"][0]["draft"]["title"] == "Mine"
+
+
+def test_patch_draft_fields_are_voice_only_and_validated(authed, bot):
+    typed = post_note(authed).get_json()["id"]
+    assert authed.patch(f"/api/v1/inbox/items/{typed}",
+                        json={"draft_title": "x"}).status_code == 400
+    item = _transcribed(authed, bot)
+    assert authed.patch(f"/api/v1/inbox/items/{item}",
+                        json={"draft_title": 5}).status_code == 400
+    assert authed.patch(f"/api/v1/inbox/items/{item}",
+                        json={"draft_project": "bad project!"}).status_code == 400
+
+
+def test_a_patch_of_draft_fields_is_csrf_pinned_and_session_only(settings, registry, notifier, bot, authed):
+    item = _transcribed(authed, bot)
+    assert bot.patch(f"/api/v1/inbox/items/{item}", json={"draft_title": "x"},
+                     headers=reader()).status_code == 401
+    assert bot.patch(f"/api/v1/inbox/items/{item}", json={"draft_title": "x"},
+                     headers=machine()).status_code == 401
+    app = _pinned_app(settings, registry, notifier)
+    client = _pinned_client(settings, registry, notifier, app)
+    base = "https://dash.example.com"
+    created = client.post("/api/v1/inbox/items",
+                          data={"text": "", "audio": (io_bytes(WEBM), "n", "audio/webm")},
+                          content_type="multipart/form-data", base_url=base,
+                          headers={"Origin": base, "Accept": "application/json"})
+    vid = created.get_json()["id"]
+    assert client.patch(f"/api/v1/inbox/items/{vid}", json={"draft_title": "x"},
+                        base_url=base, headers={"Origin": "https://evil.example"}
+                        ).status_code == 403
+
+
+
+def test_a_draft_is_escaped_on_the_board(authed, bot):
+    item = _transcribed(authed, bot)
+    sha = _queue(bot)["items"][0]["sha"]
+    bot.post(f"/api/v1/inbox/items/{item}/draft", headers=machine(), json={
+        "title": "<img src=x onerror=alert(1)>", "body": "</p><script>alert(2)</script>",
+        "src_sha": sha})
+    html = authed.get("/inbox").data.decode()
+    assert "<img src=x" not in html and "<script>alert(2)" not in html
+    assert "&lt;img src=x onerror=alert(1)&gt;" in html
+
+
+def _drafted(authed, bot, **draft):
+    item = _transcribed(authed, bot)
+    sha = _queue(bot)["items"][0]["sha"]
+    body = {"title": "Fix the sticky wheel", "body": "It sticks.\nOften.",
+            "src_sha": sha}
+    body.update(draft)
+    assert bot.post(f"/api/v1/inbox/items/{item}/draft", headers=machine(),
+                    json=body).status_code == 200
+    return item
+
+
+def _row(html, item):
+    return html.split(f'id="item-{item}"', 1)[1].split("</li>", 1)[0]
+
+
+def test_a_voice_row_shows_draft_transcript_player_and_a_hidden_edit_form(authed, bot):
+    item = _drafted(authed, bot)
+    row = _row(authed.get("/inbox").data.decode(), item)
+    assert '<h3 class="item-title">Fix the sticky wheel</h3>' in row
+    assert 'class="item-body draft-body">It sticks.\nOften.</p>' in row
+    assert "<details class=\"transcript\">" in row and "the wheel on km tracker sticks" in row
+    assert 'class="player"' in row and 'class="review-box"' in row
+    assert "needs review" in row and 'data-needs-review="1"' in row
+    form = row.split('<form class="draft-edit"', 1)[1].split("</form>", 1)[0]
+    assert " hidden>" in form.split("\n", 1)[0]
+    assert 'name="draft_title"' in form and 'value="Fix the sticky wheel"' in form
+    assert 'name="draft_project"' in form and 'list="project-list"' in form
+    assert 'enterkeyhint=' in form
+    assert 'class="edit-draft secondary"' in row
+
+
+def test_draft_states_are_visible(authed, bot):
+    pending = _transcribed(authed, bot)
+    failed = _transcribed(authed, bot, text="another note")
+    sha = next(i["sha"] for i in _queue(bot)["items"] if i["id"] == failed)
+    for _ in range(3):
+        bot.post(f"/api/v1/inbox/items/{failed}/draft", headers=machine(),
+                 json={"failed": True, "src_sha": sha})
+    html = authed.get("/inbox").data.decode()
+    assert "Drafting…" in _row(html, pending)
+    assert "Couldn't draft — edit to write one" in _row(html, failed)
+    assert 'data-needs-review="1"' in _row(html, failed)
+
+
+def test_needs_review_tile_and_filter_replace_waiting_on(authed, bot):
+    _drafted(authed, bot)
+    html = authed.get("/inbox").data.decode()
+    summary = html.split('class="summary inbox-summary"', 1)[1].split("</section>", 1)[0]
+    # Straight to the list, not to the top of the page.
+    assert "Needs review" in summary and 'href="/inbox?awaiting=review#items"' in summary
+    assert "Awaiting filing" not in summary and "Transcribing" not in summary
+    assert 'id="filter-awaiting"' not in html and "Waiting on" not in html
+    assert 'id="filter-review"' in html and 'name="awaiting" value="review"' in html
+    filtered = authed.get("/inbox?awaiting=review").data.decode()
+    assert "checked" in filtered.split('id="filter-review"', 1)[1].split(">", 1)[0]
+
+
+def test_the_privacy_note_says_the_transcript_goes_to_anthropic(authed):
+    html = authed.get("/inbox").data.decode()
+    assert ("Audio stays on this box and your Mac. The transcript and title (not the audio) "
+            "are sent from the Mac to Anthropic (Claude) to draft the item.") in html
+    assert "Recordings never leave this box" not in html
+
+
+def test_known_projects_feed_the_datalist(authed, settings):
+    settings.inbox_github_repos = ("Owner/km-tracker",)
+    html = authed.get("/inbox").data.decode()
+    datalist = html.split('<datalist id="project-list">', 1)[1].split("</datalist>", 1)[0]
+    assert '<option value="km-tracker">' in datalist
+
+
+# --------------------------------------------------------------------------- #
+# Filed to backlog.txt instead of an issue (issue #33)
+# --------------------------------------------------------------------------- #
+
+def _reviewed_voice(authed, bot):
+    item = _transcribed(authed, bot)
+    assert authed.patch(f"/api/v1/inbox/items/{item}",
+                        json={"reviewed": True}).status_code == 200
+    return item
+
+
+def _file(bot, item, line=None, headers=None):
+    line = line if line is not None else f"Fix the Mac fan noise ({'voice ' + item[:8]})"
+    return bot.post(f"/api/v1/inbox/items/{item}/filed-backlog", json={"line": line},
+                    headers=headers if headers is not None else machine())
+
+
+def test_filed_backlog_is_machine_only(authed, bot):
+    item = _reviewed_voice(authed, bot)
+    line = {"line": f"x (voice {item[:8]})"}
+    url = f"/api/v1/inbox/items/{item}/filed-backlog"
+    assert authed.post(url, json=line).status_code == 401                 # a session
+    assert authed.post(url, json=line, headers=machine()).status_code == 401
+    assert bot.post(url, json=line, headers=reader()).status_code == 401  # READ_TOKEN
+    assert bot.post(url, json=line).status_code == 401
+    assert bot.post(url, json=line, headers=machine()).status_code == 200
+
+
+def test_a_filed_note_leaves_awaiting_filing_idempotently(authed, bot):
+    item = _reviewed_voice(authed, bot)
+    assert [i["id"] for i in authed.get("/api/v1/inbox/items?awaiting=filing")
+            .get_json()["items"]] == [item]
+    first = _file(bot, item).get_json()
+    assert first["awaiting_filing"] is False
+    assert first["filed_backlog"]["line"] == f"Fix the Mac fan noise (voice {item[:8]})"
+    at = first["filed_backlog"]["at"]
+    again = _file(bot, item).get_json()                       # idempotent
+    assert again["filed_backlog"]["at"] == at and again["awaiting_filing"] is False
+    listing = authed.get("/api/v1/inbox/items").get_json()
+    assert listing["counts"]["awaiting_filing"] == 0
+    assert authed.get("/api/v1/inbox/items?awaiting=filing").get_json()["items"] == []
+    html = authed.get("/inbox").data.decode()
+    assert "filed to backlog.txt" in html
+
+
+def test_the_backlog_copy_is_linked_and_not_shown_twice(authed, bot):
+    item = _reviewed_voice(authed, bot)
+    tag = f"(voice {item[:8]})"
+    other = bot.post("/api/v1/inbox/mirror/backlog", headers=machine(), json={
+        "complete": True, "items": [{"text": f"Fix the Mac fan noise {tag}"},
+                                    {"text": "Unrelated chore"}]})
+    assert other.status_code == 200
+    before = authed.get("/api/v1/inbox/items").get_json()
+    assert len(before["items"]) == 3 and before["counts"]["total"] == 3
+    body = _file(bot, item, line=f"Fix the Mac fan noise {tag}").get_json()
+    mirror = body["filed_backlog"]["mirror_key"]
+    assert mirror and mirror.startswith("backlog:")
+    after = authed.get("/api/v1/inbox/items").get_json()
+    texts = sorted(i["title"] for i in after["items"])
+    assert len(after["items"]) == 2 and "Unrelated chore" in texts
+    assert after["counts"]["total"] == 2
+    # Still there when asked for explicitly — hidden, not deleted.
+    only = authed.get("/api/v1/inbox/items?source=backlog").get_json()["items"]
+    assert len(only) == 2
+    listed = next(i for i in after["items"] if i["id"] == item)
+    assert listed["filed_backlog"]["mirror_key"] == mirror
+
+
+def test_the_mirror_row_can_arrive_after_the_filing_call(authed, bot):
+    item = _reviewed_voice(authed, bot)
+    tag = f"(voice {item[:8]})"
+    assert _file(bot, item).get_json()["filed_backlog"]["mirror_key"] is None
+    bot.post("/api/v1/inbox/mirror/backlog", headers=machine(),
+             json={"complete": True, "items": [{"text": f"Fix the Mac fan noise {tag}"}]})
+    items = authed.get("/api/v1/inbox/items").get_json()["items"]
+    assert [i["id"] for i in items] == [item]
+    assert items[0]["filed_backlog"]["mirror_key"].startswith("backlog:")
+
+
+def test_the_filed_line_is_validated(authed, bot):
+    item = _reviewed_voice(authed, bot)
+    tag = f"(voice {item[:8]})"
+    assert _file(bot, item, line="two\nlines " + tag).status_code == 400
+    assert _file(bot, item, line="   ").status_code == 400
+    assert _file(bot, item, line="no tag here").status_code == 400
+    assert bot.post(f"/api/v1/inbox/items/{item}/filed-backlog", json={"line": 5},
+                    headers=machine()).status_code == 400
+    assert _file(bot, "0" * 32, line="x (voice 00000000)").status_code == 404
+    mirrored = bot.post("/api/v1/inbox/mirror/backlog", headers=machine(),
+                        json={"complete": True, "items": [{"text": "a chore"}]})
+    assert mirrored.status_code == 200
+    mid = authed.get("/api/v1/inbox/items?source=backlog").get_json()["items"][0]["id"]
+    assert _file(bot, mid, line=f"x (voice {mid[:8]})").status_code == 409
+    # Control characters are cleaned and the length is capped at the server's limit.
+    long = "\x1b[2J" + "y" * 900 + " " + tag
+    r = _file(bot, item, line=long)
+    assert r.status_code == 400                     # the cap cut the tag off: refused
+    ok = _file(bot, item, line="\x1b[2J" + "y" * 100 + " " + tag).get_json()
+    assert "\x1b" not in ok["filed_backlog"]["line"]
+
+
+def test_the_backlog_line_cap_is_pinned():
+    """Hopper's filing loop keeps the line under this; changing it is a contract change."""
+    assert inbox_db.MAX_BACKLOG_LINE == 500
+    line = "z" * 600
+    assert len(inbox_db.clean_text(line, inbox_db.MAX_BACKLOG_LINE)) == 500
+
+
+# --------------------------------------------------------------------------- #
+# Security-gate fixes (routes)
+# --------------------------------------------------------------------------- #
+
+def _legacy_typed(settings):
+    """A typed note made before typed notes were born reviewed."""
+    conn = inbox_db.connect(settings.inbox_db_path)
+    with conn:
+        # Made BEFORE the release (so a later tick can never share its creation second).
+        item = inbox_db.create_item(conn, source="typed", text="an older typed note",
+                                    now="2026-09-01T00:00:00Z")
+    conn.close()
+    return item
+
+
+def test_a_legacy_unticked_typed_note_can_still_be_reviewed(authed, settings):
+    item = _legacy_typed(settings)
+    row = _row(authed.get("/inbox").data.decode(), item)
+    assert 'class="review-box"' in row
+    r = authed.patch(f"/api/v1/inbox/items/{item}", json={"reviewed": True})
+    assert r.status_code == 200 and r.get_json()["awaiting_filing"] is True
+    # A new typed note (born reviewed) still gets no box, and mirrored rows stay refused.
+    new = post_note(authed).get_json()["id"]
+    assert 'class="review-box"' not in _row(authed.get("/inbox").data.decode(), new)
+
+
+def test_a_failed_transcript_says_why_on_the_board(authed, bot, settings):
+    item = _voice_note(authed)["id"]
+    for _ in range(3):
+        bot.post(f"/api/v1/inbox/items/{item}/transcript",
+                 json={"failed": True, "error": "x"}, headers=machine())
+    body = authed.get("/api/v1/inbox/items?awaiting=review").get_json()
+    assert [i["id"] for i in body["items"]] == [item] and body["items"][0]["needs_review"]
+    row = _row(authed.get("/inbox").data.decode(), item)
+    assert "Whisper couldn't transcribe this" in row and "Drafting…" not in row
+
+
+def test_a_failed_draft_post_needs_its_src_sha(authed, bot, settings):
+    item = _transcribed(authed, bot)
+    r = bot.post(f"/api/v1/inbox/items/{item}/draft", json={"failed": True},
+                 headers=machine())
+    assert r.status_code == 400
+    conn = inbox_db.connect(settings.inbox_db_path)
+    assert inbox_db.get_item(conn, item)["draft_attempts"] == 0
+    conn.close()
+
+
+def test_filing_to_the_backlog_needs_a_reviewed_open_note(authed, bot, settings):
+    item = _transcribed(authed, bot)                 # voice, NOT reviewed
+    assert _file(bot, item).status_code == 409
+    authed.patch(f"/api/v1/inbox/items/{item}", json={"reviewed": True})
+    authed.patch(f"/api/v1/inbox/items/{item}", json={"state": "closed"})
+    assert _file(bot, item).status_code == 409
+    authed.patch(f"/api/v1/inbox/items/{item}", json={"state": "open"})
+    assert _file(bot, item).status_code == 200
+
+
+def test_a_patch_that_loses_a_race_is_a_409(authed, bot, monkeypatch):
+    item = _transcribed(authed, bot)
+
+    def conflict(*a, **k):
+        raise inbox_db.Conflict(item)
+    monkeypatch.setattr(inbox_db, "update_item", conflict)
+    r = authed.patch(f"/api/v1/inbox/items/{item}", json={"reviewed": True})
+    assert r.status_code == 409
+
+
+def test_an_edit_after_review_shows_on_the_row(authed, bot):
+    item = _drafted(authed, bot)
+    authed.patch(f"/api/v1/inbox/items/{item}", json={"reviewed": True})
+    r = authed.patch(f"/api/v1/inbox/items/{item}",
+                     json={"draft_title": "Edited after review", "draft_body": "New body"})
+    assert r.get_json()["title"] == "Edited after review"
+    row = _row(authed.get("/inbox").data.decode(), item)
+    assert '<h3 class="item-title">Edited after review</h3>' in row and "New body" in row
+
+
+def test_a_legacy_typed_tick_can_be_undone_and_new_typed_notes_get_no_box(authed, settings):
+    item = _legacy_typed(settings)
+    assert authed.patch(f"/api/v1/inbox/items/{item}",
+                        json={"reviewed": True}).status_code == 200
+    row = _row(authed.get("/inbox").data.decode(), item)
+    assert 'class="review-box"' in row and "checked" in row     # still there, ticked
+    r = authed.patch(f"/api/v1/inbox/items/{item}", json={"reviewed": False})
+    assert r.status_code == 200 and r.get_json()["reviewable"] is True
+    new = post_note(authed).get_json()
+    assert new["reviewable"] is False and new["reviewed_at"] == new["created_at"]
+    assert 'class="review-box"' not in _row(authed.get("/inbox").data.decode(), new["id"])
+
+
+def test_a_final_failed_draft_goes_straight_to_failed(authed, bot, settings):
+    """The worker's breaker gives up after three tripped runs: the note must show in Needs
+    review as failed now, not after six more runs."""
+    item = _transcribed(authed, bot)
+    sha = _queue(bot)["items"][0]["sha"]
+    r = bot.post(f"/api/v1/inbox/items/{item}/draft", headers=machine(),
+                 json={"failed": True, "final": True, "error": "breaker", "src_sha": sha})
+    d = r.get_json()
+    assert d["draft"]["status"] == "failed" and d["draft"]["attempts"] == 3
+    assert d["needs_review"] is True and _queue(bot)["items"] == []
+    # Without `final` it is still one attempt.
+    other = _transcribed(authed, bot, text="another")
+    osha = next(i["sha"] for i in _queue(bot)["items"] if i["id"] == other)
+    d2 = bot.post(f"/api/v1/inbox/items/{other}/draft", headers=machine(),
+                  json={"failed": True, "src_sha": osha}).get_json()["draft"]
+    assert d2["status"] == "pending" and d2["attempts"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# Phone layout (QA round)
+# --------------------------------------------------------------------------- #
+
+def test_a_voice_row_is_one_column_in_the_designed_order(authed, bot):
+    item = _drafted(authed, bot)
+    row = _row(authed.get("/inbox").data.decode(), item)
+    order = [row.index(m) for m in ('class="item-head"', 'class="item-title"',
+                                    'draft-body', '<details class="transcript">',
+                                    '<audio class="player"', 'class="item-actions"',
+                                    'class="item-meta muted small"')]
+    assert order == sorted(order), order
+    actions = row.split('class="item-actions"', 1)[1].split("</div>", 1)[0]
+    # Edit draft, the Reviewed toggle, then Delete LAST, all in the one row.
+    assert (actions.index('class="edit-draft') < actions.index('class="review"')
+            < actions.index('class="delete-item"'))
+    assert "item-controls" not in row
+
+
+def test_the_capture_notes_are_one_collapsed_details(authed):
+    html = authed.get("/inbox").data.decode()
+    block = html.split('<details class="about-recordings">', 1)[1].split("</details>", 1)[0]
+    assert "<summary>About recordings and privacy</summary>" in block
+    assert "Audio stays on this box and your Mac." in block
+    assert "minutes of speech" in block and "about 30 days" in block
+    assert " open" not in html.split('<details class="about-recordings"', 1)[1].split(">", 1)[0]
+
+
+def test_the_phone_layout_css_rules():
+    """Pinned because each one passes every server test while looking wrong on a phone."""
+    css = _code("dashboard/static/app.css")
+    delete = css.split(".item-actions button.delete-item {", 1)[1].split("}", 1)[0]
+    assert "background: transparent" in delete and "var(--fail)" in delete
+    assert "min-height: 44px" in delete and "margin-left: auto" in delete
+    review = css.split(".item-actions .review {", 1)[1].split("}", 1)[0]
+    assert "min-height: 44px" in review and "border-radius: 999px" in review
+    assert "min-height: 44px" in css.split(".item-actions .edit-draft {", 1)[1].split("}", 1)[0]
+    assert ".filters select { min-height: 44px; }" in css or \
+        ".filters select" in css.split("{ min-height: 44px; }", 1)[0].rsplit("\n", 1)[-1]
+    clear = css.split(".filters .clear {", 1)[1].split("}", 1)[0]
+    assert "min-height: 44px" in clear
+    assert "scroll-margin-top" in css.split(".items {", 1)[1].split("}", 1)[0]
+    assert "scroll-margin-top" in css.split(".item {", 1)[1].split("}", 1)[0]
+    assert "flex-direction: row" not in css.split(".item {", 1)[1].split(".item-filing", 1)[0]

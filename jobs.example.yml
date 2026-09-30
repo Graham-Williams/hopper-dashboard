@@ -415,8 +415,8 @@ jobs:
                                 # stay the only one — services._machine_probe takes the FIRST
                                 # one per machine, so a second would make the machine-offline
                                 # rule depend on the order of this file.
-    protects: Turning Graham's recorded voice notes into searchable text (mlx-whisper, locally)
-    method: launchd com.hopper.inbox-transcribe every 5 min → pulls the queue over the public host, runs Whisper on the Mac, posts the transcript back
+    protects: Turning Graham's recorded voice notes into searchable text (mlx-whisper, locally) and a reviewable draft (claude -p on the transcript text)
+    method: launchd com.hopper.inbox-transcribe every 5 min → pulls the queue over the public host, runs Whisper on the Mac, posts the transcript back, then drafts new transcripts
     cadence_s: 300
     grace_s: 50520              # 14 h + 2 min — NOT 900. Every Mac job needs grace_s >= mac-probe's
                                 # (50400) + 120, or its deadline lands BEFORE the probe's and it goes

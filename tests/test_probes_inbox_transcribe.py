@@ -511,3 +511,469 @@ def test_whisper_stderr_cannot_forge_a_line_in_the_mac_log(tmp_path, monkeypatch
         assert not line.startswith("2026-09-19 03:00:00 run ok"), "a forged log line got in"
     (_id, body), = api.transcripts()
     assert "\n" not in body["error"] and "\x1b" not in body["error"]
+
+
+# =================================================================================
+# Phase two: drafting with `claude -p` (probes/inbox_draft.py), against a FAKE claude
+# binary — a real executable the worker really spawns, so argv, stdin, cwd and the child
+# environment are observed rather than assumed.
+# =================================================================================
+from probes import inbox_draft  # noqa: E402
+
+FAKE_CLAUDE = r'''#!/usr/bin/python3
+import json, os, sys, time
+here = os.path.dirname(os.path.abspath(__file__))
+with open(os.path.join(here, "behaviour.json")) as fh:
+    plan = json.load(fh)
+stdin = sys.stdin.read()
+n = len(open(os.path.join(here, "calls.jsonl")).read().splitlines()) \
+    if os.path.exists(os.path.join(here, "calls.jsonl")) else 0
+with open(os.path.join(here, "calls.jsonl"), "a") as fh:
+    fh.write(json.dumps({"argv": sys.argv[1:], "stdin": stdin, "cwd": os.getcwd(),
+                         "env": dict(os.environ)}) + "\n")
+mode = plan["modes"][min(n, len(plan["modes"]) - 1)]
+base = {"type": "result", "subtype": "success", "is_error": False, "num_turns": 2,
+        "terminal_reason": "completed", "api_error_status": None}
+def error(status, msg):
+    d = dict(base, is_error=True, terminal_reason="api_error", api_error_status=status,
+             result=msg)
+    print(json.dumps(d)); sys.exit(1)
+if mode == "ok":
+    out = plan.get("output", {"title": "Fix the wheel", "body": "It sticks.", "project": "km-tracker"})
+    print(json.dumps(dict(base, result=json.dumps(out), structured_output=out)))
+elif mode == "no_structured":
+    print(json.dumps(dict(base, result="I could not do that")))
+elif mode == "bad_shape":
+    print(json.dumps(dict(base, structured_output={"title": 5, "body": None})))
+elif mode == "not_logged_in":
+    error(None, "Not logged in · Please run /login")
+elif mode == "expired":
+    error(401, "Failed to authenticate. API Error: 401 OAuth access token is invalid.")
+elif mode == "limit":
+    error(429, "Claude usage limit reached")
+elif mode == "overloaded":
+    error(529, "Overloaded")
+elif mode == "bad_request":
+    error(400, "prompt is too long")
+elif mode == "garbage":
+    print("segfault or something"); sys.exit(3)
+elif mode == "chatty_garbage":
+    print("MODEL SAYS A PRIVATE THING"); sys.stderr.write("boom line one\nline two\n"); sys.exit(1)
+elif mode == "max_turns":
+    d = dict(base, is_error=True, terminal_reason="max_turns", result="MODEL RAMBLING TEXT")
+    print(json.dumps(d)); sys.exit(1)
+elif mode == "usage_text":
+    d = dict(base, is_error=True, terminal_reason="error_during_execution",
+             result="Claude usage limit reached; resets at 5pm")
+    print(json.dumps(d)); sys.exit(1)
+elif mode == "sleep":
+    time.sleep(5)
+'''
+
+ID_C = "c" * 32
+
+
+def _fake_claude(tmp_path, modes, output=None):
+    d = tmp_path / "claudebin"
+    d.mkdir(exist_ok=True)
+    exe = d / "claude"
+    exe.write_text(FAKE_CLAUDE)
+    exe.chmod(0o755)
+    plan = {"modes": modes}
+    if output is not None:
+        plan["output"] = output
+    (d / "behaviour.json").write_text(json.dumps(plan))
+    return str(exe)
+
+
+def _calls(exe):
+    path = os.path.join(os.path.dirname(exe), "calls.jsonl")
+    if not os.path.exists(path):
+        return []
+    with open(path) as fh:
+        return [json.loads(line) for line in fh]
+
+
+def _token_file(tmp_path, mode=0o600, value="sk-ant-oat01-FAKE-TOKEN"):
+    f = tmp_path / "claude-token"
+    f.write_text(value + "\n")
+    f.chmod(mode)
+    return str(f)
+
+
+class DraftApi(FakeApi):
+    """Empty transcription queue; a draft queue; records draft POSTs."""
+
+    def __init__(self, draft_items, known=("km-tracker", "taste-twin"), post_status=None):
+        FakeApi.__init__(self, [])
+        self.draft_items = draft_items
+        self.known = list(known)
+        self.post_status = post_status or {}
+
+    def api_json(self, url, token, method="GET", body=None, **kw):
+        assert token == "inbox-tok"
+        if "/draft/queue" in url:
+            self.json_calls.append((method, url, body))
+            return {"items": self.draft_items, "known_projects": self.known}
+        if url.endswith("/draft"):
+            item = url.rsplit("/", 2)[-2]
+            status = self.post_status.get(item)
+            if status:
+                raise ProbeError("POST %s: HTTP %d" % (url, status), status=status)
+            self.json_calls.append((method, url, body))
+            return {"ok": True}
+        return FakeApi.api_json(self, url, token, method=method, body=body, **kw)
+
+    def drafts(self):
+        return [(u.rsplit("/", 2)[-2], b) for m, u, b in self.json_calls
+                if u.endswith("/draft")]
+
+
+def _ditem(item_id, transcript="the wheel on km tracker sticks", **kw):
+    d = {"id": item_id, "transcript": transcript, "manual_title": None,
+         "project": None, "sha": item_id[0] * 64}
+    d.update(kw)
+    return d
+
+
+def _denv(tmp_path, exe, **extra):
+    if "INBOX_CLAUDE_TOKEN_FILE" not in extra:
+        extra["INBOX_CLAUDE_TOKEN_FILE"] = _token_file(tmp_path)
+    # NEVER the real ~/.config/hopper-dashboard/draft-state.json.
+    extra.setdefault("INBOX_DRAFT_STATE", str(tmp_path / "draft-state.json"))
+    return _env(tmp_path, INBOX_CLAUDE_BIN=exe, **extra)
+
+
+def test_drafting_is_a_no_op_without_inbox_claude_bin(tmp_path, monkeypatch):
+    api = DraftApi([_ditem(ID_A)])
+    sent = _wire(monkeypatch, api)
+    assert it.main(["--env", _env(tmp_path), "--quiet"]) == 0
+    assert not any("/draft" in u for _, u, _ in api.json_calls)
+    (_, _, _, hb), = sent
+    assert "drafted" not in hb["metrics"]
+
+
+def test_a_draft_is_made_with_a_locked_down_claude_and_posted_back(tmp_path, monkeypatch):
+    exe = _fake_claude(tmp_path, ["ok"])
+    api = DraftApi([_ditem(ID_A, manual_title=None, project="km-tracker")])
+    sent = _wire(monkeypatch, api)
+    monkeypatch.setenv("INBOX_TOKEN", "inbox-tok")          # must NOT reach the child
+    monkeypatch.setenv("INGEST_TOKEN", "ingest-tok")
+    rc = it.main(["--env", _denv(tmp_path, exe), "--quiet"])
+    assert rc == 0
+    (item_id, body), = api.drafts()
+    assert item_id == ID_A
+    assert body == {"title": "Fix the wheel", "body": "It sticks.", "project": "km-tracker",
+                    "src_sha": "a" * 64, "model": "sonnet"}
+    (call,) = _calls(exe)
+    argv = call["argv"]
+    # No tools, no MCP, no skills, no saved session, no customisations, JSON out + schema.
+    assert argv[:2] == ["-p", "--safe-mode"]
+    # No settings files of any kind (user/project/local); verified to keep OAuth working.
+    assert argv[argv.index("--setting-sources") + 1] == ""
+    i = argv.index("--tools")
+    assert argv[i + 1] == ""
+    for flag in ("--strict-mcp-config", "--no-session-persistence",
+                 "--disable-slash-commands"):
+        assert flag in argv
+    assert argv[argv.index("--output-format") + 1] == "json"
+    assert json.loads(argv[argv.index("--json-schema") + 1]) == inbox_draft.SCHEMA
+    assert argv[argv.index("--model") + 1] == "sonnet"
+    assert "--bare" not in argv
+    assert not any(a.startswith("--dangerously") or a.startswith("--allow-dangerously")
+                   for a in argv)
+    # The note never rides the command line; it is JSON data on stdin, framed as data.
+    assert not any("wheel on km tracker" in a for a in argv)
+    doc = json.loads(call["stdin"])
+    assert doc["transcript"] == "the wheel on km tracker sticks"
+    assert "not instructions" in doc["note"] and doc["known_projects"] == ["km-tracker",
+                                                                          "taste-twin"]
+    # An empty temp cwd, not the repo or $HOME.
+    assert os.path.basename(call["cwd"]).startswith("hopper-draft-")
+    assert not os.path.exists(call["cwd"])                  # and it is cleaned up
+    # The child env: the allowlist + the OAuth token + no autoupdater. None of ours.
+    env = call["env"]
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-FAKE-TOKEN"
+    assert env["DISABLE_AUTOUPDATER"] == "1"
+    assert env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
+    assert "INBOX_TOKEN" not in env and "INGEST_TOKEN" not in env
+    (_, _, _, hb), = sent
+    assert hb["status"] == "ok" and hb["metrics"]["drafted"] == 1
+    assert "drafted 1 (0 failed, 0 skipped)" in (tmp_path / "worker.log").read_text()
+
+
+@pytest.mark.parametrize("mode", ["not_logged_in", "expired", "limit", "overloaded",
+                                  "garbage"])
+def test_a_systemic_failure_stops_drafting_burns_nothing_and_fails_the_heartbeat(
+        tmp_path, monkeypatch, mode):
+    exe = _fake_claude(tmp_path, [mode])
+    api = DraftApi([_ditem(ID_A), _ditem(ID_B)])
+    sent = _wire(monkeypatch, api)
+    rc = it.main(["--env", _denv(tmp_path, exe), "--quiet"])
+    assert rc == 1
+    assert api.drafts() == []                 # no draft, and NO failed attempt either
+    assert len(_calls(exe)) == 1              # stopped at the first note
+    (_, _, _, hb), = sent
+    assert hb["status"] == "fail" and "drafting" in hb["note"]
+
+
+def test_a_timeout_is_systemic(tmp_path, monkeypatch):
+    exe = _fake_claude(tmp_path, ["sleep"])
+    api = DraftApi([_ditem(ID_A)])
+    sent = _wire(monkeypatch, api)
+    assert it.main(["--env", _denv(tmp_path, exe, INBOX_DRAFT_TIMEOUT="1"), "--quiet"]) == 1
+    assert api.drafts() == []
+    assert "timed out" in sent[0][3]["note"]
+
+
+def test_a_missing_binary_or_a_loose_token_file_is_systemic_before_any_call(
+        tmp_path, monkeypatch):
+    api = DraftApi([_ditem(ID_A)])
+    sent = _wire(monkeypatch, api)
+    assert it.main(["--env", _denv(tmp_path, str(tmp_path / "nope")), "--quiet"]) == 1
+    assert "not an executable" in sent[-1][3]["note"]
+    exe = _fake_claude(tmp_path, ["ok"])
+    loose = _token_file(tmp_path, mode=0o644)
+    assert it.main(["--env", _denv(tmp_path, exe, INBOX_CLAUDE_TOKEN_FILE=loose),
+                    "--quiet"]) == 1
+    assert "chmod 600" in sent[-1][3]["note"]
+    assert _calls(exe) == [] and api.drafts() == []
+
+
+@pytest.mark.parametrize("bad", ["no_structured", "bad_shape", "bad_request"])
+def test_a_bad_result_burns_that_notes_attempt_and_the_run_carries_on(
+        tmp_path, monkeypatch, bad):
+    exe = _fake_claude(tmp_path, [bad, "ok"])
+    api = DraftApi([_ditem(ID_A), _ditem(ID_B)])
+    sent = _wire(monkeypatch, api)
+    assert it.main(["--env", _denv(tmp_path, exe), "--quiet"]) == 0
+    # A's failure is HELD until B succeeds (the circuit breaker), so it is reported second.
+    (b_id, b_body), (a_id, a_body) = api.drafts()
+    assert a_id == ID_A and a_body["failed"] is True and a_body["src_sha"] == "a" * 64
+    assert b_id == ID_B and b_body["title"] == "Fix the wheel"
+    assert sent[0][3]["metrics"]["draft_failed"] == 1
+
+
+def test_a_409_is_skipped_without_burning_anything(tmp_path, monkeypatch):
+    exe = _fake_claude(tmp_path, ["ok"])
+    api = DraftApi([_ditem(ID_A), _ditem(ID_B)], post_status={ID_A: 409})
+    sent = _wire(monkeypatch, api)
+    assert it.main(["--env", _denv(tmp_path, exe), "--quiet"]) == 0
+    assert [i for i, _ in api.drafts()] == [ID_B]
+    assert sent[0][3]["status"] == "ok"
+
+
+def test_a_401_from_the_inbox_api_is_systemic(tmp_path, monkeypatch):
+    exe = _fake_claude(tmp_path, ["ok"])
+    api = DraftApi([_ditem(ID_A), _ditem(ID_B)], post_status={ID_A: 401})
+    sent = _wire(monkeypatch, api)
+    assert it.main(["--env", _denv(tmp_path, exe), "--quiet"]) == 1
+    assert len(_calls(exe)) == 1 and sent[0][3]["status"] == "fail"
+
+
+def test_unknown_projects_are_dropped_and_a_manual_title_is_kept(tmp_path, monkeypatch):
+    exe = _fake_claude(tmp_path, ["ok"], output={
+        "title": "Model title\nsecond line", "body": "x" * 5000, "project": "made-up"})
+    api = DraftApi([_ditem(ID_A), _ditem(ID_C, manual_title="Graham's own title")])
+    _wire(monkeypatch, api)
+    it.main(["--env", _denv(tmp_path, exe), "--quiet"])
+    (_, a), (_, c) = api.drafts()
+    assert a["title"] == "Model title second line" and a["project"] is None
+    assert len(a["body"]) == inbox_draft.MAX_BODY
+    assert c["title"] == "Graham's own title"
+    assert json.loads(_calls(exe)[1]["stdin"])["manual_title"] == "Graham's own title"
+
+
+def test_dry_run_lists_the_draft_queue_and_never_runs_claude(tmp_path, monkeypatch):
+    exe = _fake_claude(tmp_path, ["ok"])
+    api = DraftApi([_ditem(ID_A)])
+    _wire(monkeypatch, api)
+    it.main(["--env", _denv(tmp_path, exe), "--quiet", "--dry-run"])
+    assert _calls(exe) == [] and api.drafts() == []
+    assert "would draft " + ID_A in (tmp_path / "worker.log").read_text()
+
+
+def test_a_whisper_environment_fault_does_not_stop_drafting(tmp_path, monkeypatch):
+    """Notes that are ALREADY transcribed can still be drafted when ffmpeg is missing."""
+    exe = _fake_claude(tmp_path, ["ok"])
+    api = DraftApi([_ditem(ID_A)])
+    sent = _wire(monkeypatch, api, preflight_ok=False)
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    assert it.main(["--env", _denv(tmp_path, exe), "--quiet"]) == 1
+    assert [i for i, _ in api.drafts()] == [ID_A]
+    assert "INBOX_WHISPER_PYTHON" in sent[0][3]["note"]
+
+
+def test_nothing_under_probes_imports_an_anthropic_sdk():
+    """The CLI is subprocessed, like Whisper. An SDK import would break the stdlib-only,
+    3.9 probe stack (and would need an API key, which this design deliberately avoids)."""
+    import ast
+    probes_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              "probes")
+    for name in sorted(os.listdir(probes_dir)):
+        if not name.endswith(".py"):
+            continue
+        with open(os.path.join(probes_dir, name), encoding="utf-8") as fh:
+            tree = ast.parse(fh.read(), filename=name)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                names = [node.module or ""]
+            else:
+                continue
+            for mod in names:
+                top = mod.split(".")[0]
+                assert top not in ("anthropic", "claude_agent_sdk", "claude_code_sdk"), \
+                    "%s imports %s" % (name, mod)
+
+
+def test_the_argv_builder_never_emits_bare_or_dangerous_flags():
+    argv = inbox_draft.build_argv("/x/claude", "opus")
+    assert argv[0] == "/x/claude" and "--bare" not in argv
+    assert not any("dangerously" in a for a in argv)
+    assert argv[argv.index("--tools") + 1] == ""
+
+
+def test_the_draft_caps_match_the_server():
+    """Pinned like the backlog key: the worker trims to what the server stores."""
+    inbox_db = pytest.importorskip("dashboard.inbox_db")
+    assert inbox_draft.MAX_TITLE == inbox_db.DRAFT_MAX_TITLE
+    assert inbox_draft.MAX_BODY == inbox_db.DRAFT_MAX_BODY
+    assert inbox_draft.SCHEMA["properties"]["title"]["maxLength"] == inbox_db.DRAFT_MAX_TITLE
+
+
+
+# --- security-gate fixes to the drafter ------------------------------------------------
+def test_a_relative_claude_bin_is_refused_before_any_call(tmp_path, monkeypatch):
+    exe = _fake_claude(tmp_path, ["ok"])
+    api = DraftApi([_ditem(ID_A)])
+    sent = _wire(monkeypatch, api)
+    monkeypatch.chdir(os.path.dirname(exe))
+    assert it.main(["--env", _denv(tmp_path, "claude"), "--quiet"]) == 1
+    assert "absolute path" in sent[0][3]["note"]
+    assert _calls(exe) == [] and api.drafts() == []
+
+
+def test_unparseable_output_never_reaches_the_heartbeat(tmp_path, monkeypatch):
+    exe = _fake_claude(tmp_path, ["chatty_garbage"])
+    api = DraftApi([_ditem(ID_A)])
+    sent = _wire(monkeypatch, api)
+    assert it.main(["--env", _denv(tmp_path, exe), "--quiet"]) == 1
+    note = sent[0][3]["note"]
+    assert "MODEL SAYS" not in note and "PRIVATE" not in note
+    assert "rc 1" in note and "bytes of stdout" in note and "boom line one" in note
+    assert "line two" not in note
+    assert "PRIVATE" not in (tmp_path / "worker.log").read_text()
+
+
+@pytest.mark.parametrize("mode,systemic", [("max_turns", False), ("bad_request", False),
+                                           ("usage_text", True), ("expired", True),
+                                           ("limit", True), ("not_logged_in", True)])
+def test_only_narrow_errors_are_systemic(tmp_path, monkeypatch, mode, systemic):
+    exe = _fake_claude(tmp_path, [mode, "ok"])
+    api = DraftApi([_ditem(ID_A), _ditem(ID_B)])
+    sent = _wire(monkeypatch, api)
+    rc = it.main(["--env", _denv(tmp_path, exe), "--quiet"])
+    if systemic:
+        assert rc == 1 and api.drafts() == [] and len(_calls(exe)) == 1
+    else:
+        assert rc == 0
+        drafts = dict(api.drafts())
+        assert drafts[ID_A]["failed"] is True and drafts[ID_B]["title"] == "Fix the wheel"
+        assert "MODEL RAMBLING" not in drafts[ID_A]["error"]
+
+
+def test_two_bad_notes_at_the_head_never_block_a_good_one(tmp_path, monkeypatch):
+    """The re-review finding: stopping at the second failure meant a good note C behind two
+    bad ones was NEVER reached, run after run. The batch is always finished; C's success
+    proves drafting works, so A and B's failures are real and are counted."""
+    exe = _fake_claude(tmp_path, ["no_structured", "no_structured", "ok"])
+    api = DraftApi([_ditem(ID_A), _ditem(ID_B), _ditem(ID_C)])
+    sent = _wire(monkeypatch, api)
+    assert it.main(["--env", _denv(tmp_path, exe), "--quiet"]) == 0
+    drafts = dict(api.drafts())
+    assert drafts[ID_C]["title"] == "Fix the wheel"
+    assert drafts[ID_A]["failed"] is True and drafts[ID_B]["failed"] is True
+    assert len(_calls(exe)) == 3 and sent[0][3]["status"] == "ok"
+
+
+def test_the_breaker_burns_nothing_until_three_tripped_runs_in_a_row(tmp_path, monkeypatch):
+    """Every note bad and none succeeding looks like a systemic fault, so the first two such
+    runs burn nothing. A third in a row means the notes really are bad: their failures are
+    counted, so they reach `failed` and stop sitting at the head of the queue."""
+    exe = _fake_claude(tmp_path, ["no_structured"])
+    api = DraftApi([_ditem(ID_A), _ditem(ID_B)])
+    sent = _wire(monkeypatch, api)
+    env = _denv(tmp_path, exe)
+    state = tmp_path / "draft-state.json"
+    for trip in (1, 2):
+        assert it.main(["--env", env, "--quiet"]) == 1
+        assert api.drafts() == []
+        assert "circuit breaker" in sent[-1][3]["note"]
+        assert json.loads(state.read_text())["breaker_trips"] == trip
+    assert len(_calls(exe)) == 4                  # the batch was finished every time
+    assert it.main(["--env", env, "--quiet"]) == 0
+    assert sorted(i for i, b in api.drafts() if b["failed"]) == [ID_A, ID_B]
+    # Straight to `failed` (every remaining attempt), so they reach Needs review after
+    # three runs rather than nine.
+    assert all(b.get("final") is True for _, b in api.drafts())
+    assert json.loads(state.read_text())["breaker_trips"] == 0
+
+
+def test_a_successful_run_resets_the_trip_count(tmp_path, monkeypatch):
+    exe = _fake_claude(tmp_path, ["ok"])
+    (tmp_path / "draft-state.json").write_text(json.dumps({"timed_out": None,
+                                                           "breaker_trips": 2}))
+    api = DraftApi([_ditem(ID_A)])
+    _wire(monkeypatch, api)
+    assert it.main(["--env", _denv(tmp_path, exe), "--quiet"]) == 0
+    assert json.loads((tmp_path / "draft-state.json").read_text())["breaker_trips"] == 0
+
+
+def test_a_lone_bad_note_is_still_burned_when_the_queue_runs_out(tmp_path, monkeypatch):
+    exe = _fake_claude(tmp_path, ["no_structured"])
+    api = DraftApi([_ditem(ID_A)])
+    sent = _wire(monkeypatch, api)
+    assert it.main(["--env", _denv(tmp_path, exe), "--quiet"]) == 0
+    ((item_id, body),) = api.drafts()
+    assert item_id == ID_A and body["failed"] is True
+
+
+def test_a_note_that_times_out_twice_running_burns_an_attempt(tmp_path, monkeypatch):
+    exe = _fake_claude(tmp_path, ["sleep"])
+    api = DraftApi([_ditem(ID_A)])
+    sent = _wire(monkeypatch, api)
+    env = _denv(tmp_path, exe, INBOX_DRAFT_TIMEOUT="1")
+    assert it.main(["--env", env, "--quiet"]) == 1          # first time: systemic
+    assert api.drafts() == []
+    state = json.loads((tmp_path / "draft-state.json").read_text())
+    assert state == {"timed_out": ID_A, "breaker_trips": 0}
+    assert it.main(["--env", env, "--quiet"]) == 0          # same note again: its fault
+    ((item_id, body),) = api.drafts()
+    assert item_id == ID_A and body["failed"] and "two consecutive runs" in body["error"]
+    assert json.loads((tmp_path / "draft-state.json").read_text()) == {
+        "timed_out": None, "breaker_trips": 0}
+
+
+def test_a_timeout_on_a_different_note_is_systemic_again(tmp_path, monkeypatch):
+    exe = _fake_claude(tmp_path, ["sleep"])
+    (tmp_path / "draft-state.json").write_text(json.dumps({"timed_out": ID_B}))
+    api = DraftApi([_ditem(ID_A)])
+    _wire(monkeypatch, api)
+    assert it.main(["--env", _denv(tmp_path, exe, INBOX_DRAFT_TIMEOUT="1"), "--quiet"]) == 1
+    assert api.drafts() == []
+
+
+@pytest.mark.parametrize("value", ["Infinity", "-Infinity", "NaN", '"lots"', "[1]"])
+def test_a_corrupt_trip_count_in_the_state_file_is_read_as_zero(tmp_path, monkeypatch, value):
+    """json.load accepts Infinity/NaN, and int(inf) raises OverflowError — which used to
+    escape the TypeError/ValueError guard and crash drafting for every run after."""
+    exe = _fake_claude(tmp_path, ["no_structured"])
+    (tmp_path / "draft-state.json").write_text('{"timed_out": null, "breaker_trips": %s}' % value)
+    api = DraftApi([_ditem(ID_A), _ditem(ID_B)])
+    sent = _wire(monkeypatch, api)
+    assert it.main(["--env", _denv(tmp_path, exe), "--quiet"]) == 1
+    assert "circuit breaker" in sent[0][3]["note"] and "trip 1 of 3" in sent[0][3]["note"]
+    assert api.drafts() == []
+    assert json.loads((tmp_path / "draft-state.json").read_text())["breaker_trips"] == 1

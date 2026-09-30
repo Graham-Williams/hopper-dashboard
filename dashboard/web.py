@@ -9,7 +9,8 @@ for POSTs, Origin/Referer as a CSRF defence.
 
 This role also enforces HTTPS at the origin (``X-Forwarded-Proto: http`` → 307
 to ``https://<APP_HOST>…``, plus HSTS). The INGEST role does not, and must not:
-see ``_https_redirect`` below.
+see ``_https_redirect`` below. Old hostnames in ``APP_LEGACY_HOSTS`` get a
+permanent redirect to ``APP_HOST`` and nothing else (``_legacy_host_redirect``).
 """
 
 from __future__ import annotations
@@ -237,6 +238,42 @@ def _https_redirect():
 
 
 @bp.before_app_request
+def _legacy_host_redirect():
+    """An old public hostname (``APP_LEGACY_HOSTS``) only redirects to APP_HOST.
+
+    The product moved hostnames; bookmarks, the apex page's old link and
+    Hopper's saved URLs keep working through this. It is NOT dual-serving: a
+    legacy host never sees the gate, a page or the API — only a redirect.
+
+    - 307 for EVERY method (method and body preserved), to
+      ``https://<APP_HOST><raw target>``: path and query byte-exact, and the
+      host comes from the validated pin, never the request (no reflection).
+    - 307 + ``Cache-Control: no-store``, never 301/308: a permanent redirect
+      built from a wrong APP_HOST would stick in every browser that saw it,
+      with no way to recall it. Same house rule as ``_https_redirect``.
+    - ``/healthz`` is exempt, so a probe through the old name still answers.
+    - APP_HOST malformed (``https_redirect_host`` empty) → 403, fail CLOSED:
+      the Host pin would refuse this host anyway, and there is no safe
+      Location to emit.
+
+    Registered after ``_https_redirect`` (an http visitor on the old host is
+    sent straight to https on the new one) and before the gate and the Host
+    pin, which would otherwise bounce or 403 the old host first.
+    """
+    settings = _settings()
+    if not settings.app_legacy_hosts or request.path == "/healthz":
+        return None
+    if request.host.split(":", 1)[0].lower() not in settings.app_legacy_hosts:
+        return None
+    target_host = settings.https_redirect_host
+    if not target_host:
+        abort(403)
+    resp = redirect(f"https://{target_host}{_request_target()}", code=307)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@bp.before_app_request
 def _password_gate():
     if not _gate_enabled():
         return None
@@ -327,7 +364,7 @@ def healthz():
 @bp.get("/login")
 def login():
     if not _gate_enabled():
-        return redirect(url_for("web.index"))
+        return redirect(url_for("hub.index"))
     if session.get(SESSION_KEY) is True:
         return redirect(safe_next(request.args.get("next")))
     return render_template("login.html", next=request.args.get("next", ""),
@@ -337,7 +374,7 @@ def login():
 @bp.post("/login")
 def login_post():
     if not _gate_enabled():
-        return redirect(url_for("web.index"))
+        return redirect(url_for("hub.index"))
     next_target = request.form.get("next", "")
     ip = client_ip()
     limiter = current_app.extensions["login_limiter"]
@@ -366,7 +403,7 @@ def logout():
     session.clear()
     if _gate_enabled():
         return redirect(url_for("web.login"))
-    return redirect(url_for("web.index"))
+    return redirect(url_for("hub.index"))
 
 
 # --------------------------------------------------------------------------- #
@@ -383,8 +420,16 @@ def _conn():
     return db.connect_query_only(_settings().db_path)
 
 
-@bp.get("/")
-def index():
+def scheduler_stale(status: dict, now: float) -> bool:
+    """No state recomputed in five minutes: the ingest scheduler may be down,
+    and LATE will not fire until it is back. Shown on the board and the Hub."""
+    computed = db.from_iso(status["summary"].get("computed_at"))
+    return computed is None or (now - computed) > 5 * 60
+
+
+@bp.get("/dashboard")
+def board():
+    """The jobs board. It lived at ``/`` until the Hub took that path."""
     registry = current_app.extensions["registry"]
     now = time.time()
     conn = _conn()
@@ -394,10 +439,8 @@ def index():
         conn.close()
     groups = [(m, [j for j in status["jobs"] if j["machine"] == m])
               for m in ("box", "mac")]
-    computed = db.from_iso(status["summary"].get("computed_at"))
-    scheduler_stale = computed is None or (now - computed) > 5 * 60
     return render_template("index.html", status=status, groups=groups,
-                           now=now, scheduler_stale=scheduler_stale)
+                           now=now, scheduler_stale=scheduler_stale(status, now))
 
 
 @bp.get("/jobs/<job_id>")

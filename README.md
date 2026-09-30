@@ -1,6 +1,10 @@
 # hopper-dashboard
 
-A small self-hosted dashboard that shows the health of every backup and scheduled job across one home server
+**Hub** — a small self-hosted app with two halves behind one password: a jobs dashboard and a voice-first
+Inbox. The landing page (`/`) is the Hub: an Inbox card (what needs review, a Record button) and a one-row
+health strip of the dashboard. The repo keeps its original name.
+
+The dashboard (`/dashboard`) shows the health of every backup and scheduled job across one home server
 and one Mac — last run, last success, whether the destination really has fresh bytes, and how far behind the
 manual jobs are. API-first (JSON) with an HTML board on top, dead-man's-switch heartbeats, destination probes
 via rclone, and push alerts via ntfy.
@@ -14,7 +18,7 @@ target) or **UNKNOWN** (never heard from). Every transition is recorded and push
 uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -r requirements-dev.txt
 cp jobs.example.yml jobs.yml
 export INGEST_TOKEN=devtoken READ_TOKEN=devread APP_ENV=dev   # APP_ENV=dev + no APP_PASSWORD = gate off (prod refuses)
-.venv/bin/python -m dashboard                             # board: http://127.0.0.1:8080  ingest: :8081
+.venv/bin/python -m dashboard                             # Hub: http://127.0.0.1:8080  ingest: :8081
 curl -X POST -H 'Authorization: Bearer devtoken' -d result=success http://127.0.0.1:8081/api/v1/ping/km-backup
 ```
 `.venv/bin/python -m pytest -q` runs the suite (no network needed).
@@ -37,7 +41,9 @@ A voice-first work queue on the same app: record a note on your phone and it lan
 every open GitHub issue across your repos and your plain-text backlog file. Filed items stay, with their
 issue links and live open/closed state.
 
-**Audio never leaves your own machines.** The browser uploads the recording to the box and does nothing else
+**Audio never leaves your own machines; the transcript and title go to Anthropic for drafting.** Each
+transcribed note gets an AI draft (title, description, project) made on the Mac by the `claude` CLI, which
+you edit and approve by ticking Reviewed — the audio is never sent anywhere, only the transcript and title. The browser uploads the recording to the box and does nothing else
 with it — there is deliberately no in-browser speech recognition, because the Web Speech API sends your
 microphone to a third party's servers to do the work. Transcription runs locally instead, on a Mac, via
 `probes/inbox_transcribe.py` and mlx-whisper. It is a job on the board like any other, so a transcription

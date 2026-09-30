@@ -121,11 +121,11 @@ jobs:
         # This second container sets APP_HOST and asserts the upgrade itself.
         run: |
           set -eu
-          H='Host: dashboard.ci.example'
+          H='Host: hub.ci.example'
           docker run -d --name hd3 --read-only --tmpfs /tmp:mode=1777,size=64m -v /app/data \
             -v "$PWD/jobs.yml:/app/jobs.yml:ro" \
             -e INGEST_TOKEN=ci-token -e READ_TOKEN=ci-read -e APP_PASSWORD=ci-pass -e SESSION_SECRET=ci-secret \
-            -e APP_HOST=dashboard.ci.example -e DASHBOARD_NO_SCHEDULER=1 \
+            -e APP_HOST=hub.ci.example -e APP_LEGACY_HOSTS=dashboard.ci.example -e DASHBOARD_NO_SCHEDULER=1 \
             -p 8082:8080 -p 8083:8081 hopper-dashboard:ci
           for i in $(seq 1 30); do
             if curl -sf http://127.0.0.1:8082/healthz >/dev/null && curl -sf http://127.0.0.1:8083/healthz >/dev/null; then
@@ -135,7 +135,7 @@ jobs:
           done
           # X-Forwarded-Proto: http -> 307 to the PINNED host (never the request's own).
           test "$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' -H "$H" -H 'X-Forwarded-Proto: http' http://127.0.0.1:8082/)" \
-            = "307 https://dashboard.ci.example/"
+            = "307 https://hub.ci.example/"
           # ...and it must be uncacheable + Vary'd, or a self-referential redirect
           # could be stored by a shared cache / stick in a browser forever.
           curl -s -D- -o /dev/null -H "$H" -H 'X-Forwarded-Proto: http' http://127.0.0.1:8082/ > /tmp/redir
@@ -144,7 +144,7 @@ jobs:
           grep -qi '^strict-transport-security: max-age=31536000' /tmp/redir
           # A crafted Host is never reflected into Location (open-redirect guard).
           test "$(curl -s -o /dev/null -w '%{redirect_url}' -H 'Host: evil.example' -H 'X-Forwarded-Proto: http' http://127.0.0.1:8082/)" \
-            = "https://dashboard.ci.example/"
+            = "https://hub.ci.example/"
           # With NO X-Forwarded-Proto nothing is redirected: that is what keeps the
           # container HEALTHCHECK and Hopper's in-network read working.
           test "$(curl -s -o /dev/null -w '%{http_code}' -H "$H" http://127.0.0.1:8082/)" = "302"
@@ -155,6 +155,16 @@ jobs:
             -H 'Authorization: Bearer ci-token' -d result=success http://127.0.0.1:8083/api/v1/ping/km-backup)" = "200"
           test -z "$(curl -s -o /dev/null -w '%{redirect_url}' -X POST -H 'X-Forwarded-Proto: http' \
             -H 'Authorization: Bearer ci-token' -d result=success http://127.0.0.1:8083/api/v1/ping/km-backup)"
+          # The LEGACY host only redirects: 307 for every method (never 301 — a wrong
+          # APP_HOST must not stick in browsers), path+query kept, no-store, and
+          # /healthz still answers on it.
+          L='Host: dashboard.ci.example'
+          test "$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' -H "$L" 'http://127.0.0.1:8082/inbox?q=a%2Fb')" \
+            = "307 https://hub.ci.example/inbox?q=a%2Fb"
+          test "$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' -X POST -H "$L" http://127.0.0.1:8082/login)" \
+            = "307 https://hub.ci.example/login"
+          curl -s -D- -o /dev/null -H "$L" http://127.0.0.1:8082/ | grep -qi '^cache-control: no-store'
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H "$L" http://127.0.0.1:8082/healthz)" = "200"
           docker logs hd3
           docker rm -f hd3
 

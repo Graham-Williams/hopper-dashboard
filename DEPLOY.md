@@ -28,6 +28,11 @@ text). It also changes one **value**, §1c: the dashboard gets its OWN `APP_PASS
 house word, because the board is linked from the public apex page and now holds recordings of Graham's
 voice.
 
+**The Hub makeover** (the product is now "Hub" at `hub.graham-williams.com`; `dashboard.graham-williams.com`
+only redirects) changes two `.env` values and two Mac env keys, and adds one Cloudflare hostname. The
+ORDER matters and is in §3a: **DNS and the tunnel rule for `hub` first, then the box `.env`, then the Mac.**
+It also adds AI drafting of voice notes on the Mac (§4c).
+
 **Adding a job id is app-first, probe-second.** The registry is loaded once at start-up, so a new id must be
 in the live (gitignored) `jobs.yml` **and the container restarted** *before* anything posts to it — `docker
 compose up -d` in `~/hopper-dashboard` after editing the file. In the other order every ping 404s, the Mac
@@ -66,7 +71,8 @@ sed -i "s|^NTFY_TOPIC=.*|NTFY_TOPIC=hopper-$(openssl rand -hex 16)|" .env
 sed -i "s|^INGEST_BIND=.*|INGEST_BIND=${TS_IP}|" .env                   # Tailscale IP ONLY — ufw is inactive
 # The read role trusts CF-Connecting-IP only from the tunnel container's network:
 sed -i "s|^TRUSTED_PROXY_CIDR=.*|TRUSTED_PROXY_CIDR=$(docker network inspect km-tracker_default -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}')|" .env
-# leave APP_HOST=dashboard.graham-williams.com and APP_ENV=prod as shipped
+# leave APP_HOST=hub.graham-williams.com, APP_LEGACY_HOSTS=dashboard.graham-williams.com and APP_ENV=prod
+# as shipped (the legacy host only 307s to APP_HOST; see §3a for the order of the hostname move)
 # PROBE_INTERVAL_S / DASHBOARD_RCLONE_TIMEOUT_S / PROBE_FAIL_THRESHOLD / PROBE_NO_SUCCESS_S are optional —
 # compose supplies the defaults (300 / 240 / 2 / 3600), so an existing .env needs no edit. See DESIGN.md
 # "Probe cadence and flap damping" before changing any of them. NOTE the timeout knob is
@@ -202,7 +208,7 @@ The password goes in via the ENVIRONMENT, not argv — `ps` shows a process's ar
 user on the box, and `PW=... python3 -c` keeps the value out of them.
 
 **Consequences, stated so nobody debugs them twice.** The shared house word no longer opens
-`dashboard.graham-williams.com`. km-tracker, taste-twin, jjho and todoist-points are untouched
+the Hub (`hub.graham-williams.com`). km-tracker, taste-twin, jjho and todoist-points are untouched
 and keep sharing theirs. Graham needs the new word in his password manager, and anyone he has
 given the house word to can no longer reach the board — which is the point, now that `/inbox`
 stores recordings of his voice. The **local-QA recipe is unaffected**: it runs `APP_ENV=dev
@@ -584,7 +590,7 @@ docker exec -e RT="$RT" -e AH="$AH" hopper-dashboard python -c "import os,json,u
 ```
 
 The in-container read is only for verifying before §3 is wired. Hopper's normal bearer read goes through the
-public hostname — `curl -sS -H "Authorization: Bearer $READ_TOKEN" https://dashboard.graham-williams.com/api/v1/status`
+public hostname — `curl -sS -H "Authorization: Bearer $READ_TOKEN" https://hub.graham-williams.com/api/v1/status`
 — which carries the right Host by construction.
 
 **Re-installing after a change to the box probes:** the service runs
@@ -750,14 +756,52 @@ Follow the **Cloudflare** section of `~/personal-assistant/CLAUDE.md` (token `cl
 Hopper vault, field `api_token`; cache to a gitignored `chmod 600 .env.cloudflare-session`). Tunnel
 `km-tracker` (`5782cc53-4741-4a7d-80ec-89c87070b7be`) is remotely managed, so ingress lives in the API:
 
-1. Append an ingress rule **before the catch-all 404**: hostname `dashboard.graham-williams.com` →
+1. Append an ingress rule **before the catch-all 404**: hostname `hub.graham-williams.com` →
    service `http://hopper-dashboard:8080` (compose service name; the container joins `km-tracker_default`).
-2. Create a **proxied CNAME** `dashboard` → `5782cc53-4741-4a7d-80ec-89c87070b7be.cfargotunnel.com`.
-3. **Single-label host only** (`dashboard`, never `dash.hopper`) — Universal SSL covers one label.
-4. No Cloudflare Access app: the gate is the in-app shared `APP_PASSWORD` (account has zero Access apps).
+   **Keep** the existing `dashboard.graham-williams.com` rule and CNAME: the app answers that host with a
+   redirect to the Hub (and nothing else), so old bookmarks, the apex page's old link and saved URLs keep
+   working. The redirect lives in the APP, not in a Cloudflare rule (the CF token is read-only on rulesets).
+2. Create a **proxied CNAME** `hub` → `5782cc53-4741-4a7d-80ec-89c87070b7be.cfargotunnel.com`.
+3. **Single-label host only** (`hub`, never `hub.hopper`) — Universal SSL covers one label.
+4. No Cloudflare Access app: the gate is the in-app `APP_PASSWORD` (account has zero Access apps).
 
-Verify: `curl -sS -o /dev/null -w '%{http_code}\n' https://dashboard.graham-williams.com/` → `302` to
-`/login`; `https://dashboard.graham-williams.com/healthz` → `200`.
+Verify: `curl -sS -o /dev/null -w '%{http_code}\n' https://hub.graham-williams.com/` → `302` to
+`/login`; `https://hub.graham-williams.com/healthz` → `200`.
+
+### 3a. ⚠️ Moving the hostname (dashboard → hub): the order
+
+`APP_HOST` is the Host pin: the moment the box `.env` says `hub…`, a request that arrives as `dashboard…`
+is only ever redirected, and a request to a `hub…` that has no DNS goes nowhere. So:
+
+1. **Cloudflare first** (§3 steps 1-2): the `hub` ingress rule and CNAME. Check
+   `curl -sS -o /dev/null -w '%{http_code}\n' https://hub.graham-williams.com/healthz` → `200` — `/healthz`
+   is exempt from the Host pin, so this answers even while the box still says `APP_HOST=dashboard…`.
+2. **Then the box `.env`**, backed up first:
+   ```bash
+   cd ~/hopper-dashboard && cp .env ".env.bak.$(date +%F-%H%M%S)"
+   sed -i 's/^APP_HOST=.*/APP_HOST=hub.graham-williams.com/' .env
+   grep -q '^APP_LEGACY_HOSTS=' .env || echo 'APP_LEGACY_HOSTS=dashboard.graham-williams.com' >> .env
+   git pull && docker compose up -d --build
+   ```
+   (compose defaults both to exactly these values, so a `.env` with neither line gets them anyway; the
+   explicit lines are for a `.env` that still pins the OLD `APP_HOST=dashboard…`.)
+3. **Verify the redirect** — 307 for every method (never 301: a wrong `APP_HOST` must not stick in
+   browsers), path and query kept, `no-store`, `/healthz` still answers on the old name:
+   ```bash
+   curl -sS -o /dev/null -w '%{http_code} %{redirect_url}\n' 'https://dashboard.graham-williams.com/inbox?q=x'
+   # → 307 https://hub.graham-williams.com/inbox?q=x
+   curl -sS -o /dev/null -w '%{http_code}\n' https://dashboard.graham-williams.com/healthz   # → 200
+   ```
+4. **Then the Mac**: `INBOX_URL` in `~/.config/hopper-dashboard/env` MUST change to
+   `https://hub.graham-williams.com`. The worker refuses cross-host redirects (a redirect would carry the
+   `INBOX_TOKEN` somewhere else), so an old `INBOX_URL` makes every run fail rather than follow the 307:
+   ```bash
+   sed -i '' 's|^INBOX_URL=.*|INBOX_URL=https://hub.graham-williams.com|' ~/.config/hopper-dashboard/env
+   ```
+   Hopper's own bearer reads move too: `https://hub.graham-williams.com/api/v1/status`.
+
+Rollback of the hostname move: restore the `.env` backup and `docker compose up -d`; the old host serves
+again at once (the redirect is `no-store`, so no browser has cached it).
 
 **Ingest isolation check.** The read role answers 401 to ANY unauthenticated `/api/v1/*` path, so "401 =
 exposed" is NOT a valid test. Prove the ingest route simply does not exist on the public side by asking
@@ -765,8 +809,11 @@ exposed" is NOT a valid test. Prove the ingest route simply does not exist on th
 
 ```bash
 RT="$(ssh <user>@<box-tailscale-ip> "grep '^READ_TOKEN=' ~/hopper-dashboard/.env | cut -d= -f2-")"
+# The Origin header gets the request past the browser-write origin pin (without it: 403, which proves
+# nothing either), so the answer comes from routing: the ingest route must not exist here.
 curl -sS -o /dev/null -w '%{http_code}\n' -X POST -H "Authorization: Bearer $RT" \
-  https://dashboard.graham-williams.com/api/v1/ping/x          # MUST be 404 or 405 — never 200/400/401
+  -H "Origin: https://hub.graham-williams.com" \
+  https://hub.graham-williams.com/api/v1/ping/x                # MUST be 404 or 405 — never 200/400/401
 ssh <user>@<box-tailscale-ip> 'ss -ltnp | grep 8081'             # only <box-tailscale-ip>:8081, never 0.0.0.0
 ```
 
@@ -924,7 +971,9 @@ That is why it is on a 5-minute `StartInterval` and not the probe's hour.
 
 It also has a privacy consequence worth stating: because transcription happens here, on Graham's own Mac,
 **the audio of a voice note never leaves his own machines.** It goes browser → the box, and box → this Mac.
-No third party is ever sent it.
+No third party is ever sent the audio. **The transcript and title are**: with drafting on (§4c) the worker
+sends each new transcript (and a title Graham typed, if any) from this Mac to Anthropic (Claude) to draft
+the item. The page says so in the same words.
 
 **Prerequisites on the Mac**, both of which the installer only WARNS about (it cannot fix them for you):
 
@@ -948,7 +997,7 @@ and re-running is a no-op once `INBOX_TOKEN=` is present), then renders and load
 
 | key | what it is |
 |---|---|
-| `INBOX_URL` | the **PUBLIC** host, `https://dashboard.graham-williams.com` — *not* the Tailscale ingest URL |
+| `INBOX_URL` | the **PUBLIC** host, `https://hub.graham-williams.com` — *not* the Tailscale ingest URL, and *not* the legacy `dashboard…` name (the worker refuses the cross-host redirect; §3a) |
 | `INBOX_TOKEN` | the box `.env`'s `INBOX_TOKEN`. A **third** credential, separate from `INGEST_TOKEN` and `READ_TOKEN` |
 | `INBOX_WHISPER_PYTHON` | the venv interpreter that has mlx-whisper |
 | `INBOX_WHISPER_MODEL` | `mlx-community/whisper-large-v3-turbo` (weights already cached in `~/.cache/huggingface`) |
@@ -989,6 +1038,72 @@ the line still says 4 pings, which is also correct: nothing is running it.
 **If you remove the worker** (`deploy/mac/uninstall.sh --inbox-only`), `inbox-transcribe` stops heartbeating
 and goes LATE after ~14 h. That is right — nobody is running it — and no audio is lost.
 
+### 4c. Mac — drafting voice notes with `claude -p` (NEW; phase two of `inbox-transcribe`)
+
+After transcribing, the same worker drafts each new voice note: a concise imperative **title**, a short
+**description** of the problem or idea and the outcome wanted, and a **project** picked from the known list
+(the repo names in `INBOX_GITHUB_REPOS` plus the board's projects) or none. It runs the `claude` CLI on this
+Mac and posts to `POST /api/v1/inbox/items/<id>/draft`. The draft is stored ALONGSIDE the note
+(`draft_*` columns); the note's `body` stays the transcript. Graham reads and edits it on `/inbox`, and
+**ticking Reviewed copies the draft into the note's title and project** — which is what Hopper's filing
+loop then reads. **The transcript and title go to Anthropic; the audio never does.**
+
+Off until `INBOX_CLAUDE_BIN` is set. `deploy/mac/install.sh --inbox` prompts for it (`-` leaves it off) and
+appends four keys:
+
+| key | what it is |
+|---|---|
+| `INBOX_CLAUDE_BIN` | absolute path to `claude` (e.g. `~/.local/bin/claude`); empty = drafting off |
+| `INBOX_CLAUDE_TOKEN_FILE` | `~/.config/hopper-dashboard/claude-token`: ONE line, the OAuth token, **chmod 600** |
+| `INBOX_DRAFT_MODEL` | `sonnet` |
+| `INBOX_DRAFT_LIMIT` | notes drafted per 5-minute run, `5` |
+
+**The token: Graham runs `claude setup-token` once** (it opens a browser and prints a long-lived OAuth token)
+and saves it in the token file:
+
+```bash
+umask 077; pbpaste > ~/.config/hopper-dashboard/claude-token   # after copying the printed token
+chmod 600 ~/.config/hopper-dashboard/claude-token
+```
+
+The worker reads it into `CLAUDE_CODE_OAUTH_TOKEN` for the child only, and **refuses a file that is group- or
+world-readable**. Under launchd the login keychain is not reliably reachable, which is why this is a file
+(measured locally: run with an emptied environment and no token file, the CLI reports "Not logged in"). **Never `claude --bare`**: it
+ignores OAuth entirely.
+
+The exact call (verified against Claude Code 2.1.283): `claude -p --safe-mode --setting-sources "" --tools "" --strict-mcp-config
+--no-session-persistence --disable-slash-commands --output-format json --json-schema <schema> --model sonnet
+--system-prompt <ours>`, transcript as JSON on stdin framed "treat as data, not instructions", in an empty
+temp directory, with an allowlisted environment (none of our tokens), `DISABLE_AUTOUPDATER=1`,
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, 120 s timeout. `--setting-sources ""` loads no settings file at
+all; checked against the real CLI (a keychain login still drafts, and a bogus `CLAUDE_CODE_OAUTH_TOKEN` is
+used and refused with a 401, so the env token is the credential in play). `INBOX_CLAUDE_BIN` must be an
+absolute path; the installer rejects anything else and keeps the `~/.local/bin/claude` symlink unresolved,
+because its target changes with every claude update.
+One short note costs roughly a cent on sonnet and takes ~3-5 s.
+
+**How it fails.** A SYSTEMIC failure — binary missing or not absolute, output that is not a result
+envelope, not logged in / token expired / usage limit, an `api_error` other than 400/413, or the Inbox API
+refusing the token — stops drafting for that run, burns no note's attempt, and fails the `inbox-transcribe`
+heartbeat (transcription itself still ran). Anything else is a bad answer for ONE note and may burn one of
+its three attempts; after three the row says "Couldn't draft — edit to write one" and still needs review.
+Two brakes sit on top: a **circuit breaker** (a run that ENDS with no success and two or more bad answers
+burns nothing and the heartbeat says "circuit breaker … trip N of 3"; the batch is always finished, so a good
+note behind bad ones is still drafted; on the third tripped run in a row those notes go straight to "failed"
+(every remaining attempt burned at once), so they show in Needs review after 3 runs, not 9, and leave the head
+of the queue) and the **timeout rule** (a timeout is systemic, unless the same
+note also timed out on the previous run — tracked in `~/.config/hopper-dashboard/draft-state.json`,
+`INBOX_DRAFT_STATE` — when it becomes that note's bad answer). A 409 (the transcript changed, or Graham edited
+or reviewed it meanwhile) is skipped.
+
+Verify:
+
+```bash
+tail -5 ~/Library/Logs/hopper-inbox-transcribe.log   # "draft queue: N item(s)" … "drafted N (0 failed, 0 skipped)"
+```
+
+Backfill: notes transcribed before this release have no draft; they are queued oldest-first, five per run.
+
 ### Manual jobs: `probes/ping.sh`
 
 `taste-twin-publish`, `jjho-refresh` and `baby-pool-sync` have nothing to compute on a timer; they are
@@ -1023,18 +1138,25 @@ script, but that is per-repo work).
 - [ ] `docker ps` shows `hopper-dashboard` healthy; `ss -ltnp | grep 8081` shows only `<box-tailscale-ip>:8081`.
 - [ ] No root process in the container after start-up (check with `docker exec -u 10001 …`, §1c);
       `/tmp/rclone/rclone.conf` is `10001 600`.
-- [ ] `https://dashboard.graham-williams.com/` → login page; `/healthz` → 200; `POST /api/v1/ping/x` via the
-      public host **with the READ_TOKEN** is 404/405 (ingest isn't tunnelled; see §3 for why 401 proves nothing).
+- [ ] `https://hub.graham-williams.com/` → login page; `/healthz` → 200; `POST /api/v1/ping/x` via the
+      public host **with the READ_TOKEN and an `Origin: https://hub…` header** is 404/405 (ingest isn't tunnelled; see §3 for why 401 proves nothing).
+- [ ] **Hostname move** (§3a), in order: `hub` DNS + ingress first (`/healthz` 200 on `hub`), then the box
+      `.env` (`APP_HOST=hub…`, `APP_LEGACY_HOSTS=dashboard…`), then the Mac's `INBOX_URL`.
+      `https://dashboard.graham-williams.com/inbox?q=x` → **307** to `https://hub.graham-williams.com/inbox?q=x`
+      with `Cache-Control: no-store`; a POST there is also 307; `/healthz` on the old name → 200.
+- [ ] **The Hub** (`/`): Inbox card first with the Needs-review count and a Record button that lands on
+      `/inbox#capture`; the Dashboard card's health strip matches the board's counts; the nav is one row on a
+      phone (Hub · Dashboard · Inbox · Sign out) with no horizontal scroll. The board is at `/dashboard`.
 - [ ] `/api/v1/status` (READ_TOKEN) lists all **17** jobs; after ≤5 min box jobs are `OK`, after ≤1 h Mac jobs are
       `OK`/`BEHIND` (not `UNKNOWN`), manual jobs show **Never run** until their first `ping.sh`.
-- [ ] HTTPS at the origin: `curl -sI https://dashboard.graham-williams.com/healthz | grep -i strict-transport`
+- [ ] HTTPS at the origin: `curl -sI https://hub.graham-williams.com/healthz | grep -i strict-transport`
       → `max-age=31536000` (no `includeSubDomains`, no `preload`), and a forwarded-http request **307s** to
       the pinned host without reflecting the one it was sent, uncacheable and `Vary`'d (`curl` is purged from
       the image — run it from the box against the container, or from the Mac against the public host):
       ```bash
       docker exec -i hopper-dashboard python3 - <<'PY'
       import os, urllib.request as u
-      host = os.environ.get("AH") or "dashboard.graham-williams.com"
+      host = os.environ.get("AH") or "hub.graham-williams.com"
       r = u.Request("http://127.0.0.1:8080/healthz",
                     headers={"Host": "evil.example", "X-Forwarded-Proto": "http"})
       try:
@@ -1054,7 +1176,8 @@ script, but that is per-repo work).
       **`-i` is required** — without it the heredoc is discarded and the check silently "passes".
 - [ ] `APP_HOST` actually reached the container. It lives in `.env` (gitignored), so a PR cannot put it
       there — an older `.env` would ship the redirect silently disabled. Compose now defaults it to
-      `dashboard.graham-williams.com`, which is the belt; this is the braces:
+      `hub.graham-williams.com` (and `APP_LEGACY_HOSTS` to `dashboard.graham-williams.com`), which is the
+      belt; this is the braces:
       ```bash
       ssh <user>@<box-tailscale-ip> "grep -c '^APP_HOST=' ~/hopper-dashboard/.env"   # expect 1
       ssh <user>@<box-tailscale-ip> "docker logs hopper-dashboard 2>&1 | grep -i 'redirect is DISABLED'"  # expect EMPTY
@@ -1070,7 +1193,7 @@ script, but that is per-repo work).
       "informational"`, and `mac-probe` reading `{"after_s": 259200, "never": false}` (never `true` — see the
       table below). The §1d command exits non-zero if any of that is wrong; check `echo $?`.
 - [ ] **The dashboard's own password** (§1c): the shared house word is REFUSED at
-      `https://dashboard.graham-williams.com/login`, and the new one is accepted. Check the other four apps
+      `https://hub.graham-williams.com/login`, and the new one is accepted. Check the other four apps
       still take the house word — nothing about them changed, but confirm rather than assume.
 - [ ] **Backup** (§2b): `deploy/box/backup.sh` run by hand leaves `dashboard_<ts>.db` **and** `inbox_<ts>.db`
       in `~/hopper-dashboard-backups/snapshots/`, `rclone lsf gdrive:hopper-dashboard-backups` lists both
@@ -1079,6 +1202,11 @@ script, but that is per-repo work).
       Whisper transcript. `tail ~/Library/Logs/hopper-inbox-transcribe.log` shows `queue: 1 item(s)` then
       `transcribed … chars`. If it stays "transcribing…", check `launchctl list | grep inbox-transcribe`
       and then the log for the ffmpeg/PATH diagnostic — that is the expected first failure.
+- [ ] **Drafting** (§4c): with the token file in place (`stat -f %Lp ~/.config/hopper-dashboard/claude-token`
+      → `600`), a new voice note shows "Drafting…" after its transcript lands, then a draft title and
+      description within one more run; the log says `drafted 1`. Edit the draft, tick Reviewed, and the row
+      becomes "awaiting filing" with the draft's title and project. Typed notes arrive already reviewed and
+      show no Reviewed box.
 - [ ] **Backlog mirror** (§4b): the hourly probe log reads `run ok in Ns (5 sub-probes, 0 failed, 5 pings)`
       and `/inbox` lists the backlog entries. Four pings instead of five means `INBOX_URL`/`INBOX_TOKEN` are
       not in the Mac env file, which is a correct skip, not a failure.
@@ -1114,6 +1242,34 @@ script, but that is per-repo work).
       `~/.config/rclone/dashboard-ro.conf`).
 
 ## Rollback
+
+### ⚠️ Rolling back past the Hub makeover: filed-to-backlog notes come back as "awaiting filing"
+
+The Hub release's columns are additive, so an older image starts fine on the newer `inbox.db` — it simply
+IGNORES them. That has one visible consequence: an older image does not know `filed_backlog_at`, so every
+note Hopper filed as a `backlog.txt` line (issue #33) reads as **awaiting filing again**, and its backlog-mirror
+copy shows beside it. **Before Hopper re-files anything after such a rollback**, list what was already filed
+and skip those notes (the filing loop must also grep `backlog.txt` for the note's `(voice <id8>)` tag first):
+
+```bash
+# -u 10001: the app user, so no root-owned WAL sidecar is created; query_only makes it read-only.
+docker exec -u 10001 -i hopper-dashboard python3 - <<'PY'
+import sqlite3
+c = sqlite3.connect("/app/data/inbox.db")
+c.execute("PRAGMA query_only=ON")
+cols = {r[1] for r in c.execute("PRAGMA table_info(inbox_items)")}
+if "filed_backlog_at" not in cols:
+    print("no filed_backlog_at column: nothing was ever filed to the backlog"); raise SystemExit(0)
+rows = c.execute("SELECT id, filed_backlog_at, filed_backlog_line FROM inbox_items"
+                 " WHERE filed_backlog_at IS NOT NULL ORDER BY filed_backlog_at").fetchall()
+for i, at, line in rows:
+    print(f"ALREADY FILED  {i[:8]}  {at}  {line}")
+print(f"{len(rows)} note(s) already filed to backlog.txt — do NOT file these again")
+PY
+```
+
+The hostname move rolls back separately: restore the `.env` backup from §3a (an older image has no legacy
+redirect, so with `APP_HOST=hub…` the old `dashboard…` name would 403), and put the Mac's `INBOX_URL` back.
 
 ### ⚠️ Rolling the IMAGE back to `main` requires restoring `jobs.yml` FIRST
 

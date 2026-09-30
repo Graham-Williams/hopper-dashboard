@@ -1,6 +1,8 @@
 """Read side: password gate, bearer token, security headers, JSON contract,
 HTML rendering of every state."""
 
+import pytest
+
 from dashboard import db
 from dashboard.services import COOLDOWN_FLOOR_S, ok_dwell_s
 from tests.conftest import PASSWORD, READ_TOKEN
@@ -120,8 +122,10 @@ def test_empty_read_token_never_matches(settings, registry, notifier):
 # Headers / host pin
 # --------------------------------------------------------------------------- #
 
-def test_security_headers(authed):
-    r = authed.get("/")
+@pytest.mark.parametrize("path", ["/", "/dashboard"])
+def test_security_headers(authed, path):
+    """The Hub and the board each carry exactly ONE script: the nonce'd localizer."""
+    r = authed.get(path)
     h = r.headers
     assert h["X-Content-Type-Options"] == "nosniff"
     assert h["Referrer-Policy"] == "same-origin"
@@ -137,7 +141,7 @@ def test_security_headers(authed):
     assert html.count("<script") == 1 and f'<script nonce="{m.group(1)}">' in html
     assert "src=" not in html.split("<script", 1)[1].split(">", 1)[0]   # inline, no external src
     # The nonce is fresh per request.
-    r2 = authed.get("/")
+    r2 = authed.get(path)
     assert re.search(r"nonce-([A-Za-z0-9_-]+)", r2.headers["Content-Security-Policy"]).group(1) != m.group(1)
 
 
@@ -284,6 +288,93 @@ def test_redirect_runs_before_the_password_gate(settings, registry, notifier):
     assert r.status_code == 307 and r.headers["Location"] == f"{HTTPS_BASE}/"
 
 
+# --------------------------------------------------------------------------- #
+# Legacy hostname -> APP_HOST (the dashboard.* -> hub.* move)
+# --------------------------------------------------------------------------- #
+
+LEGACY_HOST = "old.example.com"
+LEGACY_BASE = f"https://{LEGACY_HOST}"
+
+
+def _legacy(settings, registry, notifier, **overrides):
+    return _pinned(settings, registry, notifier,
+                   app_legacy_hosts=(LEGACY_HOST,), **overrides)
+
+
+def test_legacy_host_is_307_no_store_for_every_method(settings, registry, notifier):
+    """307, never 301/308: a permanent redirect built from a wrong APP_HOST
+    would stick in every browser that saw it. 307 also keeps the method and
+    body, so a POST is re-sent rather than downgraded to a GET."""
+    c = _legacy(settings, registry, notifier)
+    for method in ("get", "head", "post", "patch", "put", "delete"):
+        r = getattr(c, method)("/jobs/snap", base_url=LEGACY_BASE)
+        assert r.status_code == 307, method
+        assert r.headers["Location"] == f"{HTTPS_BASE}/jobs/snap", method
+        assert r.headers["Cache-Control"] == "no-store", method
+
+
+def test_legacy_host_preserves_path_and_query_byte_for_byte(settings, registry, notifier):
+    c = _legacy(settings, registry, notifier)
+    raw = "/inbox?q=a%2Fb%20c&e=%C3%A9&awaiting=review"
+    r = c.get(raw, base_url=LEGACY_BASE)
+    assert r.status_code == 307
+    assert r.headers["Location"] == HTTPS_BASE + raw
+
+
+def test_legacy_host_is_answered_before_the_gate(settings, registry, notifier):
+    """Not bounced to a /login on the old host, and no page or API is served."""
+    c = _legacy(settings, registry, notifier)
+    r = c.get("/api/v1/status", base_url=LEGACY_BASE, headers=bearer())
+    assert r.status_code == 307
+    assert r.headers["Location"] == f"{HTTPS_BASE}/api/v1/status"
+
+
+def test_legacy_redirect_never_reflects_the_host(settings, registry, notifier):
+    """The Location host is the APP_HOST pin, whatever the request says; a
+    host that is neither legacy nor APP_HOST still gets the pin's 403."""
+    c = _legacy(settings, registry, notifier)
+    r = c.get("/", base_url=f"https://{LEGACY_HOST}:8443")
+    assert r.status_code == 307 and r.headers["Location"] == f"{HTTPS_BASE}/"
+    assert c.get("/login", base_url="https://evil.example").status_code == 403
+    # Forged raw targets fall back to the re-quoted path.
+    for forged in ("/x\r\nX-Evil: 1", "http://evil.example/x"):
+        r = c.get("/healthy", base_url=LEGACY_BASE,
+                  environ_overrides={"RAW_URI": forged, "REQUEST_URI": forged})
+        assert r.headers["Location"] == f"{HTTPS_BASE}/healthy", forged
+
+
+def test_legacy_host_healthz_is_served(settings, registry, notifier):
+    c = _legacy(settings, registry, notifier)
+    r = c.get("/healthz", base_url=LEGACY_BASE)
+    assert r.status_code == 200 and "Location" not in r.headers
+
+
+def test_legacy_host_over_http_goes_straight_to_https_app_host(settings, registry, notifier):
+    c = _legacy(settings, registry, notifier)
+    r = c.get("/inbox", base_url=f"http://{LEGACY_HOST}", headers=xfp("http"))
+    assert r.status_code == 307
+    assert r.headers["Location"] == f"{HTTPS_BASE}/inbox"
+
+
+def test_app_host_itself_is_not_redirected(settings, registry, notifier):
+    c = _legacy(settings, registry, notifier)
+    assert c.get("/login", base_url=HTTPS_BASE).status_code == 200
+
+
+def test_legacy_host_fails_closed_when_app_host_is_malformed(settings, registry, notifier):
+    """No safe Location to emit → 403, never a redirect built from a bad host."""
+    c = _legacy(settings, registry, notifier,
+                app_host="dashboard.example.test@evil.example")
+    r = c.get("/", base_url=LEGACY_BASE)
+    assert r.status_code == 403 and "Location" not in r.headers
+
+
+def test_no_legacy_hosts_means_the_old_host_is_pinned_out(settings, registry, notifier):
+    """Control: without APP_LEGACY_HOSTS the old name is just a wrong Host."""
+    c = _pinned(settings, registry, notifier)
+    assert c.get("/login", base_url=LEGACY_BASE).status_code == 403
+
+
 # The DNS maximum is 253 characters. Both sides of that boundary are pinned:
 # a 253-char host must still work, 254 must not. Built from valid 63-char
 # labels so ONLY the total length can be what rejects the long one.
@@ -384,7 +475,7 @@ def test_location_patterns_are_safe_only_under_fullmatch():
     assert not _HOSTNAME_RE.fullmatch(_OVERLONG_HOST)
     # B1: a PUBLIC origin pin always has a dot, and is never a bare IP literal.
     # Strictly a TIGHTENING — every host these apps actually use still passes.
-    for good in ("dashboard.graham-williams.com", "graham-williams.com",
+    for good in ("dashboard.graham-williams.com", "hub.graham-williams.com", "graham-williams.com",
                  "dashboard.ci.example", "a.b"):
         assert _HOSTNAME_RE.fullmatch(good), good
     for bad in ("localhost", "x", "hopper-dashboard", "127.0.0.1",
@@ -395,7 +486,7 @@ def test_location_patterns_are_safe_only_under_fullmatch():
 def test_hsts_header_on_every_response(authed, settings, registry, notifier):
     """One year, no includeSubDomains, no preload — each host owns its own
     policy and preload is effectively irreversible."""
-    assert authed.get("/").headers["Strict-Transport-Security"] == HSTS
+    assert authed.get("/dashboard").headers["Strict-Transport-Security"] == HSTS
     assert authed.get("/login").headers["Strict-Transport-Security"] == HSTS
     c = _pinned(settings, registry, notifier)
     r = c.get("/", base_url=HTTP_BASE, headers=xfp("http"))
@@ -549,7 +640,7 @@ def test_job_detail_json(read, core, registry):
 
 def test_board_renders_every_state(authed, core, registry):
     _seed_all_states(core, registry)
-    r = authed.get("/")
+    r = authed.get("/dashboard")
     assert r.status_code == 200
     html = r.data.decode()
     for state in ("OK", "LATE", "FAIL", "STALE DEST", "BEHIND", "UNKNOWN"):
@@ -565,13 +656,13 @@ def test_board_renders_every_state(authed, core, registry):
 
 
 def test_board_empty_state(authed):
-    r = authed.get("/")
+    r = authed.get("/dashboard")
     assert r.status_code == 200 and r.data.count(b"UNKNOWN") >= 8
 
 
 def test_board_flags_stale_scheduler(authed, core, registry):
     core.recompute_all(now=NOW - 3600)  # an hour ago relative to the real clock
-    assert b"Scheduler may be stale" in authed.get("/").data
+    assert b"Scheduler may be stale" in authed.get("/dashboard").data
 
 
 def test_job_page_renders_tables(authed, core, registry):
@@ -593,7 +684,7 @@ def test_html_escapes_untrusted_note(authed, core, registry):
 
 def test_container_card_marks_missing_names(authed, core, registry):
     core.record_ping(registry.get("containers"), {"status": "ok", "metrics": {"running": "app-1"}}, now=NOW)
-    html = authed.get("/").data.decode()
+    html = authed.get("/dashboard").data.decode()
     assert 'class="missing">tunnel-1' in html
 
 
@@ -601,7 +692,7 @@ def test_state_reason_exposed_and_shown(authed, read, core, registry):
     core.record_ping(registry.get("containers"), {"status": "ok", "metrics": {"running": "app-1"}}, now=NOW)
     j = {x["id"]: x for x in read.get("/api/v1/status", headers=bearer()).get_json()["jobs"]}["containers"]
     assert j["state"] == "FAIL" and "tunnel-1" in j["state_reason"]
-    html = authed.get("/").data.decode()
+    html = authed.get("/dashboard").data.decode()
     assert "not running: tunnel-1" in html
 
 
@@ -610,7 +701,7 @@ def test_state_reason_exposed_and_shown(authed, read, core, registry):
 # --------------------------------------------------------------------------- #
 
 def test_never_run_hint_is_well_formed_with_and_without_clause(authed):
-    html = authed.get("/").data.decode()
+    html = authed.get("/dashboard").data.decode()
     # 'info' has no max_age → sentence ends right after "yet"; 'offload' has one → the em-dash clause.
     assert "No completion has been pinged yet.</p>" in html
     assert "No completion has been pinged yet — the 14d max-age target is inert until the first" in html
@@ -621,7 +712,7 @@ def test_dest_row_omits_unknown_newest_and_copy_tree_pill(authed, core, registry
     # Mac probe shape for a copy tree: a count but no newest-object time, with bytes missing.
     core.record_ping(registry.get("tree"), {"status": "ok",
                      "metrics": {"missing_bytes": 4096, "missing_files": 1, "dest_count": 1032}}, now=NOW)
-    for html in (authed.get("/").data.decode(), authed.get("/jobs/tree").data.decode()):
+    for html in (authed.get("/dashboard").data.decode(), authed.get("/jobs/tree").data.decode()):
         card = html[html.index('state-stale_dest'):]
         row = card[card.index("1032 object"):card.index("</dd>", card.index("1032 object"))]
         assert "newest" not in card[card.index("Dest") if "Dest" in card else 0:card.index("1032 object")]
@@ -634,7 +725,7 @@ def test_dest_row_omits_unknown_newest_and_copy_tree_pill(authed, core, registry
 def test_non_copy_tree_dest_row_keeps_pill_and_newest(authed, core, registry):
     core.record_ping(registry.get("offload"), {"status": "metric", "metrics": {
         "lag_bytes": 0, "dest_newest_iso": db.to_iso(NOW - 3600), "dest_count": 140}}, now=NOW)
-    html = authed.get("/").data.decode()
+    html = authed.get("/dashboard").data.decode()
     assert "newest <time" in html and "140 objects" in html and 'pill-ok">fresh' in html
 
 
@@ -642,13 +733,13 @@ def test_login_page_has_no_nav_links_but_board_does(read_app, authed):
     login = read_app.test_client().get("/login").data.decode()   # fresh, signed-out client
     assert "Sign out" not in login and 'href="/api/v1/status"' not in login
     assert "hopper-dashboard v" in login                       # footer stays
-    board = authed.get("/").data.decode()
-    assert "Sign out" in board and 'href="/api/v1/status"' in board
+    board = authed.get("/dashboard").data.decode()
+    assert "Sign out" in board and 'href="/api/v1/status"' not in board   # JSON link dropped
 
 
 def test_summary_timestamps_are_localizable_time_elements(authed, core):
     core.recompute_all(now=time.time())
-    html = authed.get("/").data.decode()
+    html = authed.get("/dashboard").data.decode()
     assert "states computed <time datetime=" in html and "just now" in html
     assert "generated <time datetime=" in html
 
@@ -665,7 +756,7 @@ def _disk_ping(core, registry, free_gib, total_gib=400, now=NOW):
 
 def test_disk_gauge_renders_on_board_and_job_page(authed, core, registry):
     _disk_ping(core, registry, 100)
-    for html in (authed.get("/").data.decode(), authed.get("/jobs/disk").data.decode()):
+    for html in (authed.get("/dashboard").data.decode(), authed.get("/jobs/disk").data.decode()):
         card = html[html.index("Capacity"):]
         assert "75.0% used" in card
         assert "100.0 GiB free of 400.0 GiB" in card          # GiB, not human_bytes' decimal GB
@@ -679,25 +770,25 @@ def test_disk_gauge_renders_on_board_and_job_page(authed, core, registry):
         assert "pages after 0s not OK" in card
     # The bar must not rely on an inline style attribute: style-src is 'self' with no
     # 'unsafe-inline', so a style="width:…" bar would silently render empty.
-    assert "style=" not in authed.get("/").data.decode()
+    assert "style=" not in authed.get("/dashboard").data.decode()
 
 
 def test_disk_gauge_marks_a_low_disk(authed, core, registry):
     _disk_ping(core, registry, 10)
-    html = authed.get("/").data.decode()
+    html = authed.get("/dashboard").data.decode()
     assert "gauge-low" in html and "BEHIND" in html
     assert "only 10.0 GiB free, below the 25.0 GiB floor" in html   # state_reason hint
 
 
 def test_disk_card_without_metrics_says_so(authed):
-    html = authed.get("/").data.decode()
+    html = authed.get("/dashboard").data.decode()
     assert "no disk metrics reported yet" in html and "Capacity" in html
 
 
 def test_disk_card_survives_a_zero_total(authed, core, registry):
     """A 0-byte total (bind mount, vanished path) must not 500 the board."""
     _disk_ping(core, registry, 10, total_gib=0)
-    html = authed.get("/").data.decode()
+    html = authed.get("/dashboard").data.decode()
     assert "capacity unknown" in html and "10.0 GiB free" in html
     assert "gaugebar" not in html[html.index("Capacity"):html.index("Capacity") + 600]
 
@@ -754,7 +845,7 @@ def test_a_never_alerting_job_with_lag_thresholds_says_so_on_the_board(settings,
     app, reg, c = _board(settings, notifier, doc)
     app.extensions["core"].record_ping(
         reg.get("offload"), {"status": "ok", "metrics": {"lag_bytes": 99999}}, now=NOW)
-    html = c.get("/").data.decode()
+    html = c.get("/dashboard").data.decode()
     card = html[html.index('id="job-offload"'):]
     card = card[:card.index("</article>")]
     assert "never alerts" in card
@@ -775,7 +866,7 @@ def test_an_informational_job_still_says_why_it_never_alerts(settings, notifier)
     assert reg.get("offload").informational and reg.get("offload").alert_never
     app.extensions["core"].record_ping(
         reg.get("offload"), {"status": "ok", "metrics": {"lag_bytes": 5}}, now=NOW)
-    html = c.get("/").data.decode()
+    html = c.get("/dashboard").data.decode()
     card = html[html.index('id="job-offload"'):]
     card = card[:card.index("</article>")]
     assert "never alerts" in card and "informational: no thresholds set" in card
@@ -790,7 +881,7 @@ def test_a_job_that_can_page_gets_no_never_alerts_caption(settings, notifier):
     app, reg, c = _board(settings, notifier, doc)        # offload: alert_after_s 0
     app.extensions["core"].record_ping(
         reg.get("offload"), {"status": "ok", "metrics": {"lag_bytes": 99999}}, now=NOW)
-    html = c.get("/").data.decode()
+    html = c.get("/dashboard").data.decode()
     card = html[html.index('id="job-offload"'):]
     card = card[:card.index("</article>")]
     assert "never alerts" not in card
@@ -815,7 +906,7 @@ def test_a_disk_gauge_with_thresholds_but_alert_never_does_not_claim_it_alerts(
         reg.get("disk"), {"status": "metric",
                           "metrics": {"disk_free_bytes": 100 * 1024 ** 3,
                                       "disk_total_bytes": 400 * 1024 ** 3}}, now=NOW)
-    html = c.get("/").data.decode()
+    html = c.get("/dashboard").data.decode()
     card = html[html.index("Capacity"):]
     assert "BEHIND below 25.0 GiB free" in card          # the thresholds, stated
     assert "never pages" in card                         # ...and the policy, stated
@@ -839,7 +930,7 @@ def test_a_threshold_less_disk_gauge_that_pages_says_so(settings, notifier):
         reg.get("disk"), {"status": "metric",
                           "metrics": {"disk_free_bytes": 100 * 1024 ** 3,
                                       "disk_total_bytes": 400 * 1024 ** 3}}, now=NOW)
-    card = c.get("/").data.decode()
+    card = c.get("/dashboard").data.decode()
     card = card[card.index("Capacity"):]
     assert "no capacity thresholds set" in card
     assert "pages after 1h not OK" in card
@@ -893,3 +984,50 @@ def test_ingest_listener_is_untouched_by_vary(settings, registry, notifier):
     r = c.get("/healthz", base_url=HTTP_BASE, headers=xfp("http"))
     assert r.status_code == 200
     assert "x-forwarded-proto" not in _vary_tokens(r)
+
+
+# --------------------------------------------------------------------------- #
+# Routes: the Hub took "/", the board moved to /dashboard
+# --------------------------------------------------------------------------- #
+
+def test_board_lives_at_dashboard_and_the_hub_at_root(authed):
+    board = authed.get("/dashboard").data.decode()
+    assert 'id="job-snap"' in board
+    hub = authed.get("/").data.decode()
+    assert 'id="job-snap"' not in hub and 'class="hub' in hub
+
+
+def test_the_board_is_gated_with_a_next_back_to_it(read):
+    r = read.get("/dashboard")
+    assert r.status_code == 302
+    assert r.headers["Location"] == "/login?next=/dashboard"
+
+
+def test_job_page_crumb_and_error_page_link_to_the_new_homes(authed):
+    assert 'href="/dashboard"' in authed.get("/jobs/snap").data.decode()
+    assert 'href="/"' in authed.get("/no-such-page").data.decode()
+
+
+def test_login_and_logout_land_on_the_hub(settings, registry, notifier, authed):
+    from dashboard import create_app
+    c = create_app("read", settings, registry, notifier).test_client()
+    r = c.post("/login", data={"password": PASSWORD})
+    assert r.status_code == 302 and r.headers["Location"] == "/"
+    settings.app_password = ""
+    settings.app_env = "dev"
+    c = create_app("read", settings, registry, notifier).test_client()
+    assert c.get("/logout").headers["Location"] == "/"
+
+
+def test_rebranded_as_hub_with_no_json_nav_link(authed, read_app):
+    pages = {"/": "<title>Hub</title>", "/dashboard": "<title>Dashboard · Hub</title>",
+             "/inbox": "<title>Inbox · Hub</title>"}
+    for path, title in pages.items():
+        html = authed.get(path).data.decode()
+        assert title in html, path
+        assert "Hopper Dashboard" not in html, path
+        nav = html.split('<nav class="top"', 1)[1].split("</nav>", 1)[0]
+        assert "/api/v1/status" not in nav and ">JSON<" not in nav, path
+        assert "Hub · hopper-dashboard v" in html, path
+    login = read_app.test_client().get("/login").data.decode()
+    assert "<title>Sign in · Hub</title>" in login

@@ -284,3 +284,216 @@ def test_a_superseded_recorder_never_touches_the_new_take(ran):
     assert out["secondStreamLive"] is True, "the stale handler killed the mic"
     assert out["statusUnchanged"] is True, "the stale take rewrote the UI"
     assert out["secondState"] == "recording" and out["button"] == "■ Stop"
+
+
+# --------------------------------------------------------------------------- #
+# Editing a voice note's draft: show, cancel, save, fail — actually executed.
+# --------------------------------------------------------------------------- #
+
+EDIT_HARNESS = r"""
+'use strict';
+const fs = require('fs');
+const vm = require('vm');
+const SRC = fs.readFileSync(process.argv[2], 'utf8');
+
+function el(tag, attrs) {
+  const e = {
+    tagName: tag, hidden: false, disabled: false, textContent: '', value: '',
+    _attrs: Object.assign({}, attrs || {}), _listeners: {}, _children: [],
+    focused: false,
+    classList: {toggle: function () {}, add: function () {}, remove: function () {}},
+    addEventListener: function (t, fn) { (this._listeners[t] = this._listeners[t] || []).push(fn); },
+    setAttribute: function (k, v) { this._attrs[k] = String(v); },
+    getAttribute: function (k) {
+      return Object.prototype.hasOwnProperty.call(this._attrs, k) ? this._attrs[k] : null;
+    },
+    focus: function () { this.focused = true; },
+    fire: function (t, ev) {
+      ev = ev || {};
+      ev.preventDefault = ev.preventDefault || function () { ev.prevented = true; };
+      (this._listeners[t] || []).forEach(function (fn) { fn.call(this, ev); }, this);
+      return ev;
+    },
+    querySelector: function (sel) {
+      for (const c of this._children) {
+        if (sel[0] === '.' && (c._attrs['class'] || '').split(' ').indexOf(sel.slice(1)) !== -1) { return c; }
+        const m = /^\[name="(.+)"\]$/.exec(sel);
+        if (m && c._attrs.name === m[1]) { return c; }
+      }
+      return null;
+    }
+  };
+  return e;
+}
+
+function world(fetchImpl) {
+  const id = 'a'.repeat(32);
+  const btn = el('button', {'class': 'edit-draft', 'data-id': id});
+  btn.hidden = true;
+  const form = el('form', {id: 'edit-' + id, 'data-id': id});
+  form.hidden = true;
+  const title = el('input', {name: 'draft_title'}); title.value = 'Machine title';
+  const body = el('textarea', {name: 'draft_body'}); body.value = 'Machine body';
+  const project = el('input', {name: 'draft_project'}); project.value = '';
+  const save = el('button', {'class': 'edit-save'});
+  const cancel = el('button', {'class': 'edit-cancel'});
+  form._children = [title, body, project, save, cancel];
+  form.resets = 0;
+  form.reset = function () { this.resets += 1; title.value = 'Machine title'; body.value = 'Machine body'; project.value = ''; };
+  const err = el('p', {id: 'capture-error'});
+  const els = {'capture-error': err};
+  els['edit-' + id] = form;
+  const calls = [];
+  let reloads = 0;
+  const win = {
+    isSecureContext: true,
+    fetch: function (url, opts) { calls.push({url: url, opts: opts}); return fetchImpl(url, opts); },
+    setInterval: function () { return 0; }, clearInterval: function () {},
+    setTimeout: function () { return 0; },
+    confirm: function () { return false; }, addEventListener: function () {},
+    location: {reload: function () { reloads += 1; }}
+  };
+  const doc = {
+    getElementById: function (i) { return els[i] || null; },
+    querySelectorAll: function (sel) { return sel === '.edit-draft' ? [btn] : []; }
+  };
+  const sandbox = {document: doc, window: win, navigator: {}, console: console,
+                   Blob: function () {}, FormData: function () {}};
+  vm.runInNewContext(SRC, sandbox);
+  return {id: id, btn: btn, form: form, title: title, body: body, project: project,
+          save: save, cancel: cancel, err: err, calls: calls,
+          reloads: function () { return reloads; }};
+}
+
+function tick() { return new Promise(function (r) { setImmediate(r); }); }
+async function settle() { for (let i = 0; i < 6; i++) { await tick(); } }
+
+function ok() { return Promise.resolve({ok: true, status: 200, json: function () { return Promise.resolve({}); }}); }
+function refused() { return Promise.resolve({ok: false, status: 400, json: function () { return Promise.resolve({error: 'draft_project must be …'}); }}); }
+
+(async function () {
+  const out = {};
+
+  let w = world(ok);
+  out.initial = {btnHidden: w.btn.hidden, formHidden: w.form.hidden};
+  w.btn.fire('click');
+  out.opened = {btnHidden: w.btn.hidden, formHidden: w.form.hidden, focused: w.title.focused,
+                expanded: w.btn.getAttribute('aria-expanded')};
+  w.title.value = 'Typed then abandoned';
+  w.cancel.fire('click');
+  out.cancelled = {btnHidden: w.btn.hidden, formHidden: w.form.hidden, resets: w.form.resets,
+                   title: w.title.value, calls: w.calls.length};
+
+  w.btn.fire('click');
+  w.title.value = 'Fix the wheel';
+  w.body.value = 'Line one\nLine two';
+  w.project.value = '  km-tracker ';
+  const ev = w.form.fire('submit');
+  await settle();
+  const c = w.calls[0];
+  out.saved = {prevented: !!ev.prevented, calls: w.calls.length, url: c.url, method: c.opts.method,
+               credentials: c.opts.credentials, contentType: c.opts.headers['Content-Type'],
+               body: JSON.parse(c.opts.body), reloads: w.reloads(), formHidden: w.form.hidden};
+
+  w = world(ok);
+  w.btn.fire('click');
+  w.project.value = '';
+  w.form.fire('submit');
+  await settle();
+  out.emptyProject = JSON.parse(w.calls[0].opts.body).draft_project;
+
+  w = world(refused);
+  w.btn.fire('click');
+  w.title.value = 'Kept on failure';
+  w.form.fire('submit');
+  await settle();
+  out.failed = {reloads: w.reloads(), formHidden: w.form.hidden, title: w.title.value,
+                error: w.err.textContent, errHidden: w.err.hidden, saveDisabled: w.save.disabled};
+
+  /* A 409 on the Reviewed tick: show the server's reason, put the box back, reload. */
+  {
+    const box = el('input', {'class': 'review-box', 'data-id': 'b'.repeat(32)});
+    box.checked = true;
+    const err2 = el('p', {id: 'capture-error'});
+    let reloads2 = 0;
+    const win2 = {
+      fetch: function () {
+        return Promise.resolve({ok: false, status: 409, json: function () {
+          return Promise.resolve({error: 'the item changed while saving — reload and try again'}); }});
+      },
+      setInterval: function () { return 0; }, clearInterval: function () {},
+      setTimeout: function (fn) { fn(); return 0; },
+      confirm: function () { return false; }, addEventListener: function () {},
+      location: {reload: function () { reloads2 += 1; }}
+    };
+    const doc2 = {
+      getElementById: function (i) { return i === 'capture-error' ? err2 : null; },
+      querySelectorAll: function (sel) { return sel === '.review-box' ? [box] : []; }
+    };
+    vm.runInNewContext(SRC, {document: doc2, window: win2, navigator: {}, console: console,
+                             Blob: function () {}, FormData: function () {}});
+    box.fire('change');
+    await settle();
+    out.tick409 = {error: err2.textContent, errHidden: err2.hidden, reloads: reloads2,
+                   checked: box.checked, disabled: box.disabled};
+  }
+
+  process.stdout.write(JSON.stringify(out));
+})().catch(function (err) {
+  process.stderr.write(String((err && err.stack) || err));
+  process.exit(1);
+});
+"""
+
+
+@pytest.fixture(scope="module")
+def edited(tmp_path_factory):
+    node = shutil.which("node")
+    if node is None:                                       # pragma: no cover
+        pytest.skip("node is not installed")
+    harness = tmp_path_factory.mktemp("js") / "edit_harness.js"
+    harness.write_text(EDIT_HARNESS, encoding="utf-8")
+    proc = subprocess.run([node, str(harness), str(INBOX_JS)],
+                          capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+def test_edit_button_appears_only_once_wired_and_opens_the_form(edited):
+    assert edited["initial"] == {"btnHidden": False, "formHidden": True}
+    assert edited["opened"] == {"btnHidden": True, "formHidden": False,
+                                "focused": True, "expanded": "true"}
+
+
+def test_cancel_closes_resets_and_sends_nothing(edited):
+    assert edited["cancelled"] == {"btnHidden": False, "formHidden": True, "resets": 1,
+                                   "title": "Machine title", "calls": 0}
+
+
+def test_save_patches_the_three_draft_fields_then_reloads(edited):
+    saved = edited["saved"]
+    assert saved["prevented"] is True
+    assert saved["calls"] == 1
+    assert saved["url"] == "/api/v1/inbox/items/" + "a" * 32
+    assert saved["method"] == "PATCH" and saved["credentials"] == "same-origin"
+    assert saved["contentType"] == "application/json"
+    assert saved["body"] == {"draft_title": "Fix the wheel",
+                             "draft_body": "Line one\nLine two",
+                             "draft_project": "km-tracker"}
+    assert saved["reloads"] == 1 and saved["formHidden"] is True
+    assert edited["emptyProject"] is None
+
+
+def test_a_failed_save_keeps_the_form_and_the_text_and_says_why(edited):
+    failed = edited["failed"]
+    assert failed["reloads"] == 0 and failed["formHidden"] is False
+    assert failed["title"] == "Kept on failure"
+    assert failed["error"].startswith("Could not save that draft") and not failed["errHidden"]
+    assert failed["saveDisabled"] is False
+
+
+def test_a_409_on_the_reviewed_tick_says_why_and_reloads(edited):
+    t = edited["tick409"]
+    assert t["error"] == "the item changed while saving — reload and try again"
+    assert t["errHidden"] is False and t["reloads"] == 1
+    assert t["checked"] is False and t["disabled"] is False

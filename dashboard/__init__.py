@@ -146,6 +146,8 @@ def create_app(role: str = "read", settings: Settings | None = None,
     app.jinja_env.globals["app_env"] = settings.app_env
     app.jinja_env.globals["csp_nonce"] = web.csp_nonce
     app.register_blueprint(web.bp)
+    from . import hub
+    app.register_blueprint(hub.bp)
 
     # -- the Inbox -------------------------------------------------------- #
     # Registered on the READ role: it is browser-driven, and the Mac

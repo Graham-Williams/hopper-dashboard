@@ -198,3 +198,25 @@ def test_inbox_github_repos_are_validated_at_startup(monkeypatch):
     monkeypatch.setenv("INBOX_GITHUB_REPOS", ",".join(f"a/r{i}" for i in range(51)))
     with pytest.raises(ValueError, match="over the 50 maximum"):
         Settings.from_env()
+
+
+def test_app_legacy_hosts_are_validated_at_startup(monkeypatch, tmp_path):
+    monkeypatch.setenv("DASHBOARD_DATA", str(tmp_path))
+    monkeypatch.setenv("APP_HOST", "hub.example.com")
+    monkeypatch.setenv("APP_LEGACY_HOSTS", " Old.Example.com, older.example.com,old.example.com")
+    assert Settings.from_env().app_legacy_hosts == ("old.example.com",
+                                                    "older.example.com")
+    monkeypatch.setenv("APP_LEGACY_HOSTS", "")
+    assert Settings.from_env().app_legacy_hosts == ()
+    for bad in ("old.example.com@evil.example", "old.example.com/x", "localhost",
+                "https://old.example.com", "old.example.com:8080", "127.0.0.1"):
+        monkeypatch.setenv("APP_LEGACY_HOSTS", bad)
+        with pytest.raises(ValueError, match="APP_LEGACY_HOSTS.*not a bare hostname"):
+            Settings.from_env()
+    monkeypatch.setenv("APP_LEGACY_HOSTS", "hub.example.com")
+    with pytest.raises(ValueError, match="same as APP_HOST"):
+        Settings.from_env()
+    monkeypatch.setenv("APP_HOST", "")
+    monkeypatch.setenv("APP_LEGACY_HOSTS", "old.example.com")
+    with pytest.raises(ValueError, match="APP_HOST is empty"):
+        Settings.from_env()

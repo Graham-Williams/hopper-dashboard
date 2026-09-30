@@ -63,16 +63,25 @@ h2 { font-size: 1.05rem; text-transform: uppercase; letter-spacing: .06em;
 .bad { color: var(--fail); font-weight: 600; }
 
 /* nav */
+/* One row at 390px with no horizontal scroll: brand, two EQUAL tabs that share
+   the free width, then a short Sign out link. Every link is >= 44px tall. */
 nav.top {
-  display: flex; align-items: center; gap: 1rem; padding: .7rem .9rem;
+  display: flex; align-items: center; gap: .6rem; padding: 0 .9rem;
   background: var(--panel); border-bottom: 1px solid var(--rule);
-  position: sticky; top: 0; z-index: 2;
+  position: sticky; top: 0; z-index: 2; min-height: 52px;
 }
-nav.top .brand { color: var(--ink); font-weight: 700; display: flex; align-items: center; gap: .5rem; }
+nav.top a { color: var(--muted); min-height: 44px; display: flex; align-items: center; }
+nav.top .brand { color: var(--ink); font-weight: 700; gap: .45rem; flex: 0 0 auto; white-space: nowrap; }
 nav.top .brand .dot { width: .7rem; height: .7rem; border-radius: 50%; background: var(--accent); display: inline-block; }
 nav.top .env { font-size: .7rem; padding: .05rem .4rem; border-radius: 3px; background: var(--late); color: var(--on-state); text-transform: uppercase; }
-nav.top .spacer { flex: 1; }
-nav.top a { color: var(--muted); padding: .4rem 0; }
+nav.top .tabs { flex: 1 1 auto; display: grid; grid-template-columns: 1fr 1fr; gap: .25rem;
+                max-width: 20rem; margin: 0 auto; min-width: 0; }
+nav.top .tab { justify-content: center; padding: 0 .4rem; border-radius: 8px; font-weight: 600;
+               font-size: .95rem; white-space: nowrap; border-bottom: 3px solid transparent; }
+nav.top .tab:hover { background: var(--panel-2); text-decoration: none; }
+nav.top .tab[aria-current="page"] { color: var(--ink); border-bottom-color: var(--accent);
+                                    border-radius: 8px 8px 0 0; }
+nav.top .signout { flex: 0 0 auto; font-size: .88rem; white-space: nowrap; padding: 0 .1rem; }
 
 /* summary tiles */
 .summary { display: grid; grid-template-columns: repeat(3, 1fr); gap: .6rem; margin: .4rem 0 1.2rem; }
@@ -183,7 +192,7 @@ button:hover { filter: brightness(1.08); }
 .foot { color: var(--muted); font-size: .8rem; text-align: center; padding: 1rem .9rem 2rem; }
 
 @media (max-width: 480px) {
-  nav.top { gap: .7rem; }
+  nav.top { gap: .4rem; padding: 0 .75rem; }
   .card dl { grid-template-columns: 1fr; gap: .05rem; }
   .card dt { font-size: .76rem; text-transform: uppercase; letter-spacing: .05em; margin-top: .35rem; }
 }
@@ -201,8 +210,9 @@ button:hover { filter: brightness(1.08); }
      are never truncated: a wrapped sentence is readable, a clipped one is not.
    Tap targets are >= 44px. */
 
-.inbox-summary { grid-template-columns: repeat(3, 1fr); }
-@media (min-width: 640px) { .inbox-summary { grid-template-columns: repeat(3, 1fr) 2fr; } }
+.inbox-summary { grid-template-columns: repeat(2, 1fr); }
+@media (min-width: 640px) { .inbox-summary { grid-template-columns: 1fr 1fr 2fr; } }
+
 
 .capture-form { display: flex; flex-direction: column; gap: .6rem; }
 .field { display: flex; flex-direction: column; gap: .25rem; font-size: .9rem; color: var(--muted); }
@@ -229,22 +239,27 @@ progress.record-level {
   width: 6rem; height: .45rem; flex: 0 0 auto; align-self: center;
   accent-color: var(--late); border: 0;
 }
-.filters button, .capture-actions button { min-height: 44px; }
-.filters .clear { align-self: center; padding: .6rem .2rem; }
+.filters button, .capture-actions button, .filters select { min-height: 44px; }
+.filters .clear { align-self: flex-end; display: inline-flex; align-items: center;
+                  min-height: 44px; padding: 0 .4rem; }
+/* The two long capture notes live in one collapsed block, so the list is not a
+   screen further down on a phone. */
+details.about-recordings summary { min-height: 44px; display: flex; align-items: center;
+  width: fit-content; cursor: pointer; color: var(--link); font-size: .9rem; }
 
 .items { list-style: none; margin: .6rem 0 0; padding: 0; display: flex;
-         flex-direction: column; gap: .6rem; }
+         flex-direction: column; gap: .6rem;
+         scroll-margin-top: 64px; }  /* #items is a link target; clear the sticky nav */
 .item {
   background: var(--panel); border: 1px solid var(--rule); border-radius: 10px;
   border-left: 5px solid var(--unknown); box-shadow: var(--shadow);
   padding: .8rem .9rem; display: flex; flex-direction: column; gap: .6rem;
-  min-width: 0;
+  min-width: 0; scroll-margin-top: 64px;   /* #item-<id> links clear the sticky nav */
 }
-@media (min-width: 640px) {
-  .item { flex-direction: row; align-items: flex-start; justify-content: space-between; gap: 1rem; }
-  .item-controls { flex: 0 0 auto; align-items: flex-end; }
-}
-.item-filing { border-left-color: var(--behind); }
+/* One column at EVERY width (designed for the phone): badges, draft, transcript,
+   player, then one action row, then the meta line. */
+.item-filing { border-left-color: var(--late); }
+.item-review { border-left-color: var(--behind); }
 .item.state-closed { border-left-color: var(--ok); opacity: .75; }
 .item-main { min-width: 0; flex: 1 1 auto; }
 .item-head { display: flex; flex-wrap: wrap; gap: .3rem; margin-bottom: .35rem; }
@@ -252,11 +267,24 @@ progress.record-level {
 .item-body { margin: .3rem 0 0; font-size: .92rem; white-space: pre-wrap; overflow-wrap: anywhere; }
 .item-meta { margin: .35rem 0 0; }
 .item-issues { margin: .35rem 0 0; }
-.item-controls { display: flex; flex-direction: column; gap: .5rem; min-width: 0; }
-.item-controls .review { display: flex; align-items: center; gap: .45rem;
-  font-size: .9rem; min-height: 44px; cursor: pointer; white-space: nowrap; }
-.item-controls .review input { width: 1.2rem; height: 1.2rem; }
-.item-controls .player { width: 100%; max-width: 16rem; height: 34px; }
+.item .player { display: block; width: 100%; height: 40px; margin-top: .5rem; }
+.item-actions { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem;
+                margin-top: .6rem; }
+.item-actions .edit-draft { min-height: 44px; padding: 0 1rem; }
+/* Reviewed reads as a TOGGLE: a pill that fills in when ticked. The whole pill is
+   the 44px tap target; the checkbox inside it stays a real checkbox. */
+.item-actions .review { display: inline-flex; align-items: center; gap: .45rem;
+  min-height: 44px; padding: 0 .9rem; border: 1px solid var(--rule); border-radius: 999px;
+  font-size: .95rem; font-weight: 600; color: var(--ink); cursor: pointer;
+  white-space: nowrap; background: var(--panel); }
+.item-actions .review input { width: 1.2rem; height: 1.2rem; margin: 0; accent-color: var(--ok); }
+.item-actions .review:has(input:checked) { border-color: var(--ok); background: var(--panel-2); }
+/* Delete is deliberately QUIET: a small danger-coloured text button at the end of
+   the row, never a primary-looking block — but still a 44px tap target. */
+.item-actions button.delete-item { margin-left: auto; min-height: 44px; padding: 0 .5rem;
+  background: transparent; color: var(--fail); border: 0; font-size: .88rem;
+  font-weight: 500; }
+.item-actions button.delete-item:hover { text-decoration: underline; filter: none; }
 
 .badge { display: inline-block; padding: .05rem .45rem; border-radius: 999px;
          font-size: .72rem; font-weight: 600; background: var(--panel-2);
@@ -266,6 +294,7 @@ progress.record-level {
 .badge-github { background: var(--stale); color: var(--on-state); }
 .badge-backlog { background: var(--skipped); color: var(--on-state); }
 .badge-filing { background: var(--late); color: var(--on-state); }
+.badge-review { background: var(--behind); color: var(--on-state); }
 .badge-closed, .badge-archived { background: var(--panel-2); color: var(--muted); }
 .ts { font-weight: 600; }
 .ts-pending, .ts-live { color: var(--late); }
@@ -273,3 +302,77 @@ progress.record-level {
 .ts-failed { color: var(--fail); }
 .issue { font-weight: 600; }
 .issue-closed { color: var(--muted); text-decoration: line-through; }
+
+/* -------------------------------------------------------------------- hub -- */
+/* The landing page. Mobile-first: cards stack, Inbox first; at 640px they sit
+   side by side at EQUAL width. The Record button is the one loud thing on the
+   page and is >= 56px tall; every other tap target is >= 44px. */
+.hub { display: grid; grid-template-columns: 1fr; gap: .9rem; margin: .4rem 0 1rem; }
+@media (min-width: 640px) { .hub { grid-template-columns: 1fr 1fr; align-items: stretch; } }
+.hub-card {
+  background: var(--panel); border: 1px solid var(--rule); border-radius: 12px;
+  box-shadow: var(--shadow); padding: 1rem 1rem .9rem; display: flex;
+  flex-direction: column; gap: .75rem; min-width: 0; border-top: 4px solid var(--accent);
+}
+.hub-dashboard { border-top-color: var(--ok); }
+.hub-card h2 { color: var(--ink); }
+.hub-stat {
+  display: flex; align-items: baseline; gap: .6rem; color: var(--ink);
+  padding: .5rem .7rem; border-radius: 8px; background: var(--panel-2); min-height: 44px;
+}
+.hub-stat:hover { text-decoration: none; filter: brightness(.98); }
+.hub-stat .n { font-size: 2.4rem; font-weight: 750; line-height: 1; color: var(--behind); }
+.hub-stat .l { font-size: 1rem; font-weight: 600; }
+.hub-stat.zero .n { color: var(--muted); }
+a.hub-record {
+  display: flex; align-items: center; justify-content: center; gap: .5rem;
+  min-height: 56px; width: 100%; border-radius: 10px; background: var(--fail);
+  color: #fff; font-size: 1.1rem; font-weight: 700; letter-spacing: .01em;
+}
+a.hub-record:hover { text-decoration: none; filter: brightness(1.08); }
+a.hub-record:focus-visible, a.hub-open:focus-visible, .hub-stat:focus-visible {
+  outline: 3px solid var(--accent); outline-offset: 2px;
+}
+.hub-meta { margin: 0; font-size: .9rem; }
+a.hub-open {
+  display: flex; align-items: center; justify-content: center; gap: .35rem;
+  min-height: 44px; border-radius: 8px; border: 1px solid var(--rule);
+  font-weight: 600; margin-top: auto;
+}
+a.hub-open:hover { background: var(--panel-2); text-decoration: none; }
+.health { margin: 0; display: flex; flex-wrap: wrap; align-items: center; gap: .25rem .45rem;
+          font-size: 1.05rem; font-weight: 650; padding: .55rem .7rem; border-radius: 8px;
+          background: var(--panel-2); min-height: 44px; }
+.health .sep { color: var(--muted); font-weight: 400; }
+.health .hs { white-space: nowrap; }
+.health .hs.zero { color: var(--muted); font-weight: 500; }
+.hs-ok .glyph { color: var(--ok); }
+.hs-behind:not(.zero) { color: var(--behind); }
+.hs-failing:not(.zero) { color: var(--fail); }
+.hs-unknown { color: var(--muted); }
+.hub-warn { margin: 0; padding: .5rem .7rem; border-radius: 8px; border: 1px solid var(--late);
+            font-size: .9rem; }
+
+/* Drafts (voice notes). The draft body keeps the model's line breaks
+   (pre-line) and is autoescaped like everything else. */
+.draft-body { white-space: pre-line; }
+.draft-state { margin: .3rem 0 0; font-weight: 600; }
+.draft-pending { color: var(--late); }
+.draft-failed { color: var(--fail); }
+details.transcript { margin: .45rem 0 0; font-size: .9rem; }
+details.transcript summary { cursor: pointer; color: var(--link); min-height: 44px;
+                             display: flex; align-items: center; width: fit-content; }
+details.transcript .item-body { color: var(--muted); margin-top: 0; }
+.draft-edit { display: flex; flex-direction: column; gap: .5rem; margin-top: .6rem;
+              padding: .7rem; border-radius: 8px; background: var(--panel-2); }
+.draft-edit[hidden] { display: none; }
+.edit-actions { display: flex; gap: .5rem; }
+.edit-actions button { flex: 1 1 0; }
+button.secondary { background: transparent; color: var(--link); border: 1px solid var(--rule); }
+button.secondary:hover { background: var(--panel-2); filter: none; }
+
+label.check { display: flex; align-items: center; gap: .45rem; min-height: 44px;
+              font-size: .95rem; color: var(--ink); cursor: pointer; }
+label.check input { width: 1.2rem; height: 1.2rem; }
+a.tile-link { color: inherit; }
+a.tile-link:hover { text-decoration: none; filter: brightness(.98); }

@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% from "_macros.html" import chip, when, history_strip, disk_gauge %}
+{% block title %}Dashboard · Hub{% endblock %}
 {% block content %}
 {% set s = status.summary %}
 <section class="summary" aria-label="Summary">
