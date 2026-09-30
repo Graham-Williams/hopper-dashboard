@@ -983,10 +983,14 @@ def mirror_backlog():
     run (``inbox_db.apply_filed_backlog_rule``: a note filed to backlog.txt
     closes when its line is removed or marked ✅ DONE, and reopens if the rule
     closed it and the line is open again). Every upsert, complete or not, sets
-    a backlog row's state from its What: line (``backlog_is_done``). An EMPTY list is refused outright unless
+    a backlog row's state from its What: line (``backlog_is_done``). An EMPTY
+    list (or one whose entries are all blank) is refused outright unless
     ``allow_empty`` is set, because "the file was unreadable" and "Graham
     emptied the backlog" arrive looking identical and one of them must not
     archive every row.
+
+    All or nothing: the payload is validated in full before anything is
+    written, so a 400 leaves the store exactly as it was.
     """
     denied = _require_inbox_token()
     if denied is not None:
@@ -1000,7 +1004,27 @@ def mirror_backlog():
     if len(items) > MAX_BACKLOG_ITEMS:
         return _err(f"more than {MAX_BACKLOG_ITEMS} items")
     complete = bool(doc.get("complete"))
-    if not items and not doc.get("allow_empty"):
+    # ALL OR NOTHING. The whole payload is validated here, before the transaction opens: a
+    # `return` inside `with conn:` COMMITS whatever was upserted before it, so one bad
+    # item in the middle used to leave the items ahead of it written (and states changed).
+    entries: list[tuple[str, str, str | None]] = []
+    for raw in items:
+        if not isinstance(raw, dict):
+            return _err("each item must be an object")
+        text = inbox_db.clean_text(raw.get("text"), inbox_db.MAX_TEXT)
+        if not text:
+            continue
+        key = raw.get("key")
+        if not isinstance(key, str) or not key.startswith(inbox_db.MIRROR_BACKLOG + ":"):
+            key = inbox_db.normalise_backlog_key(text)
+        try:
+            project = clean_project(raw.get("project"))
+        except ValueError as exc:
+            return _err(str(exc))
+        entries.append((key, text, project))
+    # Checked on what survived cleaning, not on the raw list: a push of blank entries is
+    # just as empty, and a COMPLETE one would archive every row.
+    if not entries and not doc.get("allow_empty"):
         return _err("refusing to sync an empty backlog — an unreadable file and "
                     "an emptied one look identical here; pass allow_empty:true "
                     "if you really mean it")
@@ -1011,20 +1035,7 @@ def mirror_backlog():
         with conn:
             # Taken BEFORE any upsert: the filed-note rule acts on what this whole push changed.
             before = inbox_db.filed_line_status(conn) if complete else {}
-            for raw in items:
-                if not isinstance(raw, dict):
-                    return _err("each item must be an object")
-                text = inbox_db.clean_text(raw.get("text"), inbox_db.MAX_TEXT)
-                if not text:
-                    continue
-                key = raw.get("key")
-                if not isinstance(key, str) or not key.startswith(
-                        inbox_db.MIRROR_BACKLOG + ":"):
-                    key = inbox_db.normalise_backlog_key(text)
-                try:
-                    project = clean_project(raw.get("project"))
-                except ValueError as exc:
-                    return _err(str(exc))
+            for key, text, project in entries:
                 # A backlog row's state IS its What: line: ✅ DONE → closed, else open.
                 inbox_db.upsert_mirror_item(
                     conn, mirror_key=key, source="backlog",

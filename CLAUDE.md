@@ -332,6 +332,10 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
 - **Item lifecycle** — what closed/archived/reopen mean per source (voice, typed, github, backlog), and which
   of them is automatic: the table in DESIGN.md "Item lifecycle". One table (`inbox_items`), `state`
   open/closed plus `archived_at`. Update the table when any close/archive/reopen rule changes.
+- **Never `return` from inside `with conn:`.** It is a normal exit, so it COMMITS every write made before
+  it — that is how a 400 on one backlog item used to keep the items ahead of it. Validate the whole request
+  first (the backlog push does), or raise to roll back. `tests/test_inbox.py` pins it with an `ast` guard
+  over `dashboard/`.
 - `inbox.py` — the blueprint. `MACHINE_ENDPOINTS` is what scopes `INBOX_TOKEN` (now including
   `inbox.draft_queue` and `inbox.post_draft`); the create route raises
   `request.max_content_length` PER REQUEST (the global 64 KB cap in `__init__.py` protects every other

@@ -590,6 +590,10 @@ An open, filed note whose tag went from open (or never seen) to `done`/`gone` cl
 touched: a note closed by hand has `closed_by` NULL (every hand state change clears it) and the issues rule
 (`apply_issue_transitions`) writes `issues`. What this means in practice:
 
+- a push is ALL OR NOTHING: `POST /api/v1/inbox/mirror/backlog` validates the whole payload before it
+  writes anything, so a 400 (a non-object item, a bad project) changes nothing at all — it used to commit
+  every item upserted before the bad one. A push whose entries are all blank after cleaning is refused like
+  an empty one (a complete one would otherwise archive every row);
 - a partial (`complete: false`), refused or failed push closes and reopens nothing;
 - a reworded line that keeps the tag, or the tag moving to another entry, closes nothing (the tag is still
   on a live open row at the end of the push);

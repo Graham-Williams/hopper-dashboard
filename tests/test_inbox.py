@@ -1634,6 +1634,57 @@ def test_a_partial_or_refused_push_changes_nothing(authed, bot):
     assert r["reopened_notes"] == 0 and _state(authed, item)[0] == "closed"
 
 
+def _dump(settings):
+    conn = inbox_db.connect(settings.inbox_db_path)
+    try:
+        return [dict(r) for r in conn.execute("SELECT * FROM inbox_items ORDER BY id")]
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("bad", ["not an object",
+                                 {"text": "Bad project", "project": "has spaces"}])
+def test_a_backlog_push_with_a_bad_item_in_the_middle_changes_nothing(
+        authed, bot, settings, bad):
+    """All or nothing: a 400 on item 2 must not leave item 1 written (a return inside the
+    transaction used to COMMIT everything upserted before it)."""
+    item, line = _filed_with_line(authed, bot)
+    before = _dump(settings)
+    r = bot.post("/api/v1/inbox/mirror/backlog", headers=machine(), json={
+        "complete": True, "items": [{"text": "✅ DONE — " + line},   # would close things
+                                    bad,
+                                    {"text": "A brand new entry"}]})
+    assert r.status_code == 400
+    assert _dump(settings) == before
+
+
+def test_no_route_returns_from_inside_a_write_transaction():
+    """A structural guard beside the behavioural test above, because the failure is silent:
+    `with conn:` COMMITS on a normal exit, and a `return` is a normal exit — so an error
+    response sent from inside the block keeps every write made before it. Validate first,
+    or raise to roll back."""
+    import ast
+    import pathlib
+    offenders = []
+    for path in sorted((pathlib.Path(__file__).resolve().parent.parent
+                        / "dashboard").glob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.With) and any(
+                    ast.unparse(i.context_expr).endswith("conn") for i in node.items):
+                offenders += [f"{path.name}:{n.lineno}" for n in ast.walk(node)
+                              if isinstance(n, ast.Return)]
+    assert offenders == []
+
+
+def test_a_push_of_only_blank_entries_is_refused_like_an_empty_one(authed, bot, settings):
+    _sync_backlog(bot, "Keep me", "And me")
+    before = _dump(settings)
+    r = bot.post("/api/v1/inbox/mirror/backlog", headers=machine(), json={
+        "complete": True, "items": [{"text": "   "}, {"text": "\x00"}]})
+    assert r.status_code == 400 and "allow_empty" in r.get_json()["error"]
+    assert _dump(settings) == before
+
+
 def test_a_filed_note_waits_for_its_line_to_reach_the_mirror(authed, bot):
     item = _reviewed_voice(authed, bot)
     _file(bot, item, line=f"Fix the fan (voice {item[:8]})")
