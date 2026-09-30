@@ -56,6 +56,14 @@ def walk_files(root):
 
 
 def main(argv):
+    fd_check = os.environ.get("FAKE_RCLONE_FD_CHECK")
+    if fd_check:
+        try:
+            os.fstat(int(fd_check))
+            sys.stderr.write("fake rclone: fd %s inherited\n" % fd_check)
+            print("fd %s inherited" % fd_check)
+        except OSError:
+            pass
     log = os.environ.get("FAKE_RCLONE_LOG")
     if log:
         import json
@@ -127,6 +135,8 @@ def main(argv):
         dst = local_path(dstspec)
         os.makedirs(dst, exist_ok=True)
         immutable = "--immutable" in flags
+        # rclone's own comparison: size + modtime, unless --checksum (size + content).
+        by_checksum = "--checksum" in flags
         refused = []
         if os.path.isdir(src):
             for rel in walk_files(src):
@@ -134,10 +144,17 @@ def main(argv):
                     continue
                 out = os.path.join(dst, rel)
                 if immutable and os.path.isfile(out):
-                    with open(os.path.join(src, rel), "rb") as a, open(out, "rb") as b:
-                        if a.read() != b.read():
-                            refused.append(rel)
-                            continue
+                    here = os.path.join(src, rel)
+                    if by_checksum:
+                        with open(here, "rb") as a, open(out, "rb") as b:
+                            same = a.read() == b.read()
+                    else:
+                        same = (os.path.getsize(here) == os.path.getsize(out)
+                                and int(os.path.getmtime(here)) == int(os.path.getmtime(out)))
+                    if not same:
+                        refused.append(rel)
+                        continue
+                    continue                      # unchanged: nothing to do
                 os.makedirs(os.path.dirname(out), exist_ok=True)
                 shutil.copy2(os.path.join(src, rel), out)
             if refused:

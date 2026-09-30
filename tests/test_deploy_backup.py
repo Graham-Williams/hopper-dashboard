@@ -335,9 +335,15 @@ _FLOCK_SHIM = "\n".join([
     "#!/usr/bin/env python3",
     "import fcntl, sys",
     "args = sys.argv[1:]",
+    "conflict = 1",
+    "if '-E' in args:",
+    "    conflict = int(args[args.index('-E') + 1])",
+    "    del args[args.index('-E'):args.index('-E') + 2]",
     "fd = int([a for a in args if not a.startswith('-')][-1])",
     "try:",
     "    fcntl.flock(fd, fcntl.LOCK_EX | (fcntl.LOCK_NB if '-n' in args else 0))",
+    "except BlockingIOError:",
+    "    sys.exit(conflict)",
     "except OSError:",
     "    sys.exit(1)",
     "",
@@ -974,18 +980,80 @@ def test_every_leftover_staging_dir_is_swept_under_the_run_lock(box, mode):
 @audio_harness
 @pytest.mark.parametrize("mode", ["copy", "mirror"])
 def test_a_second_run_while_one_holds_the_lock_exits_0_and_does_nothing(box, mode):
+    """Exit 0 ONLY while the holder looks alive: a run completed within the hour."""
     import fcntl
     box.audio_mode = mode
     box.add_audio("a.webm")
+    box.run(expect=0)                                      # a completed run: last_complete
+    calls_before = len(box.rclone_calls())
     state = os.path.join(box.backup_root, "state")
-    os.makedirs(state, exist_ok=True)
     with open(os.path.join(state, "backup.lock"), "w") as held:
         fcntl.flock(held.fileno(), fcntl.LOCK_EX)
         rc, out = box.run()
-    assert rc == 0 and "another run in progress" in out
-    assert box.remote_audio() == [] and box.remote_dbs() == [] and box.rclone_calls() == []
-    assert not os.listdir(os.path.join(box.backup_root, "snapshots")) if os.path.isdir(
-        os.path.join(box.backup_root, "snapshots")) else True
+        assert rc == 0 and "another run in progress" in out
+        assert len(box.rclone_calls()) == calls_before      # it did nothing
+        # A holder with no completed run for over an hour is a stuck run: page.
+        with open(os.path.join(state, "last_complete.epoch"), "w") as fh:
+            fh.write(str(int(time.time()) - 2 * 3600))
+        rc, out = box.run()
+        assert rc == 1 and "stuck" in out
+        os.remove(os.path.join(state, "last_complete.epoch"))
+        rc, out = box.run()
+        assert rc == 1
+
+
+@audio_harness
+def test_no_long_child_inherits_the_lock(box):
+    """docker and rclone run with fd 9 closed, so an orphaned child cannot keep holding the
+    lock after the script is gone (the fake rclone records its open descriptors)."""
+    box.add_audio("a.webm")
+    rc, out = box.run(expect=0, FAKE_RCLONE_FD_CHECK=9)
+    assert "fd 9 inherited" not in out
+    body = _read("backup.sh")
+    assert "docker() { command docker \"$@\" 9>&-; }" in body
+    assert "rclone() { command rclone \"$@\" 9>&-; }" in body
+
+
+@audio_harness
+def test_an_audio_copy_done_from_the_environment_never_triggers_the_cleanup(box):
+    """Only a copy-mode upload that fully succeeded may remove mirror mode's leftovers — never
+    a value inherited from the environment, in either mode."""
+    box.add_audio("a.webm")
+    box.run(expect=0, BACKUP_AUDIO_MODE="mirror")
+    rc, out = box.run(expect=0, BACKUP_AUDIO_MODE="mirror", AUDIO_COPY_DONE=1)
+    assert box.host_mirror() == ["a.webm"] and box.stored_count() == "1"
+    # Copy mode, but no audio uploaded this run (audio backup off): still nothing removed.
+    rc, out = box.run(expect=0, BACKUP_AUDIO_MODE="copy", BACKUP_AUDIO=0, AUDIO_COPY_DONE=1)
+    assert box.host_mirror() == ["a.webm"] and box.stored_count() == "1"
+
+
+@audio_harness
+def test_an_identical_recording_with_a_new_mtime_is_a_no_op_and_a_changed_one_fails(box):
+    """--checksum: size+content, not modtime, so a re-staged identical file never trips
+    --immutable (it used to be an exit 6 on every run)."""
+    box.audio_mode = "copy"
+    box.add_audio("a.webm")
+    box.run(expect=0)
+    remote_a = os.path.join(box.remote, "hopper-dashboard-backups", "audio", "a.webm")
+    os.utime(remote_a, (1_600_000_000, 1_600_000_000))       # same bytes, another mtime
+    rc, out = box.run()
+    assert rc == 0, out
+    assert any(c[0] == "copy" and "--checksum" in c for c in box.rclone_calls())
+    with open(remote_a, "w", encoding="utf-8") as fh:
+        fh.write("different bytes")
+    rc, out = box.run()
+    assert rc != 0
+
+
+@audio_harness
+def test_a_killed_runs_snapshot_temp_copies_are_swept_under_the_lock(box):
+    box.run(expect=0)
+    snaps = os.path.join(box.backup_root, "snapshots")
+    for name in (".snapshot.ABC123.db", ".snapshot.ABC123.db-wal", ".snapshot.ABC123.db-shm"):
+        with open(os.path.join(snaps, name), "w", encoding="utf-8") as fh:
+            fh.write("a half-written copy of inbox.db")
+    box.run(expect=0)
+    assert not [n for n in os.listdir(snaps) if n.startswith(".snapshot.")]
 
 
 @audio_harness
@@ -1059,30 +1127,104 @@ def _touch_db(path):
         fh.write("an old snapshot")
 
 
+def _days_ago(days):
+    return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(time.time() - days * 86400))
+
+
+def _tiers(box):
+    local = os.path.join(box.backup_root, "snapshots")
+    remote = os.path.join(box.remote, "hopper-dashboard-backups")
+    return local, remote, os.path.join(remote, "daily")
+
+
+def _names(d, prefix):
+    return sorted(n for n in os.listdir(d) if n.startswith(prefix))
+
+
+def _rename_newest(d, prefix, days):
+    newest = _names(d, prefix)[-1]
+    target = f"{prefix}{_days_ago(days)}.db"
+    os.rename(os.path.join(d, newest), os.path.join(d, target))
+    return target
+
+
+def _change_inbox(box):
+    conn = sqlite3.connect(os.path.join(box.container, "app", "data", "inbox.db"))
+    conn.execute("INSERT INTO inbox (v) VALUES (?)", (str(time.time()),))
+    conn.commit()
+    conn.close()
+
+
 @audio_harness
 def test_db_snapshots_older_than_30_days_go_in_every_tier_but_never_a_tiers_newest(box):
     """A deleted note's words live on in the database snapshots: the age cap is what makes
-    "gone about 30 days later" true, whatever the count caps would keep."""
+    "gone within about 30 days" true, whatever the count caps would keep."""
     box.run(expect=0)
-    local = os.path.join(box.backup_root, "snapshots")
-    remote = os.path.join(box.remote, "hopper-dashboard-backups")
-    # The newest local snapshot of an UNCHANGED db is old: it must be kept as the newest.
-    newest = sorted(n for n in os.listdir(local) if n.startswith("dashboard_"))[-1]
-    os.rename(os.path.join(local, newest), os.path.join(local, "dashboard_20200101T000000Z.db"))
-    for path in (os.path.join(local, "dashboard_20190101T000000Z.db"),
-                 os.path.join(remote, "inbox_20190101T000000Z.db"),
-                 os.path.join(remote, "daily", "dashboard_20190101T000000Z.db")):
-        _touch_db(path)
-    # Make the next run push again, so the Drive ring and the daily tier are pruned.
+    local, remote, daily = _tiers(box)
+    kept = _rename_newest(local, "dashboard_", 35)              # an UNCHANGED db's newest
+    for d, name in ((local, "dashboard_"), (remote, "inbox_"), (daily, "dashboard_")):
+        for days in (40, 45):
+            _touch_db(os.path.join(d, f"{name}{_days_ago(days)}.db"))
     for n in os.listdir(os.path.join(box.backup_root, "state")):
-        if n.startswith("last_drive_"):
+        if n.startswith("last_drive_"):                         # push again
             os.remove(os.path.join(box.backup_root, "state", n))
-    for n in os.listdir(os.path.join(remote, "daily")):
-        if not n.startswith(("dashboard_2019", "inbox_2019")):
-            os.remove(os.path.join(remote, "daily", n))
+    box.run(expect=0)
+    assert _names(local, "dashboard_") == [kept]                # a tier's newest stays
+    # Drive ring and daily/: index 0 is fresh, so index 1 (the one before the latest change)
+    # is kept for a week; older ones go.
+    assert len(_names(remote, "inbox_")) == 2 and len(_names(daily, "dashboard_")) == 2
+
+
+@audio_harness
+def test_a_quiet_db_is_still_pruned_on_drive_on_every_run_that_reaches_it(box):
+    """BK-19: an unchanged inbox.db is not uploaded again — and its Drive tiers used to be
+    pruned only after an upload, so they were never pruned at all."""
+    box.run(expect=0)
+    _, remote, daily = _tiers(box)
+    newest = _names(remote, "inbox_")[-1]
+    stamps = {days: _days_ago(days) for days in (40, 45, 50)}
+    for stamp in stamps.values():
+        _touch_db(os.path.join(remote, f"inbox_{stamp}.db"))
+        _touch_db(os.path.join(daily, f"inbox_{stamp}.db"))
     rc, out = box.run(expect=0)
-    assert "dashboard_20200101T000000Z.db" in os.listdir(local)        # a tier's newest stays
-    assert "dashboard_20190101T000000Z.db" not in os.listdir(local)
-    assert "inbox_20190101T000000Z.db" not in os.listdir(remote)
-    assert "dashboard_20190101T000000Z.db" not in os.listdir(os.path.join(remote, "daily"))
-    assert box.remote_dbs() and box.remote_daily()
+    assert "Drive already has this DB" in out                  # no upload happened
+    # Index 0 is the fresh one, index 1 (40 days) is kept for a week; the rest are pruned.
+    assert _names(remote, "inbox_") == sorted([newest, f"inbox_{stamps[40]}.db"])
+    assert len(_names(daily, "inbox_")) == 2
+
+
+@audio_harness
+def test_an_idle_month_then_one_change_keeps_the_snapshot_before_the_change(box):
+    """The snapshot just before the latest change is the one a bad change is undone from:
+    kept until the new one is a week old, however old it is. And no run removes more than
+    5 snapshots per tier by age."""
+    box.run(expect=0)
+    local, _, _ = _tiers(box)
+    before_change = _rename_newest(local, "inbox_", 40)       # a month of nothing
+    for days in range(41, 49):                                  # 8 older ones
+        _touch_db(os.path.join(local, f"inbox_{_days_ago(days)}.db"))
+    _change_inbox(box)
+    rc, out = box.run(expect=0)
+    names = _names(local, "inbox_")
+    assert before_change in names                               # index 1: kept for a week
+    assert len(names) == 2 + 3                                  # 8 old ones, 5 removed
+    rc, out = box.run(expect=0)                                 # the next run: 3 more
+    assert _names(local, "inbox_")[-2:] == sorted(names)[-2:] and len(_names(local, "inbox_")) == 2
+
+
+@audio_harness
+@pytest.mark.parametrize("jump", ["forward", "backward"])
+def test_a_clock_jump_skips_age_removal_for_that_run(box, jump):
+    box.run(expect=0)
+    local, _, _ = _tiers(box)
+    _rename_newest(local, "dashboard_", 60)
+    old = f"dashboard_{_days_ago(90)}.db"
+    _touch_db(os.path.join(local, old))
+    last = os.path.join(box.backup_root, "state", "last_run.epoch")
+    with open(last, "w") as fh:
+        fh.write(str(int(time.time()) + (86400 if jump == "backward" else -8 * 86400)))
+    rc, out = box.run(expect=0)
+    assert old in os.listdir(local), "an age removal ran on a clock it cannot trust"
+    assert "skipping age-based snapshot removal" in out
+    rc, out = box.run(expect=0)                                 # the next run is normal
+    assert old not in os.listdir(local)

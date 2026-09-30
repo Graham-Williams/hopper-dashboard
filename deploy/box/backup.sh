@@ -139,6 +139,9 @@ BACKUP_AUDIO="${BACKUP_AUDIO:-1}"
 # copy (the default since 2026-09-29): `rclone copy` only — never a deletion on the remote.
 # mirror: the 2026-09-19 behaviour — copy, then a guarded, logged delete pass (see push_audio).
 BACKUP_AUDIO_MODE="${BACKUP_AUDIO_MODE:-copy}"
+# Set to 1 by a copy-mode upload that fully succeeded — and ONLY by that: never inherited from
+# the environment, because it authorises removing the box copy (see the end of the script).
+AUDIO_COPY_DONE=0
 # --- the audio brakes. THREE of them, and each can refuse on its own -------------------
 #
 # In BACKUP_AUDIO_MODE=mirror the audio tree MIRRORS deletions (see push_audio), so these are the only thing standing
@@ -187,35 +190,96 @@ AUDIO_DROP_WINDOW_MIN=$((10#${AUDIO_DROP_WINDOW_MIN}))
 # password; the on-box mirror should not be readable by every account on the box.
 install -d -m 0700 "${BACKUP_ROOT}"
 install -d -m 0700 "${LOCAL_BACKUP_DIR}" "${STATE_DIR}"
-# ONE RUN AT A TIME, in both modes. A run started by hand while the timer's is going (or a
-# timer run that finds a hand run) exits 0 without doing anything: the run that holds the
-# lock does the work and reports it, and a skipped overlap is not a failure worth a page. The
-# lock is on fd 9 for the life of the script; the kernel drops it however the script ends.
-command -v flock >/dev/null 2>&1 \
+# ONE RUN AT A TIME, in both modes. The lock is on fd 9 for the life of the script (the kernel
+# drops it however the script ends), and every long child — docker, rclone — runs with fd 9
+# CLOSED (the wrappers below), so an orphaned child can never keep holding it.
+#
+# A run that finds the lock held (flock exits 75) exits 0 and does nothing — the holder does
+# the work and reports it — but ONLY while a run completed within the last hour
+# (state/last_complete.epoch). A holder with no completed run for longer is a STUCK run, and
+# that must page: exit 1, so the heartbeat fails. Any other flock error is a failure too.
+type -P flock >/dev/null 2>&1 \
   || die "flock is not on PATH (util-linux) — it is what keeps two runs from overlapping"
 exec 9>"${STATE_DIR}/backup.lock"
-if ! flock -n 9; then
-  log "another run in progress (${STATE_DIR}/backup.lock is held) — this run exits and does nothing"
-  exit 0
+LOCK_RC=0
+flock -n -E 75 9 || LOCK_RC=$?
+if (( LOCK_RC == 75 )); then
+  LAST_COMPLETE="$(cat "${STATE_DIR}/last_complete.epoch" 2>/dev/null || true)"
+  if [[ "${LAST_COMPLETE}" =~ ^[0-9]{1,12}$ ]] && (( $(date +%s) - 10#${LAST_COMPLETE} < 3600 )); then
+    log "another run in progress (${STATE_DIR}/backup.lock is held) — this run exits and does nothing"
+    exit 0
+  fi
+  die "another run holds ${STATE_DIR}/backup.lock and no run has completed in the last hour — a stuck run? (check its process and journal)"
+elif (( LOCK_RC != 0 )); then
+  die "could not take the run lock ${STATE_DIR}/backup.lock (flock exited ${LOCK_RC})"
 fi
-# Under the lock, every audio staging dir is a DEAD run's (killed by TimeoutStartSec, OOM, a
-# reboot): a whole copy of the recordings outside every retention rule. Sweep them all.
+docker() { command docker "$@" 9>&-; }
+rclone() { command rclone "$@" 9>&-; }
+# Under the lock, what a DEAD run (killed by TimeoutStartSec, OOM, a reboot) left behind is
+# swept, all of it: audio staging dirs (a whole copy of the recordings, outside every
+# retention rule) and half-written DB snapshot temps (.snapshot.*.db and their -wal/-shm).
 find "${BACKUP_ROOT}" -mindepth 1 -maxdepth 1 -type d -name '.audio.*' \
   -exec rm -rf {} + 2>/dev/null || true
-command -v docker >/dev/null 2>&1 || die "docker not on PATH (the snapshot runs inside the container)"
+find "${LOCAL_BACKUP_DIR}" -mindepth 1 -maxdepth 1 -name '.snapshot.*' \
+  -exec rm -f {} + 2>/dev/null || true
+type -P docker >/dev/null 2>&1 || die "docker not on PATH (the snapshot runs inside the container)"
 [[ "$(docker inspect -f '{{.State.Running}}' "${CONTAINER}" 2>/dev/null || echo false)" == "true" ]] \
   || die "container ${CONTAINER} is not running — cannot snapshot a WAL DB from the host (see the header)"
 
 sha256_of() { sha256sum "$1" | cut -d' ' -f1; }
 
+# --- snapshot retention: count caps, and an AGE cap that cannot empty a tier ---------
 # The snapshot names carry their UTC stamp (<name>_YYYYMMDDTHHMMSSZ[_N].db), so age is read
 # from the NAME — the same on the box and on Drive, and immune to a copy resetting an mtime.
+# Per tier, newest first:
+#   * index 0 (the newest) always stays;
+#   * index 1 — the snapshot from before the latest change, the one a bad change is undone
+#     from — stays until index 0 is at least AGE_KEEP_PREVIOUS_DAYS (7) old;
+#   * at most AGE_REMOVALS_PER_RUN (5) are removed BY AGE per tier per run (the count caps
+#     still apply in full);
+#   * a CLOCK GUARD: if now is earlier than the last run (state/last_run.epoch), or more than
+#     7 days after it, no age removal happens this run — a clock that jumped (NTP, a bad RTC)
+#     cannot age every snapshot at once. Count retention still applies.
 stamp_of_epoch() { date -u -d "@$1" +%Y%m%dT%H%M%S 2>/dev/null || date -u -r "$1" +%Y%m%dT%H%M%S; }
-AGE_CUTOFF="$(stamp_of_epoch "$(( $(date +%s) - 10#${SNAPSHOT_MAX_AGE_DAYS} * 86400 ))")"
-too_old() {  # <file name> <prefix> — true when its stamp is older than the age cap
+AGE_KEEP_PREVIOUS_DAYS=7
+AGE_REMOVALS_PER_RUN=5
+NOW_EPOCH="$(date +%s)"
+AGE_CUTOFF="$(stamp_of_epoch "$(( NOW_EPOCH - 10#${SNAPSHOT_MAX_AGE_DAYS} * 86400 ))")"
+WEEK_CUTOFF="$(stamp_of_epoch "$(( NOW_EPOCH - AGE_KEEP_PREVIOUS_DAYS * 86400 ))")"
+AGE_OK=1
+LAST_RUN="$(cat "${STATE_DIR}/last_run.epoch" 2>/dev/null || true)"
+if [[ "${LAST_RUN}" =~ ^[0-9]{1,12}$ ]]; then
+  if (( NOW_EPOCH < 10#${LAST_RUN} )); then
+    AGE_OK=0
+    log "WARN: the clock reads earlier than the last run's — skipping age-based snapshot removal this run (count retention still applies)"
+  elif (( NOW_EPOCH - 10#${LAST_RUN} > 7 * 86400 )); then
+    AGE_OK=0
+    log "WARN: more than 7 days since the last run (a clock jump, or the box was off) — skipping age-based snapshot removal this run (count retention still applies)"
+  fi
+fi
+printf '%s\n' "${NOW_EPOCH}" > "${STATE_DIR}/last_run.epoch"
+stamp_before() {  # <file name> <prefix> <cutoff stamp> — true when its stamp is older
   local stamp="${1#"$2"}"
   stamp="${stamp:0:15}"
-  [[ "${stamp}" =~ ^[0-9]{8}T[0-9]{6}$ && "${stamp}" < "${AGE_CUTOFF}" ]]
+  [[ "${stamp}" =~ ^[0-9]{8}T[0-9]{6}$ && "${stamp}" < "$3" ]]
+}
+# Print the names (newest first on the command line) that retention removes from one tier.
+retention_victims() {  # <count cap> <prefix> <name>…
+  local keep="$1" prefix="$2"; shift 2
+  local names=("$@") i aged=0 keep_previous=0
+  if (( ${#names[@]} > 1 )) && ! stamp_before "${names[0]}" "${prefix}" "${WEEK_CUTOFF}"; then
+    keep_previous=1
+  fi
+  for (( i = 1; i < ${#names[@]}; i++ )); do
+    if (( i >= keep )); then printf '%s\n' "${names[$i]}"; continue; fi
+    (( AGE_OK )) || continue
+    (( i == 1 && keep_previous )) && continue
+    (( aged < AGE_REMOVALS_PER_RUN )) || continue
+    if stamp_before "${names[$i]}" "${prefix}" "${AGE_CUTOFF}"; then
+      printf '%s\n' "${names[$i]}"
+      aged=$((aged + 1))
+    fi
+  done
 }
 
 # --- one DB: snapshot inside the container, verify, dedupe, keep ---------------------
@@ -295,18 +359,13 @@ PY
     log "${name}: saved ${dest##*/} (sha ${SNAPSHOT_CKSUM:0:12})"
   fi
 
-  local snaps=()
-  while IFS= read -r f; do snaps+=("$f"); done \
+  local snaps=() victim
+  while IFS= read -r f; do snaps+=("${f##*/}"); done \
     < <(ls -1 "${LOCAL_BACKUP_DIR}/${name}"_*.db 2>/dev/null | sort -r || true)
-  if (( ${#snaps[@]} > LOCAL_RETENTION )); then
-    for old in "${snaps[@]:LOCAL_RETENTION}"; do rm -f "${old}"; log "${name}: pruned ${old##*/}"; done
-  fi
-  # The age cap — never the newest (index 0), whatever its age.
-  for old in "${snaps[@]:1}"; do
-    if [[ -e "${old}" ]] && too_old "${old##*/}" "${name}_"; then
-      rm -f "${old}"; log "${name}: pruned ${old##*/} (older than ${SNAPSHOT_MAX_AGE_DAYS} days)"
-    fi
-  done
+  while IFS= read -r victim; do
+    [[ -n "${victim}" ]] || continue
+    rm -f "${LOCAL_BACKUP_DIR}/${victim}"; log "${name}: pruned ${victim}"
+  done < <(retention_victims "${LOCAL_RETENTION}" "${name}_" ${snaps[@]+"${snaps[@]}"})
 }
 
 # --- Drive (throttled, decoupled from the local snapshot) ---------------------------
@@ -315,7 +374,7 @@ PY
 # failing the unit every 5 minutes during setup teaches everyone to ignore it.
 rclone_ready() {
   [[ -n "${RCLONE_DEST}" ]] || { log "WARN: RCLONE_DEST not set — local snapshots only"; return 1; }
-  command -v rclone >/dev/null 2>&1 || { log "WARN: rclone not installed — local snapshots only"; return 1; }
+  type -P rclone >/dev/null 2>&1 || { log "WARN: rclone not installed — local snapshots only"; return 1; }
   rclone listremotes 2>/dev/null | grep -qx "${RCLONE_DEST%%:*}:" \
     || { log "WARN: rclone remote '${RCLONE_DEST%%:*}:' not configured — local snapshots only"; return 1; }
 }
@@ -327,35 +386,38 @@ prune_remote() {  # <dir> <glob> <keep>
   # --files-only is load-bearing: without it `lsf` also lists the daily/ SUBDIR, which
   # reverse-sorts last and lands in the delete slice on every run once the listing exceeds
   # the retention count (harmless, but it logs an rclone ERROR on every push for ever).
-  # Past the count cap, or past the age cap — never the tier's newest (index 0). Drive keeps a
-  # deleted file in its trash for up to 30 days more; the docs say so.
-  local i prefix="${2%\*.db}"
-  for (( i = 1; i < ${#files[@]}; i++ )); do
-    if (( i >= $3 )) || too_old "${files[$i]}" "${prefix}"; then
-      rclone deletefile "$1/${files[$i]}" && log "pruned ${1##*/}/${files[$i]}" \
-        || log "WARN: could not prune ${files[$i]}"
-    fi
-  done
+  # The same rules as the local tier (retention_victims). Drive keeps a deleted file in its
+  # trash for up to 30 days more; the docs say so.
+  local victim prefix="${2%\*.db}"
+  while IFS= read -r victim; do
+    [[ -n "${victim}" ]] || continue
+    rclone deletefile "$1/${victim}" && log "pruned ${1##*/}/${victim}" \
+      || log "WARN: could not prune ${victim}"
+  done < <(retention_victims "$3" "${prefix}" ${files[@]+"${files[@]}"})
 }
 
 push_db() {  # <name> <snapshot path> <checksum>
   local name="$1" path="$2" cksum="$3" ck_file="${STATE_DIR}/last_drive_${1}.sha256" last=""
   [[ -f "${ck_file}" ]] && last="$(cat "${ck_file}")"
   if [[ "${cksum}" == "${last}" ]]; then
-    log "${name}: Drive already has this DB (sha ${cksum:0:12})"; return 0
+    log "${name}: Drive already has this DB (sha ${cksum:0:12})"
+  else
+    log "${name}: pushing ${path##*/} to ${RCLONE_DEST}"
+    rclone copy "${path}" "${RCLONE_DEST}" || { log "ERROR: rclone copy failed for ${name}"; return 1; }
+    # Daily long-tail tier: the ring can rotate out within hours, so a logical corruption
+    # noticed a day later would have no clean copy left. At most one file per UTC day.
+    local today; today="$(date -u +%Y%m%d)"
+    if [[ -z "$(rclone lsf "${RCLONE_DEST}/daily" --files-only --include "${name}_${today}T*.db" 2>/dev/null | head -n1 || true)" ]]; then
+      rclone copy "${path}" "${RCLONE_DEST}/daily" || { log "ERROR: rclone copy to daily/ failed"; return 1; }
+      log "${name}: added today's daily snapshot"
+    fi
+    printf '%s\n' "${cksum}" > "${ck_file}"
   fi
-  log "${name}: pushing ${path##*/} to ${RCLONE_DEST}"
-  rclone copy "${path}" "${RCLONE_DEST}" || { log "ERROR: rclone copy failed for ${name}"; return 1; }
+  # BOTH tiers are pruned on EVERY run that reaches Drive, for every DB — upload or not. A
+  # quiet DB (no new snapshot for weeks) used to be pruned only after an upload, i.e. never,
+  # so its old snapshots — and the words in them — stayed past the age cap (BK-19).
   prune_remote "${RCLONE_DEST}" "${name}_*.db" "${DRIVE_RETENTION}"
-  # Daily long-tail tier: the ring above can rotate out within hours, so a logical corruption
-  # noticed a day later would have no clean copy left. At most one file per UTC day.
-  local today; today="$(date -u +%Y%m%d)"
-  if [[ -z "$(rclone lsf "${RCLONE_DEST}/daily" --files-only --include "${name}_${today}T*.db" 2>/dev/null | head -n1 || true)" ]]; then
-    rclone copy "${path}" "${RCLONE_DEST}/daily" || { log "ERROR: rclone copy to daily/ failed"; return 1; }
-    prune_remote "${RCLONE_DEST}/daily" "${name}_*.db" "${DAILY_RETENTION}"
-    log "${name}: added today's daily snapshot"
-  fi
-  printf '%s\n' "${cksum}" > "${ck_file}"
+  prune_remote "${RCLONE_DEST}/daily" "${name}_*.db" "${DAILY_RETENTION}"
 }
 
 # --- the audio tree: add-only by default, or a MIRROR with deletions ------------------
@@ -632,7 +694,9 @@ push_audio_copy() {
   chmod -R go-rwx "${staged}" || log "WARN: audio: could not tighten the staged tree's modes"
   count="$(find "${staged}" -type f ! -name '*.part' 2>/dev/null | wc -l | tr -d ' ')"
 
-  rclone copy --immutable --exclude '*.part' "${staged}" "${remote}" \
+  # --checksum: compare size + content, not modtime, so a re-staged identical recording is a
+  # no-op instead of an --immutable failure (rclone's exit 6) on every run.
+  rclone copy --immutable --checksum --exclude '*.part' "${staged}" "${remote}" \
     || { log "ERROR: rclone copy of the audio tree failed (a recording that changed on the remote is refused, never overwritten — check ${remote})"; return 1; }
   AUDIO_COPY_DONE=1
   log "audio: ${count} recording(s) copied to ${remote} (add-only: nothing is deleted off-box; no copy is kept on the box)"
@@ -730,7 +794,7 @@ fi
 # Copy mode keeps no copy on the box. After a FULLY successful run, remove what mirror mode
 # left there — its box copy and its brake state (a later switch back to mirror takes its
 # baseline from the Drive listing again).
-if [[ "${AUDIO_COPY_DONE:-0}" == "1" ]]; then
+if [[ "${BACKUP_AUDIO_MODE}" == "copy" && "${AUDIO_COPY_DONE}" == "1" ]]; then
   if [[ -e "${AUDIO_MIRROR_DIR}" || -e "${AUDIO_MIRROR_DIR}.old" \
         || -e "${STATE_DIR}/last_audio_count" || -e "${STATE_DIR}/audio_high_water" ]]; then
     rm -rf "${AUDIO_MIRROR_DIR}" "${AUDIO_MIRROR_DIR}.old"
@@ -738,4 +802,5 @@ if [[ "${AUDIO_COPY_DONE:-0}" == "1" ]]; then
     log "audio: removed the box copy and brake state left by mirror mode (copy mode keeps no copy on the box)"
   fi
 fi
+printf '%s\n' "$(date +%s)" > "${STATE_DIR}/last_complete.epoch"
 log "done (${SNAPSHOTS} DB snapshot(s))"

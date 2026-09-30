@@ -483,14 +483,20 @@ already in Google Drive stays there until you remove it by hand." The Delete con
 `…/audio/<yyyy>/<mm>/<note id>.*` in the backup folder. **The
 transcript TEXT is not retracted from backups already taken.** Every `inbox_*.db` snapshot — the local ring,
 the Drive ring and the `daily/` tier — still contains whatever was said. Each tier has an age cap on top of
-its count cap (`SNAPSHOT_MAX_AGE_DAYS`, 30; a tier's newest snapshot always stays), so those snapshots are
-**removed about 30 days later**, and a removed Drive file may then sit in Drive's trash for up to 30 more
-days. The page says: "Database backups already taken still hold the transcript text; they are removed about
-30 days later, and may then sit in Google Drive's trash for up to 30 more days." That is
+its count cap (`SNAPSHOT_MAX_AGE_DAYS`, 30), so those snapshots are **removed within about 30 days**, and a
+removed Drive file may then sit in Drive's trash for up to 30 more days. The age cap cannot empty a tier:
+the newest snapshot always stays; the one just before the latest change stays until the newest is a week
+old (so a bad change can be undone from it, however old it is); at most 5 go by age per tier per run; and
+a clock that reads earlier than the last run, or more than 7 days after it, skips age removal for that
+run. Every run that reaches Drive prunes both Drive tiers for every DB, uploaded or not (a quiet DB was
+never pruned there, BK-19). The page says: "Database backups already taken still hold the transcript text;
+they are removed within about 30 days — the one just before the latest change is kept a week after it, so
+a bad change can be undone — and may then sit in Google Drive's trash for up to 30 more days." That is
 the correct trade: rewriting historical database snapshots to erase a row would mean a backup that can be
 edited after the fact, which is not a backup. But the claim has to be stated honestly rather than sold as
-"deleted everywhere" — the words persist for about 30 days in dated database backups (plus Drive's
-trash), and (in copy mode) the recording persists in Drive until removed by hand.
+"deleted everywhere" — the words persist for about 30 days in dated database backups (a week more for the
+one just before the latest change; plus Drive's trash), and (in copy mode) the recording persists in Drive
+until removed by hand.
 
 ### What the Inbox adds to the board
 

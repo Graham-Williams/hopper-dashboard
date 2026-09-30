@@ -642,7 +642,8 @@ EOF
 # Run it once by hand before trusting the timer. Expect two "saved …" lines and a Drive push.
 # ONE run at a time (flock on ~/hopper-dashboard-backups/state/backup.lock; `flock` is util-linux):
 # a hand run that finds the timer's run going exits 0 with "another run in progress" and does
-# NOTHING — read the log line, and run it again when that one has finished.
+# NOTHING — read the log line, and run it again when that one has finished. (If it says the
+# lock is held with no completed run in the last hour instead, that holder is stuck: find it.)
 deploy/box/backup.sh
 ls -la ~/hopper-dashboard-backups/snapshots/       # dashboard_<ts>.db + inbox_<ts>.db
 rclone lsf gdrive:hopper-dashboard-backups         # both, plus daily/ and audio/
@@ -689,11 +690,14 @@ What it does, and the two things that are non-negotiable about how:
   not what you want, list first: `rclone lsf gdrive:hopper-dashboard-backups/audio --recursive` against
   the container's tree. The baseline comes from the Drive listing (a successful copy-mode run removed
   mirror mode's stored count). Any other value of `BACKUP_AUDIO_MODE` is refused before the run starts.
-- **One run at a time.** The whole run holds `flock -n` on `state/backup.lock`; a second run (the timer's
-  and a hand run overlapping) exits 0 with "another run in progress" and does nothing, so it does not fail
-  the heartbeat. Under the lock, every `~/hopper-dashboard-backups/.audio.*` staging directory is a DEAD
-  run's (a whole copy of the recordings, left by a run killed mid-way) and all of them are swept at the
-  start, in both modes. In mirror mode, a box copy left as `audio.old` by a run killed between the swap's
+- **One run at a time.** The whole run holds `flock -n -E 75` on `state/backup.lock`. A second run (the
+  timer's and a hand run overlapping) exits 0 with "another run in progress" and does nothing — but ONLY
+  while a run completed within the last hour (`state/last_complete.epoch`); a lock held with no completed
+  run for longer is a stuck run, and exits 1 so the heartbeat fails (check `ps`/the journal for the
+  holder). docker and rclone run with the lock's descriptor closed, so an orphaned child cannot hold it.
+  Under the lock, every `~/hopper-dashboard-backups/.audio.*` staging directory and every
+  `snapshots/.snapshot.*` DB temp is a DEAD run's (left by a run killed mid-way) and all of them are swept
+  at the start, in both modes. In mirror mode, a box copy left as `audio.old` by a run killed between the swap's
   two `mv`s is put back before anything else.
 - **The brakes on MIRROR mode — three of them, and each can refuse on its own.** A mass deletion is far
   likelier to be a wiped volume or a mis-set path than an intentional purge, so the run REFUSES to
@@ -742,9 +746,12 @@ What it does, and the two things that are non-negotiable about how:
   recording from the Hub immediately (in copy mode the recording stays in Drive until removed by hand; in
   mirror mode it leaves Drive within one backup cycle). Every `inbox_*.db` snapshot already taken — the
   local ring, the Drive ring and the `daily/` tier — still contains the transcript. Each tier has an AGE
-  cap on top of its count cap (`SNAPSHOT_MAX_AGE_DAYS`, 30; each tier's newest snapshot always stays), so
-  those snapshots are **removed about 30 days later**, and a removed Drive file may then sit in Drive's
-  trash for up to 30 more days. Do not "fix" this by rewriting historical
+  cap on top of its count cap (`SNAPSHOT_MAX_AGE_DAYS`, 30), so those snapshots are **removed within about
+  30 days**, and a removed Drive file may then sit in Drive's trash for up to 30 more days. The age cap
+  cannot empty a tier: its newest always stays, the one just before the latest change stays until the
+  newest is a week old, at most 5 go by age per tier per run, and a clock that reads earlier than the last
+  run (or more than 7 days after it, `state/last_run.epoch`) skips age removal for that run with a WARN.
+  Both Drive tiers are pruned for every DB on every run that reaches Drive, uploaded or not. Do not "fix" this by rewriting historical
   snapshots; a backup that can be edited after the fact is not a backup. Keeping the DB backups is
   correct, and the UI and DESIGN.md say so plainly instead of promising more than Delete delivers.
 - **Retention values are validated before anything is pruned.** `LOCAL_RETENTION`, `DRIVE_RETENTION`,
@@ -780,13 +787,24 @@ V=$(docker volume inspect hopper-dashboard_hopper-dashboard-data -f '{{.Mountpoi
 sudo rm -f "$V/inbox.db-wal" "$V/inbox.db-shm"
 sudo cp ~/hopper-dashboard-backups/snapshots/inbox_<ts>.db "$V/inbox.db"
 sudo chown 10001:10001 "$V/inbox.db"
-docker compose up -d
+# Audio, from Drive (copy mode keeps no copy on the box) — ALSO before the container starts:
+rclone copy gdrive:hopper-dashboard-backups/audio ~/audio-restore
+sudo mkdir -p "$V/inbox/audio"
+sudo cp -a ~/audio-restore/. "$V/inbox/audio/"
+sudo chown -R 10001:10001 "$V/inbox/audio"
+rm -rf ~/audio-restore
+docker compose up -d                       # LAST — only once the DB AND the audio are back
 ```
 
-Audio files are restored by copying them back under `/app/data/inbox/audio/<yyyy>/<mm>/` with the same
-ownership — from Drive (copy mode keeps no copy on the box): `rclone copy
-gdrive:hopper-dashboard-backups/audio "$V/inbox/audio"`, then `sudo chown -R 10001:10001 "$V/inbox/audio"`. A row whose `audio_path` points at a file that is not there is **not** a crash: the scheduler's
-reconcile clears the dangling path and the board shows the item with its transcript and no player.
+**⚠️ Restore the audio BEFORE `docker compose up -d`, never after.** The scheduler prunes within its first
+minute: a row whose recording is missing has its `audio_path` cleared (and, if it was never transcribed, is
+sent to Needs review as "Recording missing"), and the hourly orphan sweep then DELETES any file no row
+points at — so audio copied in after the start is thrown away again, and those notes lose their player for
+good. Measured against the app's own prune and sweep, with a real `rclone` and a local directory standing in
+for Drive: restored before the start, the rows kept their `audio_path` and the files survived; started
+first, the first prune cleared the path and the next sweep deleted the restored file as an orphan. If it
+has already happened, stop the container, restore the audio, and put each row's `audio_path` back
+(`<yyyy>/<mm>/<id>.<ext>`) before starting it again.
 
 ## 3. Cloudflare — public read side
 

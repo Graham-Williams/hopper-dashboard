@@ -1573,8 +1573,9 @@ def test_the_capture_note_says_what_delete_and_the_prune_reach(authed):
             "other copy of the audio, and a copy already in Google Drive stays there until you "
             "remove it by hand.") in html
     assert ("Database backups already taken still hold the transcript text; they are removed "
-            "about 30 days later, and may then sit in Google Drive's trash for up to 30 more "
-            "days.") in html
+            "within about 30 days — the one just before the latest change is kept a week after "
+            "it, so a bad change can be undone — and may then sit in Google Drive's trash for up "
+            "to 30 more days.") in html
 
 
 def test_the_delete_button_carries_the_drive_path_of_a_recording(authed, bot):
