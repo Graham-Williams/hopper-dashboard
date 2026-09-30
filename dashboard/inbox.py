@@ -979,7 +979,9 @@ def mirror_backlog():
     ``{"complete": true, "items": [{"key": …, "text": …, "project": …}]}``
 
     ``complete`` is the caller asserting it read the entire file; only then may
-    keys that are absent be archived. An EMPTY list is refused outright unless
+    keys that are absent be archived — and only then may a note filed to
+    backlog.txt whose tagged line was just archived be CLOSED
+    (``closed_by='backlog'``). A line that is back reopens such a note on any sync. An EMPTY list is refused outright unless
     ``allow_empty`` is set, because "the file was unreadable" and "Graham
     emptied the backlog" arrive looking identical and one of them must not
     archive every row.
@@ -1024,12 +1026,20 @@ def mirror_backlog():
                     title=inbox_db.derive_title(text), body=text,
                     project=project, now=now)
                 seen.append(key)
-            archived = 0
+            # A line that is present again reopens the note the backlog rule closed
+            # (positive evidence, so any sync may do it). Closing needs a COMPLETE sync.
+            reopened = inbox_db.reopen_filed_notes_whose_lines_returned(conn, now=now)
+            archived = closed = 0
             if complete:
+                # Before the archive: the rule needs to see which tagged rows it is about
+                # to archive.
+                closed = inbox_db.close_filed_notes_whose_lines_left(
+                    conn, seen_keys=seen, now=now)
                 archived = inbox_db.archive_missing(
                     conn, prefix=inbox_db.MIRROR_BACKLOG + ":",
                     seen_keys=seen, now=now)
         return jsonify({"synced": len(seen), "archived": archived,
-                        "complete": complete})
+                        "complete": complete, "closed_notes": closed,
+                        "reopened_notes": reopened})
     finally:
         conn.close()

@@ -658,7 +658,8 @@ def test_the_backlog_mirror_refuses_to_archive_on_an_empty_list(bot, authed):
          "text": "Other thing"}]}
     r = bot.post("/api/v1/inbox/mirror/backlog", json=payload, headers=machine())
     assert r.status_code == 200 and r.get_json() == {
-        "synced": 2, "archived": 0, "complete": True}
+        "synced": 2, "archived": 0, "complete": True, "closed_notes": 0,
+        "reopened_notes": 0}
     # An unreadable file and an emptied backlog look identical here.
     r = bot.post("/api/v1/inbox/mirror/backlog",
                   json={"complete": True, "items": []}, headers=machine())
@@ -669,7 +670,8 @@ def test_the_backlog_mirror_refuses_to_archive_on_an_empty_list(bot, authed):
     r = bot.post("/api/v1/inbox/mirror/backlog",
                   json={"complete": True, "items": [payload["items"][0]]},
                   headers=machine())
-    assert r.get_json() == {"synced": 1, "archived": 1, "complete": True}
+    assert r.get_json() == {"synced": 1, "archived": 1, "complete": True,
+                            "closed_notes": 0, "reopened_notes": 0}
     page = authed.get("/api/v1/inbox/items?source=backlog").get_json()
     assert len(page["items"]) == 1
     # A PARTIAL sync archives nothing.
@@ -1497,6 +1499,106 @@ def test_the_backlog_line_cap_is_pinned():
     assert inbox_db.MAX_BACKLOG_LINE == 500
     line = "z" * 600
     assert len(inbox_db.clean_text(line, inbox_db.MAX_BACKLOG_LINE)) == 500
+
+
+# --- a filed note closes when its backlog.txt line is removed ------------------ #
+
+def _sync_backlog(bot, *texts, complete=True):
+    return bot.post("/api/v1/inbox/mirror/backlog", headers=machine(), json={
+        "complete": complete, "items": [{"text": t} for t in texts]})
+
+
+def _state(authed, item):
+    row = next(i for i in authed.get("/api/v1/inbox/items?state=closed").get_json()["items"]
+               + authed.get("/api/v1/inbox/items?state=open").get_json()["items"]
+               if i["id"] == item)
+    return row["state"], row["closed_at"]
+
+
+def _filed_with_line(authed, bot):
+    item = _reviewed_voice(authed, bot)
+    line = f"Fix the Mac fan noise (voice {item[:8]})"
+    assert _file(bot, item, line=line).status_code == 200
+    assert _sync_backlog(bot, line, "Unrelated chore").status_code == 200
+    return item, line
+
+
+def test_a_filed_note_closes_when_its_line_leaves_backlog_txt(authed, bot):
+    item, _ = _filed_with_line(authed, bot)
+    assert _state(authed, item) == ("open", None)
+    r = _sync_backlog(bot, "Unrelated chore")
+    assert r.status_code == 200 and r.get_json()["closed_notes"] == 1
+    state, closed_at = _state(authed, item)
+    assert state == "closed" and closed_at
+    # A repeat sync changes nothing (the close is on the transition).
+    assert _sync_backlog(bot, "Unrelated chore").get_json()["closed_notes"] == 0
+
+
+def test_a_partial_or_failed_sync_never_closes_a_filed_note(authed, bot):
+    item, _ = _filed_with_line(authed, bot)
+    assert _sync_backlog(bot, "Unrelated chore", complete=False).status_code == 200
+    assert _sync_backlog(bot, complete=True).status_code == 400          # empty: refused
+    bad = bot.post("/api/v1/inbox/mirror/backlog", headers=machine(), json={
+        "complete": True, "items": [{"text": "Unrelated chore"}, "not an object"]})
+    assert bad.status_code == 400
+    assert _state(authed, item) == ("open", None)
+
+
+def test_a_filed_note_waits_for_its_line_and_an_edited_line_keeps_it_open(authed, bot):
+    item = _reviewed_voice(authed, bot)
+    tag = f"(voice {item[:8]})"
+    _file(bot, item, line=f"Fix the fan {tag}")
+    # Filed, but the line has not reached the mirror yet: nothing to close on.
+    _sync_backlog(bot, "Unrelated chore")
+    assert _state(authed, item) == ("open", None)
+    _sync_backlog(bot, f"Fix the fan {tag}")
+    # Hopper rewords the line: the old key archives, the new one still carries the tag.
+    r = _sync_backlog(bot, f"Fix the loud fan on the Mac {tag}")
+    assert r.get_json()["archived"] == 1 and r.get_json()["closed_notes"] == 0
+    assert _state(authed, item) == ("open", None)
+
+
+def test_a_line_that_comes_back_reopens_the_note_and_hides_the_copy_again(authed, bot):
+    item, line = _filed_with_line(authed, bot)
+    _sync_backlog(bot, "Unrelated chore")
+    assert _state(authed, item)[0] == "closed"
+    # Closed and its line archived: the default list shows the note, no copy.
+    listed = authed.get("/api/v1/inbox/items").get_json()["items"]
+    assert [i["title"] for i in listed if i["source"] == "backlog"] == ["Unrelated chore"]
+    r = _sync_backlog(bot, line, "Unrelated chore", complete=False)   # any sync may reopen
+    assert r.get_json()["reopened_notes"] == 1
+    assert _state(authed, item) == ("open", None)
+    after = authed.get("/api/v1/inbox/items").get_json()
+    assert sorted(i["source"] for i in after["items"]) == ["backlog", "voice"]
+    assert after["counts"]["total"] == 2                      # the tagged copy is hidden again
+    assert next(i for i in after["items"] if i["id"] == item)["filed_backlog"]["mirror_key"]
+
+
+def test_a_note_closed_by_hand_is_never_reopened_by_the_backlog_rule(authed, bot):
+    item, line = _filed_with_line(authed, bot)
+    assert authed.patch(f"/api/v1/inbox/items/{item}",
+                        json={"state": "closed"}).status_code == 200
+    _sync_backlog(bot, "Unrelated chore")
+    _sync_backlog(bot, line, "Unrelated chore")
+    assert _state(authed, item)[0] == "closed"
+    # And one the rule closed, then Graham re-closed by hand, is his now.
+    item2, line2 = _filed_with_line(authed, bot)
+    _sync_backlog(bot, line, "Unrelated chore")
+    assert _state(authed, item2)[0] == "closed"
+    authed.patch(f"/api/v1/inbox/items/{item2}", json={"state": "open"})
+    authed.patch(f"/api/v1/inbox/items/{item2}", json={"state": "closed"})
+    _sync_backlog(bot, line, line2, "Unrelated chore")
+    assert _state(authed, item2)[0] == "closed"
+
+
+def test_a_note_reopened_by_hand_is_not_closed_again_while_its_line_stays_gone(authed, bot):
+    item, _ = _filed_with_line(authed, bot)
+    _sync_backlog(bot, "Unrelated chore")
+    assert _state(authed, item)[0] == "closed"
+    authed.patch(f"/api/v1/inbox/items/{item}", json={"state": "open"})
+    _sync_backlog(bot, "Unrelated chore")
+    _sync_backlog(bot, "Unrelated chore", "Another chore")
+    assert _state(authed, item) == ("open", None)
 
 
 # --------------------------------------------------------------------------- #

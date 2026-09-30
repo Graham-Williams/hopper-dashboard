@@ -228,7 +228,9 @@ inbox_items(id TEXT PK,                     -- uuid4 hex; opaque, appears in URL
   -- added 2026-09-28 through INBOX_COLUMNS (the additive migration's first real use):
   draft_title, draft_body, draft_project, draft_status, draft_at, draft_attempts,
   draft_model, draft_src_sha, draft_edited_at,
-  filed_backlog_at, filed_backlog_line)       -- issue #33
+  filed_backlog_at, filed_backlog_line,       -- issue #33
+  draft_copied_at,
+  closed_by)                                  -- 'backlog' when the backlog rule closed it, else NULL
 inbox_issues(id INTEGER PK, item_id → inbox_items(id), repo, number, url, title,
   state, linked_at, checked_at, closed_at)
 inbox_mirror_state(key PK, etag, last_sync_at, last_status, last_error,
@@ -253,6 +255,33 @@ Two unique indexes carry most of the correctness:
 `typed` · `failed` (Whisper gave up after 3 attempts) · `live` (legacy; no longer produced — see the privacy
 note under Security posture). Without `pending` and `failed` the board cannot tell "transcribing…" from
 "this will never transcribe", and the Mac worker has nothing to back off from.
+
+### Item lifecycle: what "closed" and "archived" mean
+
+Every kind of item is a row in ONE table, `inbox_items`, and they share two independent flags: `state`
+(`open` | `closed`, with `closed_at`) and `archived_at` (NULL = live). **Closed** means the work is done and
+the row stays on the board with a badge (the state filter shows it). **Archived** means the thing it
+mirrored no longer exists upstream; archived rows are left out of every list and count (`list_items` has an
+`include_archived` switch, but no route uses it), and nothing is ever deleted except by Delete. "By hand"
+below means `PATCH /api/v1/inbox/items/<id> {"state": …}` with a session; the page has no close or reopen
+button today.
+
+| source | becomes closed | becomes archived | reopens | who |
+|---|---|---|---|---|
+| `voice` | (1) by hand; (2) when EVERY linked GitHub issue is closed, checked on each complete scan of a repo it links to; (3) when filed to backlog.txt (`filed_backlog_at`) and its `(voice <id8>)` line is removed from the file — on the complete sync that archives the line, never on a partial or failed one; `closed_by='backlog'` | never | by hand; or, only if the backlog rule closed it, when its line is back in backlog.txt (any sync). A note closed by hand, or by the issues rule, is never reopened automatically — not even when a linked issue reopens | (1) by hand, (2)(3) automatic |
+| `typed` | the same as `voice` | never | the same as `voice` | the same as `voice` |
+| `github` (mirrored issue) | automatically, when a complete open-issue scan of its repo no longer lists it (closed, transferred or deleted upstream); also by hand | never | automatically, on every complete scan that lists it as open; also by hand | automatic, and it wins: a hand close of an issue still open upstream is undone on the next complete scan, and a hand reopen of one closed upstream is re-closed |
+| `backlog` (mirrored line) | by hand only | automatically, when a COMPLETE sync of backlog.txt no longer has the line (removed, or reworded — a reworded line is a new row) | un-archived automatically when the same line is posted again (any sync); `state` is never touched by the mirror | archive automatic, close by hand |
+
+A backlog row that carries a filed note's tag is also HIDDEN from the default list and the counts while that
+note is not closed (see "Filing to backlog.txt" below); the close rule keeps this consistent, because the
+note only closes when that row is archived, and only reopens when it is live again.
+
+The backlog close rule acts on the TRANSITION (a tagged row this sync is about to archive, and no tagged row
+still in the file), not on the resulting state, so a note Graham reopens by hand stays open while the line
+stays gone. The issues rule and the GitHub mirror are state-based: a hand reopen of a note whose linked issues are all
+closed is closed again by the next complete scan of that repo (a 304 "nothing changed" answer is not a
+scan), and the mirror overrides hand changes to `github` rows the same way.
 
 ### Three credentials, and why it is three and not one
 
@@ -529,6 +558,18 @@ then leaves awaiting-filing, and the backlog-mirror row that line comes back as 
 whichever arrives first) is **hidden from the default list and the counts while that note is not closed
 or archived** (shown again once it is) — the simpler of hiding or
 nesting — and linked as `filed_backlog.mirror_key` on the note. `?source=backlog` still lists it.
+
+**Removing the line closes the note** (the backlog twin of "all linked issues closed → close"). A COMPLETE
+backlog sync that is about to archive a live row carrying a filed note's tag, while no row still in the file
+carries it, closes that note (`state='closed'`, `closed_at`, `closed_by='backlog'`) before archiving —
+`inbox_db.close_filed_notes_whose_lines_left`. A partial (`complete: false`), refused or failed sync closes
+nothing; a reworded line (new key, same tag) closes nothing; a filed note whose line has not reached the
+mirror yet closes nothing. If the line comes back (any sync un-archives it), a note with
+`closed_by='backlog'` reopens (`reopen_filed_notes_whose_lines_returned`); a note closed by hand never
+does, because every hand state change clears `closed_by`. Why a column rather than inferring it from
+timestamps: it is the one fact the reopen needs ("did the rule close this?"), and a hand close in the
+same second as a sync would otherwise be indistinguishable. The sync response adds `closed_notes` and
+`reopened_notes`.
 
 **The `claude -p` call** is locked down: `--safe-mode --setting-sources "" --tools "" --strict-mcp-config
 --no-session-persistence --disable-slash-commands --output-format json --json-schema … --model sonnet

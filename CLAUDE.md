@@ -319,6 +319,12 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   while the note is not closed or archived (`_FILED_COPY_SQL`; `?source=backlog` still shows it). The
   route needs a reviewed, open note (409). An older image ignores these columns, so a rollback brings
   filed notes back as awaiting filing — DEPLOY.md Rollback has the check. The tag is the ONLY link — keep the convention.
+  **Removing the line closes the note**: a COMPLETE backlog sync that is about to archive the tagged row (and
+  keeps no other row with that tag) closes it with `closed_by='backlog'`; a returning line reopens only a
+  `closed_by='backlog'` note, and every hand state change clears `closed_by`. Transition-based on purpose.
+- **Item lifecycle** — what closed/archived/reopen mean per source (voice, typed, github, backlog), and which
+  of them is automatic: the table in DESIGN.md "Item lifecycle". One table (`inbox_items`), `state`
+  open/closed plus `archived_at`. Update the table when any close/archive/reopen rule changes.
 - `inbox.py` — the blueprint. `MACHINE_ENDPOINTS` is what scopes `INBOX_TOKEN` (now including
   `inbox.draft_queue` and `inbox.post_draft`); the create route raises
   `request.max_content_length` PER REQUEST (the global 64 KB cap in `__init__.py` protects every other

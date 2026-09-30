@@ -217,6 +217,10 @@ INBOX_COLUMNS: tuple[tuple[str, str], ...] = (
     # When a review first copied the draft into title/project. A re-tick copies the draft
     # project again only if this is NULL (``reviewed_at`` cannot say it: an untick clears it).
     ("draft_copied_at", "TEXT"),
+    # WHO closed the row, when a rule did: 'backlog' = its backlog.txt line was removed
+    # (``close_filed_notes_whose_lines_left``). NULL for a hand close or any other rule, and
+    # cleared by every hand state change — so the reopen rule can only undo its own close.
+    ("closed_by", "TEXT"),
 )
 
 
@@ -476,7 +480,9 @@ def update_item(conn: sqlite3.Connection, item_id: str, changes: dict,
             sets += ["reviewed=?", "reviewed_at=?"]
             args += [1 if value else 0, now if value else None]
         elif key == "state":
-            sets += ["state=?", "closed_at=?"]
+            # A hand close/reopen is Graham's decision: clearing closed_by stops the
+            # backlog rule from ever reopening (or re-closing on) what he did.
+            sets += ["state=?", "closed_at=?", "closed_by=NULL"]
             args += [value, now if value == "closed" else None]
 
     d_title = (clean_draft_title(changes["draft_title"])
@@ -847,6 +853,60 @@ def close_missing_mirror_items(conn: sqlite3.Connection, *, prefix: str,
     sql += clause
     args += extra
     return int(conn.execute(sql, args).rowcount or 0)
+
+
+#: A backlog-mirror row ``b`` that carries note ``inbox_items``'s ``(voice <id8>)`` tag.
+_TAGGED_LINE_SQL = ("b.source = 'backlog' AND instr(b.body, '(voice ' ||"
+                    " substr(inbox_items.id, 1, 8) || ')') > 0")
+CLOSED_BY_BACKLOG = "backlog"
+
+
+def close_filed_notes_whose_lines_left(conn: sqlite3.Connection, *,
+                                       seen_keys: Iterable[str],
+                                       now: str | None = None) -> int:
+    """Close notes filed to backlog.txt whose line is about to be archived.
+
+    The backlog-file twin of :func:`close_items_whose_issues_all_closed`: a note filed as a
+    ``(voice <id8>)`` line is done when the line is gone. Call ONLY inside a COMPLETE sync,
+    after the upserts and BEFORE :func:`archive_missing`, with the same ``seen_keys``. A note
+    closes when a live tagged row is missing from ``seen_keys`` (so THIS sync archives it —
+    the transition, so a note Graham reopened by hand is not re-closed by every later sync)
+    and NO tagged row is in ``seen_keys`` (a reworded line comes back under a new key, still
+    tagged, and must close nothing). Matched in Python over the few tagged rows, like
+    :func:`backlog_copies`, so no timestamp coincidence can stand in for the transition.
+    Marks ``closed_by='backlog'`` so :func:`reopen_filed_notes_whose_lines_returned` can
+    undo exactly this and nothing else.
+    """
+    now = now or now_iso()
+    seen = set(seen_keys)
+    leaving: set[str] = set()
+    staying: set[str] = set()
+    for row in conn.execute(
+            "SELECT mirror_key, body FROM inbox_items WHERE source = 'backlog'"
+            " AND archived_at IS NULL AND body LIKE '%(voice %'"):
+        tags = set(VOICE_TAG_RE.findall(row["body"] or ""))
+        (staying if row["mirror_key"] in seen else leaving).update(tags)
+    closed = 0
+    for tag in sorted(leaving - staying):
+        closed += int(conn.execute(
+            "UPDATE inbox_items SET state='closed', closed_at=?, closed_by=?, updated_at=? "
+            "WHERE substr(id, 1, 8) = ? AND source IN ('voice','typed')"
+            " AND filed_backlog_at IS NOT NULL AND state='open' AND archived_at IS NULL",
+            (now, CLOSED_BY_BACKLOG, now, tag)).rowcount or 0)
+    return closed
+
+
+def reopen_filed_notes_whose_lines_returned(conn: sqlite3.Connection,
+                                            now: str | None = None) -> int:
+    """Reopen a note the backlog rule closed, once its tagged line is live in the mirror
+    again. Only ``closed_by='backlog'``: a note Graham closed by hand stays closed."""
+    now = now or now_iso()
+    return int(conn.execute(
+        "UPDATE inbox_items SET state='open', closed_at=NULL, closed_by=NULL, updated_at=? "
+        "WHERE state='closed' AND closed_by=?"
+        f" AND EXISTS (SELECT 1 FROM inbox_items b WHERE {_TAGGED_LINE_SQL}"
+        "   AND b.archived_at IS NULL)",
+        (now, CLOSED_BY_BACKLOG)).rowcount or 0)
 
 
 def reopen_mirror_item(conn: sqlite3.Connection, mirror_key: str,

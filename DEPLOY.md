@@ -1274,6 +1274,12 @@ print(f"{len(rows)} note(s) already filed to backlog.txt — do NOT file these a
 PY
 ```
 
+`closed_by` (added with the backlog close rule) is additive in the same way: an older image ignores it, so a
+note the rule closed simply stays closed, and it is not reopened if its line comes back while the old image
+runs. Once the newer image is back, the next sync that sees the line reopens it as usual. The
+reverse gap: a line REMOVED while the old image ran is already archived by then, so its note does not close
+itself afterwards (the rule acts on the removal) — close it by hand.
+
 The hostname move rolls back separately: restore the `.env` backup from §3a (an older image has no legacy
 redirect, so with `APP_HOST=hub…` the old `dashboard…` name would 403), and put the Mac's `INBOX_URL` back.
 
