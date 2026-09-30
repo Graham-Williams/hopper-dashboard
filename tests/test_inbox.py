@@ -202,17 +202,18 @@ def test_the_origin_pin_now_covers_patch(settings, registry, notifier):
                           headers={"Origin": base, "Accept": "application/json"})
     assert created.status_code == 201
     item = created.get_json()["id"]
+    change = {"project": "km-tracker"}
     # No Origin, no Referer → refused.
-    assert client.patch(f"/api/v1/inbox/items/{item}", json={"reviewed": True},
+    assert client.patch(f"/api/v1/inbox/items/{item}", json=change,
                         base_url=base).status_code == 403
     # A foreign Origin → refused.
-    assert client.patch(f"/api/v1/inbox/items/{item}", json={"reviewed": True},
+    assert client.patch(f"/api/v1/inbox/items/{item}", json=change,
                         base_url=base,
                         headers={"Origin": "https://evil.example"}).status_code == 403
     # The app's own Origin → allowed.
-    ok = client.patch(f"/api/v1/inbox/items/{item}", json={"reviewed": True},
+    ok = client.patch(f"/api/v1/inbox/items/{item}", json=change,
                       base_url=base, headers={"Origin": base})
-    assert ok.status_code == 200 and ok.get_json()["reviewed"] is True
+    assert ok.status_code == 200 and ok.get_json()["project"] == "km-tracker"
 
 
 def test_a_session_plus_a_machine_token_is_still_csrf_pinned(
@@ -444,9 +445,10 @@ def test_patch_validates_and_rejects_unknown_fields(authed):
                         json={"title": "   "}).status_code == 400
     assert authed.patch("/api/v1/inbox/items/" + "0" * 32,
                         json={"reviewed": True}).status_code == 404
+    # A draft title written in the same request is what a voice note's tick needs (R-03).
     ok = authed.patch(f"/api/v1/inbox/items/{item}",
                       json={"reviewed": True, "project": "km-tracker",
-                            "state": "closed"})
+                            "state": "closed", "draft_title": "Fix it"})
     body = ok.get_json()
     assert body["reviewed"] and body["project"] == "km-tracker"
     assert body["state"] == "closed" and body["closed_at"]
@@ -1229,12 +1231,13 @@ def test_reviewed_true_is_refused_on_a_non_voice_row(authed, settings):
     assert r.status_code == 200 and r.get_json()["reviewed"] is False
     voice = _voice_note(authed)["id"]
     assert authed.patch(f"/api/v1/inbox/items/{voice}",
-                        json={"reviewed": True}).get_json()["reviewed"] is True
+                        json={"reviewed": True, "draft_title": "Fix it"}
+                        ).get_json()["reviewed"] is True
 
 
-def test_only_voice_rows_render_a_reviewed_checkbox(authed):
+def test_only_voice_rows_render_a_reviewed_checkbox(authed, bot):
     typed = post_note(authed, "typed row").get_json()["id"]
-    voice = _voice_note(authed)["id"]
+    voice = _drafted(authed, bot)
     html = authed.get("/inbox").data.decode()
 
     def row(item_id):
@@ -1431,7 +1434,7 @@ def test_a_draft_is_escaped_on_the_board(authed, bot):
 
 def _drafted(authed, bot, **draft):
     item = _transcribed(authed, bot)
-    sha = _queue(bot)["items"][0]["sha"]
+    sha = next(i for i in _queue(bot)["items"] if i["id"] == item)["sha"]
     body = {"title": "Fix the sticky wheel", "body": "It sticks.\nOften.",
             "src_sha": sha}
     body.update(draft)
@@ -1510,12 +1513,53 @@ def test_known_projects_feed_the_datalist(authed, settings):
     assert '<option value="km-tracker">' in datalist
 
 
+# --- R-03: a voice note can be ticked Reviewed only once there is a draft ---- #
+
+def test_a_voice_note_cannot_be_reviewed_before_it_has_a_draft(authed, bot):
+    pending = _voice_note(authed)["id"]                     # transcript still pending
+    r = authed.patch(f"/api/v1/inbox/items/{pending}", json={"reviewed": True})
+    assert r.status_code == 409 and "nothing to review yet" in r.get_json()["error"]
+    drafting = _transcribed(authed, bot)                    # transcribed, draft pending
+    assert authed.patch(f"/api/v1/inbox/items/{drafting}",
+                        json={"reviewed": True}).status_code == 409
+    listed = {i["id"]: i for i in authed.get("/api/v1/inbox/items").get_json()["items"]}
+    assert not listed[pending]["reviewed"] and not listed[drafting]["awaiting_filing"]
+    # No Reviewed box to tick, either, until there is something to review.
+    html = authed.get("/inbox").data.decode()
+    assert 'class="review-box"' not in _row(html, pending)
+    assert 'class="review-box"' not in _row(html, drafting)
+
+
+def test_a_failed_draft_can_be_reviewed_once_graham_writes_one(authed, bot):
+    item = _transcribed(authed, bot)
+    sha = next(i for i in _queue(bot)["items"] if i["id"] == item)["sha"]
+    bot.post(f"/api/v1/inbox/items/{item}/draft", headers=machine(),
+             json={"failed": True, "final": True, "error": "x", "src_sha": sha})
+    assert authed.patch(f"/api/v1/inbox/items/{item}",
+                        json={"reviewed": True}).status_code == 409
+    # Writing the draft and ticking in ONE request is allowed (the edit supplies the title).
+    r = authed.patch(f"/api/v1/inbox/items/{item}",
+                     json={"draft_title": "Fix the fan", "reviewed": True})
+    assert r.status_code == 200 and r.get_json()["awaiting_filing"] is True
+
+
+def test_a_drafted_voice_note_and_a_legacy_typed_note_review_as_before(authed, bot, settings):
+    drafted = _drafted(authed, bot)
+    assert authed.patch(f"/api/v1/inbox/items/{drafted}",
+                        json={"reviewed": True}).status_code == 200
+    assert authed.patch(f"/api/v1/inbox/items/{drafted}",
+                        json={"reviewed": False}).status_code == 200       # untick: always
+    legacy = _legacy_typed(settings)
+    assert authed.patch(f"/api/v1/inbox/items/{legacy}",
+                        json={"reviewed": True}).status_code == 200
+
+
 # --------------------------------------------------------------------------- #
 # Filed to backlog.txt instead of an issue (issue #33)
 # --------------------------------------------------------------------------- #
 
 def _reviewed_voice(authed, bot):
-    item = _transcribed(authed, bot)
+    item = _drafted(authed, bot)                  # a voice note can be ticked once drafted
     assert authed.patch(f"/api/v1/inbox/items/{item}",
                         json={"reviewed": True}).status_code == 200
     return item
@@ -1981,7 +2025,7 @@ def test_a_failed_draft_post_needs_its_src_sha(authed, bot, settings):
 
 
 def test_filing_to_the_backlog_needs_a_reviewed_open_note(authed, bot, settings):
-    item = _transcribed(authed, bot)                 # voice, NOT reviewed
+    item = _drafted(authed, bot)                     # voice, NOT reviewed
     assert _file(bot, item).status_code == 409
     authed.patch(f"/api/v1/inbox/items/{item}", json={"reviewed": True})
     authed.patch(f"/api/v1/inbox/items/{item}", json={"state": "closed"})

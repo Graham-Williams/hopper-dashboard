@@ -549,6 +549,12 @@ transcript and the audio prune depends on it being Whisper's. Rules:
 - Graham editing any draft field stamps `draft_edited_at`: from then on no machine draft may overwrite it
   (409), and the draft is `ready`. A manual title typed at capture is forced into `draft_title`, and the
   capture form's project seeds `draft_project`.
+- **A voice note can be ticked Reviewed only once it has a draft** (R-03): a draft title that is `ready`
+  (the machine's, or Graham's own edit), or one written in the same request. Before that the PATCH is a
+  409 ("nothing to review yet — wait for the draft, or write one with Edit draft") and the page shows no
+  Reviewed box (`inbox.can_tick_reviewed`): ticking a note that is still transcribing used to hand Hopper's
+  filing loop an "(untitled)" note with an empty body. Unticking is always allowed; typed and legacy
+  notes are unchanged.
 - **Ticking Reviewed on a voice note copies the draft**: `title := draft_title` (made `manual`; only over a
   still-derived title, or a draft edited in the same request, so a re-tick never takes back a rename) and
   `project := draft_project` — only on the FIRST copy (`draft_copied_at IS NULL`; `reviewed_at` cannot say

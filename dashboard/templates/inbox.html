@@ -216,8 +216,9 @@
           <button type="button" class="edit-draft secondary" data-id="{{ it.id }}" hidden>Edit draft</button>
           {% endif %}
           {#- Voice notes, plus an OLDER typed note (inbox.reviewable); the PATCH
-              applies the same rule. -#}
-          {% if it.reviewable %}
+              applies the same rule. A voice note gets the box only once it has a
+              draft to review (inbox.can_tick_reviewed; the PATCH 409s before that). -#}
+          {% if it.can_tick_reviewed %}
           <label class="review">
             <input type="checkbox" class="review-box" data-id="{{ it.id }}"
                    {% if it.reviewed %}checked{% endif %}>

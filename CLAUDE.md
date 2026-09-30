@@ -304,7 +304,9 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   `draft_project` → `project` only on the first copy (`draft_copied_at`) or when it is in the same
   PATCH; editing the draft after review also writes `title`/`project`. Needs review = voice, open,
   unreviewed, draft `ready`|`failed` OR a failed transcript; it sorts first and has a tile, a filter
-  (`?awaiting=review`) and a count. Reviewed is voice-only plus LEGACY typed notes, ticked or not
+  (`?awaiting=review`) and a count. A voice note can be ticked only once it has a draft title (`ready`, or
+  written in the same PATCH) — else 409 `NOTHING_TO_REVIEW`, and no box (`can_tick_reviewed`) (R-03).
+  Reviewed is voice-only plus LEGACY typed notes, ticked or not
   (`inbox.reviewable`: typed and `reviewed_at != created_at` — a note born reviewed has the two equal
   from the same INSERT); new typed notes are created `reviewed=1`. The migration backfills
   `draft_copied_at = reviewed_at` for already-reviewed voice notes (NULLs only). A Graham edit stamps `draft_edited_at`

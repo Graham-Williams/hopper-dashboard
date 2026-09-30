@@ -248,6 +248,29 @@ def reviewable(row: dict) -> bool:
     return row["source"] == "typed" and row["reviewed_at"] != row["created_at"]
 
 
+#: R-03. A voice note's Reviewed tick means "I have read the draft and it is worth doing", and
+#: it is what hands the note to Hopper's filing loop — so it needs a draft to have read.
+NOTHING_TO_REVIEW = ("nothing to review yet — wait for the draft, or write one with Edit "
+                     "draft")
+
+
+def draft_to_review(row: dict, changes: dict | None = None) -> bool:
+    """Whether a voice note has a draft title Graham can review: the machine's (``ready``)
+    or his own (edited by hand — also ``ready``), or one written in this same request."""
+    changes = changes or {}
+    if "draft_title" in changes:
+        return bool(inbox_db.clean_draft_title(changes["draft_title"]))
+    return bool(row.get("draft_title")) and (row.get("draft_status") == inbox_db.DRAFT_READY
+                                             or bool(row.get("draft_edited_at")))
+
+
+def can_tick_reviewed(row: dict) -> bool:
+    """Whether the Reviewed box is offered: ``reviewable``, and for a voice note that is not
+    reviewed yet, only once there is a draft (a ticked box can always be unticked)."""
+    return reviewable(row) and (bool(row["reviewed"]) or row["source"] != "voice"
+                                or draft_to_review(row))
+
+
 #: Mirrored rows are VIEWS of something upstream, so Delete is refused on them: it could not
 #: remove the issue or the backlog.txt line, and the row would come back on the next sync.
 #: Each message says where to act instead. Voice and typed notes stay deletable.
@@ -299,6 +322,7 @@ def item_json(row: dict, issues: list[dict] | None = None,
         "updated_at": row["updated_at"],
         "reviewed": bool(row["reviewed"]),
         "reviewable": reviewable(row),
+        "can_tick_reviewed": can_tick_reviewed(row),
         "deletable": deletable(row),
         "reviewed_at": row["reviewed_at"],
         "state": row["state"],
@@ -611,6 +635,9 @@ def patch_item(item_id: str):
         if changes.get("reviewed") is True and not reviewable(current):
             return _err("only a voice note (or an unticked older typed note) "
                         "can be marked reviewed")
+        if (changes.get("reviewed") is True and current["source"] == "voice"
+                and not current["reviewed"] and not draft_to_review(current, changes)):
+            return _err(NOTHING_TO_REVIEW, 409)
         if (any(k in changes for k in inbox_db.DRAFT_FIELDS)
                 and current["source"] != "voice"):
             return _err("only a voice note has a draft")
