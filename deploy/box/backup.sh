@@ -130,8 +130,10 @@ DRIVE_RETENTION="${DRIVE_RETENTION:-30}"
 DAILY_RETENTION="${DAILY_RETENTION:-30}"
 # An AGE cap on every snapshot tier (local ring, Drive ring, daily/), on top of the count
 # caps: a deleted note's words live on in the database snapshots, and this is what makes
-# "removed about 30 days later" true whatever the counts would keep. Each tier's NEWEST
-# snapshot always stays, however old (an unchanged DB is not re-snapshotted).
+# "removed within about 30 days" true whatever the counts would keep. It can never empty a
+# tier: the newest snapshot always stays, and so does the state as of a week ago (the newest
+# snapshot stamped more than 7 days back), at most 5 go by age per tier per run, and a jumped
+# clock skips age removal for a run — see retention_victims below.
 SNAPSHOT_MAX_AGE_DAYS="${SNAPSHOT_MAX_AGE_DAYS:-30}"
 DRIVE_PUSH_INTERVAL_MIN="${DRIVE_PUSH_INTERVAL_MIN:-15}"
 ALLOW_EMPTY_SNAPSHOT="${ALLOW_EMPTY_SNAPSHOT:-0}"
@@ -195,24 +197,41 @@ install -d -m 0700 "${LOCAL_BACKUP_DIR}" "${STATE_DIR}"
 # CLOSED (the wrappers below), so an orphaned child can never keep holding it.
 #
 # A run that finds the lock held (flock exits 75) exits 0 and does nothing — the holder does
-# the work and reports it — but ONLY while a run completed within the last hour
-# (state/last_complete.epoch). A holder with no completed run for longer is a STUCK run, and
-# that must page: exit 1, so the heartbeat fails. Any other flock error is a failure too.
+# the work and reports it — but ONLY while the holder looks alive: the newer of
+# state/last_run.epoch (written by every run right after it takes the lock) and
+# state/last_complete.epoch is between 0 and 3600 s old. A stamp that is missing or unreadable
+# falls through to the other; neither, or a stamp from the future, means exit 1 — a STUCK run
+# must page, so the heartbeat fails. Any other flock error is a failure too.
 type -P flock >/dev/null 2>&1 \
   || die "flock is not on PATH (util-linux) — it is what keeps two runs from overlapping"
 exec 9>"${STATE_DIR}/backup.lock"
 LOCK_RC=0
 flock -n -E 75 9 || LOCK_RC=$?
 if (( LOCK_RC == 75 )); then
-  LAST_COMPLETE="$(cat "${STATE_DIR}/last_complete.epoch" 2>/dev/null || true)"
-  if [[ "${LAST_COMPLETE}" =~ ^[0-9]{1,12}$ ]] && (( $(date +%s) - 10#${LAST_COMPLETE} < 3600 )); then
-    log "another run in progress (${STATE_DIR}/backup.lock is held) — this run exits and does nothing"
-    exit 0
+  HOLDER_SEEN=""
+  for stamp_file in last_run.epoch last_complete.epoch; do
+    stamp="$(cat "${STATE_DIR}/${stamp_file}" 2>/dev/null || true)"
+    stamp="${stamp//[[:space:]]/}"
+    [[ "${stamp}" =~ ^[0-9]{1,12}$ ]] || continue
+    if [[ -z "${HOLDER_SEEN}" ]] || (( 10#${stamp} > 10#${HOLDER_SEEN} )); then
+      HOLDER_SEEN="${stamp}"
+    fi
+  done
+  if [[ -n "${HOLDER_SEEN}" ]]; then
+    HOLDER_AGE=$(( $(date +%s) - 10#${HOLDER_SEEN} ))
+    if (( HOLDER_AGE >= 0 && HOLDER_AGE < 3600 )); then
+      log "another run in progress (${STATE_DIR}/backup.lock is held) — this run exits and does nothing"
+      exit 0
+    fi
   fi
-  die "another run holds ${STATE_DIR}/backup.lock and no run has completed in the last hour — a stuck run? (check its process and journal)"
+  die "another run holds ${STATE_DIR}/backup.lock and no run started or completed in the last hour — a stuck run? (check its process and journal)"
 elif (( LOCK_RC != 0 )); then
   die "could not take the run lock ${STATE_DIR}/backup.lock (flock exited ${LOCK_RC})"
 fi
+# The holder's "I am alive" stamp, written right after taking the lock (an overlapping run
+# reads it, above). The previous value is kept for the clock guard further down.
+PREVIOUS_RUN="$(cat "${STATE_DIR}/last_run.epoch" 2>/dev/null || true)"
+date +%s > "${STATE_DIR}/last_run.epoch"
 docker() { command docker "$@" 9>&-; }
 rclone() { command rclone "$@" 9>&-; }
 # Under the lock, what a DEAD run (killed by TimeoutStartSec, OOM, a reboot) left behind is
@@ -233,8 +252,10 @@ sha256_of() { sha256sum "$1" | cut -d' ' -f1; }
 # from the NAME — the same on the box and on Drive, and immune to a copy resetting an mtime.
 # Per tier, newest first:
 #   * index 0 (the newest) always stays;
-#   * index 1 — the snapshot from before the latest change, the one a bad change is undone
-#     from — stays until index 0 is at least AGE_KEEP_PREVIOUS_DAYS (7) old;
+#   * the STATE AS OF A WEEK AGO — the newest snapshot stamped before WEEK_CUTOFF
+#     (AGE_KEEP_PREVIOUS_DAYS, 7) — stays, whatever its age and whatever the count cap says:
+#     a bad change is undone from it, and later writes (a review tick, a boot's ETag forget —
+#     each a new snapshot) can never push it out early, as "index 1" let them;
 #   * at most AGE_REMOVALS_PER_RUN (5) are removed BY AGE per tier per run (the count caps
 #     still apply in full);
 #   * a CLOCK GUARD: if now is earlier than the last run (state/last_run.epoch), or more than
@@ -247,7 +268,7 @@ NOW_EPOCH="$(date +%s)"
 AGE_CUTOFF="$(stamp_of_epoch "$(( NOW_EPOCH - 10#${SNAPSHOT_MAX_AGE_DAYS} * 86400 ))")"
 WEEK_CUTOFF="$(stamp_of_epoch "$(( NOW_EPOCH - AGE_KEEP_PREVIOUS_DAYS * 86400 ))")"
 AGE_OK=1
-LAST_RUN="$(cat "${STATE_DIR}/last_run.epoch" 2>/dev/null || true)"
+LAST_RUN="${PREVIOUS_RUN//[[:space:]]/}"
 if [[ "${LAST_RUN}" =~ ^[0-9]{1,12}$ ]]; then
   if (( NOW_EPOCH < 10#${LAST_RUN} )); then
     AGE_OK=0
@@ -257,7 +278,6 @@ if [[ "${LAST_RUN}" =~ ^[0-9]{1,12}$ ]]; then
     log "WARN: more than 7 days since the last run (a clock jump, or the box was off) — skipping age-based snapshot removal this run (count retention still applies)"
   fi
 fi
-printf '%s\n' "${NOW_EPOCH}" > "${STATE_DIR}/last_run.epoch"
 stamp_before() {  # <file name> <prefix> <cutoff stamp> — true when its stamp is older
   local stamp="${1#"$2"}"
   stamp="${stamp:0:15}"
@@ -266,14 +286,16 @@ stamp_before() {  # <file name> <prefix> <cutoff stamp> — true when its stamp 
 # Print the names (newest first on the command line) that retention removes from one tier.
 retention_victims() {  # <count cap> <prefix> <name>…
   local keep="$1" prefix="$2"; shift 2
-  local names=("$@") i aged=0 keep_previous=0
-  if (( ${#names[@]} > 1 )) && ! stamp_before "${names[0]}" "${prefix}" "${WEEK_CUTOFF}"; then
-    keep_previous=1
-  fi
+  local names=("$@") i aged=0 week_ago=""
+  # Newest first, so the first name stamped before the week cutoff is the state a week ago
+  # (index 0 itself when the DB has been quiet all week — it is kept anyway).
+  for (( i = 0; i < ${#names[@]}; i++ )); do
+    if stamp_before "${names[$i]}" "${prefix}" "${WEEK_CUTOFF}"; then week_ago="${names[$i]}"; break; fi
+  done
   for (( i = 1; i < ${#names[@]}; i++ )); do
+    [[ "${names[$i]}" == "${week_ago}" ]] && continue        # protected from BOTH caps
     if (( i >= keep )); then printf '%s\n' "${names[$i]}"; continue; fi
     (( AGE_OK )) || continue
-    (( i == 1 && keep_previous )) && continue
     (( aged < AGE_REMOVALS_PER_RUN )) || continue
     if stamp_before "${names[$i]}" "${prefix}" "${AGE_CUTOFF}"; then
       printf '%s\n' "${names[$i]}"

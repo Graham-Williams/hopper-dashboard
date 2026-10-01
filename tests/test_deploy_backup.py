@@ -992,14 +992,62 @@ def test_a_second_run_while_one_holds_the_lock_exits_0_and_does_nothing(box, mod
         rc, out = box.run()
         assert rc == 0 and "another run in progress" in out
         assert len(box.rclone_calls()) == calls_before      # it did nothing
-        # A holder with no completed run for over an hour is a stuck run: page.
-        with open(os.path.join(state, "last_complete.epoch"), "w") as fh:
-            fh.write(str(int(time.time()) - 2 * 3600))
+        # A holder that neither started (last_run) nor completed (last_complete) a run in the
+        # last hour is a stuck run: page.
+        for stamp in ("last_complete.epoch", "last_run.epoch"):
+            with open(os.path.join(state, stamp), "w") as fh:
+                fh.write(str(int(time.time()) - 2 * 3600))
         rc, out = box.run()
         assert rc == 1 and "stuck" in out
-        os.remove(os.path.join(state, "last_complete.epoch"))
+        for stamp in ("last_complete.epoch", "last_run.epoch"):
+            os.remove(os.path.join(state, stamp))
         rc, out = box.run()
-        assert rc == 1
+        assert rc == 1                                     # both stamps missing
+
+
+def _held_run(box, stamps):
+    """Run while the TEST holds the lock, with exactly these stamps in state/."""
+    import fcntl
+    state = os.path.join(box.backup_root, "state")
+    os.makedirs(state, exist_ok=True)
+    for name in ("last_complete.epoch", "last_run.epoch"):
+        path = os.path.join(state, name)
+        if os.path.exists(path):
+            os.remove(path)
+    for name, value in stamps.items():
+        with open(os.path.join(state, name), "w") as fh:
+            fh.write(value)
+    with open(os.path.join(state, "backup.lock"), "w") as held:
+        fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+        return box.run()
+
+
+@audio_harness
+def test_the_lock_exit_reads_the_newer_of_the_two_stamps(box):
+    now = int(time.time())
+    # A first-ever run still in progress: it wrote last_run right after taking the lock, and
+    # nothing has completed yet. Not stuck.
+    rc, out = _held_run(box, {"last_run.epoch": str(now - 60)})
+    assert rc == 0 and "another run in progress" in out
+    # A stamp from the future is not "recent": exit 1, whatever the other says.
+    rc, out = _held_run(box, {"last_run.epoch": str(now + 3600),
+                              "last_complete.epoch": str(now - 60)})
+    assert rc == 1
+    # An unreadable stamp falls through to the other one.
+    rc, out = _held_run(box, {"last_run.epoch": "garbage\n",
+                              "last_complete.epoch": str(now - 60)})
+    assert rc == 0
+    rc, out = _held_run(box, {"last_run.epoch": "garbage\n"})
+    assert rc == 1
+
+
+@audio_harness
+def test_the_holder_writes_last_run_right_after_taking_the_lock(box):
+    body = _read("backup.sh")
+    lock_at = body.index("flock -n -E 75 9")
+    stamp_at = body.index('> "${STATE_DIR}/last_run.epoch"')
+    snapshot_at = body.index("snapshot_db \"${name}\" \"${src}\"")
+    assert lock_at < stamp_at < snapshot_at
 
 
 @audio_harness
@@ -1213,6 +1261,26 @@ def test_an_idle_month_then_one_change_keeps_the_snapshot_before_the_change(box)
 
 
 @audio_harness
+def test_later_writes_never_push_out_the_state_as_of_a_week_ago(box):
+    """Gate item 4: after an idle month, ONE change, then more writes (a review tick, a boot's
+    ETag forget — each one a new snapshot): the snapshot from before the change is the state
+    as of a week ago, and it must survive — positional 'index 1' let the second write age it
+    out at once."""
+    box.run(expect=0)
+    local, remote, _ = _tiers(box)
+    week_old_state = _rename_newest(local, "inbox_", 40)       # a month of nothing
+    for d in (remote,):
+        newest = _names(d, "inbox_")[-1]
+        os.rename(os.path.join(d, newest), os.path.join(d, week_old_state))
+    for _ in range(3):                                          # the change, then two writes
+        _change_inbox(box)
+        box.run(expect=0)
+    assert week_old_state in _names(local, "inbox_")
+    assert week_old_state in _names(remote, "inbox_")
+    assert len(_names(local, "inbox_")) == 4
+
+
+@audio_harness
 @pytest.mark.parametrize("jump", ["forward", "backward"])
 def test_a_clock_jump_skips_age_removal_for_that_run(box, jump):
     box.run(expect=0)
@@ -1228,3 +1296,57 @@ def test_a_clock_jump_skips_age_removal_for_that_run(box, jump):
     assert "skipping age-based snapshot removal" in out
     rc, out = box.run(expect=0)                                 # the next run is normal
     assert old not in os.listdir(local)
+
+
+
+# --- DEPLOY.md's restore recipe, run in bash with stub commands ------------------------
+def _restore_block():
+    doc = open(os.path.join(REPO, "DEPLOY.md"), encoding="utf-8").read()
+    start = doc.index("cd ~/hopper-dashboard && docker compose stop")
+    start = doc.rindex("```bash", 0, start) + len("```bash")
+    return doc[start:doc.index("```", start)]
+
+
+def _run_restore(tmp_path, rclone_rc):
+    home = tmp_path / "home"
+    (home / "hopper-dashboard").mkdir(parents=True)
+    snaps = home / "hopper-dashboard-backups" / "snapshots"
+    snaps.mkdir(parents=True)
+    (snaps / "inbox_20260930T000000Z.db").write_text("a snapshot")
+    vol = tmp_path / "volume"
+    vol.mkdir()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "calls.log"
+    stub = ('#!/bin/bash\necho "$(basename "$0") $*" >> "%s"\n' % log)
+    for name, body in (
+            ("docker", stub + 'if [[ "$1" == volume ]]; then echo "%s"; fi\n' % vol),
+            ("rclone", stub + ('if [[ "$1" == copy && %d == 0 ]]; then mkdir -p "$3"; '
+                               'echo audio > "$3/rec.webm"; fi\nexit %d\n')
+             % (rclone_rc, rclone_rc)),
+            ("sudo", stub + 'exec "$@"\n'),
+            ("chown", stub)):
+        path = bin_dir / name
+        path.write_text(body)
+        path.chmod(0o755)
+    script = _restore_block().replace("<ts>", "20260930T000000Z")
+    proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60,
+                          env={"PATH": "%s:/usr/bin:/bin" % bin_dir, "HOME": str(home)})
+    calls = log.read_text().splitlines() if log.exists() else []
+    return proc, calls
+
+
+def test_the_restore_recipe_stops_before_cp_rm_and_up_when_rclone_fails(tmp_path):
+    proc, calls = _run_restore(tmp_path, rclone_rc=1)
+    assert proc.returncode != 0
+    assert any(c.startswith("rclone copy") for c in calls)
+    assert not any(c.startswith(("sudo cp -a", "docker compose up")) for c in calls), calls
+
+
+def test_the_restore_recipe_runs_through_when_rclone_succeeds(tmp_path):
+    proc, calls = _run_restore(tmp_path, rclone_rc=0)
+    assert proc.returncode == 0, proc.stderr
+    first = lambda prefix: next(i for i, c in enumerate(calls) if c.startswith(prefix))
+    assert first("rclone copy") < first("sudo cp -a") < first("docker compose up")
+    assert calls[-1].startswith("docker compose up")
+    assert (tmp_path / "volume" / "inbox" / "audio" / "rec.webm").exists()

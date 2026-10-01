@@ -643,7 +643,8 @@ EOF
 # ONE run at a time (flock on ~/hopper-dashboard-backups/state/backup.lock; `flock` is util-linux):
 # a hand run that finds the timer's run going exits 0 with "another run in progress" and does
 # NOTHING — read the log line, and run it again when that one has finished. (If it says the
-# lock is held with no completed run in the last hour instead, that holder is stuck: find it.)
+# lock is held with no run started or completed in the last hour instead, that holder is
+# stuck: find it.)
 deploy/box/backup.sh
 ls -la ~/hopper-dashboard-backups/snapshots/       # dashboard_<ts>.db + inbox_<ts>.db
 rclone lsf gdrive:hopper-dashboard-backups         # both, plus daily/ and audio/
@@ -692,9 +693,10 @@ What it does, and the two things that are non-negotiable about how:
   mirror mode's stored count). Any other value of `BACKUP_AUDIO_MODE` is refused before the run starts.
 - **One run at a time.** The whole run holds `flock -n -E 75` on `state/backup.lock`. A second run (the
   timer's and a hand run overlapping) exits 0 with "another run in progress" and does nothing — but ONLY
-  while a run completed within the last hour (`state/last_complete.epoch`); a lock held with no completed
-  run for longer is a stuck run, and exits 1 so the heartbeat fails (check `ps`/the journal for the
-  holder). docker and rclone run with the lock's descriptor closed, so an orphaned child cannot hold it.
+  while the holder looks alive: the newer of `state/last_run.epoch` (each run writes it right after
+  taking the lock) and `state/last_complete.epoch` is under an hour old. Otherwise — both stamps missing
+  or unreadable, a stamp from the future, or older than an hour — it is a stuck run, and the overlapping
+  run exits 1 so the heartbeat fails (check `ps`/the journal for the holder). docker and rclone run with the lock's descriptor closed, so an orphaned child cannot hold it.
   Under the lock, every `~/hopper-dashboard-backups/.audio.*` staging directory and every
   `snapshots/.snapshot.*` DB temp is a DEAD run's (left by a run killed mid-way) and all of them are swept
   at the start, in both modes. In mirror mode, a box copy left as `audio.old` by a run killed between the swap's
@@ -748,8 +750,9 @@ What it does, and the two things that are non-negotiable about how:
   local ring, the Drive ring and the `daily/` tier — still contains the transcript. Each tier has an AGE
   cap on top of its count cap (`SNAPSHOT_MAX_AGE_DAYS`, 30), so those snapshots are **removed within about
   30 days**, and a removed Drive file may then sit in Drive's trash for up to 30 more days. The age cap
-  cannot empty a tier: its newest always stays, the one just before the latest change stays until the
-  newest is a week old, at most 5 go by age per tier per run, and a clock that reads earlier than the last
+  cannot empty a tier: its newest always stays, so does the state as of a week ago (the newest snapshot
+  stamped more than 7 days back, whatever its age or the count cap), at most 5 go by age per tier per run,
+  and a clock that reads earlier than the last
   run (or more than 7 days after it, `state/last_run.epoch`) skips age removal for that run with a WARN.
   Both Drive tiers are pruned for every DB on every run that reaches Drive, uploaded or not. Do not "fix" this by rewriting historical
   snapshots; a backup that can be edited after the fact is not a backup. Keeping the DB backups is
@@ -783,17 +786,24 @@ silently hands back the PRE-restore data, with no error, and the next checkpoint
 
 ```bash
 cd ~/hopper-dashboard && docker compose stop
-V=$(docker volume inspect hopper-dashboard_hopper-dashboard-data -f '{{.Mountpoint}}')
-sudo rm -f "$V/inbox.db-wal" "$V/inbox.db-shm"
-sudo cp ~/hopper-dashboard-backups/snapshots/inbox_<ts>.db "$V/inbox.db"
-sudo chown 10001:10001 "$V/inbox.db"
-# Audio, from Drive (copy mode keeps no copy on the box) — ALSO before the container starts:
-rclone copy gdrive:hopper-dashboard-backups/audio ~/audio-restore
-sudo mkdir -p "$V/inbox/audio"
-sudo cp -a ~/audio-restore/. "$V/inbox/audio/"
-sudo chown -R 10001:10001 "$V/inbox/audio"
-rm -rf ~/audio-restore
-docker compose up -d                       # LAST — only once the DB AND the audio are back
+export V=$(docker volume inspect hopper-dashboard_hopper-dashboard-data -f '{{.Mountpoint}}')
+# One strict subshell: a failed or PARTIAL step (an rclone copy that dies half-way) stops
+# everything after it — no cp over the volume, no rm of the scratch copy, no `up`.
+(
+  set -euo pipefail
+  umask 077
+  : "${V:?set V to the volume path}"
+  sudo rm -f "$V/inbox.db-wal" "$V/inbox.db-shm"
+  sudo cp ~/hopper-dashboard-backups/snapshots/inbox_<ts>.db "$V/inbox.db"
+  sudo chown 10001:10001 "$V/inbox.db"
+  # Audio, from Drive (copy mode keeps no copy on the box) — ALSO before the container starts:
+  rclone copy gdrive:hopper-dashboard-backups/audio ~/audio-restore
+  sudo mkdir -p "$V/inbox/audio"
+  sudo cp -a ~/audio-restore/. "$V/inbox/audio/"
+  sudo chown -R 10001:10001 "$V/inbox/audio"
+  rm -rf ~/audio-restore
+  docker compose up -d                     # LAST — only once the DB AND the audio are back
+)
 ```
 
 **⚠️ Restore the audio BEFORE `docker compose up -d`, never after.** The scheduler prunes within its first
