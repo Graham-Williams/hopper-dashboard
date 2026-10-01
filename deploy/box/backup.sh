@@ -188,11 +188,14 @@ require_positive_int AUDIO_DROP_WINDOW_MIN "${AUDIO_DROP_WINDOW_MIN}"
 # The audio tree is copied out with `docker cp`, which works only off the DATA VOLUME: the
 # container is read-only, and its /tmp is a tmpfs that docker cp cannot read. Refuse anything
 # else before a run starts, rather than fail (or copy from the wrong place) halfway through.
-# A plain path: /app/data/ plus at least one segment, none of them empty, `.` or `..`, and no
-# trailing slash (so not /app/data itself, not //, not /app/data/../anything).
+# A plain path: /app/data/ plus at least one segment, none of them empty, `.` or `..`, no
+# trailing slash (so not /app/data itself, not //, not /app/data/../anything), and no newline
+# or other control character (a newline would end the `read` below early, so a second line
+# such as /../../etc would never be looked at).
 audio_dir_ok() {
   local rest seg
   local -a segs
+  [[ "$1" != *[[:cntrl:]]* ]] || return 1
   [[ "$1" == /app/data/* ]] || return 1
   rest="${1#/app/data/}"
   [[ -n "${rest}" && "${rest}" != */ ]] || return 1
@@ -202,7 +205,7 @@ audio_dir_ok() {
   done
 }
 audio_dir_ok "${CONTAINER_AUDIO_DIR}" \
-  || die "CONTAINER_AUDIO_DIR='${CONTAINER_AUDIO_DIR}' must be a plain path under /app/data (the data volume) — /app/data/ plus at least one segment, none empty, . or .., no trailing slash: the container is read-only and docker cp cannot read its tmpfs /tmp"
+  || die "CONTAINER_AUDIO_DIR=$(printf '%q' "${CONTAINER_AUDIO_DIR}") must be a plain path under /app/data (the data volume) — /app/data/ plus at least one segment, none empty, . or .., no trailing slash: the container is read-only and docker cp cannot read its tmpfs /tmp"
 # Normalise to base 10 NOW, once, so no later `(( ))` can read a leading zero as octal.
 AUDIO_MAX_DROP_PCT=$((10#${AUDIO_MAX_DROP_PCT}))
 AUDIO_MAX_DROP_FILES=$((10#${AUDIO_MAX_DROP_FILES}))
@@ -349,13 +352,15 @@ snapshot_db() {
   # never interpolated into the python source. Exit 3: no such DB; 4: no room on the tmpfs.
   docker exec -i -e SRC="${src}" -e NAME="${name}" -e SNAPDIR=/tmp "${CONTAINER}" \
     python3 - > "${tmp}" 2> "${err}" <<'PY' || rc=$?
-import glob, hashlib, os, shutil, sqlite3, sys, tempfile
+import glob, hashlib, os, shutil, signal, sqlite3, sys, tempfile
 src, name, snapdir = os.environ["SRC"], os.environ["NAME"], os.environ["SNAPDIR"]
-# FIRST, clear every snapshot temp an earlier exec left on the tmpfs (only a SIGKILLed one
-# can: every other exit removes its own, below). All of them, not just old ones: the host's
-# run lock means no snapshot is being made now, and a leftover must never eat the room this
-# one is about to measure. (The orphan of a killed host run, if still running, loses only a
-# result nobody is waiting for.)
+# FIRST, clear every snapshot temp an earlier exec left on the tmpfs. The `finally` below
+# removes this one's on every exit — an error, Ctrl-C, and SIGTERM or SIGHUP too (turned into
+# an exit that unwinds, further down); only a SIGKILL (or a crash of the interpreter itself)
+# can leave one behind, and this sweep is what removes it. All of them, not just old ones:
+# the host's run lock means no snapshot is being made now, and a leftover must never eat the
+# room this one is about to measure. (The orphan of a killed host run, if still running,
+# loses only a result nobody is waiting for.)
 for stale in glob.glob(os.path.join(snapdir, "*_snap.*.db*")):
     try:
         os.remove(stale)
@@ -381,6 +386,10 @@ if usage.free < want:
         % (snapdir, mib(usage.total), mib(usage.free), os.path.basename(src), mib(need),
            mib(want)))
     sys.exit(4)
+# Python's default SIGTERM/SIGHUP end the process WITHOUT unwinding, so a `finally` never
+# runs; as SystemExit (128 + signal, as a shell reports it) they unwind like any other exit.
+for sig in (signal.SIGTERM, signal.SIGHUP):
+    signal.signal(sig, lambda signum, frame: sys.exit(128 + signum))
 fd, dst = tempfile.mkstemp(prefix=name + "_snap.", suffix=".db", dir=snapdir)
 os.close(fd)
 try:
@@ -420,7 +429,17 @@ PY
     0) ;;
     3) log "${name}: $(tail -n 1 "${err}")"; return 2 ;;
     4) failed "$(tail -n 1 "${err}")"; return 1 ;;
-    *) failed "the snapshot inside ${CONTAINER} failed (exit ${rc}): $(grep -v '^SNAPSHOT ' "${err}" | tail -n 3 | tr '\n' ' ')"
+    *) local why
+       why="$(grep -v '^SNAPSHOT ' "${err}" | tail -n 3 | tr '\n' ' ' | sed 's/ *$//')"
+       if [[ -n "${why}" ]]; then
+         failed "the snapshot inside ${CONTAINER} failed (exit ${rc}): ${why}"
+       elif (( rc == 137 )); then
+         failed "the snapshot inside ${CONTAINER} was killed (exit 137)"
+       elif (( rc == 143 )); then
+         failed "the snapshot inside ${CONTAINER} was terminated (exit 143)"
+       else
+         failed "the snapshot inside ${CONTAINER} failed (exit ${rc}) without saying why"
+       fi
        return 1 ;;
   esac
   sent="$(grep '^SNAPSHOT ' "${err}" | tail -n 1 || true)"

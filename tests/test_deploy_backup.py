@@ -648,6 +648,33 @@ def test_no_failed_run_of_any_kind_leaks_a_snapshot_temp(box, kind):
     assert _snap_temps(box) == []                     # ...and swept by the next snapshot
 
 
+def _grow_live_db(box, name, kib=400):
+    """Big enough that its snapshot cannot fit in a pipe buffer."""
+    conn = sqlite3.connect(os.path.join(box.container, "app", "data", name + ".db"))
+    conn.executemany("INSERT INTO %s (v) VALUES (?)" % name, [("x" * 1000,)] * kib)
+    conn.commit()
+    conn.close()
+
+
+def test_a_sigterm_mid_snapshot_leaves_no_temp(box):
+    """Python's default SIGTERM does not unwind, so a `finally` never runs: the temp stayed
+    on the tmpfs. The snapshot step turns SIGTERM into an exit that does unwind. Only a
+    SIGKILL can leave one, and the next run's sweep removes that."""
+    _grow_live_db(box, "inbox")
+    rc, out = box.run(BACKUP_AUDIO=0, FAKE_DOCKER_EXEC_SIGTERM=1, FAKE_DOCKER_EXEC_ONLY="inbox")
+    assert rc == 1, out
+    assert "ERROR: inbox: the snapshot inside fake-dashboard was terminated (exit 143)" in out
+    assert _snap_temps(box) == []
+    assert [n.split("_")[0] for n in _local_snaps(box)] == ["dashboard"]
+
+
+def test_an_exec_that_dies_without_a_word_says_how_it_died(box):
+    rc, out = box.run(BACKUP_AUDIO=0, FAKE_DOCKER_EXEC_KILLED=1, FAKE_DOCKER_EXEC_ONLY="inbox")
+    assert rc == 1
+    assert "ERROR: inbox: the snapshot inside fake-dashboard was killed (exit 137)" in out, out
+    assert "failed (exit 137): " not in out
+
+
 def test_a_corrupt_dashboard_db_never_stops_inbox_or_the_audio(box):
     """One DB failing is logged as an ERROR naming it; the other DB and the audio are still
     backed up, and only then does the run exit 1 (so the heartbeat fails)."""
@@ -725,7 +752,8 @@ def test_a_snapshot_temp_left_in_the_containers_tmp_is_swept(box):
 @pytest.mark.parametrize("where", [
     "/app/data", "/app/data/", "/app/data//inbox/audio", "/app/data/inbox/audio/",
     "/app/data/./inbox", "/app/data/inbox/.", "/app/data/../tmp/audio", "/app/data/inbox/..",
-    "//app/data/inbox/audio", "/tmp/audio", "app/data/inbox/audio", "/app/database/audio"])
+    "//app/data/inbox/audio", "/tmp/audio", "app/data/inbox/audio", "/app/database/audio",
+    "/app/data/inbox\n/../../etc", "/app/data/in\tbox/audio", "/app/data/inbox/audio\x01"])
 def test_the_audio_dir_must_be_on_the_data_volume(box, where):
     """The audio is copied with `docker cp`, which only works off the data volume (not the
     tmpfs /tmp, and nothing else in the read-only container persists): a plain path with at

@@ -30,6 +30,10 @@ Fault injection, all opt-in via the environment:
                                  ...flips the byte at that offset (same size, different bytes).
   FAKE_DOCKER_EXEC_KILLED=1      the exec dies as if SIGKILLed mid-snapshot: exit 137, nothing
                                  on stdout, and the temp it had made LEFT on the container's /tmp.
+  FAKE_DOCKER_EXEC_SIGTERM=1     a REAL SIGTERM, mid-snapshot: the program's stdout is not read,
+                                 so (given a snapshot bigger than a pipe buffer) it blocks writing
+                                 it with its temp on /tmp; then it is sent SIGTERM, and whatever
+                                 it leaves is what a SIGTERM leaves. Exits 128 + 15 like docker.
   FAKE_DOCKER_EXEC_ONLY=<name>   apply the four faults above only to the snapshot of that DB
                                  (the exec's NAME); default: every one.
   FAKE_DOCKER_TMPFS_BYTES=<n>    the size of the container's /tmp tmpfs (default 64 MiB, as in
@@ -44,10 +48,13 @@ run failed while this fake let it pass). Each container has its OWN /tmp (<root>
 a program's TMPDIR points too), so anything a snapshot leaves there is visible to a test,
 and that /tmp has the tmpfs's size limit.
 """
+import glob
 import os
 import shutil
+import signal
 import subprocess
 import sys
+import time
 
 ROOT = os.environ.get("FAKE_DOCKER_ROOT")
 if not ROOT:
@@ -199,11 +206,25 @@ def main(argv):
             return subprocess.call([sys.executable, "-c", rest[2]], env=env)
         if len(rest) >= 2 and rest[1] == "-":
             faults = [k for k in ("FAKE_DOCKER_EXEC_STDOUT_LIMIT", "FAKE_DOCKER_EXEC_STDOUT_EXTRA",
-                                  "FAKE_DOCKER_EXEC_STDOUT_FLIP", "FAKE_DOCKER_EXEC_KILLED")
+                                  "FAKE_DOCKER_EXEC_STDOUT_FLIP", "FAKE_DOCKER_EXEC_KILLED",
+                                  "FAKE_DOCKER_EXEC_SIGTERM")
                       if k in os.environ]
             only = os.environ.get("FAKE_DOCKER_EXEC_ONLY")
             if not faults or (only and env.get("NAME") != only):
                 return subprocess.call([sys.executable, "-"], env=env, stdin=sys.stdin)
+            if os.environ.get("FAKE_DOCKER_EXEC_SIGTERM"):
+                child = subprocess.Popen([sys.executable, "-"], env=env, stdin=sys.stdin,
+                                         stdout=subprocess.PIPE)
+                temps = os.path.join(env["SNAPDIR"], "*_snap.*.db")
+                deadline = time.time() + 30
+                while not glob.glob(temps) and child.poll() is None and time.time() < deadline:
+                    time.sleep(0.01)
+                time.sleep(0.2)                  # let it fill the pipe and block writing
+                if child.poll() is None:
+                    child.send_signal(signal.SIGTERM)
+                child.stdout.read()              # drain only now, so it can exit
+                rc = child.wait()
+                return 128 - rc if rc < 0 else rc
             child = subprocess.run([sys.executable, "-"], env=env, stdin=sys.stdin,
                                    stdout=subprocess.PIPE)
             if os.environ.get("FAKE_DOCKER_EXEC_KILLED"):

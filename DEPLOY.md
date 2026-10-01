@@ -665,8 +665,11 @@ What it does, and the two things that are non-negotiable about how:
   copy against both (a stream cut short fails the run even if the exec exited 0), then **re-verifies it**
   (integrity, schema, the wiped-DB guard), since everything downstream only sha256s the host file. A
   stream too long or too short is reported as not matching the declared size; the same size with other
-  bytes, the declared sha256. Any failure leaves no partial file on the host, and the in-container temp
-  is removed on every exit but a SIGKILL. A DB not in the container yet (a fresh volume) is skipped
+  bytes, the declared sha256. Any failure leaves no partial file on the host. The in-container temp is
+  removed on every exit — an error, and SIGTERM or SIGHUP too (the step turns them into an exit that
+  unwinds; Python's default does not) — except a SIGKILL, and the next run's sweep removes that one.
+  An exec that dies without a message is reported as "killed (exit 137)" or "terminated (exit 143)".
+  A DB not in the container yet (a fresh volume) is skipped
   with a WARN. **Any other snapshot failure is an ERROR naming that DB, and the run carries on** with
   the other DB and the audio, then exits 1 at the end so the heartbeat fails: a `dashboard.db` problem
   never stops `inbox.db` or the recordings being backed up.
@@ -674,8 +677,10 @@ What it does, and the two things that are non-negotiable about how:
   in docker-compose.yml) — RAM, shared with the app, which spools uploads there too. Before each
   snapshot the step checks there is room for the DB (and its WAL) plus 10%, plus 8 MiB left for the
   app; if not, it fails that DB up front with a message naming `/tmp`, the tmpfs size, its free space
-  and the DB's size, rather than leaving SQLite's "database or disk is full" as the only clue. Today:
-  `dashboard.db` ≈ 5.7 MB and `inbox.db` ≈ 0.3 MB, so a DB up to roughly 50 MB fits. To raise it, edit
+  and the DB's size, rather than leaving SQLite's "database or disk is full" as the only clue. With the
+  64 MiB default a DB up to roughly 50 MB fits (less whatever the app is spooling at that moment).
+  Check the sizes now:
+  `docker exec -u 10001 hopper-dashboard sh -c 'ls -la /app/data/*.db; df -h /tmp'`. To raise it, edit
   `size=64m` there (it is RAM, so stay well under the container's `mem_limit`) and recreate the
   container (`docker compose up -d`). Every snapshot first removes ALL `*_snap.*.db*` files on that
   `/tmp`: only an exec killed mid-snapshot can leave one, the host's run lock means none is in use, and
