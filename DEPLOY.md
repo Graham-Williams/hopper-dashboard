@@ -782,47 +782,60 @@ empty DB, and snapshotting that would rotate every good copy out of the ring and
 
 **Restoring is NOT a `cp`.** Stop the container, delete the live DB's stale `-wal`/`-shm` sidecars, copy the
 snapshot in, and re-own it to uid 10001 — otherwise SQLite replays the old WAL over the restored image and
-silently hands back the PRE-restore data, with no error, and the next checkpoint bakes it in. The recipe
-checks the container really is stopped and refuses a volume with any symlink in its top two levels (the
-app controls the volume, and everything below runs as root), touching nothing in either case:
+silently hands back the PRE-restore data, with no error, and the next checkpoint bakes it in. Replace
+`<ts>` with the snapshot's stamp, then paste the whole block. What each part is for (the block itself has
+NO comments, so it pastes safely into any shell — an interactive zsh with default options runs a pasted
+`#` line as a command, which used to stop the restore right after `compose stop` with the app down):
+
+- **One strict subshell** (`set -euo pipefail`): a failed or partial step stops everything after it — a
+  failed stop, a container still running, a symlink in the volume, an rclone copy that dies half-way —
+  so there is no `rm` or `cp` over the volume, no `rm` of the scratch copy and no `compose up`.
+- **The container must really be stopped.** `ps` is captured on its own line so a failing `ps` stops
+  the restore too ("still running — nothing touched").
+- **No symlinks anywhere in the volume.** The app (uid 10001) controls the volume, and the `install`,
+  `cp` and `chown` that follow run as root: a link — at any depth, down to the recordings at
+  `inbox/audio/<yyyy>/<mm>/<id>.<ext>` — would aim them at a file of the app's choosing. The volume has
+  no legitimate links, so `find "$V" -type l` finding any stops the restore ("symlink in the volume —
+  nothing touched"), as does a failing `find` (captured on its own line, like `ps`). As a second guard,
+  the audio copy uses `cp -a --remove-destination`: each destination entry is replaced, never written
+  through.
+- **The DB:** the stale sidecars go, the snapshot is copied in and re-owned to uid 10001.
+- **The audio, from Drive** (copy mode keeps no copy on the box), ALSO before the container starts (see
+  below). Its directories are made with `install -d -o 10001 -g 10001 -m 0700`, not `mkdir -p`: on a
+  fresh volume, mkdir under the subshell's umask 077 makes `inbox/` owned by root with mode 0700, and
+  the app could not reach its own audio.
+- **`docker compose up -d` LAST**, only once the DB and the audio are back.
+- **The last line** reports any stop: "RESTORE STOPPED — up not run; check docker compose ps".
 
 ```bash
 export V=$(docker volume inspect hopper-dashboard_hopper-dashboard-data -f '{{.Mountpoint}}')
-# One strict subshell: a failed or PARTIAL step stops everything after it. A failed stop, a
-# container that is still running, a symlink in the volume, an rclone copy that dies half-way:
-# no rm or cp over the volume, no rm of the scratch copy, no compose up. The last line says so.
 (
   set -euo pipefail
   umask 077
   : "${V:?set V to the volume path}"
   cd ~/hopper-dashboard
   docker compose stop
-  running="$(docker compose ps -q --status running)"   # a failing ps stops here too
+  running="$(docker compose ps -q --status running)"
   [ -z "$running" ] || { echo "still running — nothing touched" >&2; exit 1; }
-  # The app (uid 10001) controls the volume: a symlink in it would aim the root install, cp
-  # and chown below at a file of its choosing. Two lines, so a failing find stops here too.
-  links="$(sudo find "$V" -maxdepth 2 -type l)"
+  links="$(sudo find "$V" -type l)"
   [ -z "$links" ] || { echo "symlink in the volume — nothing touched" >&2; exit 1; }
   sudo rm -f "$V/inbox.db-wal" "$V/inbox.db-shm"
   sudo cp ~/hopper-dashboard-backups/snapshots/inbox_<ts>.db "$V/inbox.db"
   sudo chown 10001:10001 "$V/inbox.db"
-  # Audio, from Drive (copy mode keeps no copy on the box) — ALSO before the container starts.
-  # install -d, not mkdir -p: on a FRESH volume mkdir under umask 077 makes inbox/ owned by
-  # root with mode 0700, and the app (uid 10001) could not reach its own audio.
   rclone copy gdrive:hopper-dashboard-backups/audio ~/audio-restore
   sudo install -d -o 10001 -g 10001 -m 0700 "$V/inbox" "$V/inbox/audio"
-  sudo cp -a ~/audio-restore/. "$V/inbox/audio/"
+  sudo cp -a --remove-destination ~/audio-restore/. "$V/inbox/audio/"
   sudo chown -R 10001:10001 "$V/inbox/audio"
   rm -rf ~/audio-restore
-  docker compose up -d                     # LAST — only once the DB AND the audio are back
+  docker compose up -d
 )
 [ $? -eq 0 ] || { echo "RESTORE STOPPED — up not run; check docker compose ps" >&2; false; }
 ```
 Keep that last check on its OWN line. `( … ) || echo …` would put the subshell on the left of `||`,
-where the shell ignores `set -e` inside it: a failed stop would carry on to `rm`, `cp` and `up`
-(`tests/test_deploy_backup.py` runs the block and catches exactly that). Keep apostrophes and
-backticks out of the block's comments: zsh, by default, reads a pasted `#` line as a command, so
-an apostrophe opens a quote that swallows the rest of the recipe (and a backtick runs a command).
+where the shell ignores `set -e` inside it: a failed stop would carry on to `rm`, `cp` and `up`.
+`tests/test_deploy_backup.py` runs this exact block — under bash, `zsh -f`, and pasted into an
+interactive default zsh — against stub commands, and checks every refusal by what was written, not
+by the exit code. Keep the block free of comments.
 
 **⚠️ Restore the audio BEFORE `docker compose up -d`, never after.** The scheduler prunes within its first
 minute: a row whose recording is missing has its `audio_path` cleared (and, if it was never transcribed, is

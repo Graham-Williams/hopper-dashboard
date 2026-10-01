@@ -1320,14 +1320,21 @@ def _restore_block():
     return doc[start:doc.index("```", start)]
 
 
+#: Where the rclone stub puts the one recording, laid out like the real store and its Drive
+#: copy: inbox/audio/<yyyy>/<mm>/<id>.<ext>, five levels below the volume.
+AUDIO_REL = os.path.join("2026", "09", "a" * 32 + ".webm")
+
+
 def _run_restore(tmp_path, rclone_rc, stop_rc=0, ps_rc=0, running="", checkout=True,
-                 volume=None, find_fails=False, shell="bash"):
+                 volume=None, find_fails=False, find_blind=False, shell="bash"):
     """Run the recipe with stubs. docker answers `volume inspect` with the volume path,
     `compose stop` with `stop_rc`, and `compose ps -q --status running` with `running` and
     `ps_rc`; `checkout=False` leaves out ~/hopper-dashboard; `volume(vol)` prepares the
-    volume first; `find_fails` makes `find` exit 1 (it is the real find otherwise). `shell`:
-    the recipe is pasted into bash or zsh (zsh with its comments recognised)."""
-    if shutil.which(shell) is None:
+    volume first; `find_fails` makes `find` exit 1, `find_blind` makes it see nothing (it is
+    the real find otherwise). `shell`:
+    the block run by `bash -c`, `zsh -f -c`, or ("zsh-i") PASTED into an interactive zsh
+    with default options — fed on stdin, where a `#` line is a command, not a comment."""
+    if shutil.which(shell.split("-")[0]) is None:
         pytest.skip(f"{shell} is not installed")
     home = tmp_path / "home"
     home.mkdir()
@@ -1350,23 +1357,38 @@ def _run_restore(tmp_path, rclone_rc, stop_rc=0, ps_rc=0, running="", checkout=T
                 'if [[ "$1 $2" == "compose stop" ]]; then exit %d; fi\n'
                 'if [[ "$1 $2" == "compose ps" ]]; then printf "%%s" "%s"; exit %d; fi\n')
              % (vol, stop_rc, running, ps_rc)),
-            ("rclone", stub + ('if [[ "$1" == copy && %d == 0 ]]; then mkdir -p "$3"; '
-                               'echo audio > "$3/rec.webm"; fi\nexit %d\n')
-             % (rclone_rc, rclone_rc)),
+            ("rclone", stub + ('if [[ "$1" == copy && %d == 0 ]]; then '
+                               'mkdir -p "$3/$(dirname "%s")"; echo audio > "$3/%s"; fi\n'
+                               'exit %d\n')
+             % (rclone_rc, AUDIO_REL, AUDIO_REL, rclone_rc)),
+            # cp: GNU's --remove-destination (each destination entry is unlinked, never
+            # written through), emulated, so the recipe runs the same on a BSD cp.
+            ("cp", stub + (
+                'args=(); rd=0\n'
+                'for a in "$@"; do if [[ "$a" == --remove-destination ]]; then rd=1; '
+                'else args+=("$a"); fi; done\n'
+                'if (( rd )); then n=${#args[@]}; src="${args[$((n-2))]}"; dst="${args[$((n-1))]}"\n'
+                '  (cd "$src" && /usr/bin/find . ! -type d) | while IFS= read -r rel; do\n'
+                '    if [[ -e "$dst/$rel" || -L "$dst/$rel" ]]; then rm -f "$dst/$rel"; fi; done\n'
+                'fi\n'
+                'exec /bin/cp "${args[@]}"\n')),
             ("sudo", stub + 'exec "$@"\n'),
             ("install", stub + (
                 'mode=""; dirs=()\n'
                 'while (( $# )); do case "$1" in -d) shift;; -o|-g) shift 2;; -m) mode="$2"; shift 2;;'
                 ' *) dirs+=("$1"); shift;; esac; done\n'
                 'for d in "${dirs[@]}"; do mkdir -p "$d"; [[ -z "$mode" ]] || chmod "$mode" "$d"; done\n')),
-            ("find", stub + ('exit 1\n' if find_fails else 'exec /usr/bin/find "$@"\n')),
+            ("find", stub + ('exit 1\n' if find_fails else 'exit 0\n' if find_blind
+                             else 'exec /usr/bin/find "$@"\n')),
             ("chown", stub)):
         path = bin_dir / name
         path.write_text(body)
         path.chmod(0o755)
     script = _restore_block().replace("<ts>", "20260930T000000Z")
-    argv = ["zsh", "-f", "-c", script] if shell == "zsh" else ["bash", "-c", script]
+    argv = {"bash": ["bash", "-c", script], "zsh": ["zsh", "-f", "-c", script],
+            "zsh-i": ["zsh", "-f", "-i"]}[shell]
     proc = subprocess.run(argv, capture_output=True, text=True, timeout=60,
+                          input=script if shell == "zsh-i" else None,
                           env={"PATH": "%s:/usr/bin:/bin" % bin_dir, "HOME": str(home)})
     calls = log.read_text().splitlines() if log.exists() else []
     return proc, calls
@@ -1379,17 +1401,20 @@ def test_the_restore_recipe_stops_before_cp_rm_and_up_when_rclone_fails(tmp_path
     assert not any(c.startswith(("sudo cp -a", "docker compose up")) for c in calls), calls
 
 
-@pytest.mark.parametrize("shell", ["bash", "zsh"])
+@pytest.mark.parametrize("shell", ["bash", "zsh", "zsh-i"])
 def test_the_restore_recipe_runs_through_when_rclone_succeeds(tmp_path, shell):
     proc, calls = _run_restore(tmp_path, rclone_rc=0, shell=shell)
     assert proc.returncode == 0, proc.stderr
     first = lambda prefix: next(i for i, c in enumerate(calls) if c.startswith(prefix))
     assert (first("docker compose stop") < first("docker compose ps -q --status running")
-            < first("sudo rm") < first("rclone copy") < first("sudo cp -a")
-            < first("docker compose up"))
+            < first("sudo find") < first("sudo rm") < first("rclone copy")
+            < first("sudo cp -a") < first("docker compose up"))
     assert calls[-1].startswith("docker compose up")
-    assert (tmp_path / "volume" / "inbox" / "audio" / "rec.webm").exists()
+    assert (tmp_path / "volume" / "inbox" / "audio" / AUDIO_REL).read_text() == "audio\n"
     assert "RESTORE STOPPED" not in proc.stderr
+    # The copy into the volume REPLACES each destination entry, never writes through one
+    # (a second guard behind the symlink check).
+    assert any(c.startswith("sudo cp -a --remove-destination ") for c in calls), calls
 
 
 #: The recipe's last line on any stop. Neutral: after a missing checkout or a container that
@@ -1417,8 +1442,9 @@ def _symlinked_db(vol):
 @pytest.mark.parametrize("case", ["inbox-dir", "inbox-db", "find-fails"])
 def test_the_restore_recipe_refuses_a_volume_with_a_symlink(tmp_path, case, shell):
     """The app (uid 10001) controls the volume. A symlink in it would point root's install,
-    cp and chown at a file of the app's choosing, so any symlink within two levels stops the
-    restore before anything is written — and so does a `find` that fails."""
+    cp and chown at a file of the app's choosing, so any symlink ANYWHERE in the volume (it
+    has no legitimate ones) stops the restore before anything is written — and so does a
+    `find` that fails."""
     kwargs = {"inbox-dir": {"volume": _symlinked_inbox_dir},
               "inbox-db": {"volume": _symlinked_db},
               "find-fails": {"find_fails": True}}[case]
@@ -1434,13 +1460,52 @@ def test_the_restore_recipe_refuses_a_volume_with_a_symlink(tmp_path, case, shel
         assert (tmp_path / "elsewhere.db").read_text() == "not the app's"
 
 
-def test_the_restore_recipe_comments_survive_a_zsh_paste():
-    """zsh (by default) reads `#` lines of a paste as commands: an apostrophe in one opens
-    a quote that swallows the rest of the recipe, and a backtick runs a command."""
+@pytest.mark.parametrize("shell", ["bash", "zsh", "zsh-i"])
+def test_the_restore_recipe_refuses_a_link_deep_in_the_audio_tree(tmp_path, shell):
+    """A recording lives five levels down (inbox/audio/<yyyy>/<mm>/<id>.<ext>). A link planted
+    at the exact path the restore copies a recording to must stop the restore before
+    anything is written. Checked on the WRITES, not the exit code: on macOS cp fails with
+    EACCES there, so an exit-code check would pass even with the guard missing."""
+    sentinel = tmp_path / "sensitive"
+    sentinel.write_text("do not overwrite")
+
+    def plant(vol):
+        link = vol / "inbox" / "audio" / AUDIO_REL
+        link.parent.mkdir(parents=True)
+        os.symlink(sentinel, link)
+
+    proc, calls = _run_restore(tmp_path, rclone_rc=0, shell=shell, volume=plant)
+    assert "symlink in the volume — nothing touched" in proc.stderr, proc.stderr
+    assert not any(c.startswith(WRITES) for c in calls), calls
+    assert sentinel.read_text() == "do not overwrite"
+    assert STOPPED in proc.stderr and proc.returncode != 0
+
+
+def test_the_audio_copy_replaces_a_link_rather_than_writing_through_it(tmp_path):
+    """The second guard, on its own: a link that appears AFTER the check (here, a `find` that
+    sees nothing) is replaced by the restored file — `cp --remove-destination` — and the file
+    it pointed at is untouched."""
+    sentinel = tmp_path / "sensitive"
+    sentinel.write_text("do not overwrite")
+
+    def plant(vol):
+        link = vol / "inbox" / "audio" / AUDIO_REL
+        link.parent.mkdir(parents=True)
+        os.symlink(sentinel, link)
+
+    proc, calls = _run_restore(tmp_path, rclone_rc=0, volume=plant, find_blind=True)
+    assert proc.returncode == 0, proc.stderr
+    restored = tmp_path / "volume" / "inbox" / "audio" / AUDIO_REL
+    assert not restored.is_symlink() and restored.read_text() == "audio\n"
+    assert sentinel.read_text() == "do not overwrite"
+
+
+def test_the_restore_block_has_no_comments():
+    """Paste-safe in any shell: an interactive zsh with default options runs a pasted `#`
+    line as a COMMAND, which stopped the restore after `compose stop` with the app down.
+    The explanations live in the prose above the block."""
     for line in _restore_block().splitlines():
-        if "#" in line:
-            comment = line[line.index("#"):]
-            assert "'" not in comment and "`" not in comment, line
+        assert "#" not in line, line
 
 
 def test_the_restore_recipe_makes_the_audio_dirs_the_apps_on_a_fresh_volume(tmp_path):
