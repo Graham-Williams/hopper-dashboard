@@ -788,7 +788,7 @@ silently hands back the PRE-restore data, with no error, and the next checkpoint
 export V=$(docker volume inspect hopper-dashboard_hopper-dashboard-data -f '{{.Mountpoint}}')
 # One strict subshell: a failed or PARTIAL step stops everything after it. A failed stop, a
 # container that is still running, an rclone copy that dies half-way: no rm or cp over the
-# volume, no rm of the scratch copy, no `up`.
+# volume, no rm of the scratch copy, no `up` — and it says so on the last line.
 (
   set -euo pipefail
   umask 077
@@ -796,19 +796,25 @@ export V=$(docker volume inspect hopper-dashboard_hopper-dashboard-data -f '{{.M
   cd ~/hopper-dashboard
   docker compose stop
   running="$(docker compose ps -q --status running)"   # a failing `ps` stops here too
-  [ -z "$running" ]                                     # still running: touch nothing
+  [ -z "$running" ] || { echo "still running — nothing touched" >&2; exit 1; }
   sudo rm -f "$V/inbox.db-wal" "$V/inbox.db-shm"
   sudo cp ~/hopper-dashboard-backups/snapshots/inbox_<ts>.db "$V/inbox.db"
   sudo chown 10001:10001 "$V/inbox.db"
-  # Audio, from Drive (copy mode keeps no copy on the box) — ALSO before the container starts:
+  # Audio, from Drive (copy mode keeps no copy on the box) — ALSO before the container starts.
+  # `install -d`, not `mkdir -p`: on a FRESH volume mkdir under umask 077 makes inbox/ root's
+  # 0700, and the app (uid 10001) could not reach its own audio.
   rclone copy gdrive:hopper-dashboard-backups/audio ~/audio-restore
-  sudo mkdir -p "$V/inbox/audio"
+  sudo install -d -o 10001 -g 10001 -m 0700 "$V/inbox" "$V/inbox/audio"
   sudo cp -a ~/audio-restore/. "$V/inbox/audio/"
   sudo chown -R 10001:10001 "$V/inbox/audio"
   rm -rf ~/audio-restore
   docker compose up -d                     # LAST — only once the DB AND the audio are back
 )
+[ $? -eq 0 ] || { echo "RESTORE STOPPED — app left down" >&2; false; }
 ```
+Keep that last check on its OWN line. `( … ) || echo …` would put the subshell on the left of `||`,
+where the shell ignores `set -e` inside it: a failed stop would carry on to `rm`, `cp` and `up`
+(`tests/test_deploy_backup.py` runs the block and catches exactly that).
 
 **⚠️ Restore the audio BEFORE `docker compose up -d`, never after.** The scheduler prunes within its first
 minute: a row whose recording is missing has its `audio_path` cleared (and, if it was never transcribed, is

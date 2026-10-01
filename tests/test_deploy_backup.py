@@ -1347,6 +1347,11 @@ def _run_restore(tmp_path, rclone_rc, stop_rc=0, ps_rc=0, running="", checkout=T
                                'echo audio > "$3/rec.webm"; fi\nexit %d\n')
              % (rclone_rc, rclone_rc)),
             ("sudo", stub + 'exec "$@"\n'),
+            ("install", stub + (
+                'mode=""; dirs=()\n'
+                'while (( $# )); do case "$1" in -d) shift;; -o|-g) shift 2;; -m) mode="$2"; shift 2;;'
+                ' *) dirs+=("$1"); shift;; esac; done\n'
+                'for d in "${dirs[@]}"; do mkdir -p "$d"; [[ -z "$mode" ]] || chmod "$mode" "$d"; done\n')),
             ("chown", stub)):
         path = bin_dir / name
         path.write_text(body)
@@ -1374,6 +1379,23 @@ def test_the_restore_recipe_runs_through_when_rclone_succeeds(tmp_path):
             < first("docker compose up"))
     assert calls[-1].startswith("docker compose up")
     assert (tmp_path / "volume" / "inbox" / "audio" / "rec.webm").exists()
+    assert "RESTORE STOPPED" not in proc.stderr
+
+
+def test_the_restore_recipe_makes_the_audio_dirs_the_apps_on_a_fresh_volume(tmp_path):
+    """On a FRESH volume there is no inbox/ yet. `mkdir -p` under the recipe's umask 077 made
+    it root-owned 0700, and the chown that followed only fixed inbox/audio — so the app (uid
+    10001) could not even reach its own audio. Both are made by `install -d` as 10001, 0700."""
+    proc, calls = _run_restore(tmp_path, rclone_rc=0)
+    assert proc.returncode == 0, proc.stderr
+    vol = tmp_path / "volume"
+    made = [c for c in calls if c.startswith("install ")]
+    assert made == ["install -d -o 10001 -g 10001 -m 0700 %s/inbox %s/inbox/audio" % (vol, vol)]
+    assert not any(c.startswith(("sudo mkdir", "mkdir")) for c in calls), calls
+    for path in (vol / "inbox", vol / "inbox" / "audio"):
+        assert oct(path.stat().st_mode & 0o777) == "0o700", path
+    first = lambda prefix: next(i for i, c in enumerate(calls) if c.startswith(prefix))
+    assert first("rclone copy") < first("install -d") < first("sudo cp -a")
 
 
 @pytest.mark.parametrize("failure", ["no-checkout", "stop-fails", "ps-fails", "still-running"])
@@ -1385,7 +1407,11 @@ def test_the_restore_recipe_touches_nothing_unless_the_container_is_stopped(tmp_
               "ps-fails": {"ps_rc": 1}, "still-running": {"running": "3f2c1a"}}[failure]
     proc, calls = _run_restore(tmp_path, rclone_rc=0, **kwargs)
     assert proc.returncode != 0
-    assert not any(c.startswith(("sudo", "rclone", "docker compose up")) for c in calls), calls
+    assert not any(c.startswith(("sudo", "rclone", "install", "docker compose up"))
+                   for c in calls), calls
+    # It says so, in words, whichever step stopped it.
+    assert "RESTORE STOPPED — app left down" in proc.stderr
+    assert ("still running — nothing touched" in proc.stderr) == (failure == "still-running")
     if failure == "no-checkout":
         assert not any(c.startswith("docker compose") for c in calls), calls
     elif failure == "stop-fails":
