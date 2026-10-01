@@ -382,6 +382,27 @@ async function capture() {
     out.captureIsAnAction = {mid: mid, after: gets()};
   }
 
+  /* An Add that gets no answer still settles, so it never holds back a later action's settle
+     of the tiles. */
+  {
+    w = world(1000000, {fetch: function (url) {
+      if (url === undefined) { return Promise.reject(new TypeError('Failed to fetch')); }  // POST
+      return Promise.resolve({ok: true, status: 200, json: function () { return Promise.resolve({}); }});
+    }});
+    const gets = function () {
+      return w.fetched.filter(function (u) { return u === '/api/v1/inbox/counts'; }).length;
+    };
+    w.run();
+    w.els['capture-text'].value = 'a typed note';
+    w.add();
+    await settle();
+    const afterAdd = gets();
+    w.toggle.fire('click');
+    await settle();
+    out.offlineAddSettles = {afterAdd: afterAdd, afterAction: gets(),
+                             error: w.els['capture-error'].textContent};
+  }
+
   /* No answer at all. */
   w = world(1000000, {fetch: function () { return Promise.reject(new TypeError('Failed to fetch')); }});
   w.run();
@@ -501,6 +522,12 @@ def test_a_capture_save_never_reloads_over_a_take_or_an_open_edit(ran):
     rec = ran["capture"]["whileRecording"]
     assert rec["recording"] is True and rec["micLive"] is True        # the take carries on
     assert rec["posts"] == [[]]                                       # text only: no audio
+
+
+def test_an_offline_add_still_settles_and_never_blocks_a_later_settle(ran):
+    o = ran["capture"]["offlineAddSettles"]
+    assert o["error"].startswith("Not saved — check your connection")
+    assert o["afterAdd"] == 1 and o["afterAction"] == 2
 
 
 def test_a_capture_save_holds_back_the_tiles_settle_until_it_lands(ran):

@@ -1320,10 +1320,15 @@ def _restore_block():
     return doc[start:doc.index("```", start)]
 
 
-def _run_restore(tmp_path, rclone_rc, stop_rc=0, ps_rc=0, running="", checkout=True):
+def _run_restore(tmp_path, rclone_rc, stop_rc=0, ps_rc=0, running="", checkout=True,
+                 volume=None, find_fails=False, shell="bash"):
     """Run the recipe with stubs. docker answers `volume inspect` with the volume path,
     `compose stop` with `stop_rc`, and `compose ps -q --status running` with `running` and
-    `ps_rc`; `checkout=False` leaves out ~/hopper-dashboard."""
+    `ps_rc`; `checkout=False` leaves out ~/hopper-dashboard; `volume(vol)` prepares the
+    volume first; `find_fails` makes `find` exit 1 (it is the real find otherwise). `shell`:
+    the recipe is pasted into bash or zsh (zsh with its comments recognised)."""
+    if shutil.which(shell) is None:
+        pytest.skip(f"{shell} is not installed")
     home = tmp_path / "home"
     home.mkdir()
     if checkout:
@@ -1333,6 +1338,8 @@ def _run_restore(tmp_path, rclone_rc, stop_rc=0, ps_rc=0, running="", checkout=T
     (snaps / "inbox_20260930T000000Z.db").write_text("a snapshot")
     vol = tmp_path / "volume"
     vol.mkdir()
+    if volume is not None:
+        volume(vol)
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     log = tmp_path / "calls.log"
@@ -1352,12 +1359,14 @@ def _run_restore(tmp_path, rclone_rc, stop_rc=0, ps_rc=0, running="", checkout=T
                 'while (( $# )); do case "$1" in -d) shift;; -o|-g) shift 2;; -m) mode="$2"; shift 2;;'
                 ' *) dirs+=("$1"); shift;; esac; done\n'
                 'for d in "${dirs[@]}"; do mkdir -p "$d"; [[ -z "$mode" ]] || chmod "$mode" "$d"; done\n')),
+            ("find", stub + ('exit 1\n' if find_fails else 'exec /usr/bin/find "$@"\n')),
             ("chown", stub)):
         path = bin_dir / name
         path.write_text(body)
         path.chmod(0o755)
     script = _restore_block().replace("<ts>", "20260930T000000Z")
-    proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60,
+    argv = ["zsh", "-f", "-c", script] if shell == "zsh" else ["bash", "-c", script]
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=60,
                           env={"PATH": "%s:/usr/bin:/bin" % bin_dir, "HOME": str(home)})
     calls = log.read_text().splitlines() if log.exists() else []
     return proc, calls
@@ -1370,8 +1379,9 @@ def test_the_restore_recipe_stops_before_cp_rm_and_up_when_rclone_fails(tmp_path
     assert not any(c.startswith(("sudo cp -a", "docker compose up")) for c in calls), calls
 
 
-def test_the_restore_recipe_runs_through_when_rclone_succeeds(tmp_path):
-    proc, calls = _run_restore(tmp_path, rclone_rc=0)
+@pytest.mark.parametrize("shell", ["bash", "zsh"])
+def test_the_restore_recipe_runs_through_when_rclone_succeeds(tmp_path, shell):
+    proc, calls = _run_restore(tmp_path, rclone_rc=0, shell=shell)
     assert proc.returncode == 0, proc.stderr
     first = lambda prefix: next(i for i, c in enumerate(calls) if c.startswith(prefix))
     assert (first("docker compose stop") < first("docker compose ps -q --status running")
@@ -1380,6 +1390,57 @@ def test_the_restore_recipe_runs_through_when_rclone_succeeds(tmp_path):
     assert calls[-1].startswith("docker compose up")
     assert (tmp_path / "volume" / "inbox" / "audio" / "rec.webm").exists()
     assert "RESTORE STOPPED" not in proc.stderr
+
+
+#: The recipe's last line on any stop. Neutral: after a missing checkout or a container that
+#: is still running, the app is NOT down, so it says what did not happen and where to look.
+STOPPED = "RESTORE STOPPED — up not run; check docker compose ps"
+
+#: What a restore that stopped must never have done.
+WRITES = ("sudo rm", "sudo cp", "sudo chown", "sudo install", "install", "chown", "rclone",
+          "docker compose up")
+
+
+def _symlinked_inbox_dir(vol):
+    elsewhere = vol.parent / "elsewhere"
+    elsewhere.mkdir()
+    os.symlink(elsewhere, vol / "inbox")
+
+
+def _symlinked_db(vol):
+    target = vol.parent / "elsewhere.db"
+    target.write_text("not the app's")
+    os.symlink(target, vol / "inbox.db")
+
+
+@pytest.mark.parametrize("shell", ["bash", "zsh"])
+@pytest.mark.parametrize("case", ["inbox-dir", "inbox-db", "find-fails"])
+def test_the_restore_recipe_refuses_a_volume_with_a_symlink(tmp_path, case, shell):
+    """The app (uid 10001) controls the volume. A symlink in it would point root's install,
+    cp and chown at a file of the app's choosing, so any symlink within two levels stops the
+    restore before anything is written — and so does a `find` that fails."""
+    kwargs = {"inbox-dir": {"volume": _symlinked_inbox_dir},
+              "inbox-db": {"volume": _symlinked_db},
+              "find-fails": {"find_fails": True}}[case]
+    proc, calls = _run_restore(tmp_path, rclone_rc=0, shell=shell, **kwargs)
+    assert proc.returncode != 0
+    assert any(c.startswith("sudo find") for c in calls), calls
+    assert not any(c.startswith(WRITES) for c in calls), calls
+    assert STOPPED in proc.stderr
+    assert ("symlink in the volume — nothing touched" in proc.stderr) == (case != "find-fails")
+    if case == "inbox-dir":
+        assert not os.listdir(tmp_path / "elsewhere")              # nothing made through it
+    if case == "inbox-db":
+        assert (tmp_path / "elsewhere.db").read_text() == "not the app's"
+
+
+def test_the_restore_recipe_comments_survive_a_zsh_paste():
+    """zsh (by default) reads `#` lines of a paste as commands: an apostrophe in one opens
+    a quote that swallows the rest of the recipe, and a backtick runs a command."""
+    for line in _restore_block().splitlines():
+        if "#" in line:
+            comment = line[line.index("#"):]
+            assert "'" not in comment and "`" not in comment, line
 
 
 def test_the_restore_recipe_makes_the_audio_dirs_the_apps_on_a_fresh_volume(tmp_path):
@@ -1398,19 +1459,21 @@ def test_the_restore_recipe_makes_the_audio_dirs_the_apps_on_a_fresh_volume(tmp_
     assert first("rclone copy") < first("install -d") < first("sudo cp -a")
 
 
+@pytest.mark.parametrize("shell", ["bash", "zsh"])
 @pytest.mark.parametrize("failure", ["no-checkout", "stop-fails", "ps-fails", "still-running"])
-def test_the_restore_recipe_touches_nothing_unless_the_container_is_stopped(tmp_path, failure):
+def test_the_restore_recipe_touches_nothing_unless_the_container_is_stopped(tmp_path, failure,
+                                                                             shell):
     """The stop is INSIDE the strict subshell, and the container is checked to be stopped
     before anything touches the volume: a failed `cd`, a failed stop, a failed `ps` or a
     container still running ends the recipe there — no rm, no cp, no rclone, no `up`."""
     kwargs = {"no-checkout": {"checkout": False}, "stop-fails": {"stop_rc": 1},
               "ps-fails": {"ps_rc": 1}, "still-running": {"running": "3f2c1a"}}[failure]
-    proc, calls = _run_restore(tmp_path, rclone_rc=0, **kwargs)
+    proc, calls = _run_restore(tmp_path, rclone_rc=0, shell=shell, **kwargs)
     assert proc.returncode != 0
     assert not any(c.startswith(("sudo", "rclone", "install", "docker compose up"))
                    for c in calls), calls
     # It says so, in words, whichever step stopped it.
-    assert "RESTORE STOPPED — app left down" in proc.stderr
+    assert STOPPED in proc.stderr
     assert ("still running — nothing touched" in proc.stderr) == (failure == "still-running")
     if failure == "no-checkout":
         assert not any(c.startswith("docker compose") for c in calls), calls
