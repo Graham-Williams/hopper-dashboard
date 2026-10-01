@@ -658,8 +658,17 @@ What it does, and the two things that are non-negotiable about how:
   API. It cannot run host-side: both DBs are WAL-mode and their `-wal`/`-shm` sidecars are owned by the
   container's uid 10001, so the backup API — which must WRITE those sidecars to take its read lock — fails
   with *"attempt to write a readonly database"* even when the source is opened `mode=ro`. The finished file
-  is integrity-checked in the container, `docker cp`'d out, and **re-verified on the host** (a truncated copy
-  would otherwise reach Drive undetected, since everything downstream only sha256s the host file).
+  is integrity-checked in the container and **streamed out on that same exec's stdout** — never
+  `docker cp`: the container is `read_only` with a **tmpfs `/tmp`** (docker-compose.yml), and `docker cp`
+  cannot read a tmpfs (*"Could not find the file /tmp/… in container"* — every run failed that way until
+  this changed). The program's last stderr line states the bytes and sha256 it sent; the host checks its
+  copy against both (a stream cut short fails the run even if the exec exited 0), then **re-verifies it**
+  (integrity, schema, the wiped-DB guard), since everything downstream only sha256s the host file. Any
+  failure leaves no partial file, and the in-container temp is removed (a killed run's is swept by the
+  next). A DB not in the container yet (a fresh volume) is skipped with a WARN; any other snapshot
+  failure fails the run. `CONTAINER_AUDIO_DIR` must be under `/app/data`: the audio tree IS copied with
+  `docker cp`, which works only off the data volume. CI runs this step for real against the built image
+  with the same `--read-only --tmpfs /tmp` settings (`.github/workflows/ci.yml`, docker-build job).
 - **The DB snapshots are additive, and so is the AUDIO TREE by default (`BACKUP_AUDIO_MODE=copy`).** The
   two databases go up with `rclone copy` into a ring plus a `daily/` tier: the upload never deletes, and a
   snapshot leaves Drive only when enough newer ones have pushed it out by retention count. Nothing that

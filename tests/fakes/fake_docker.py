@@ -19,6 +19,17 @@ Fault injection, all opt-in via the environment:
                                  does not — the two disagree with no fault injected at all.
   FAKE_DOCKER_CP_LIMIT=<n>       `docker cp` of a tree copies only the first n files and still
                                  EXITS 0 — an interrupted copy that looks like a success.
+  FAKE_DOCKER_EXEC_STDOUT_LIMIT=<n>
+                                 `docker exec ... python3 -` passes only the first n bytes of
+                                 the program's stdout through — a stream cut short.
+  FAKE_DOCKER_EXEC_RC=<n>        ...and then exits n (default: the program's own exit code, so
+                                 a cut-short stream can also EXIT 0 and look like a success).
+
+Faithful to the real container where it matters: the app's container is `read_only: true`
+with a TMPFS on /tmp (docker-compose.yml), and `docker cp` cannot read a file on a tmpfs
+mount — the daemon answers "Could not find the file ... in container". So `docker cp` FROM
+any path under /tmp fails here exactly as it does on the box (it is how every real backup
+run failed while this fake let it pass).
 """
 import os
 import shutil
@@ -33,6 +44,14 @@ if not ROOT:
 
 def host(path):
     return os.path.join(ROOT, path.lstrip("/"))
+
+
+#: Mounted as tmpfs in the real container; `docker cp` cannot read from it.
+TMPFS = ("/tmp",)
+
+
+def on_tmpfs(path):
+    return any(path == m or path.startswith(m + "/") for m in TMPFS)
 
 
 def cp_tree(src_dir, dst_dir):
@@ -61,7 +80,11 @@ def main(argv):
     if cmd == "cp":
         src, dst = argv[1], argv[2]
         if ":" in src:
-            _, path = src.split(":", 1)
+            container, path = src.split(":", 1)
+            if on_tmpfs(path):
+                sys.stderr.write("Error response from daemon: Could not find the file %s "
+                                 "in container %s\n" % (path, container))
+                return 1
             if path.endswith("/."):
                 src_dir = host(path[:-2])
                 if not os.path.isdir(src_dir):
@@ -123,9 +146,11 @@ def main(argv):
         return 0
 
     if rest[0] == "python3":
-        for key in ("SRC", "DST", "DIR"):
+        for key in ("SRC", "DST", "DIR", "SNAPDIR"):
             if key in env:
                 env[key] = host(env[key])
+        if "SNAPDIR" in env:
+            os.makedirs(env["SNAPDIR"], exist_ok=True)
         if len(rest) >= 3 and rest[1] == "-c":
             override = os.environ.get("FAKE_DOCKER_AUDIO_COUNT")
             if override is not None:
@@ -133,7 +158,14 @@ def main(argv):
                 return 0
             return subprocess.call([sys.executable, "-c", rest[2]], env=env)
         if len(rest) >= 2 and rest[1] == "-":
-            return subprocess.call([sys.executable, "-"], env=env, stdin=sys.stdin)
+            limit = os.environ.get("FAKE_DOCKER_EXEC_STDOUT_LIMIT")
+            if limit is None:
+                return subprocess.call([sys.executable, "-"], env=env, stdin=sys.stdin)
+            child = subprocess.run([sys.executable, "-"], env=env, stdin=sys.stdin,
+                                   stdout=subprocess.PIPE)
+            sys.stdout.buffer.write(child.stdout[:int(limit)])
+            sys.stdout.buffer.flush()
+            return int(os.environ.get("FAKE_DOCKER_EXEC_RC", child.returncode))
     sys.stderr.write("fake docker exec: unsupported %r\n" % (rest,))
     return 2
 

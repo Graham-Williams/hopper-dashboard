@@ -16,7 +16,10 @@
 #      sidecars are owned by the container user (UID 10001). SQLite's online backup API must
 #      WRITE those sidecars to take its read lock, so running it host-side fails with
 #      "attempt to write a readonly database" — even opening mode=ro. So: snapshot + integrity
-#      check via `docker exec`, then `docker cp` the finished file out.
+#      check via `docker exec`, and the checked file STREAMED OUT on that exec's stdout. Never
+#      `docker cp`: the container is read_only with a TMPFS on /tmp (docker-compose.yml), and
+#      docker cp cannot read a tmpfs — every run failed with "Could not find the file
+#      /tmp/... in container". The host re-checks what it received (size, sha256, integrity).
 #   2. THE DATABASES ARE ADDITIVE. Their snapshots go up with `rclone copy`, so nothing that
 #      happens on the box — a prune bug, a wiped volume, a bad restore — can delete an
 #      off-box DB snapshot. (The ring and the daily/ tier DO delete, deliberately and by
@@ -182,6 +185,15 @@ require_positive_int SNAPSHOT_MAX_AGE_DAYS "${SNAPSHOT_MAX_AGE_DAYS}"
 require_percent AUDIO_MAX_DROP_PCT "${AUDIO_MAX_DROP_PCT}"
 require_positive_int AUDIO_MAX_DROP_FILES "${AUDIO_MAX_DROP_FILES}"
 require_positive_int AUDIO_DROP_WINDOW_MIN "${AUDIO_DROP_WINDOW_MIN}"
+# The audio tree is copied out with `docker cp`, which works only off the DATA VOLUME: the
+# container is read-only, and its /tmp is a tmpfs that docker cp cannot read. Refuse anything
+# else before a run starts, rather than fail (or copy from the wrong place) halfway through.
+case "${CONTAINER_AUDIO_DIR}" in
+  /app/data/*) ;;
+  *) die "CONTAINER_AUDIO_DIR='${CONTAINER_AUDIO_DIR}' must be under /app/data (the data volume): the container is read-only and docker cp cannot read its tmpfs /tmp" ;;
+esac
+[[ "/${CONTAINER_AUDIO_DIR}/" != */../* && "/${CONTAINER_AUDIO_DIR}/" != */./* ]] \
+  || die "CONTAINER_AUDIO_DIR='${CONTAINER_AUDIO_DIR}' must be a plain path under /app/data (no . or ..)"
 # Normalise to base 10 NOW, once, so no later `(( ))` can read a leading zero as octal.
 AUDIO_MAX_DROP_PCT=$((10#${AUDIO_MAX_DROP_PCT}))
 AUDIO_MAX_DROP_FILES=$((10#${AUDIO_MAX_DROP_FILES}))
@@ -304,61 +316,95 @@ retention_victims() {  # <count cap> <prefix> <name>…
 }
 
 # --- one DB: snapshot inside the container, verify, dedupe, keep ---------------------
-# Sets SNAPSHOT_PATH / SNAPSHOT_CKSUM for the caller.
+# Sets SNAPSHOT_PATH / SNAPSHOT_CKSUM for the caller. Returns 2 for a DB that is not in the
+# container (yet); every other failure dies, and none of them keeps a partial file.
 snapshot_db() {
-  local name="$1" src="$2" tmp ctmp prev rc=0
+  local name="$1" src="$2" tmp err prev rc=0 sent got
   tmp="$(mktemp "${LOCAL_BACKUP_DIR}/.snapshot.XXXXXX.db")"
-  ctmp=""
-  # Armed BEFORE the in-container mktemp so an early failure still reaps the host temp —
-  # it is a dotfile, which the <name>_*.db prune glob never sees. The suffix glob catches
-  # the snapshot's own -wal/-shm, created when the verification step below opens it.
-  cleanup_db() {
-    rm -f "${tmp}" "${tmp}"-*
-    [[ -n "${ctmp}" ]] && docker exec "${CONTAINER}" rm -f "${ctmp}" >/dev/null 2>&1 || true
-  }
+  err="${tmp%.db}.err"
+  # Dotfiles, which the <name>_*.db prune glob never sees; a killed run's are swept under the
+  # lock. The suffix glob catches the snapshot's own -wal/-shm, created when the verification
+  # step below opens it.
+  cleanup_db() { rm -f "${tmp}" "${tmp}"-* "${err}"; }
   trap cleanup_db RETURN
+  snapshot_failed() { cleanup_db; die "$@"; }
 
-  ctmp="$(docker exec "${CONTAINER}" mktemp "/tmp/${name}_snap.XXXXXX.db")" \
-    || die "could not create a temp path inside ${CONTAINER}"
-  # Paths go in via -e, never interpolated into the python source.
-  docker exec -i -e SRC="${src}" -e DST="${ctmp}" "${CONTAINER}" python3 - <<'PY' || return 2
-import os, sqlite3, sys
-src, dst = os.environ["SRC"], os.environ["DST"]
+  # Made AND checked inside the container, then streamed out on stdout into ${tmp}. The
+  # program's LAST stderr line says what it sent ("SNAPSHOT <bytes> <sha256>"), so a stream
+  # cut short is caught even when the exec still exits 0. Paths go in via -e, never
+  # interpolated into the python source.
+  docker exec -i -e SRC="${src}" -e NAME="${name}" -e SNAPDIR=/tmp "${CONTAINER}" \
+    python3 - > "${tmp}" 2> "${err}" <<'PY' || rc=$?
+import glob, hashlib, os, sqlite3, sys, tempfile
+src, name, snapdir = os.environ["SRC"], os.environ["NAME"], os.environ["SNAPDIR"]
 # The host-side precondition checks a HOST path; this is the path actually read. Without
 # this guard sqlite3.connect() would CREATE the missing file and .backup() would faithfully
 # copy an empty DB — a snapshot that passes integrity_check and rotates every good copy out.
 if not os.path.isfile(src):
     sys.stderr.write("source DB not found inside the container at %s\n" % src)
-    sys.exit(1)
-s = sqlite3.connect(src)
-try:
-    d = sqlite3.connect(dst)
+    sys.exit(3)
+# An exec killed mid-snapshot leaves its temp on the tmpfs (RAM) until the container
+# restarts. The host's run lock means none of these is in use now: clear them.
+for stale in glob.glob(os.path.join(snapdir, "*_snap.*.db*")):
     try:
-        s.backup(d)
-    finally:
-        d.close()
-finally:
-    s.close()
-c = sqlite3.connect(dst)
+        os.remove(stale)
+    except OSError:
+        pass
+fd, dst = tempfile.mkstemp(prefix=name + "_snap.", suffix=".db", dir=snapdir)
+os.close(fd)
 try:
-    ok = c.execute("PRAGMA integrity_check").fetchone()[0]
+    s = sqlite3.connect(src)
+    try:
+        d = sqlite3.connect(dst)
+        try:
+            s.backup(d)
+        finally:
+            d.close()
+    finally:
+        s.close()
+    c = sqlite3.connect(dst)
+    try:
+        ok = c.execute("PRAGMA integrity_check").fetchone()[0]
+    finally:
+        c.close()
+    if ok != "ok":
+        sys.stderr.write("integrity_check failed: %s\n" % ok)
+        sys.exit(1)
+    digest, size, out = hashlib.sha256(), 0, sys.stdout.buffer
+    with open(dst, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            out.write(chunk)
+            digest.update(chunk)
+            size += len(chunk)
+    out.flush()
+    sys.stderr.write("SNAPSHOT %d %s\n" % (size, digest.hexdigest()))
 finally:
-    c.close()
-if ok != "ok":
-    sys.stderr.write("integrity_check failed: %s\n" % ok)
-    sys.exit(1)
+    for path in (dst, dst + "-journal", dst + "-wal", dst + "-shm"):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 PY
-  docker cp "${CONTAINER}:${ctmp}" "${tmp}" || die "docker cp of the ${name} snapshot failed"
-  docker exec "${CONTAINER}" rm -f "${ctmp}" >/dev/null 2>&1 && ctmp="" || true
+  if (( rc == 3 )); then
+    log "${name}: $(tail -n 1 "${err}")"
+    return 2
+  elif (( rc != 0 )); then
+    snapshot_failed "the ${name} snapshot inside ${CONTAINER} failed (exit ${rc}): $(grep -v '^SNAPSHOT ' "${err}" | tail -n 3 | tr '\n' ' ')"
+  fi
+  sent="$(grep '^SNAPSHOT ' "${err}" | tail -n 1 || true)"
+  got="SNAPSHOT $(wc -c < "${tmp}" | tr -d '[:space:]') $(sha256_of "${tmp}")"
+  [[ -n "${sent}" && "${sent}" == "${got}" ]] \
+    || snapshot_failed "the ${name} snapshot stream from ${CONTAINER} was incomplete (sent: ${sent#SNAPSHOT }; received: ${got#SNAPSHOT })"
 
-  # Re-verify the HOST copy — the file we actually keep and push. A truncated `docker cp`
-  # would otherwise ship to Drive undetected, since everything downstream only sha256s this.
+  # Re-verify the HOST copy — the file we actually keep and push: integrity, schema, and the
+  # wiped-DB guard. Everything downstream only sha256s this file.
   prev="$(ls -1 "${LOCAL_BACKUP_DIR}/${name}"_*.db 2>/dev/null | sort | tail -n1 || true)"
+  rc=0
   python3 "${SCRIPT_DIR}/verify_snapshot.py" "${tmp}" "${prev}" "${ALLOW_EMPTY_SNAPSHOT}" || rc=$?
   if (( rc == 3 )); then
-    die "refusing the ${name} snapshot: every table is empty while ${prev##*/} has data — the live DB looks wiped. Investigate before the good copies rotate out; set ALLOW_EMPTY_SNAPSHOT=1 if it really was emptied on purpose"
+    snapshot_failed "refusing the ${name} snapshot: every table is empty while ${prev##*/} has data — the live DB looks wiped. Investigate before the good copies rotate out; set ALLOW_EMPTY_SNAPSHOT=1 if it really was emptied on purpose"
   elif (( rc != 0 )); then
-    die "${name} snapshot failed verification after copy out of the container"
+    snapshot_failed "${name} snapshot failed verification after it was streamed out of the container"
   fi
 
   SNAPSHOT_CKSUM="$(sha256_of "${tmp}")"

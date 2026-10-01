@@ -542,6 +542,89 @@ def test_the_harness_really_drives_the_script(box):
     assert len(box.remote_daily()) == 2
 
 
+# --- the DB snapshot: made in the container, streamed out on stdout ----------------------
+def _local_snaps(box):
+    d = os.path.join(box.backup_root, "snapshots")
+    return sorted(n for n in os.listdir(d)) if os.path.isdir(d) else []
+
+
+def _container_tmp(box):
+    d = os.path.join(box.container, "tmp")
+    return sorted(os.listdir(d)) if os.path.isdir(d) else []
+
+
+def test_db_snapshots_stream_out_of_a_read_only_container_with_a_tmpfs(box):
+    """The box's container is read_only with a tmpfs /tmp, and `docker cp` cannot read a
+    tmpfs (the fake answers exactly like the daemon did on the box). The snapshot is made
+    and checked in the container, streamed out on stdout, and its temp is gone after."""
+    rc, out = box.run(expect=0, BACKUP_AUDIO=0)
+    snaps = _local_snaps(box)
+    assert [n.split("_")[0] for n in snaps] == ["dashboard", "inbox"], snaps
+    for n in snaps:                                   # complete, valid SQLite files
+        conn = sqlite3.connect(os.path.join(box.backup_root, "snapshots", n))
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        conn.close()
+    assert _container_tmp(box) == []
+    assert len(box.remote_dbs()) == 2
+
+
+@pytest.mark.parametrize("exit_code", ["0", "137"])
+def test_a_snapshot_stream_cut_short_fails_loudly_and_keeps_nothing(box, exit_code):
+    """A stream cut short — whether the exec then exits 0 (looks like success) or not — must
+    fail the run and leave no partial file anywhere: not as a snapshot, not as a temp."""
+    box.run(expect=0, BACKUP_AUDIO=0)
+    before, pushed = _local_snaps(box), box.remote_dbs()
+    box._make_db(os.path.join(box.container, "app", "data", "inbox.db"), "inbox")  # a change
+    rc, out = box.run(BACKUP_AUDIO=0, FAKE_DOCKER_EXEC_STDOUT_LIMIT=1000,
+                      FAKE_DOCKER_EXEC_RC=exit_code)
+    assert rc == 1, out
+    if exit_code == "0":
+        assert "snapshot stream from fake-dashboard was incomplete" in out, out
+    else:
+        assert "exit 137" in out, out
+    assert _local_snaps(box) == before                # no partial file kept, no temp left
+    assert box.remote_dbs() == pushed
+    assert _container_tmp(box) == []
+
+
+def test_a_db_not_in_the_container_yet_is_skipped_not_fatal(box):
+    os.remove(os.path.join(box.container, "app", "data", "inbox.db"))
+    rc, out = box.run(expect=0, BACKUP_AUDIO=0)
+    assert "inbox (/app/data/inbox.db) could not be snapshotted" in out
+    assert [n.split("_")[0] for n in _local_snaps(box)] == ["dashboard"]
+
+
+def test_a_live_db_that_fails_its_check_fails_the_run(box):
+    """Not a quiet skip: a live DB that cannot be snapshotted cleanly must page."""
+    with open(os.path.join(box.container, "app", "data", "inbox.db"), "wb") as fh:
+        fh.write(b"this is not a database" * 200)
+    rc, out = box.run(BACKUP_AUDIO=0)
+    assert rc == 1 and "inbox snapshot inside fake-dashboard failed" in out, out
+    assert not [n for n in _local_snaps(box) if n.startswith(("inbox", "."))]
+    assert _container_tmp(box) == []
+
+
+def test_a_snapshot_temp_left_in_the_containers_tmp_is_swept(box):
+    """An exec killed mid-snapshot leaves its temp on the tmpfs (RAM) until the container
+    restarts; the next snapshot clears it (the run lock means none is in use)."""
+    tmp = os.path.join(box.container, "tmp")
+    os.makedirs(tmp, exist_ok=True)
+    for name in ("inbox_snap.k1ll3d.db", "inbox_snap.k1ll3d.db-wal"):
+        with open(os.path.join(tmp, name), "w", encoding="utf-8") as fh:
+            fh.write("half a snapshot")
+    box.run(expect=0, BACKUP_AUDIO=0)
+    assert _container_tmp(box) == []
+
+
+@pytest.mark.parametrize("where", ["/tmp/audio", "/app/data/../tmp/audio", "app/data/inbox/audio"])
+def test_the_audio_dir_must_be_on_the_data_volume(box, where):
+    """The audio is copied with `docker cp`, which only works off the data volume (not the
+    tmpfs /tmp, and nothing else in the read-only container persists)."""
+    rc, out = box.run(CONTAINER_AUDIO_DIR=where)
+    assert rc == 1 and "CONTAINER_AUDIO_DIR" in out and "/app/data" in out, out
+    assert box.rclone_calls() == [] and _local_snaps(box) == []
+
+
 # --- the happy path ----------------------------------------------------------------
 @audio_harness
 def test_a_normal_run_mirrors_and_a_normal_deletion_reaches_drive(box):

@@ -427,7 +427,9 @@ re-derivable and it had no off-box backup — verified on the box: only `km-back
 `todoist-points-backup.timer` existed. `inbox.db` and the audio tree changed that, so
 `deploy/box/backup.sh` + `hopper-dashboard-backup.{service,timer}` now snapshot BOTH DBs from inside the
 container (the WAL sidecars are owned by uid 10001; a host-side online backup fails "attempt to write a
-readonly database") and push them to Drive with **`rclone copy`** into a retention ring plus a `daily/`
+readonly database"), stream each checked snapshot out on the exec's stdout (never `docker cp`: the
+container's `/tmp` is a tmpfs, which `docker cp` cannot read), re-check it on the host, and push them to
+Drive with **`rclone copy`** into a retention ring plus a `daily/`
 tier. The upload itself never deletes; the ring and the daily tier prune by COUNT, deliberately, so a
 snapshot leaves Drive only when enough newer ones have replaced it. Nothing that happens to the live DB
 can remove an off-box DB snapshot.
