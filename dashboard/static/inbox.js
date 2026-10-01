@@ -643,8 +643,30 @@
      control on that row is: two answers about one row can never land out of order. */
   var ROW_CONTROLS = '.review-box, .toggle-state, .delete-item, .edit-save';
   function setBusy(row, busy, control) {
-    each(row, ROW_CONTROLS, function (node) { node.disabled = busy; });
-    if (control) { control.disabled = busy; }
+    each(row, ROW_CONTROLS, function (node) { node.disabled = busy || saveLocked(node); });
+    if (control) { control.disabled = busy || saveLocked(control); }
+  }
+
+  /* A CLOSED note's editor may stay open (it holds changes not saved yet), but its Save must
+     not work: it says "Reopen to save" and stays disabled — through any other request on
+     the row — until the note is open again. */
+  function saveLocked(node) {
+    return node.getAttribute('data-reopen-to-save') !== null;
+  }
+  function lockSave(save, locked) {
+    if (!save) { return; }
+    if (locked) {
+      if (!saveLocked(save)) {
+        save.setAttribute('data-label', save.textContent);
+        save.setAttribute('data-reopen-to-save', '1');
+      }
+      save.textContent = 'Reopen to save';
+      save.disabled = true;
+    } else if (saveLocked(save)) {
+      save.removeAttribute('data-reopen-to-save');
+      save.textContent = save.getAttribute('data-label') || 'Save';
+      save.disabled = false;
+    }
   }
 
   /* One request about one item. Resolves to readAnswer's {ok, status, body}; rejects
@@ -672,9 +694,20 @@
   }
 
   /* The tiles: Needs review, Open and the item total, from the same counts() the page
-     was rendered with. */
-  function applyCounts(counts) {
+     was rendered with. Answers can land out of order (two rows, two requests), so counts
+     are applied only when their stamp (`counts_at`, a decimal string of nanoseconds) is
+     newer than the last applied; unstamped counts are applied as they come. */
+  var countsAt = '';
+  function newerStamp(at) {
+    if (typeof at !== 'string' || !/^[0-9]+$/.test(at)) { return true; }
+    if (!countsAt) { return true; }
+    if (at.length !== countsAt.length) { return at.length > countsAt.length; }
+    return at > countsAt;
+  }
+  function applyCounts(counts, at) {
     if (!counts || typeof counts !== 'object') { return; }
+    if (!newerStamp(at)) { return; }
+    if (typeof at === 'string' && /^[0-9]+$/.test(at)) { countsAt = at; }
     Object.keys(counts).forEach(function (key) {
       var n = counts[key];
       if (typeof n !== 'number') { return; }
@@ -691,11 +724,21 @@
     });
   }
 
+  /* One GET of the counts, for an answer that carried none. A failure leaves the tiles as
+     they are; a refresh puts them right. */
+  function refreshCounts() {
+    window.fetch('/api/v1/inbox/counts', {credentials: 'same-origin',
+                                          headers: {'Accept': 'application/json'}})
+      .then(readAnswer).then(function (answer) {
+        if (answer.ok) { applyCounts(answer.body.counts, answer.body.counts_at); }
+      }, function () { /* offline: the tiles wait for a refresh */ });
+  }
+
   /* The row, from the item as the server now has it (inbox.item_json). The same rules
      the template renders it with — keep the two in step. */
   function applyItem(row, item) {
     if (!item || typeof item !== 'object') { return; }
-    applyCounts(item.counts);
+    applyCounts(item.counts, item.counts_at);
     if (!row || !item.id) { return; }
     var draft = item.draft || {};
     var voice = item.source === 'voice';
@@ -746,16 +789,30 @@
     show(row, '.draft-failed-line', !noTranscriptOn && !pendingOn &&
                                     draft.status === 'failed' && !draft.edited_at);
 
-    /* Controls: a closed note offers only Reopen and Delete. */
-    show(row, '.action-start', !closed);
+    /* Controls: a closed note offers only Reopen and Delete. Its first group keeps its slot
+       but shows nothing (`dormant`, visibility: hidden), so Reopen lands where Close was. */
+    each(row, '.action-start', function (group) {
+      group.hidden = false;
+      group.classList.toggle('dormant', closed);
+    });
     show(row, 'label.review', !!item.can_tick_reviewed);
     each(row, '.review-box', function (box) { box.checked = !!item.reviewed; });
     showToggles(row, item.state);
 
     /* The editor's fields follow the saved draft, unless they hold changes of Graham's
-       that are not saved yet. */
+       that are not saved yet. On a closed note an UNCHANGED editor closes with its group;
+       one with changes stays open (unsaved input), with a Save that cannot save. */
     each(row, 'form.draft-edit', function (formEl) {
-      if (formIsDirty(formEl)) { return; }
+      var dirty = formIsDirty(formEl);
+      lockSave(formEl.querySelector('.edit-save'), closed);
+      if (closed && !dirty && !formEl.hidden) {
+        formEl.hidden = true;
+        each(row, '.edit-draft', function (btn) {
+          btn.hidden = false;
+          btn.setAttribute('aria-expanded', 'false');
+        });
+      }
+      if (dirty) { return; }
       var values = {draft_title: draft.title, draft_body: draft.body,
                     draft_project: draft.project};
       Object.keys(values).forEach(function (name) {
@@ -766,6 +823,23 @@
         }
       });
     });
+  }
+
+  /* A tick refused because the note has no draft to review (yet): leave no unticked box
+     that can only be refused again. The answer carries the row as it is now — "Drafting…",
+     or the failed-draft line — and without it the row says a draft is coming, unless it
+     already shows why there is none. */
+  function nothingToReview(row, item) {
+    if (item && item.id) {
+      applyItem(row, item);
+      return;
+    }
+    show(row, 'label.review', false);
+    var explained = false;
+    each(row, '.draft-failed-line, .no-transcript', function (node) {
+      if (!node.hidden) { explained = true; }
+    });
+    if (!explained) { show(row, '.draft-pending', true); }
   }
 
   /* ------------------------------------------------------------------ */
@@ -785,6 +859,7 @@
           /* Nothing was written (a 409: a new draft landed, or there is nothing to
              review yet). The box goes back to what is TRUE, and the row says why. */
           box.checked = !wanted;
+          if (answer.body.code === 'nothing_to_review') { nothingToReview(row, answer.body.item); }
           rowError(row, 'Not saved — ' + reasonOf(answer));
           return;
         }
@@ -939,7 +1014,11 @@
           return;
         }
         if (row && row.parentNode) { row.parentNode.removeChild(row); }
-        applyCounts(answer.body.counts);
+        if (answer.body.counts) {
+          applyCounts(answer.body.counts, answer.body.counts_at);
+        } else {
+          refreshCounts();
+        }
         if (shownEl) {
           shownEl.textContent = String(Math.max(0, (parseInt(shownEl.textContent, 10) || 1) - 1));
         }

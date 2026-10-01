@@ -18,6 +18,7 @@ route                                        auth    notes
 ``PATCH /api/v1/inbox/items/<id>``           S       + origin pin + limiter
 ``DELETE /api/v1/inbox/items/<id>``          S       + origin pin + limiter
 ``GET  /api/v1/inbox/items``                 S | R   Hopper may read it
+``GET  /api/v1/inbox/counts``                S | R   the tiles' numbers, stamped
 ``GET  /inbox/audio/<id>``                   S | I
 ``GET  /api/v1/inbox/transcribe/queue``      I
 ``POST /api/v1/inbox/items/<id>/transcript`` I
@@ -56,6 +57,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import time
 
 from flask import (Blueprint, current_app, jsonify, redirect, render_template,
@@ -256,6 +258,9 @@ def reviewable(row: dict) -> bool:
 #: it is what hands the note to Hopper's filing loop — so it needs a draft to have read.
 NOTHING_TO_REVIEW = ("nothing to review yet — wait for the draft, or write one with Edit "
                      "draft")
+#: The same refusal for a machine: the 409's ``code``. Not "not_reviewable" — every voice note
+#: IS ``reviewable`` (item_json says so); it just has no draft to review yet.
+NOTHING_TO_REVIEW_CODE = "nothing_to_review"
 
 
 def draft_to_review(row: dict, changes: dict | None = None) -> bool:
@@ -376,6 +381,24 @@ def item_json(row: dict, issues: list[dict] | None = None,
     }
 
 
+_STAMP_LOCK = threading.Lock()
+_last_stamp = 0
+
+
+def counts_answer(conn) -> dict:
+    """The tiles' numbers, and when they were read: ``counts_at`` is ``time.time_ns()`` taken
+    AFTER ``counts()`` (never smaller than this process's previous stamp, so a wall-clock step
+    back cannot reorder two of its answers). The page applies counts only when their stamp is
+    newer than the last it applied, so an answer that arrives late can never roll the tiles
+    back. A decimal STRING: a JSON number this big is not exact in JavaScript."""
+    global _last_stamp
+    counts = inbox_db.counts(conn)
+    with _STAMP_LOCK:
+        _last_stamp = max(time.time_ns(), _last_stamp + 1)
+        stamp = _last_stamp
+    return {"counts": counts, "counts_at": str(stamp)}
+
+
 def _list_args(args) -> dict:
     reviewed = args.get("reviewed")
     try:
@@ -460,6 +483,17 @@ def list_items():
         conn.close()
     page["watched_repos"] = list(_settings().inbox_github_repos or ())
     return jsonify(page)
+
+
+@bp.get("/api/v1/inbox/counts")
+def get_counts():
+    """S | R — just the tiles' numbers, stamped (``counts_answer``). The page fetches it once
+    when an answer it acted on carried no counts (a DELETE of a note already gone)."""
+    conn = _conn()
+    try:
+        return jsonify(counts_answer(conn))
+    finally:
+        conn.close()
 
 
 @bp.post("/api/v1/inbox/items")
@@ -665,7 +699,12 @@ def patch_item(item_id: str):
                         "can be marked reviewed")
         if (changes.get("reviewed") is True and current["source"] == "voice"
                 and not current["reviewed"] and not draft_to_review(current, changes)):
-            return _err(NOTHING_TO_REVIEW, 409)
+            # Machine-readable, with the row as it is NOW: the page hides the Reviewed box
+            # and shows why there is nothing to tick ("Drafting…", or the failed-draft line)
+            # rather than leaving an unticked box that can only be refused again.
+            issues = inbox_db.issues_for(conn, [current["id"]]).get(current["id"], [])
+            return jsonify({"error": NOTHING_TO_REVIEW, "code": NOTHING_TO_REVIEW_CODE,
+                            "item": item_json(current, issues)}), 409
         if (any(k in changes for k in inbox_db.DRAFT_FIELDS)
                 and current["source"] != "voice"):
             return _err("only a voice note has a draft")
@@ -682,7 +721,7 @@ def patch_item(item_id: str):
         # The page updates the row and the tiles IN PLACE from this answer (no reload): the
         # item's derived fields, and the same counts() the tiles are rendered from.
         body = item_json(row, issues)
-        body["counts"] = inbox_db.counts(conn)
+        body.update(counts_answer(conn))
         return jsonify(body)
     finally:
         conn.close()
@@ -718,17 +757,19 @@ def delete_item(item_id: str):
     try:
         current = inbox_db.get_item(conn, item_id)
         if current is None:
-            return _err("no such item", 404)
+            # Already gone — which is what was asked for. The 404 still carries the counts,
+            # so the page can drop the row AND put the tiles right without a reload.
+            return jsonify({"error": "no such item", **counts_answer(conn)}), 404
         if not deletable(current):
             return _err(MIRROR_DELETE_REFUSALS.get(
                 current["source"], "only a voice or typed note can be deleted"), 409)
         with conn:
             row = inbox_db.delete_item(conn, item_id)
-        counts = inbox_db.counts(conn)          # for the page's tiles (no reload)
+        answer = counts_answer(conn)            # for the page's tiles (no reload)
     finally:
         conn.close()
     if row is None:
-        return _err("no such item", 404)
+        return jsonify({"error": "no such item", **answer}), 404
     audio_removed = False
     if row["audio_path"]:
         audio_removed = inbox_audio.delete(settings.inbox_audio_dir,
@@ -739,7 +780,7 @@ def delete_item(item_id: str):
             log.warning("inbox: deleted item %s but its audio file remains; "
                         "the orphan sweep will collect it", row["id"])
     return jsonify({"deleted": row["id"], "had_audio": bool(row["audio_path"]),
-                    "audio_removed": audio_removed, "counts": counts})
+                    "audio_removed": audio_removed, **answer})
 
 
 @bp.get("/inbox/audio/<item_id>")

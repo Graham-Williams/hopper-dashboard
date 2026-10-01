@@ -1003,7 +1003,8 @@ function voiceRow() {
     E('form', Object.assign({'class': 'draft-edit', id: 'edit-' + ID, 'data-id': ID}, H), [
       E('input', {name: 'draft_title'}), E('textarea', {name: 'draft_body'}),
       E('input', {name: 'draft_project'}),
-      E('button', {'class': 'edit-save'}), E('button', {'class': 'edit-cancel'})]),
+      Object.assign(E('button', {'class': 'edit-save'}), {textContent: 'Save'}),
+      E('button', {'class': 'edit-cancel'})]),
     E('p', Object.assign({'class': 'row-error'}, H))]);
 }
 
@@ -1037,6 +1038,7 @@ function world(fetchImpl, opts) {
   vm.runInNewContext(SRC, {document: doc, window: win, navigator: {}, console: console,
                            Blob: function () {}, FormData: function () {}});
   return {row: row, list: list, root: root, calls: calls, unload: unload,
+          setFetch: function (fn) { fetchImpl = fn; },
           reloads: function () { return reloads; },
           q: function (sel) { return row.querySelector(sel); },
           tiles: function () {
@@ -1051,9 +1053,9 @@ function ok(body) {
   return function () { return Promise.resolve({ok: true, status: 200,
     json: function () { return Promise.resolve(body); }}); };
 }
-function refused(status, error) {
+function refused(status, error, body) {
   return function () { return Promise.resolve({ok: false, status: status,
-    json: function () { return Promise.resolve({error: error}); }}); };
+    json: function () { return Promise.resolve(Object.assign({error: error}, body || {})); }}); };
 }
 function item(over) {
   return Object.assign({id: ID, source: 'voice', state: 'open', reviewed: false,
@@ -1100,7 +1102,9 @@ function item(over) {
                closedBadge: w.q('.badge-closed').hidden,
                closeHidden: w.q('.toggle-state[data-to="closed"]').hidden,
                reopenHidden: w.q('.toggle-state[data-to="open"]').hidden,
-               startGroupHidden: w.q('.action-start').hidden, tiles: w.tiles(),
+               startGroupHidden: w.q('.action-start').hidden,
+               startGroupDormant: w.q('.action-start').classList.contains('dormant'),
+               tiles: w.tiles(),
                enabled: !w.q('.toggle-state[data-to="closed"]').disabled};
 
   /* A 409 on the tick: the box shows the TRUE (unchanged) state, the reason is inline. */
@@ -1174,14 +1178,16 @@ function item(over) {
   /* Reopen: a closed row gets its first group and Close back. */
   w = world(ok(item({state: 'open', counts: {needs_review: 1, open: 2, total: 3}})));
   w.row.setAttribute('data-state', 'closed');
-  w.q('.action-start').hidden = true;
+  w.q('.action-start').classList.add('dormant');
   w.q('.badge-closed').hidden = false;
   const reopen = w.q('.toggle-state[data-to="open"]');
   reopen.hidden = false;
   w.q('.toggle-state[data-to="closed"]').hidden = true;
   reopen.fire('click');
   await settle();
-  out.reopen = {state: w.row.getAttribute('data-state'), startHidden: w.q('.action-start').hidden,
+  out.reopen = {state: w.row.getAttribute('data-state'),
+                startHidden: w.q('.action-start').hidden ||
+                             w.q('.action-start').classList.contains('dormant'),
                 closedBadge: w.q('.badge-closed').hidden,
                 closeHidden: w.q('.toggle-state[data-to="closed"]').hidden,
                 reopenHidden: reopen.hidden, body: JSON.parse(w.calls[0].opts.body)};
@@ -1195,6 +1201,105 @@ function item(over) {
   resolve({ok: true, status: 200, json: function () { return Promise.resolve(item({state: 'closed'})); }});
   await settle();
   out.doubleTap = {calls: w.calls.length};
+
+  /* Counts that arrive out of order: only a NEWER stamp is applied (the row itself always
+     follows its own answer). */
+  w = world(ok(item({reviewed: true, needs_review: false, awaiting_filing: true,
+                     counts: {needs_review: 0, open: 2, total: 3}, counts_at: '1790000000000002000'})));
+  const ob = w.q('.review-box');
+  ob.checked = true;
+  ob.fire('change');
+  await settle();
+  w.calls.length = 0;
+  const later = item({reviewed: false, needs_review: true,
+                      counts: {needs_review: 7, open: 7, total: 7}, counts_at: '1790000000000001000'});
+  w.setFetch(ok(later));
+  ob.checked = false;
+  ob.fire('change');
+  await settle();
+  out.staleCounts = {tiles: w.tiles(), reviewed: w.row.getAttribute('data-reviewed')};
+  /* A longer stamp is a later one, though it sorts first as text ("10…" < "17…"). */
+  w.setFetch(ok(item({counts: {needs_review: 4, open: 5, total: 6}, counts_at: '10000000000000000000'})));
+  ob.checked = true;
+  ob.fire('change');
+  await settle();
+  out.longerStamp = w.tiles();
+
+  /* Delete answered 404: the row is gone anyway; the answer's counts are applied... */
+  w = world(refused(404, 'no such item', {counts: {needs_review: 0, open: 1, total: 1},
+                                          counts_at: '1790000000000003000'}));
+  w.q('.delete-item').fire('click');
+  await settle();
+  out.del404 = {rows: w.list.children.length, tiles: w.tiles(), calls: w.calls.length};
+  /* ...or, when it carries none, ONE GET of the counts is. */
+  w = world(function (url, o) {
+    if (o && o.method === 'DELETE') { return refused(404, 'no such item')(); }
+    return ok({counts: {needs_review: 0, open: 0, total: 0}, counts_at: '1790000000000004000'})();
+  });
+  w.q('.delete-item').fire('click');
+  await settle();
+  out.del404bare = {rows: w.list.children.length, tiles: w.tiles(),
+                    urls: w.calls.map(function (c) { return [(c.opts && c.opts.method) || 'GET', c.url]; })};
+
+  /* Close with the editor open and unchanged: it closes with the first group. */
+  w = world(ok(item({state: 'closed', needs_review: false})));
+  w.q('.edit-draft').fire('click');
+  const ef = w.root.querySelector('.draft-edit');
+  w.q('.toggle-state[data-to="closed"]').fire('click');
+  await settle();
+  out.closeCleanEditor = {formHidden: ef.hidden};
+
+  /* Close with unsaved changes in the editor: it stays open (that is unsaved input), but its
+     Save cannot save a closed note — not even after a failed Reopen. */
+  w = world(ok(item({state: 'closed', needs_review: false})));
+  w.q('.edit-draft').fire('click');
+  const df = w.root.querySelector('.draft-edit');
+  const dsave = df.querySelector('.edit-save');
+  df.querySelector('[name="draft_title"]').value = 'Half typed';
+  w.q('.toggle-state[data-to="closed"]').fire('click');
+  await settle();
+  out.closeDirtyEditor = {formHidden: df.hidden, saveDisabled: dsave.disabled, label: dsave.textContent,
+                          kept: df.querySelector('[name="draft_title"]').value};
+  const before = w.calls.length;
+  df.fire('submit');
+  await settle();
+  out.closeDirtyEditor.submitSent = w.calls.length - before;
+  w.setFetch(function () { return Promise.reject(new Error('offline')); });
+  w.q('.toggle-state[data-to="open"]').fire('click');
+  await settle();
+  out.closeDirtyEditor.afterFailedReopen = {saveDisabled: dsave.disabled, label: dsave.textContent};
+  w.setFetch(ok(item({state: 'open'})));
+  w.q('.toggle-state[data-to="open"]').fire('click');
+  await settle();
+  out.closeDirtyEditor.afterReopen = {saveDisabled: dsave.disabled, label: dsave.textContent,
+                                      kept: df.querySelector('[name="draft_title"]').value};
+
+  /* A tick refused because there is nothing to review yet: no unticked box is left behind;
+     the row shows what IS happening (Drafting…, or the failed-draft line). */
+  const notYet = function (draftStatus, withItem) {
+    const body = {error: 'nothing to review yet — wait for the draft, or write one with Edit draft',
+                  code: 'nothing_to_review'};
+    if (withItem) {
+      body.item = item({can_tick_reviewed: false,
+                        draft: {title: null, body: null, project: null, status: draftStatus,
+                                edited_at: null}});
+      delete body.item.counts;
+    }
+    return refused(409, body.error, body);
+  };
+  out.notYet = {};
+  for (const [name, status, withItem] of [['pending', 'pending', true], ['failed', 'failed', true],
+                                          ['bare', null, false]]) {
+    w = world(notYet(status, withItem));
+    const nb = w.q('.review-box');
+    nb.checked = true;
+    nb.fire('change');
+    await settle();
+    out.notYet[name] = {boxShown: !w.q('label.review').hidden, checked: nb.checked,
+                        drafting: !w.q('.draft-pending').hidden,
+                        failedLine: !w.q('.draft-failed-line').hidden,
+                        error: w.q('.row-error').textContent};
+  }
 
   /* beforeunload: prompts only while something would be lost. */
   w = world(ok({}), {captureText: 'half a thought'});
@@ -1243,7 +1348,9 @@ def test_close_flips_state_badge_buttons_and_the_start_group(inplace):
     c = inplace["close"]
     assert c["reloads"] == 0 and c["state"] == "closed" and "state-closed" in c["classes"]
     assert c["closedBadge"] is False and c["closeHidden"] is True and c["reopenHidden"] is False
-    assert c["startGroupHidden"] is True and c["tiles"] == ["0", "1", "3"] and c["enabled"]
+    # The first group keeps its slot (invisible, not removed), so Reopen lands where Close was.
+    assert c["startGroupDormant"] is True and c["startGroupHidden"] is False
+    assert c["tiles"] == ["0", "1", "3"] and c["enabled"]
 
 
 def test_a_refused_tick_shows_the_true_state_and_says_not_saved(inplace):
@@ -1292,6 +1399,44 @@ def test_reopen_brings_back_the_first_group_and_close(inplace):
     assert r["body"] == {"state": "open"} and r["state"] == "open"
     assert r["startHidden"] is False and r["closedBadge"] is True
     assert r["closeHidden"] is False and r["reopenHidden"] is True
+
+
+def test_counts_that_arrive_out_of_order_are_never_applied(inplace):
+    stale = inplace["staleCounts"]
+    assert stale["tiles"] == ["0", "2", "3"]          # the older stamp lost...
+    assert stale["reviewed"] == "0"                   # ...but the row follows its answer
+    assert inplace["longerStamp"] == ["4", "5", "6"]
+
+
+def test_a_delete_404_removes_the_row_and_still_gets_fresh_counts(inplace):
+    assert inplace["del404"] == {"rows": 0, "tiles": ["0", "1", "1"], "calls": 1}
+    bare = inplace["del404bare"]
+    assert bare["rows"] == 0 and bare["tiles"] == ["0", "0", "0"]
+    assert bare["urls"] == [["DELETE", "/api/v1/inbox/items/" + "a" * 32],
+                            ["GET", "/api/v1/inbox/counts"]]
+
+
+def test_closing_a_note_closes_its_unchanged_editor(inplace):
+    assert inplace["closeCleanEditor"] == {"formHidden": True}
+
+
+def test_a_closed_note_never_offers_a_working_save(inplace):
+    d = inplace["closeDirtyEditor"]
+    assert d["formHidden"] is False and d["kept"] == "Half typed"     # unsaved input stays
+    assert d["saveDisabled"] is True and d["label"] == "Reopen to save"
+    assert d["submitSent"] == 0
+    assert d["afterFailedReopen"] == {"saveDisabled": True, "label": "Reopen to save"}
+    assert d["afterReopen"] == {"saveDisabled": False, "label": "Save", "kept": "Half typed"}
+
+
+def test_a_tick_with_nothing_to_review_yet_leaves_no_unticked_box(inplace):
+    n = inplace["notYet"]
+    for name in ("pending", "failed", "bare"):
+        assert n[name]["boxShown"] is False and n[name]["checked"] is False, name
+        assert n[name]["error"].startswith("Not saved — nothing to review yet"), name
+    assert n["pending"]["drafting"] is True and n["pending"]["failedLine"] is False
+    assert n["failed"]["failedLine"] is True and n["failed"]["drafting"] is False
+    assert n["bare"]["drafting"] is True                  # no item in the answer: Drafting…
 
 
 def test_a_double_tap_sends_one_request(inplace):

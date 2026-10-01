@@ -394,17 +394,24 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   width (phone-first): badges, draft title/body, Transcript `<details>`, the player, one action row
   in TWO nowrap groups — [Edit draft][Reviewed] and, right-aligned, [Close/Reopen][Delete] (Delete LAST),
   all ≥44px — so at 390 px the second pair wraps as a unit; Close and Reopen share a min-width, so a state
-  flip never reflows the row. A CLOSED note shows only the second group (reopen before editing or
-  reviewing). Then the meta line. NO row action reloads the page: the Reviewed tick, Close/Reopen
+  flip never reflows the row. A CLOSED note shows only the second group, in the same place (reopen
+  before editing or reviewing). Then the meta line. NO row action reloads the page: the Reviewed tick, Close/Reopen
   (`.toggle-state`, notes only), a draft save and Delete update the row IN PLACE from the answer. PATCH
   and DELETE answer with `item_json` plus fresh `counts` (the same `counts()` the tiles render), and
   `applyItem`/`applyCounts` in inbox.js flip `hidden`, classes and data-* and set textContent — so the
   template renders BOTH states of everything that can change (both toggle buttons, every badge, the draft
-  lines, the Reviewed label, the first action group), the one not in force `hidden`, and app.css's
+  lines, the Reviewed label), the one not in force `hidden`, and app.css's
   `[hidden] { display: none !important; }` keeps a hidden badge or group off screen. Keep `applyItem` and
   the template's conditions in step. A refusal or failure says "Not saved — <reason>" in the row's
   `.row-error` and leaves every control showing the true state (a tick is reverted). Every control on a
   row is disabled only while one of its requests is in flight (no double taps, no out-of-order answers).
+  Counts carry `counts_at` (a decimal string of ns, `inbox.counts_answer`); `applyCounts` applies only a
+  newer stamp, and a DELETE answered 404 still drops the row and applies that answer's counts (or GETs
+  `/api/v1/inbox/counts` once). A closed note's first group keeps its slot (`.dormant`, visibility:
+  hidden — never `hidden`, which would move Reopen up a line); closing closes an unchanged draft editor,
+  and a changed one stays open with Save locked to "Reopen to save" (`lockSave`; `setBusy` keeps it
+  locked). The "nothing to review yet" 409 has `code: "nothing_to_review"` plus `item`, which the page
+  applies (no unticked box left behind).
   Capture save is the one action that reloads (the new row needs Jinja), and only when nothing else is
   unsaved — a take recording, starting (permission prompt open) or held, capture text, a dirty draft
   editor; otherwise it resets what it sent, gives Add back and says "Added — refresh to see it in the

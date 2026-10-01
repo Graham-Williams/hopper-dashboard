@@ -1525,7 +1525,10 @@ class _Shown(HTMLParser):
         return any(hidden for _, hidden in self.stack)
 
     def handle_starttag(self, tag, attrs):
-        hidden = self._hidden() or any(k == "hidden" for k, _ in attrs)
+        # `dormant` is app.css's `visibility: hidden`: the element keeps its slot (so Reopen
+        # lands where Close was) and shows nothing.
+        hidden = (self._hidden() or any(k == "hidden" for k, _ in attrs)
+                  or "dormant" in (dict(attrs).get("class") or "").split())
         if not hidden:
             self.classes.update((dict(attrs).get("class") or "").split())
         if tag not in self.VOID:
@@ -1760,17 +1763,20 @@ def test_a_closed_note_offers_reopen_and_delete_but_no_edit_or_review(authed, bo
     voice = _drafted(authed, bot)
     authed.patch(f"/api/v1/inbox/items/{voice}", json={"state": "closed"})
     actions = _actions(authed.get("/inbox").data.decode(), voice)
-    # Edit draft and Reviewed are in the first group, and a closed note's is hidden.
-    start = actions.split('class="action-group action-start"', 1)[1].split("</span>\n", 1)[0]
-    assert "hidden" in start.split(">", 1)[0]
-    assert "edit-draft" in start and "review-box" in start
-    assert "review-box" not in _shown(actions)[1]
+    # Edit draft and Reviewed are in the first group. A closed note's KEEPS ITS SLOT, shown
+    # as nothing (`dormant`: visibility hidden), so Reopen sits exactly where Close was.
+    opening = actions.split('class="action-group action-start', 1)[1].split(">", 1)[0]
+    assert "dormant" in opening and "hidden" not in opening
+    assert "review-box" not in _shown(actions)[1] and "edit-draft" not in _shown(actions)[1]
     assert ">Reopen<" in actions and "delete-item" in actions
     authed.patch(f"/api/v1/inbox/items/{voice}", json={"state": "open"})
     actions = _actions(authed.get("/inbox").data.decode(), voice)
-    start = actions.split('class="action-group action-start"', 1)[1]
-    assert "hidden" not in start.split(">", 1)[0]
+    opening = actions.split('class="action-group action-start', 1)[1].split(">", 1)[0]
+    assert "dormant" not in opening and "hidden" not in opening
     assert "review-box" in _shown(actions)[1]
+    css = _code("dashboard/static/app.css")
+    assert "visibility: hidden" in css.split(".item-actions .action-start.dormant {", 1)[1] \
+        .split("}", 1)[0]
 
 
 def test_the_delete_button_says_whether_the_note_still_has_its_recording(authed, bot, settings):
@@ -1802,6 +1808,38 @@ def test_patch_and_delete_answer_with_the_derived_fields_and_fresh_counts(authed
     assert gone["counts"] == authed.get("/api/v1/inbox/items").get_json()["counts"]
 
 
+def _stamp(body):
+    at = body["counts_at"]
+    assert isinstance(at, str) and at.isdigit()             # exact in JS: not a float
+    return int(at)
+
+
+def test_every_answer_with_counts_is_stamped_and_the_stamps_only_grow(authed, bot):
+    voice = _drafted(authed, bot)
+    typed = post_note(authed, "typed row").get_json()["id"]
+    stamps = [_stamp(authed.patch(f"/api/v1/inbox/items/{voice}",
+                                  json={"reviewed": True}).get_json()),
+              _stamp(authed.patch(f"/api/v1/inbox/items/{typed}",
+                                  json={"state": "closed"}).get_json()),
+              _stamp(authed.delete(f"/api/v1/inbox/items/{typed}").get_json())]
+    gone = authed.delete(f"/api/v1/inbox/items/{typed}")      # already gone: a 404...
+    assert gone.status_code == 404
+    body = gone.get_json()                                    # ...that still carries counts
+    assert body["counts"] == authed.get("/api/v1/inbox/items").get_json()["counts"]
+    stamps.append(_stamp(body))
+    counted = authed.get("/api/v1/inbox/counts")
+    assert counted.status_code == 200
+    assert counted.get_json()["counts"] == body["counts"]
+    stamps.append(_stamp(counted.get_json()))
+    assert stamps == sorted(stamps) and len(set(stamps)) == len(stamps)
+
+
+def test_the_counts_route_needs_a_session_or_the_read_token(authed, bot):
+    assert bot.get("/api/v1/inbox/counts").status_code == 401
+    assert bot.get("/api/v1/inbox/counts", headers=reader()).status_code == 200
+    assert bot.get("/api/v1/inbox/counts", headers=machine()).status_code == 401
+
+
 def _tag(row, cls):
     """The opening tag of the first element carrying `cls` in a rendered row."""
     at = row.index(cls)
@@ -1827,7 +1865,7 @@ def test_both_states_of_everything_that_toggles_are_pre_rendered(authed, bot):
     assert "hidden" in _tag(_row(html, pending), 'class="review"')   # rendered, not offered
     crow = _row(html, closed)
     assert "hidden" not in _tag(crow, "badge-closed")
-    assert "hidden" in _tag(crow, "action-start")               # reopen first
+    assert "dormant" in _tag(crow, "action-start")              # reopen first (slot kept)
     # The tiles carry what the counts update.
     for key in ("needs_review", "open", "total"):
         assert f'data-count="{key}"' in html
@@ -1856,6 +1894,10 @@ def test_a_voice_note_cannot_be_reviewed_before_it_has_a_draft(authed, bot):
     pending = _voice_note(authed)["id"]                     # transcript still pending
     r = authed.patch(f"/api/v1/inbox/items/{pending}", json={"reviewed": True})
     assert r.status_code == 409 and "nothing to review yet" in r.get_json()["error"]
+    # Machine-readable, with the row as it is now: the page hides the box and shows why.
+    assert r.get_json()["code"] == "nothing_to_review"
+    now = r.get_json()["item"]
+    assert now["id"] == pending and now["can_tick_reviewed"] is False and not now["reviewed"]
     drafting = _transcribed(authed, bot)                    # transcribed, draft pending
     assert authed.patch(f"/api/v1/inbox/items/{drafting}",
                         json={"reviewed": True}).status_code == 409

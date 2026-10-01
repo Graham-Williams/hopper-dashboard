@@ -646,7 +646,13 @@ transcript and the audio prune depends on it being Whisper's. Rules:
 - `PATCH /api/v1/inbox/items/<id>` accepts `draft_title`, `draft_body`, `draft_project` (voice only; same
   session / Origin / limiter rules).
 - PATCH answers with the item AND fresh `counts`; DELETE answers `{deleted, had_audio, audio_removed,
-  counts}` — the same `counts()` the tiles are rendered from. That is what lets the page update in place:
+  counts}` — the same `counts()` the tiles are rendered from — and a DELETE of a note that is already
+  gone is a 404 that still carries `counts`. Every such answer has `counts_at`: `time.time_ns()` taken
+  after `counts()` (never below the process's previous stamp), as a decimal STRING because a JSON number
+  that big is not exact in JavaScript; the page applies counts only when their stamp is newer than the
+  last it applied, so answers landing out of order never roll the tiles back. `GET /api/v1/inbox/counts`
+  (session or READ_TOKEN) answers `{counts, counts_at}`; the page calls it once when a DELETE answer
+  carried no counts. That is what lets the page update in place:
   **no row action reloads it** (the Reviewed tick, Close, Reopen, a draft save, Delete). Each row is
   rendered with both states of everything an action can change, the one not in force `hidden`, and
   inbox.js flips `hidden`, classes and data-* from the answer (never markup). A refusal shows "Not saved —
@@ -655,6 +661,14 @@ transcript and the audio prune depends on it being Whisper's. Rules:
   starting or held, capture text, an open draft editor with changes): then it resets what it sent and
   says "Added — refresh to see it in the list". A `beforeunload` guard asks before leaving while any of
   that exists.
+- A CLOSED note's [Edit draft][Reviewed] group keeps its slot and shows nothing (`.dormant`,
+  `visibility: hidden`), so Reopen sits exactly where Close was. Closing a note closes its draft editor
+  if it holds no changes; one with changes stays open (it is unsaved input), but its Save reads "Reopen
+  to save" and stays disabled until the note is open again.
+- The "nothing to review yet" 409 on a Reviewed tick carries `code: "nothing_to_review"` and `item`, the
+  row as it is now, so the page hides the box and shows "Drafting…" or the failed-draft line instead of
+  an unticked box that would only be refused again. (Not "not_reviewable": every voice note IS
+  `reviewable`; it just has no draft yet.)
 - `GET /api/v1/inbox/draft/queue` (INBOX_TOKEN) → `{items: [{id, transcript, manual_title, project, sha}],
   known_projects, max_attempts, max_title, max_body}`. Oldest first; includes the backfill (transcribed
   notes with no draft) and notes whose draft is stale. `known_projects` = the repo names of

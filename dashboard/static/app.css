@@ -281,6 +281,9 @@ details.about-recordings summary { min-height: 44px; display: flex; align-items:
 .item-actions .action-group { display: inline-flex; flex-wrap: nowrap; align-items: center;
   gap: .5rem; }
 .item-actions .action-end { margin-left: auto; }
+/* A closed note's [Edit draft][Reviewed]: the slot stays, nothing in it shows or takes a tap
+   or focus, so Close and Reopen sit at the same x AND y (no 52 px jump at 390 px). */
+.item-actions .action-start.dormant { visibility: hidden; }
 .item-actions .edit-draft { min-height: 44px; padding: 0 1rem; }
 /* The same width for Close and Reopen: flipping a note's state never reflows its row. */
 .item-actions .toggle-state { min-height: 44px; min-width: 6.25rem; padding: 0 1rem; }
