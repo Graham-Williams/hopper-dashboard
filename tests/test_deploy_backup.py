@@ -1023,15 +1023,28 @@ def _held_run(box, stamps):
 
 
 @audio_harness
-def test_the_lock_exit_reads_the_newer_of_the_two_stamps(box):
+def test_the_lock_exit_accepts_either_fresh_stamp(box):
+    """Exit 0 when EITHER stamp is 0 <= age < 3600; a stamp that is missing, unreadable, old
+    or in the future says nothing, so it can never hide a fresh one."""
     now = int(time.time())
     # A first-ever run still in progress: it wrote last_run right after taking the lock, and
     # nothing has completed yet. Not stuck.
     rc, out = _held_run(box, {"last_run.epoch": str(now - 60)})
     assert rc == 0 and "another run in progress" in out
-    # A stamp from the future is not "recent": exit 1, whatever the other says.
+    # A FUTURE last_complete (a clock that ran ahead) must not hide a fresh last_run...
+    rc, out = _held_run(box, {"last_run.epoch": str(now - 60),
+                              "last_complete.epoch": str(now + 3600)})
+    assert rc == 0 and "another run in progress" in out
+    # ...nor the other way round.
     rc, out = _held_run(box, {"last_run.epoch": str(now + 3600),
                               "last_complete.epoch": str(now - 60)})
+    assert rc == 0
+    # Neither fresh: both in the future, or both over an hour old.
+    rc, out = _held_run(box, {"last_run.epoch": str(now + 3600),
+                              "last_complete.epoch": str(now + 7200)})
+    assert rc == 1 and "stuck" in out
+    rc, out = _held_run(box, {"last_run.epoch": str(now - 7200),
+                              "last_complete.epoch": str(now - 3600)})
     assert rc == 1
     # An unreadable stamp falls through to the other one.
     rc, out = _held_run(box, {"last_run.epoch": "garbage\n",
@@ -1302,14 +1315,19 @@ def test_a_clock_jump_skips_age_removal_for_that_run(box, jump):
 # --- DEPLOY.md's restore recipe, run in bash with stub commands ------------------------
 def _restore_block():
     doc = open(os.path.join(REPO, "DEPLOY.md"), encoding="utf-8").read()
-    start = doc.index("cd ~/hopper-dashboard && docker compose stop")
+    start = doc.index("docker volume inspect hopper-dashboard_hopper-dashboard-data")
     start = doc.rindex("```bash", 0, start) + len("```bash")
     return doc[start:doc.index("```", start)]
 
 
-def _run_restore(tmp_path, rclone_rc):
+def _run_restore(tmp_path, rclone_rc, stop_rc=0, ps_rc=0, running="", checkout=True):
+    """Run the recipe with stubs. docker answers `volume inspect` with the volume path,
+    `compose stop` with `stop_rc`, and `compose ps -q --status running` with `running` and
+    `ps_rc`; `checkout=False` leaves out ~/hopper-dashboard."""
     home = tmp_path / "home"
-    (home / "hopper-dashboard").mkdir(parents=True)
+    home.mkdir()
+    if checkout:
+        (home / "hopper-dashboard").mkdir()
     snaps = home / "hopper-dashboard-backups" / "snapshots"
     snaps.mkdir(parents=True)
     (snaps / "inbox_20260930T000000Z.db").write_text("a snapshot")
@@ -1320,7 +1338,11 @@ def _run_restore(tmp_path, rclone_rc):
     log = tmp_path / "calls.log"
     stub = ('#!/bin/bash\necho "$(basename "$0") $*" >> "%s"\n' % log)
     for name, body in (
-            ("docker", stub + 'if [[ "$1" == volume ]]; then echo "%s"; fi\n' % vol),
+            ("docker", stub + (
+                'if [[ "$1" == volume ]]; then echo "%s"; fi\n'
+                'if [[ "$1 $2" == "compose stop" ]]; then exit %d; fi\n'
+                'if [[ "$1 $2" == "compose ps" ]]; then printf "%%s" "%s"; exit %d; fi\n')
+             % (vol, stop_rc, running, ps_rc)),
             ("rclone", stub + ('if [[ "$1" == copy && %d == 0 ]]; then mkdir -p "$3"; '
                                'echo audio > "$3/rec.webm"; fi\nexit %d\n')
              % (rclone_rc, rclone_rc)),
@@ -1347,6 +1369,27 @@ def test_the_restore_recipe_runs_through_when_rclone_succeeds(tmp_path):
     proc, calls = _run_restore(tmp_path, rclone_rc=0)
     assert proc.returncode == 0, proc.stderr
     first = lambda prefix: next(i for i, c in enumerate(calls) if c.startswith(prefix))
-    assert first("rclone copy") < first("sudo cp -a") < first("docker compose up")
+    assert (first("docker compose stop") < first("docker compose ps -q --status running")
+            < first("sudo rm") < first("rclone copy") < first("sudo cp -a")
+            < first("docker compose up"))
     assert calls[-1].startswith("docker compose up")
     assert (tmp_path / "volume" / "inbox" / "audio" / "rec.webm").exists()
+
+
+@pytest.mark.parametrize("failure", ["no-checkout", "stop-fails", "ps-fails", "still-running"])
+def test_the_restore_recipe_touches_nothing_unless_the_container_is_stopped(tmp_path, failure):
+    """The stop is INSIDE the strict subshell, and the container is checked to be stopped
+    before anything touches the volume: a failed `cd`, a failed stop, a failed `ps` or a
+    container still running ends the recipe there — no rm, no cp, no rclone, no `up`."""
+    kwargs = {"no-checkout": {"checkout": False}, "stop-fails": {"stop_rc": 1},
+              "ps-fails": {"ps_rc": 1}, "still-running": {"running": "3f2c1a"}}[failure]
+    proc, calls = _run_restore(tmp_path, rclone_rc=0, **kwargs)
+    assert proc.returncode != 0
+    assert not any(c.startswith(("sudo", "rclone", "docker compose up")) for c in calls), calls
+    if failure == "no-checkout":
+        assert not any(c.startswith("docker compose") for c in calls), calls
+    elif failure == "stop-fails":
+        assert calls[-1].startswith("docker compose stop"), calls     # nothing after it ran
+    else:
+        assert calls[-1].startswith("docker compose ps"), calls
+    assert not (tmp_path / "volume" / "inbox.db").exists()

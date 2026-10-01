@@ -757,9 +757,9 @@ there is no default URL in the code, by design.
   once; Drive keeps it until removed by hand, and the Inbox page says so. A fully successful copy run
   removes mirror mode's leftover box copy and brake state. Every run holds `flock -n` on
   `state/backup.lock` via `flock -n -E 75 9`: the holder writes `state/last_run.epoch` right after
-  taking it; a run that finds it held exits 0 ONLY while the newer of `last_run.epoch` and
-  `last_complete.epoch` is 0–3599 s old (a missing or unreadable stamp falls through to the other;
-  neither, or a future stamp, exits 1 — a stuck run must page), and docker/rclone
+  taking it; a run that finds it held exits 0 ONLY while EITHER `last_run.epoch` or
+  `last_complete.epoch` is 0–3599 s old (each judged on its own, so a missing, unreadable, old or
+  future stamp never hides a fresh one; neither fresh exits 1 — a stuck run must page), and docker/rclone
   run through wrappers that close fd 9 (`9>&-`) so no orphan can hold the lock. Under the lock it sweeps
   ALL `.audio.*` staging dirs and `.snapshot.*` DB temps; mirror mode first restores a box copy left as
   `audio.old` by a killed swap. `AUDIO_COPY_DONE` starts at 0 (never from the environment) and the

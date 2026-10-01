@@ -197,33 +197,32 @@ install -d -m 0700 "${LOCAL_BACKUP_DIR}" "${STATE_DIR}"
 # CLOSED (the wrappers below), so an orphaned child can never keep holding it.
 #
 # A run that finds the lock held (flock exits 75) exits 0 and does nothing — the holder does
-# the work and reports it — but ONLY while the holder looks alive: the newer of
-# state/last_run.epoch (written by every run right after it takes the lock) and
-# state/last_complete.epoch is between 0 and 3600 s old. A stamp that is missing or unreadable
-# falls through to the other; neither, or a stamp from the future, means exit 1 — a STUCK run
-# must page, so the heartbeat fails. Any other flock error is a failure too.
+# the work and reports it — but ONLY while the holder looks alive: EITHER
+# state/last_run.epoch (written by every run right after it takes the lock) or
+# state/last_complete.epoch is between 0 and 3600 s old. Each is judged on its own (missing,
+# unreadable, old or future says nothing); neither fresh means exit 1 — a STUCK run must
+# page, so the heartbeat fails. Any other flock error is a failure too.
 type -P flock >/dev/null 2>&1 \
   || die "flock is not on PATH (util-linux) — it is what keeps two runs from overlapping"
 exec 9>"${STATE_DIR}/backup.lock"
 LOCK_RC=0
 flock -n -E 75 9 || LOCK_RC=$?
 if (( LOCK_RC == 75 )); then
-  HOLDER_SEEN=""
+  # The holder looks alive if EITHER stamp is 0 <= age < 3600: it started (last_run, written
+  # right after taking the lock) or completed (last_complete) a run within the hour. Each
+  # stamp is judged on its own, so one that is missing, unreadable, old or in the future
+  # (a clock that ran ahead) can never hide a fresh one.
+  NOW="$(date +%s)"
   for stamp_file in last_run.epoch last_complete.epoch; do
     stamp="$(cat "${STATE_DIR}/${stamp_file}" 2>/dev/null || true)"
     stamp="${stamp//[[:space:]]/}"
     [[ "${stamp}" =~ ^[0-9]{1,12}$ ]] || continue
-    if [[ -z "${HOLDER_SEEN}" ]] || (( 10#${stamp} > 10#${HOLDER_SEEN} )); then
-      HOLDER_SEEN="${stamp}"
-    fi
-  done
-  if [[ -n "${HOLDER_SEEN}" ]]; then
-    HOLDER_AGE=$(( $(date +%s) - 10#${HOLDER_SEEN} ))
+    HOLDER_AGE=$(( NOW - 10#${stamp} ))
     if (( HOLDER_AGE >= 0 && HOLDER_AGE < 3600 )); then
       log "another run in progress (${STATE_DIR}/backup.lock is held) — this run exits and does nothing"
       exit 0
     fi
-  fi
+  done
   die "another run holds ${STATE_DIR}/backup.lock and no run started or completed in the last hour — a stuck run? (check its process and journal)"
 elif (( LOCK_RC != 0 )); then
   die "could not take the run lock ${STATE_DIR}/backup.lock (flock exited ${LOCK_RC})"

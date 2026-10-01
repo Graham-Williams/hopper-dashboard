@@ -693,10 +693,10 @@ What it does, and the two things that are non-negotiable about how:
   mirror mode's stored count). Any other value of `BACKUP_AUDIO_MODE` is refused before the run starts.
 - **One run at a time.** The whole run holds `flock -n -E 75` on `state/backup.lock`. A second run (the
   timer's and a hand run overlapping) exits 0 with "another run in progress" and does nothing — but ONLY
-  while the holder looks alive: the newer of `state/last_run.epoch` (each run writes it right after
-  taking the lock) and `state/last_complete.epoch` is under an hour old. Otherwise — both stamps missing
-  or unreadable, a stamp from the future, or older than an hour — it is a stuck run, and the overlapping
-  run exits 1 so the heartbeat fails (check `ps`/the journal for the holder). docker and rclone run with the lock's descriptor closed, so an orphaned child cannot hold it.
+  while the holder looks alive: EITHER `state/last_run.epoch` (each run writes it right after taking
+  the lock) or `state/last_complete.epoch` is 0–3599 s old. Each stamp is judged on its own, so one
+  that is missing, unreadable, old or from the future never hides a fresh one. Neither fresh — it is
+  a stuck run, and the overlapping run exits 1 so the heartbeat fails (check `ps`/the journal for the holder). docker and rclone run with the lock's descriptor closed, so an orphaned child cannot hold it.
   Under the lock, every `~/hopper-dashboard-backups/.audio.*` staging directory and every
   `snapshots/.snapshot.*` DB temp is a DEAD run's (left by a run killed mid-way) and all of them are swept
   at the start, in both modes. In mirror mode, a box copy left as `audio.old` by a run killed between the swap's
@@ -785,14 +785,18 @@ snapshot in, and re-own it to uid 10001 — otherwise SQLite replays the old WAL
 silently hands back the PRE-restore data, with no error, and the next checkpoint bakes it in:
 
 ```bash
-cd ~/hopper-dashboard && docker compose stop
 export V=$(docker volume inspect hopper-dashboard_hopper-dashboard-data -f '{{.Mountpoint}}')
-# One strict subshell: a failed or PARTIAL step (an rclone copy that dies half-way) stops
-# everything after it — no cp over the volume, no rm of the scratch copy, no `up`.
+# One strict subshell: a failed or PARTIAL step stops everything after it. A failed stop, a
+# container that is still running, an rclone copy that dies half-way: no rm or cp over the
+# volume, no rm of the scratch copy, no `up`.
 (
   set -euo pipefail
   umask 077
   : "${V:?set V to the volume path}"
+  cd ~/hopper-dashboard
+  docker compose stop
+  running="$(docker compose ps -q --status running)"   # a failing `ps` stops here too
+  [ -z "$running" ]                                     # still running: touch nothing
   sudo rm -f "$V/inbox.db-wal" "$V/inbox.db-shm"
   sudo cp ~/hopper-dashboard-backups/snapshots/inbox_<ts>.db "$V/inbox.db"
   sudo chown 10001:10001 "$V/inbox.db"
