@@ -405,10 +405,12 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   the template's conditions in step. A refusal or failure says "Not saved — <reason>" in the row's
   `.row-error` and leaves every control showing the true state (a tick is reverted). Every control on a
   row is disabled only while one of its requests is in flight (no double taps, no out-of-order answers).
-  Counts carry `counts_at` (a decimal string of ns, `inbox.counts_answer`); `applyCounts` applies only a
-  newer stamp, and a DELETE answered 404 still drops the row and applies that answer's counts (or GETs
-  `/api/v1/inbox/counts` once). A closed note's first group keeps its slot (`.dormant`, visibility:
-  hidden — never `hidden`, which would move Reopen up a line); closing closes an unchanged draft editor,
+  An answer's counts are applied at once, then the tiles SETTLE: every action request (`send()`, and the
+  capture save) is counted in flight, and when one settles — any outcome — with none left, a ~300 ms
+  debounce makes ONE `GET /api/v1/inbox/counts`, applied unless another action started since
+  (`countsSeq`). No stamps. A DELETE answered 404 still drops the row. A closed note's first group keeps
+  its slot (`.dormant`, visibility: hidden — never `hidden`, which would move Reopen up a line) and is
+  `inert` (template and `applyItem`); closing closes an unchanged draft editor,
   and a changed one stays open with Save locked to "Reopen to save" (`lockSave`; `setBusy` keeps it
   locked). The "nothing to review yet" 409 has `code: "nothing_to_review"` plus `item`, which the page
   applies (no unticked box left behind).

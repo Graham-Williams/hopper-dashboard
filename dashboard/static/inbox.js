@@ -540,6 +540,7 @@
       if (submitBtn) { submitBtn.disabled = true; }
       var heldStatus = statusEl ? statusEl.textContent : '';
       status('Saving…');
+      actionStarted();
       function restoreStatus() {
         if (statusEl && statusEl.textContent === 'Saving…') { status(heldStatus); }
       }
@@ -549,6 +550,7 @@
         credentials: 'same-origin',
         headers: {'Accept': 'application/json'}
       }).then(readAnswer).then(function (answer) {
+        actionSettled();
         /* Add is given back on EVERY outcome: it is disabled only while this is in flight. */
         if (submitBtn) { submitBtn.disabled = false; }
         if (!answer.ok) {
@@ -560,6 +562,7 @@
         }
         added(sentBlob, sentFields);
       }, function () {
+        actionSettled();
         if (submitBtn) { submitBtn.disabled = false; }
         restoreStatus();
         fail('Not saved — ' + OFFLINE + '. The note is still here: press “Add to inbox” ' +
@@ -670,7 +673,7 @@
   }
 
   /* One request about one item. Resolves to readAnswer's {ok, status, body}; rejects
-     only when no answer came back at all. */
+     only when no answer came back at all. Every one is an ACTION for the settle rule. */
   function send(id, method, payload) {
     var init = {method: method, credentials: 'same-origin',
                 headers: {'Accept': 'application/json'}};
@@ -678,8 +681,11 @@
       init.headers['Content-Type'] = 'application/json';
       init.body = JSON.stringify(payload);
     }
+    actionStarted();
     return window.fetch('/api/v1/inbox/items/' + encodeURIComponent(id), init)
-      .then(readAnswer);
+      .then(readAnswer)
+      .then(function (answer) { actionSettled(); return answer; },
+            function (err) { actionSettled(); throw err; });
   }
 
   /* Close shows on an open note, Reopen on a closed one; never both. */
@@ -693,21 +699,48 @@
     });
   }
 
-  /* The tiles: Needs review, Open and the item total, from the same counts() the page
-     was rendered with. Answers can land out of order (two rows, two requests), so counts
-     are applied only when their stamp (`counts_at`, a decimal string of nanoseconds) is
-     newer than the last applied; unstamped counts are applied as they come. */
-  var countsAt = '';
-  function newerStamp(at) {
-    if (typeof at !== 'string' || !/^[0-9]+$/.test(at)) { return true; }
-    if (!countsAt) { return true; }
-    if (at.length !== countsAt.length) { return at.length > countsAt.length; }
-    return at > countsAt;
+  /* The tiles SETTLE to the server's counts after each burst of actions. An answer's own
+     counts are shown at once, but two answers can land out of order (two workers, two
+     rows), and a refusal carries none. So whenever an action settles — success, 409, 404
+     or failure — and no other is in flight, the page waits SETTLE_MS for more, then GETs
+     the counts once and applies them as the final word. */
+  var SETTLE_MS = 300;
+  var inFlight = 0;
+  var settleTimer = null;
+  var countsSeq = 0;
+  function actionStarted() {
+    inFlight += 1;
+    countsSeq += 1;                       // a settle GET already out is now stale
+    if (settleTimer !== null) {
+      window.clearTimeout(settleTimer);
+      settleTimer = null;
+    }
   }
-  function applyCounts(counts, at) {
+  function actionSettled() {
+    inFlight = Math.max(0, inFlight - 1);
+    if (inFlight > 0) { return; }
+    settleTimer = window.setTimeout(function () {
+      settleTimer = null;
+      refreshCounts();
+    }, SETTLE_MS);
+  }
+  /* The settle GET. It goes out only while nothing is in flight, and is applied only if no
+     action has started since (that action settles and fetches again). A failure leaves the
+     tiles as they are. */
+  function refreshCounts() {
+    var mine = countsSeq;
+    window.fetch('/api/v1/inbox/counts', {credentials: 'same-origin',
+                                          headers: {'Accept': 'application/json'}})
+      .then(readAnswer).then(function (answer) {
+        if (mine !== countsSeq) { return; }
+        if (answer.ok) { applyCounts(answer.body.counts); }
+      }, function () { /* offline: the tiles wait for the next settle or a refresh */ });
+  }
+
+  /* The tiles: Needs review, Open and the item total, from the same counts() the page
+     was rendered with. */
+  function applyCounts(counts) {
     if (!counts || typeof counts !== 'object') { return; }
-    if (!newerStamp(at)) { return; }
-    if (typeof at === 'string' && /^[0-9]+$/.test(at)) { countsAt = at; }
     Object.keys(counts).forEach(function (key) {
       var n = counts[key];
       if (typeof n !== 'number') { return; }
@@ -724,21 +757,11 @@
     });
   }
 
-  /* One GET of the counts, for an answer that carried none. A failure leaves the tiles as
-     they are; a refresh puts them right. */
-  function refreshCounts() {
-    window.fetch('/api/v1/inbox/counts', {credentials: 'same-origin',
-                                          headers: {'Accept': 'application/json'}})
-      .then(readAnswer).then(function (answer) {
-        if (answer.ok) { applyCounts(answer.body.counts, answer.body.counts_at); }
-      }, function () { /* offline: the tiles wait for a refresh */ });
-  }
-
   /* The row, from the item as the server now has it (inbox.item_json). The same rules
      the template renders it with — keep the two in step. */
   function applyItem(row, item) {
     if (!item || typeof item !== 'object') { return; }
-    applyCounts(item.counts, item.counts_at);
+    applyCounts(item.counts);
     if (!row || !item.id) { return; }
     var draft = item.draft || {};
     var voice = item.source === 'voice';
@@ -790,10 +813,13 @@
                                     draft.status === 'failed' && !draft.edited_at);
 
     /* Controls: a closed note offers only Reopen and Delete. Its first group keeps its slot
-       but shows nothing (`dormant`, visibility: hidden), so Reopen lands where Close was. */
+       but shows nothing (`dormant`, visibility: hidden, and `inert`), so Reopen lands where
+       Close was. */
     each(row, '.action-start', function (group) {
       group.hidden = false;
       group.classList.toggle('dormant', closed);
+      /* inert: nothing in it takes focus or a tap, even if app.css never loads. */
+      if (closed) { group.setAttribute('inert', ''); } else { group.removeAttribute('inert'); }
     });
     show(row, 'label.review', !!item.can_tick_reviewed);
     each(row, '.review-box', function (box) { box.checked = !!item.reviewed; });
@@ -1014,11 +1040,7 @@
           return;
         }
         if (row && row.parentNode) { row.parentNode.removeChild(row); }
-        if (answer.body.counts) {
-          applyCounts(answer.body.counts, answer.body.counts_at);
-        } else {
-          refreshCounts();
-        }
+        applyCounts(answer.body.counts);      // the settle GET follows either way
         if (shownEl) {
           shownEl.textContent = String(Math.max(0, (parseInt(shownEl.textContent, 10) || 1) - 1));
         }

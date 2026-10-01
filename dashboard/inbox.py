@@ -18,7 +18,7 @@ route                                        auth    notes
 ``PATCH /api/v1/inbox/items/<id>``           S       + origin pin + limiter
 ``DELETE /api/v1/inbox/items/<id>``          S       + origin pin + limiter
 ``GET  /api/v1/inbox/items``                 S | R   Hopper may read it
-``GET  /api/v1/inbox/counts``                S | R   the tiles' numbers, stamped
+``GET  /api/v1/inbox/counts``                S | R   the tiles' numbers
 ``GET  /inbox/audio/<id>``                   S | I
 ``GET  /api/v1/inbox/transcribe/queue``      I
 ``POST /api/v1/inbox/items/<id>/transcript`` I
@@ -57,7 +57,6 @@ from __future__ import annotations
 
 import logging
 import re
-import threading
 import time
 
 from flask import (Blueprint, current_app, jsonify, redirect, render_template,
@@ -381,24 +380,6 @@ def item_json(row: dict, issues: list[dict] | None = None,
     }
 
 
-_STAMP_LOCK = threading.Lock()
-_last_stamp = 0
-
-
-def counts_answer(conn) -> dict:
-    """The tiles' numbers, and when they were read: ``counts_at`` is ``time.time_ns()`` taken
-    AFTER ``counts()`` (never smaller than this process's previous stamp, so a wall-clock step
-    back cannot reorder two of its answers). The page applies counts only when their stamp is
-    newer than the last it applied, so an answer that arrives late can never roll the tiles
-    back. A decimal STRING: a JSON number this big is not exact in JavaScript."""
-    global _last_stamp
-    counts = inbox_db.counts(conn)
-    with _STAMP_LOCK:
-        _last_stamp = max(time.time_ns(), _last_stamp + 1)
-        stamp = _last_stamp
-    return {"counts": counts, "counts_at": str(stamp)}
-
-
 def _list_args(args) -> dict:
     reviewed = args.get("reviewed")
     try:
@@ -487,11 +468,12 @@ def list_items():
 
 @bp.get("/api/v1/inbox/counts")
 def get_counts():
-    """S | R — just the tiles' numbers, stamped (``counts_answer``). The page fetches it once
-    when an answer it acted on carried no counts (a DELETE of a note already gone)."""
+    """S | R — just the tiles' numbers. The page shows each action answer's counts at once,
+    then SETTLES to this: one GET ~300 ms after the last of a burst of actions settles, the
+    final word (two answers can land out of order; this read cannot)."""
     conn = _conn()
     try:
-        return jsonify(counts_answer(conn))
+        return jsonify({"counts": inbox_db.counts(conn)})
     finally:
         conn.close()
 
@@ -721,7 +703,7 @@ def patch_item(item_id: str):
         # The page updates the row and the tiles IN PLACE from this answer (no reload): the
         # item's derived fields, and the same counts() the tiles are rendered from.
         body = item_json(row, issues)
-        body.update(counts_answer(conn))
+        body["counts"] = inbox_db.counts(conn)
         return jsonify(body)
     finally:
         conn.close()
@@ -759,17 +741,17 @@ def delete_item(item_id: str):
         if current is None:
             # Already gone — which is what was asked for. The 404 still carries the counts,
             # so the page can drop the row AND put the tiles right without a reload.
-            return jsonify({"error": "no such item", **counts_answer(conn)}), 404
+            return jsonify({"error": "no such item", "counts": inbox_db.counts(conn)}), 404
         if not deletable(current):
             return _err(MIRROR_DELETE_REFUSALS.get(
                 current["source"], "only a voice or typed note can be deleted"), 409)
         with conn:
             row = inbox_db.delete_item(conn, item_id)
-        answer = counts_answer(conn)            # for the page's tiles (no reload)
+        counts = inbox_db.counts(conn)          # for the page's tiles (no reload)
     finally:
         conn.close()
     if row is None:
-        return jsonify({"error": "no such item", **answer}), 404
+        return jsonify({"error": "no such item", "counts": counts}), 404
     audio_removed = False
     if row["audio_path"]:
         audio_removed = inbox_audio.delete(settings.inbox_audio_dir,
@@ -780,7 +762,7 @@ def delete_item(item_id: str):
             log.warning("inbox: deleted item %s but its audio file remains; "
                         "the orphan sweep will collect it", row["id"])
     return jsonify({"deleted": row["id"], "had_audio": bool(row["audio_path"]),
-                    "audio_removed": audio_removed, **answer})
+                    "audio_removed": audio_removed, "counts": counts})
 
 
 @bp.get("/inbox/audio/<item_id>")

@@ -647,12 +647,14 @@ transcript and the audio prune depends on it being Whisper's. Rules:
   session / Origin / limiter rules).
 - PATCH answers with the item AND fresh `counts`; DELETE answers `{deleted, had_audio, audio_removed,
   counts}` — the same `counts()` the tiles are rendered from — and a DELETE of a note that is already
-  gone is a 404 that still carries `counts`. Every such answer has `counts_at`: `time.time_ns()` taken
-  after `counts()` (never below the process's previous stamp), as a decimal STRING because a JSON number
-  that big is not exact in JavaScript; the page applies counts only when their stamp is newer than the
-  last it applied, so answers landing out of order never roll the tiles back. `GET /api/v1/inbox/counts`
-  (session or READ_TOKEN) answers `{counts, counts_at}`; the page calls it once when a DELETE answer
-  carried no counts. That is what lets the page update in place:
+  gone is a 404 that still carries `counts`. The page shows an answer's counts at once, then **settles
+  to the server's counts after each burst**: whenever an action request settles (success, 409, 404 or
+  no answer at all) and no other is in flight — a capture save counts as one — it waits ~300 ms, then
+  makes ONE `GET /api/v1/inbox/counts` (session or READ_TOKEN, `{counts}`) and applies it as the final
+  word, unless another action has started since. Answers can land out of order (two gunicorn workers,
+  two rows) and a refusal carries no counts, so the tiles may be briefly wrong in between; the settle
+  read is what makes them right. (No per-answer stamps: a stamp read apart from the SELECT could not
+  order two answers truthfully.) That is what lets the page update in place:
   **no row action reloads it** (the Reviewed tick, Close, Reopen, a draft save, Delete). Each row is
   rendered with both states of everything an action can change, the one not in force `hidden`, and
   inbox.js flips `hidden`, classes and data-* from the answer (never markup). A refusal shows "Not saved —
@@ -662,7 +664,8 @@ transcript and the audio prune depends on it being Whisper's. Rules:
   says "Added — refresh to see it in the list". A `beforeunload` guard asks before leaving while any of
   that exists.
 - A CLOSED note's [Edit draft][Reviewed] group keeps its slot and shows nothing (`.dormant`,
-  `visibility: hidden`), so Reopen sits exactly where Close was. Closing a note closes its draft editor
+  `visibility: hidden`), so Reopen sits exactly where Close was, and is `inert`, so nothing in it takes
+  focus or a tap even if app.css never loads. Closing a note closes its draft editor
   if it holds no changes; one with changes stays open (it is unsaved input), but its Save reads "Reopen
   to save" and stays disabled until the note is open again.
 - The "nothing to review yet" 409 on a Reviewed tick carries `code: "nothing_to_review"` and `item`, the

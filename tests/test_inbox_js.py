@@ -69,6 +69,7 @@ function world(maxBytes, opts) {
   let reloads = 0;
   const unload = [];
   const posts = [];
+  const fetched = [];
   els['capture-form'].setAttribute('data-audio-max-bytes', maxBytes);
   /* An open Edit-draft form somewhere on the page, with changes not saved yet. */
   const draftField = {value: 'Typed, not saved', defaultValue: 'Machine title'};
@@ -128,7 +129,8 @@ function world(maxBytes, opts) {
     setInterval: function (fn) { tid += 1; timers.set(tid, fn); return tid; },
     clearInterval: function (id) { timers.delete(id); },
     setTimeout: function (fn) { fn(); return 0; },
-    fetch: function () { return answer(); },
+    clearTimeout: function () {},
+    fetch: function (url) { fetched.push(url); return answer(url); },
     FormData: FakeFormData,
     confirm: function () { return false; },
     addEventListener: function (t, fn) { if (t === 'beforeunload') { unload.push(fn); } },
@@ -155,6 +157,7 @@ function world(maxBytes, opts) {
                    FormData: FakeFormData, console: console};
   return {
     els: els, streams: streams, recorders: recorders, toggle: toggle, posts: posts,
+    fetched: fetched,
     reloads: function () { return reloads; },
     run: function () { vm.runInNewContext(SRC, sandbox); },
     click: function () { els['record-btn'].fire('click'); },
@@ -275,7 +278,8 @@ function captured(w) {
   return {reloads: w.reloads(), done: w.els['capture-done'].textContent,
           doneHidden: w.els['capture-done'].hidden, error: w.els['capture-error'].textContent,
           addDisabled: w.els['capture-submit'].disabled, text: w.els['capture-text'].value,
-          status: w.status(), posts: w.posts.map(function (p) { return p.fields; })};
+          status: w.status(), posts: w.posts.map(function (p) { return p.fields; }),
+          settleGets: w.fetched.filter(function (u) { return u === '/api/v1/inbox/counts'; }).length};
 }
 
 /* 5. Capture save: the one action that reloads, and never over unsaved input. */
@@ -355,6 +359,28 @@ async function capture() {
   w.add();
   await settle();
   out.refusedWithReason = captured(w);
+
+  /* A capture save is an action too: a row action that comes and goes while it is in flight
+     does not settle the tiles; the capture's own settle does. */
+  {
+    let land;
+    w = world(1000000, {fetch: function (url) {
+      if (url === undefined) { return new Promise(function (r) { land = r; }); }   // the POST
+      return Promise.resolve({ok: true, status: 200, json: function () { return Promise.resolve({}); }});
+    }});
+    w.run();
+    w.els['capture-text'].value = 'a typed note';
+    w.add();
+    w.toggle.fire('click');
+    await settle();
+    const gets = function () {
+      return w.fetched.filter(function (u) { return u === '/api/v1/inbox/counts'; }).length;
+    };
+    const mid = gets();
+    land({ok: true, status: 201, json: function () { return Promise.resolve({}); }});
+    await settle();
+    out.captureIsAnAction = {mid: mid, after: gets()};
+  }
 
   /* No answer at all. */
   w = world(1000000, {fetch: function () { return Promise.reject(new TypeError('Failed to fetch')); }});
@@ -470,9 +496,15 @@ def test_a_capture_save_never_reloads_over_a_take_or_an_open_edit(ran):
         assert c["done"] == ADDED and c["doneHidden"] is False, case
         assert c["addDisabled"] is False and c["text"] == "", case     # reset; Add is back
         assert c["error"] == "", case
+    # The tiles settle to the server's counts (the new note is counted, though not listed).
+    assert ran["capture"]["dirtyDraft"]["settleGets"] == 1
     rec = ran["capture"]["whileRecording"]
     assert rec["recording"] is True and rec["micLive"] is True        # the take carries on
     assert rec["posts"] == [[]]                                       # text only: no audio
+
+
+def test_a_capture_save_holds_back_the_tiles_settle_until_it_lands(ran):
+    assert ran["capture"]["captureIsAnAction"] == {"mid": 0, "after": 1}
 
 
 def test_a_take_recorded_while_a_save_is_in_flight_is_kept(ran):
@@ -591,7 +623,7 @@ function world(fetchImpl) {
     isSecureContext: true,
     fetch: function (url, opts) { calls.push({url: url, opts: opts}); return fetchImpl(url, opts); },
     setInterval: function () { return 0; }, clearInterval: function () {},
-    setTimeout: function () { return 0; },
+    setTimeout: function () { return 0; }, clearTimeout: function () {},
     confirm: function () { return false; }, addEventListener: function () {},
     location: {reload: function () { reloads += 1; }}
   };
@@ -748,7 +780,7 @@ function world(fetchImpl, to, unsaved) {
   const win = {
     fetch: function (url, opts) { calls.push({url: url, opts: opts}); return fetchImpl(); },
     setInterval: function () { return 0; }, clearInterval: function () {},
-    setTimeout: function (fn) { fn(); return 0; },
+    setTimeout: function () { return 0; }, clearTimeout: function () {},
     confirm: function () { return false; }, addEventListener: function () {},
     location: {reload: function () { reloads += 1; }}
   };
@@ -824,7 +856,7 @@ function answer(status, body) {
     const win = {
       fetch: function () { asked.push('fetched'); return Promise.resolve({ok: true, status: 200}); },
       setInterval: function () { return 0; }, clearInterval: function () {},
-      setTimeout: function () { return 0; },
+      setTimeout: function () { return 0; }, clearTimeout: function () {},
       confirm: function (msg) { asked.push(msg); return false; }, addEventListener: function () {},
       location: {reload: function () {}}
     };
@@ -976,7 +1008,8 @@ function E(tag, attrs, kids) {
 }
 
 const ID = 'a'.repeat(32);
-function voiceRow() {
+const ID2 = 'b'.repeat(32);
+function voiceRow(ID) {
   const H = {hidden: ''};
   return E('li', {id: 'item-' + ID, 'class': 'item item-review state-open', 'data-id': ID,
                   'data-source': 'voice', 'data-state': 'open', 'data-reviewed': '0',
@@ -1010,8 +1043,9 @@ function voiceRow() {
 
 function world(fetchImpl, opts) {
   opts = opts || {};
-  const row = voiceRow();
-  const list = E('ul', {id: 'items'}, [row]);
+  const row = voiceRow(ID);
+  const rows = opts.rows === 2 ? [row, voiceRow(ID2)] : [row];
+  const list = E('ul', {id: 'items'}, rows);
   const tile = function (key) { return E('div', {'class': 'tile'}, [E('span', {'data-count': key})]); };
   const root = E('main', {}, [tile('needs_review'), tile('open'), tile('total'),
                               E('span', {'data-plural-of': 'total'}), list,
@@ -1019,10 +1053,14 @@ function world(fetchImpl, opts) {
   const calls = [];
   const unload = [];
   let reloads = 0;
+  /* Timers are QUEUED, and run only by flush(): the settle debounce is under test. */
+  const timers = new Map();
+  let tid = 0;
   const win = {
     fetch: function (url, o) { calls.push({url: url, opts: o}); return fetchImpl(url, o); },
     setInterval: function () { return 0; }, clearInterval: function () {},
-    setTimeout: function (fn) { fn(); return 0; },
+    setTimeout: function (fn, ms) { tid += 1; timers.set(tid, {fn: fn, ms: ms}); return tid; },
+    clearTimeout: function (id) { timers.delete(id); },
     confirm: function () { return true; },
     addEventListener: function (t, fn) { if (t === 'beforeunload') { unload.push(fn); } },
     location: {reload: function () { reloads += 1; }}
@@ -1037,7 +1075,26 @@ function world(fetchImpl, opts) {
                querySelectorAll: function (sel) { return root.querySelectorAll(sel); }};
   vm.runInNewContext(SRC, {document: doc, window: win, navigator: {}, console: console,
                            Blob: function () {}, FormData: function () {}});
+  if (opts.tiles) {
+    Object.keys(opts.tiles).forEach(function (k) {
+      root.querySelector('[data-count="' + k + '"]').textContent = opts.tiles[k];
+    });
+  }
   return {row: row, list: list, root: root, calls: calls, unload: unload,
+          row2: rows[1] || null,
+          q2: function (sel) { return rows[1].querySelector(sel); },
+          timers: function () { return Array.from(timers.values()).map(function (t) { return t.ms; }); },
+          flush: function () {
+            while (timers.size) {
+              const [id, t] = timers.entries().next().value;
+              timers.delete(id);
+              t.fn();
+            }
+          },
+          gets: function () {
+            return calls.filter(function (c) { return !(c.opts && c.opts.method); })
+              .map(function (c) { return c.url; });
+          },
           setFetch: function (fn) { fetchImpl = fn; },
           reloads: function () { return reloads; },
           q: function (sel) { return row.querySelector(sel); },
@@ -1104,6 +1161,7 @@ function item(over) {
                reopenHidden: w.q('.toggle-state[data-to="open"]').hidden,
                startGroupHidden: w.q('.action-start').hidden,
                startGroupDormant: w.q('.action-start').classList.contains('dormant'),
+               startGroupInert: w.q('.action-start').getAttribute('inert') !== null,
                tiles: w.tiles(),
                enabled: !w.q('.toggle-state[data-to="closed"]').disabled};
 
@@ -1179,6 +1237,7 @@ function item(over) {
   w = world(ok(item({state: 'open', counts: {needs_review: 1, open: 2, total: 3}})));
   w.row.setAttribute('data-state', 'closed');
   w.q('.action-start').classList.add('dormant');
+  w.q('.action-start').setAttribute('inert', '');
   w.q('.badge-closed').hidden = false;
   const reopen = w.q('.toggle-state[data-to="open"]');
   reopen.hidden = false;
@@ -1186,6 +1245,7 @@ function item(over) {
   reopen.fire('click');
   await settle();
   out.reopen = {state: w.row.getAttribute('data-state'),
+                inert: w.q('.action-start').getAttribute('inert') !== null,
                 startHidden: w.q('.action-start').hidden ||
                              w.q('.action-start').classList.contains('dormant'),
                 closedBadge: w.q('.badge-closed').hidden,
@@ -1202,43 +1262,152 @@ function item(over) {
   await settle();
   out.doubleTap = {calls: w.calls.length};
 
-  /* Counts that arrive out of order: only a NEWER stamp is applied (the row itself always
-     follows its own answer). */
-  w = world(ok(item({reviewed: true, needs_review: false, awaiting_filing: true,
-                     counts: {needs_review: 0, open: 2, total: 3}, counts_at: '1790000000000002000'})));
-  const ob = w.q('.review-box');
-  ob.checked = true;
-  ob.fire('change');
+  /* Answers that land out of order (two rows, two requests): each is shown at once, and once
+     nothing is in flight the page settles to ONE GET of the server's counts. */
+  {
+    const pend = {};
+    w = world(function (url, o) {
+      if (!(o && o.method)) { return ok({counts: {needs_review: 0, open: 1, total: 3}})(); }
+      return new Promise(function (r) { pend[url] = r; });
+    }, {rows: 2});
+    const answer = function (body) {
+      return {ok: true, status: 200, json: function () { return Promise.resolve(body); }};
+    };
+    const b1 = w.q('.review-box');
+    b1.checked = true;
+    b1.fire('change');                                         // A: row 1, in flight
+    w.q2('.toggle-state[data-to="closed"]').fire('click');      // B: row 2, in flight
+    pend['/api/v1/inbox/items/' + ID2](answer(item({id: ID2, state: 'closed', needs_review: false,
+      counts: {needs_review: 1, open: 1, total: 3}})));        // B lands first (newer)...
+    await settle();
+    const whileAInFlight = w.timers().length;
+    pend['/api/v1/inbox/items/' + ID](answer(item({reviewed: true, needs_review: false,
+      awaiting_filing: true, counts: {needs_review: 1, open: 2, total: 3}})));   // ...A (older)
+    await settle();
+    out.outOfOrder = {whileAInFlight: whileAInFlight, optimistic: w.tiles(),
+                      getsBeforeFlush: w.gets().length, delays: w.timers()};
+    w.flush();
+    await settle();
+    out.outOfOrder.tiles = w.tiles();
+    out.outOfOrder.gets = w.gets();
+  }
+
+  /* UI-43: a refused tick carries no counts, yet the note left Needs review (its draft went
+     back to pending). The settle GET puts the tile right. */
+  w = world(function (url, o) {
+    if (!(o && o.method)) { return ok({counts: {needs_review: 0, open: 2, total: 3}})(); }
+    const now = item({needs_review: false, can_tick_reviewed: false,
+                      draft: {title: null, body: null, project: null, status: 'pending', edited_at: null}});
+    delete now.counts;
+    return refused(409, 'nothing to review yet — wait for the draft, or write one with Edit draft',
+                   {code: 'nothing_to_review', item: now})();
+  }, {tiles: {needs_review: '1', open: '2', total: '3'}});
+  const ub = w.q('.review-box');
+  ub.checked = true;
+  ub.fire('change');
   await settle();
-  w.calls.length = 0;
-  const later = item({reviewed: false, needs_review: true,
-                      counts: {needs_review: 7, open: 7, total: 7}, counts_at: '1790000000000001000'});
-  w.setFetch(ok(later));
-  ob.checked = false;
-  ob.fire('change');
+  out.ui43 = {beforeSettle: w.tiles(), badge: !w.q('.badge-review').hidden};
+  w.flush();
   await settle();
-  out.staleCounts = {tiles: w.tiles(), reviewed: w.row.getAttribute('data-reviewed')};
-  /* A longer stamp is a later one, though it sorts first as text ("10…" < "17…"). */
-  w.setFetch(ok(item({counts: {needs_review: 4, open: 5, total: 6}, counts_at: '10000000000000000000'})));
-  ob.checked = true;
-  ob.fire('change');
+  out.ui43.after = w.tiles();
+  out.ui43.gets = w.gets().length;
+
+  /* An action that gets no answer at all (offline) settles too. */
+  w = world(function (url, o) {
+    if (!(o && o.method)) { return ok({counts: {needs_review: 4, open: 4, total: 4}})(); }
+    return Promise.reject(new TypeError('Failed to fetch'));
+  });
+  w.q('.toggle-state[data-to="closed"]').fire('click');
   await settle();
-  out.longerStamp = w.tiles();
+  out.offlineSettles = {pending: w.timers()};
+  w.flush();
+  await settle();
+  out.offlineSettles.tiles = w.tiles();
+
+  /* A burst of three quick actions: exactly ONE settle GET, ~300 ms after the last. */
+  w = world(function (url, o) {
+    if (!(o && o.method)) { return ok({counts: {needs_review: 0, open: 2, total: 3}})(); }
+    return ok(item({state: JSON.parse(o.body).state || 'open'}))();
+  });
+  w.q('.review-box').checked = true;
+  w.q('.review-box').fire('change');
+  await settle();
+  w.q('.toggle-state[data-to="closed"]').fire('click');
+  await settle();
+  w.q('.toggle-state[data-to="open"]').fire('click');
+  await settle();
+  out.burst = {patches: w.calls.length - w.gets().length, getsBeforeFlush: w.gets().length,
+               pending: w.timers()};
+  w.flush();
+  await settle();
+  out.burst.gets = w.gets();
+
+  /* A settle GET whose answer lands after another action has started is not applied (that
+     action's own settle fetches again). */
+  {
+    let landGet;
+    let landPatch;
+    w = world(function (url, o) {
+      if (!(o && o.method)) { return new Promise(function (r) { landGet = r; }); }
+      return landPatch ? new Promise(function (r) { landPatch = r; })
+                       : ok(item({state: 'closed', counts: {needs_review: 1, open: 1, total: 3}}))();
+    });
+    w.q('.toggle-state[data-to="closed"]').fire('click');
+    await settle();
+    w.flush();                                                // the settle GET goes out...
+    landPatch = function () {};
+    w.q('.toggle-state[data-to="open"]').fire('click');       // ...and Reopen starts
+    const staleGet = landGet;
+    if (staleGet) {
+      staleGet({ok: true, status: 200, json: function () {
+        return Promise.resolve({counts: {needs_review: 9, open: 9, total: 9}}); }});
+    }
+    await settle();
+    out.lateGet = {sent: !!staleGet, tiles: w.tiles()};
+  }
+  {
+    let landGet = null;
+    w = world(function (url, o) {
+      if (!(o && o.method)) { return new Promise(function (r) { landGet = landGet || r; }); }
+      return ok(item({state: JSON.parse(o.body).state,
+                      counts: {needs_review: 1, open: JSON.parse(o.body).state === 'open' ? 2 : 1,
+                               total: 3}}))();
+    });
+    w.q('.toggle-state[data-to="closed"]').fire('click');
+    await settle();
+    w.flush();                                                // settle GET #1 goes out
+    w.q('.toggle-state[data-to="open"]').fire('click');       // a quick Reopen comes and goes
+    await settle();
+    landGet({ok: true, status: 200, json: function () {      // #1 lands late, read before it
+      return Promise.resolve({counts: {needs_review: 9, open: 9, total: 9}}); }});
+    await settle();
+    out.staleSettle = {tiles: w.tiles(), pending: w.timers()};
+  }
 
   /* Delete answered 404: the row is gone anyway; the answer's counts are applied... */
-  w = world(refused(404, 'no such item', {counts: {needs_review: 0, open: 1, total: 1},
-                                          counts_at: '1790000000000003000'}));
-  w.q('.delete-item').fire('click');
-  await settle();
-  out.del404 = {rows: w.list.children.length, tiles: w.tiles(), calls: w.calls.length};
-  /* ...or, when it carries none, ONE GET of the counts is. */
   w = world(function (url, o) {
-    if (o && o.method === 'DELETE') { return refused(404, 'no such item')(); }
-    return ok({counts: {needs_review: 0, open: 0, total: 0}, counts_at: '1790000000000004000'})();
+    if (o && o.method === 'DELETE') {
+      return refused(404, 'no such item', {counts: {needs_review: 0, open: 1, total: 1}})();
+    }
+    return ok({counts: {needs_review: 0, open: 1, total: 2}})();
   });
   w.q('.delete-item').fire('click');
   await settle();
-  out.del404bare = {rows: w.list.children.length, tiles: w.tiles(),
+  out.del404 = {rows: w.list.children.length, tiles: w.tiles(), calls: w.calls.length};
+  w.flush();
+  await settle();
+  out.del404.settled = w.tiles();
+  /* ...or, when it carries none, the settle GET is what puts the tiles right. */
+  w = world(function (url, o) {
+    if (o && o.method === 'DELETE') { return refused(404, 'no such item')(); }
+    return ok({counts: {needs_review: 0, open: 0, total: 0}})();
+  });
+  w.q('.delete-item').fire('click');
+  await settle();
+  const bareBefore = w.calls.length;
+  w.flush();
+  await settle();
+  out.del404bare = {rows: w.list.children.length, tiles: w.tiles(), callsBeforeFlush: bareBefore,
                     urls: w.calls.map(function (c) { return [(c.opts && c.opts.method) || 'GET', c.url]; })};
 
   /* Close with the editor open and unchanged: it closes with the first group. */
@@ -1350,6 +1519,7 @@ def test_close_flips_state_badge_buttons_and_the_start_group(inplace):
     assert c["closedBadge"] is False and c["closeHidden"] is True and c["reopenHidden"] is False
     # The first group keeps its slot (invisible, not removed), so Reopen lands where Close was.
     assert c["startGroupDormant"] is True and c["startGroupHidden"] is False
+    assert c["startGroupInert"] is True          # not focusable or tappable, even without app.css
     assert c["tiles"] == ["0", "1", "3"] and c["enabled"]
 
 
@@ -1397,21 +1567,48 @@ def test_an_answer_never_overwrites_typing_in_an_open_editor(inplace):
 def test_reopen_brings_back_the_first_group_and_close(inplace):
     r = inplace["reopen"]
     assert r["body"] == {"state": "open"} and r["state"] == "open"
-    assert r["startHidden"] is False and r["closedBadge"] is True
+    assert r["startHidden"] is False and r["closedBadge"] is True and r["inert"] is False
     assert r["closeHidden"] is False and r["reopenHidden"] is True
 
 
-def test_counts_that_arrive_out_of_order_are_never_applied(inplace):
-    stale = inplace["staleCounts"]
-    assert stale["tiles"] == ["0", "2", "3"]          # the older stamp lost...
-    assert stale["reviewed"] == "0"                   # ...but the row follows its answer
-    assert inplace["longerStamp"] == ["4", "5", "6"]
+def test_out_of_order_answers_settle_to_the_servers_counts(inplace):
+    o = inplace["outOfOrder"]
+    assert o["whileAInFlight"] == 0                  # nothing settles while A is in flight
+    assert o["optimistic"] == ["1", "2", "3"]        # the late, older answer shows at first...
+    assert o["getsBeforeFlush"] == 0 and o["delays"] == [300]
+    assert o["tiles"] == ["0", "1", "3"]             # ...and the settle GET is the final word
+    assert o["gets"] == ["/api/v1/inbox/counts"]
+
+
+def test_a_refused_tick_still_settles_the_needs_review_tile(inplace):
+    u = inplace["ui43"]
+    assert u["beforeSettle"] == ["1", "2", "3"] and u["badge"] is False
+    assert u["after"] == ["0", "2", "3"] and u["gets"] == 1
+
+
+def test_an_action_that_gets_no_answer_still_settles(inplace):
+    assert inplace["offlineSettles"] == {"pending": [300], "tiles": ["4", "4", "4"]}
+
+
+def test_a_burst_of_actions_makes_exactly_one_settle_request(inplace):
+    b = inplace["burst"]
+    assert b["patches"] == 3 and b["getsBeforeFlush"] == 0 and b["pending"] == [300]
+    assert b["gets"] == ["/api/v1/inbox/counts"]
+
+
+def test_a_settle_answer_that_lands_mid_action_is_not_applied(inplace):
+    assert inplace["lateGet"] == {"sent": True, "tiles": ["1", "1", "3"]}
+    # One that lands after a later action has come and gone is just as stale: that action's
+    # own settle GET (pending) is the one that counts.
+    assert inplace["staleSettle"] == {"tiles": ["1", "2", "3"], "pending": [300]}
 
 
 def test_a_delete_404_removes_the_row_and_still_gets_fresh_counts(inplace):
-    assert inplace["del404"] == {"rows": 0, "tiles": ["0", "1", "1"], "calls": 1}
+    d = inplace["del404"]
+    assert d["rows"] == 0 and d["tiles"] == ["0", "1", "1"] and d["calls"] == 1
+    assert d["settled"] == ["0", "1", "2"]
     bare = inplace["del404bare"]
-    assert bare["rows"] == 0 and bare["tiles"] == ["0", "0", "0"]
+    assert bare["rows"] == 0 and bare["tiles"] == ["0", "0", "0"] and bare["callsBeforeFlush"] == 1
     assert bare["urls"] == [["DELETE", "/api/v1/inbox/items/" + "a" * 32],
                             ["GET", "/api/v1/inbox/counts"]]
 

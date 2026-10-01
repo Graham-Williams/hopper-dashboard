@@ -243,10 +243,11 @@
               Reopen share a min-width, so flipping one never reflows the row. A CLOSED
               note shows only the second group: the first keeps its SLOT but shows nothing
               (`dormant`, visibility: hidden — not `hidden`, which would pull the second
-              group up a line and move Reopen away from where Close was). Reopen it
+              group up a line and move Reopen away from where Close was), and is `inert`,
+              so nothing in it takes focus or a tap even if app.css never loads. Reopen it
               before editing or reviewing. -#}
           {% if voice or it.reviewable %}
-          <span class="action-group action-start{% if it.state == 'closed' %} dormant{% endif %}">
+          <span class="action-group action-start{% if it.state == 'closed' %} dormant{% endif %}"{% if it.state == 'closed' %} inert{% endif %}>
           {% if voice %}
           <button type="button" class="edit-draft secondary" data-id="{{ it.id }}" hidden>Edit draft</button>
           {% endif %}

@@ -1767,12 +1767,13 @@ def test_a_closed_note_offers_reopen_and_delete_but_no_edit_or_review(authed, bo
     # as nothing (`dormant`: visibility hidden), so Reopen sits exactly where Close was.
     opening = actions.split('class="action-group action-start', 1)[1].split(">", 1)[0]
     assert "dormant" in opening and "hidden" not in opening
+    assert " inert" in opening            # no focus or tap even if app.css never loads
     assert "review-box" not in _shown(actions)[1] and "edit-draft" not in _shown(actions)[1]
     assert ">Reopen<" in actions and "delete-item" in actions
     authed.patch(f"/api/v1/inbox/items/{voice}", json={"state": "open"})
     actions = _actions(authed.get("/inbox").data.decode(), voice)
     opening = actions.split('class="action-group action-start', 1)[1].split(">", 1)[0]
-    assert "dormant" not in opening and "hidden" not in opening
+    assert "dormant" not in opening and "hidden" not in opening and "inert" not in opening
     assert "review-box" in _shown(actions)[1]
     css = _code("dashboard/static/app.css")
     assert "visibility: hidden" in css.split(".item-actions .action-start.dormant {", 1)[1] \
@@ -1808,30 +1809,26 @@ def test_patch_and_delete_answer_with_the_derived_fields_and_fresh_counts(authed
     assert gone["counts"] == authed.get("/api/v1/inbox/items").get_json()["counts"]
 
 
-def _stamp(body):
-    at = body["counts_at"]
-    assert isinstance(at, str) and at.isdigit()             # exact in JS: not a float
-    return int(at)
-
-
-def test_every_answer_with_counts_is_stamped_and_the_stamps_only_grow(authed, bot):
+def test_answers_carry_counts_and_the_counts_route_has_the_final_word(authed, bot):
+    """Every action answer carries the tiles' counts (shown at once), a DELETE of a note
+    already gone included; the page then settles to GET /api/v1/inbox/counts. No stamps:
+    a stamp read apart from the SELECT could order two answers wrongly."""
     voice = _drafted(authed, bot)
     typed = post_note(authed, "typed row").get_json()["id"]
-    stamps = [_stamp(authed.patch(f"/api/v1/inbox/items/{voice}",
-                                  json={"reviewed": True}).get_json()),
-              _stamp(authed.patch(f"/api/v1/inbox/items/{typed}",
-                                  json={"state": "closed"}).get_json()),
-              _stamp(authed.delete(f"/api/v1/inbox/items/{typed}").get_json())]
-    gone = authed.delete(f"/api/v1/inbox/items/{typed}")      # already gone: a 404...
-    assert gone.status_code == 404
-    body = gone.get_json()                                    # ...that still carries counts
-    assert body["counts"] == authed.get("/api/v1/inbox/items").get_json()["counts"]
-    stamps.append(_stamp(body))
+    listed = lambda: authed.get("/api/v1/inbox/items").get_json()["counts"]
+    answers = []
+    for item, change in ((voice, {"reviewed": True}), (typed, {"state": "closed"})):
+        answers.append(authed.patch(f"/api/v1/inbox/items/{item}", json=change))
+        assert answers[-1].get_json()["counts"] == listed()
+    gone = authed.delete(f"/api/v1/inbox/items/{typed}")
+    assert gone.get_json()["counts"] == listed()
+    again = authed.delete(f"/api/v1/inbox/items/{typed}")      # already gone: a 404...
+    assert again.status_code == 404 and again.get_json()["counts"] == listed()
     counted = authed.get("/api/v1/inbox/counts")
-    assert counted.status_code == 200
-    assert counted.get_json()["counts"] == body["counts"]
-    stamps.append(_stamp(counted.get_json()))
-    assert stamps == sorted(stamps) and len(set(stamps)) == len(stamps)
+    assert counted.status_code == 200 and counted.get_json() == {"counts": listed()}
+    for body in [r.get_json() for r in answers] + [gone.get_json(), again.get_json(),
+                                                   counted.get_json()]:
+        assert "counts_at" not in body
 
 
 def test_the_counts_route_needs_a_session_or_the_read_token(authed, bot):
