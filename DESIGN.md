@@ -338,6 +338,11 @@ act (C-04/05/06), like Delete.
 - **B-14 — a truncated read of backlog.txt archives the entries after the cut** until the next complete
   push (an hour later) brings them back with the same ids. Filed notes do not flap on it (the two-push
   grace period).
+- **A merged link can re-close a note Graham reopened by hand.** When the boot-time spelling
+  canonicalisation merges a note's two links to one issue, the kept link is reset to 'open' (so the first
+  full scan fires the real transition). If that issue was already closed and Graham had reopened the note
+  by hand, the scan sees open → closed and closes the note again. It needs links stored under two
+  spellings of one repo, which only pre-upgrade data can have, so it is rare; reopen the note again.
 - **G-26 — a repo with more than 1000 open issues mirrors nothing** (the listing is treated as partial, so
   nothing is upserted or closed). Far beyond any watched repo.
 
