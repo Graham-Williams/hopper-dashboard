@@ -568,6 +568,19 @@ def test_db_snapshots_stream_out_of_a_read_only_container_with_a_tmpfs(box):
     assert len(box.remote_dbs()) == 2
 
 
+def _snap_temps(box):
+    """Snapshot temps left on the container's /tmp (its tmpfs) or in the host's snapshot dir."""
+    return ([n for n in _container_tmp(box) if "_snap." in n]
+            + [n for n in _local_snaps(box) if n.startswith(".")])
+
+
+def _empty_live_db(box, name):
+    conn = sqlite3.connect(os.path.join(box.container, "app", "data", name + ".db"))
+    conn.execute("DELETE FROM %s" % name)
+    conn.commit()
+    conn.close()
+
+
 @pytest.mark.parametrize("exit_code", ["0", "137"])
 def test_a_snapshot_stream_cut_short_fails_loudly_and_keeps_nothing(box, exit_code):
     """A stream cut short — whether the exec then exits 0 (looks like success) or not — must
@@ -579,12 +592,104 @@ def test_a_snapshot_stream_cut_short_fails_loudly_and_keeps_nothing(box, exit_co
                       FAKE_DOCKER_EXEC_RC=exit_code)
     assert rc == 1, out
     if exit_code == "0":
-        assert "snapshot stream from fake-dashboard was incomplete" in out, out
+        assert "did not match the declared size" in out, out
     else:
         assert "exit 137" in out, out
     assert _local_snaps(box) == before                # no partial file kept, no temp left
     assert box.remote_dbs() == pushed
     assert _container_tmp(box) == []
+
+
+@pytest.mark.parametrize("fault,said", [
+    ({"FAKE_DOCKER_EXEC_STDOUT_LIMIT": "1000"}, "did not match the declared size"),
+    ({"FAKE_DOCKER_EXEC_STDOUT_EXTRA": "trailing junk"}, "did not match the declared size"),
+    ({"FAKE_DOCKER_EXEC_STDOUT_FLIP": "200"}, "did not match the declared sha256"),
+])
+def test_a_stream_that_is_not_what_was_declared_says_how(box, fault, said):
+    """Too short, too long (both: the size), or the same size with other bytes (the sha)."""
+    rc, out = box.run(BACKUP_AUDIO=0, FAKE_DOCKER_EXEC_ONLY="inbox", **fault)
+    assert rc == 1 and "ERROR: inbox: " in out and said in out, out
+    assert "incomplete" not in out
+    assert [n.split("_")[0] for n in _local_snaps(box)] == ["dashboard"]
+
+
+KINDS = ["in-container", "cut-short", "too-long", "sha", "host-verify", "killed"]
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_no_failed_run_of_any_kind_leaks_a_snapshot_temp(box, kind):
+    """Every way a snapshot can fail, run three times over: nothing is left on the
+    container's tmpfs (shared RAM the app also spools uploads into) or on the host. A
+    killed exec cannot clean up after itself, so its temp IS left — and the next snapshot
+    sweeps it (under the run lock, so none is in use)."""
+    fault = {"cut-short": {"FAKE_DOCKER_EXEC_STDOUT_LIMIT": "1000"},
+             "too-long": {"FAKE_DOCKER_EXEC_STDOUT_EXTRA": "junk"},
+             "sha": {"FAKE_DOCKER_EXEC_STDOUT_FLIP": "200"},
+             "killed": {"FAKE_DOCKER_EXEC_KILLED": "1"}}.get(kind, {})
+    if kind == "in-container":
+        with open(os.path.join(box.container, "app", "data", "inbox.db"), "wb") as fh:
+            fh.write(b"this is not a database" * 200)
+    if kind == "host-verify":
+        box.run(expect=0, BACKUP_AUDIO=0)            # a snapshot with data to compare against
+        _empty_live_db(box, "inbox")                  # the wiped-DB guard refuses the next one
+    for _ in range(3):
+        rc, out = box.run(BACKUP_AUDIO=0, FAKE_DOCKER_EXEC_ONLY="inbox", **fault)
+        assert rc == 1 and "ERROR: inbox: " in out, out
+        if kind == "killed":
+            assert _snap_temps(box) == ["inbox_snap.k1ll3d.db"]   # really left behind...
+        else:
+            assert _snap_temps(box) == [], out
+    if kind == "in-container":                        # a sound DB again for the clean run
+        live = os.path.join(box.container, "app", "data", "inbox.db")
+        os.remove(live)
+        box._make_db(live, "inbox")
+    rc, out = box.run(BACKUP_AUDIO=0, ALLOW_EMPTY_SNAPSHOT=1)
+    assert rc == 0, out
+    assert _snap_temps(box) == []                     # ...and swept by the next snapshot
+
+
+def test_a_corrupt_dashboard_db_never_stops_inbox_or_the_audio(box):
+    """One DB failing is logged as an ERROR naming it; the other DB and the audio are still
+    backed up, and only then does the run exit 1 (so the heartbeat fails)."""
+    box.add_audio("a.webm", "b.webm")
+    with open(os.path.join(box.container, "app", "data", "dashboard.db"), "wb") as fh:
+        fh.write(b"this is not a database" * 200)
+    rc, out = box.run()
+    assert rc == 1, out
+    assert "ERROR: dashboard: " in out
+    assert [n.split("_")[0] for n in _local_snaps(box)] == ["inbox"]
+    assert [n.split("_")[0] for n in box.remote_dbs()] == ["inbox"]
+    assert box.remote_audio() == ["a.webm", "b.webm"]
+    assert _snap_temps(box) == []
+
+
+def test_a_db_too_big_for_the_tmpfs_fails_that_db_with_a_clear_message(box):
+    """The snapshot is made on the container's tmpfs /tmp, which the app shares. A DB that
+    will not fit (with headroom) is failed up front, naming /tmp, its size and the DB's —
+    never SQLite's bare "database or disk is full". The other DB still goes."""
+    conn = sqlite3.connect(os.path.join(box.container, "app", "data", "dashboard.db"))
+    conn.executemany("INSERT INTO dashboard (v) VALUES (?)", [("x" * 1000,)] * 400)
+    conn.commit()
+    conn.close()
+    rc, out = box.run(BACKUP_AUDIO=0, FAKE_DOCKER_TMPFS_BYTES=str(8 * 1024 * 1024 + 150 * 1024))
+    assert rc == 1, out
+    line = next(l for l in out.splitlines() if "ERROR: dashboard: " in l)
+    assert "/tmp" in line and "tmpfs" in line and "8.1 MiB" in line, line
+    assert "dashboard.db (0.4 MiB" in line and "docker-compose.yml" in line, line
+    assert "database or disk is full" not in out
+    assert [n.split("_")[0] for n in _local_snaps(box)] == ["inbox"]
+    assert _snap_temps(box) == []
+
+
+def test_leftovers_are_swept_before_the_room_is_measured(box):
+    """A killed run's temp must not eat the headroom the next snapshot needs."""
+    tmp = os.path.join(box.container, "tmp")
+    os.makedirs(tmp, exist_ok=True)
+    with open(os.path.join(tmp, "inbox_snap.k1ll3d.db"), "wb") as fh:
+        fh.write(b"\0" * (1024 * 1024))
+    rc, out = box.run(BACKUP_AUDIO=0, FAKE_DOCKER_TMPFS_BYTES=str(8 * 1024 * 1024 + 500 * 1024))
+    assert rc == 0, out
+    assert _snap_temps(box) == []
 
 
 def test_a_db_not_in_the_container_yet_is_skipped_not_fatal(box):
@@ -595,12 +700,13 @@ def test_a_db_not_in_the_container_yet_is_skipped_not_fatal(box):
 
 
 def test_a_live_db_that_fails_its_check_fails_the_run(box):
-    """Not a quiet skip: a live DB that cannot be snapshotted cleanly must page."""
+    """Not a quiet skip: a live DB that cannot be snapshotted cleanly must page — and the
+    other DB is still backed up."""
     with open(os.path.join(box.container, "app", "data", "inbox.db"), "wb") as fh:
         fh.write(b"this is not a database" * 200)
     rc, out = box.run(BACKUP_AUDIO=0)
-    assert rc == 1 and "inbox snapshot inside fake-dashboard failed" in out, out
-    assert not [n for n in _local_snaps(box) if n.startswith(("inbox", "."))]
+    assert rc == 1 and "ERROR: inbox: the snapshot inside fake-dashboard failed" in out, out
+    assert [n.split("_")[0] for n in _local_snaps(box)] == ["dashboard"]
     assert _container_tmp(box) == []
 
 
@@ -616,13 +722,23 @@ def test_a_snapshot_temp_left_in_the_containers_tmp_is_swept(box):
     assert _container_tmp(box) == []
 
 
-@pytest.mark.parametrize("where", ["/tmp/audio", "/app/data/../tmp/audio", "app/data/inbox/audio"])
+@pytest.mark.parametrize("where", [
+    "/app/data", "/app/data/", "/app/data//inbox/audio", "/app/data/inbox/audio/",
+    "/app/data/./inbox", "/app/data/inbox/.", "/app/data/../tmp/audio", "/app/data/inbox/..",
+    "//app/data/inbox/audio", "/tmp/audio", "app/data/inbox/audio", "/app/database/audio"])
 def test_the_audio_dir_must_be_on_the_data_volume(box, where):
     """The audio is copied with `docker cp`, which only works off the data volume (not the
-    tmpfs /tmp, and nothing else in the read-only container persists)."""
+    tmpfs /tmp, and nothing else in the read-only container persists): a plain path with at
+    least one segment under /app/data, no empty, `.` or `..` segment, no trailing slash."""
     rc, out = box.run(CONTAINER_AUDIO_DIR=where)
     assert rc == 1 and "CONTAINER_AUDIO_DIR" in out and "/app/data" in out, out
     assert box.rclone_calls() == [] and _local_snaps(box) == []
+
+
+@pytest.mark.parametrize("where", ["/app/data/inbox/audio", "/app/data/x"])
+def test_a_plain_audio_dir_under_the_data_volume_is_accepted(box, where):
+    rc, out = box.run(CONTAINER_AUDIO_DIR=where)
+    assert rc == 0, out
 
 
 # --- the happy path ----------------------------------------------------------------

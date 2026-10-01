@@ -663,10 +663,24 @@ What it does, and the two things that are non-negotiable about how:
   cannot read a tmpfs (*"Could not find the file /tmp/… in container"* — every run failed that way until
   this changed). The program's last stderr line states the bytes and sha256 it sent; the host checks its
   copy against both (a stream cut short fails the run even if the exec exited 0), then **re-verifies it**
-  (integrity, schema, the wiped-DB guard), since everything downstream only sha256s the host file. Any
-  failure leaves no partial file, and the in-container temp is removed (a killed run's is swept by the
-  next). A DB not in the container yet (a fresh volume) is skipped with a WARN; any other snapshot
-  failure fails the run. `CONTAINER_AUDIO_DIR` must be under `/app/data`: the audio tree IS copied with
+  (integrity, schema, the wiped-DB guard), since everything downstream only sha256s the host file. A
+  stream too long or too short is reported as not matching the declared size; the same size with other
+  bytes, the declared sha256. Any failure leaves no partial file on the host, and the in-container temp
+  is removed on every exit but a SIGKILL. A DB not in the container yet (a fresh volume) is skipped
+  with a WARN. **Any other snapshot failure is an ERROR naming that DB, and the run carries on** with
+  the other DB and the audio, then exits 1 at the end so the heartbeat fails: a `dashboard.db` problem
+  never stops `inbox.db` or the recordings being backed up.
+- **The snapshot is made on the container's `/tmp`, a 64 MiB tmpfs** (`tmpfs: - /tmp:mode=1777,size=64m`
+  in docker-compose.yml) — RAM, shared with the app, which spools uploads there too. Before each
+  snapshot the step checks there is room for the DB (and its WAL) plus 10%, plus 8 MiB left for the
+  app; if not, it fails that DB up front with a message naming `/tmp`, the tmpfs size, its free space
+  and the DB's size, rather than leaving SQLite's "database or disk is full" as the only clue. Today:
+  `dashboard.db` ≈ 5.7 MB and `inbox.db` ≈ 0.3 MB, so a DB up to roughly 50 MB fits. To raise it, edit
+  `size=64m` there (it is RAM, so stay well under the container's `mem_limit`) and recreate the
+  container (`docker compose up -d`). Every snapshot first removes ALL `*_snap.*.db*` files on that
+  `/tmp`: only an exec killed mid-snapshot can leave one, the host's run lock means none is in use, and
+  a leftover must never eat the room being measured (an orphaned exec of a killed host run, if any,
+  loses only a result nobody is waiting for). `CONTAINER_AUDIO_DIR` must be under `/app/data`: the audio tree IS copied with
   `docker cp`, which works only off the data volume. CI runs this step for real against the built image
   with the same `--read-only --tmpfs /tmp` settings (`.github/workflows/ci.yml`, docker-build job).
 - **The DB snapshots are additive, and so is the AUDIO TREE by default (`BACKUP_AUDIO_MODE=copy`).** The

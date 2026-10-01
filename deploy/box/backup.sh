@@ -188,12 +188,21 @@ require_positive_int AUDIO_DROP_WINDOW_MIN "${AUDIO_DROP_WINDOW_MIN}"
 # The audio tree is copied out with `docker cp`, which works only off the DATA VOLUME: the
 # container is read-only, and its /tmp is a tmpfs that docker cp cannot read. Refuse anything
 # else before a run starts, rather than fail (or copy from the wrong place) halfway through.
-case "${CONTAINER_AUDIO_DIR}" in
-  /app/data/*) ;;
-  *) die "CONTAINER_AUDIO_DIR='${CONTAINER_AUDIO_DIR}' must be under /app/data (the data volume): the container is read-only and docker cp cannot read its tmpfs /tmp" ;;
-esac
-[[ "/${CONTAINER_AUDIO_DIR}/" != */../* && "/${CONTAINER_AUDIO_DIR}/" != */./* ]] \
-  || die "CONTAINER_AUDIO_DIR='${CONTAINER_AUDIO_DIR}' must be a plain path under /app/data (no . or ..)"
+# A plain path: /app/data/ plus at least one segment, none of them empty, `.` or `..`, and no
+# trailing slash (so not /app/data itself, not //, not /app/data/../anything).
+audio_dir_ok() {
+  local rest seg
+  local -a segs
+  [[ "$1" == /app/data/* ]] || return 1
+  rest="${1#/app/data/}"
+  [[ -n "${rest}" && "${rest}" != */ ]] || return 1
+  IFS=/ read -r -a segs <<<"${rest}"
+  for seg in "${segs[@]}"; do
+    [[ -n "${seg}" && "${seg}" != "." && "${seg}" != ".." ]] || return 1
+  done
+}
+audio_dir_ok "${CONTAINER_AUDIO_DIR}" \
+  || die "CONTAINER_AUDIO_DIR='${CONTAINER_AUDIO_DIR}' must be a plain path under /app/data (the data volume) — /app/data/ plus at least one segment, none empty, . or .., no trailing slash: the container is read-only and docker cp cannot read its tmpfs /tmp"
 # Normalise to base 10 NOW, once, so no later `(( ))` can read a leading zero as octal.
 AUDIO_MAX_DROP_PCT=$((10#${AUDIO_MAX_DROP_PCT}))
 AUDIO_MAX_DROP_FILES=$((10#${AUDIO_MAX_DROP_FILES}))
@@ -316,40 +325,62 @@ retention_victims() {  # <count cap> <prefix> <name>…
 }
 
 # --- one DB: snapshot inside the container, verify, dedupe, keep ---------------------
-# Sets SNAPSHOT_PATH / SNAPSHOT_CKSUM for the caller. Returns 2 for a DB that is not in the
-# container (yet); every other failure dies, and none of them keeps a partial file.
+# Sets SNAPSHOT_PATH / SNAPSHOT_CKSUM for the caller. Returns 0 when the snapshot is kept, 2
+# for a DB that is not in the container (yet), and 1 for ANY failure — logged as an ERROR
+# naming the DB, with nothing partial kept on the host or in the container. A failure never
+# stops the other DBs or the audio: the caller carries on and the run exits 1 at the end.
+# (Called as `snapshot_db … || rc=$?`, so errexit is OFF in here: every step is checked.)
 snapshot_db() {
-  local name="$1" src="$2" tmp err prev rc=0 sent got
-  tmp="$(mktemp "${LOCAL_BACKUP_DIR}/.snapshot.XXXXXX.db")"
+  local name="$1" src="$2" tmp err prev rc=0 sent sent_size sent_sha got_size
+  tmp="$(mktemp "${LOCAL_BACKUP_DIR}/.snapshot.XXXXXX.db")" \
+    || { log "ERROR: ${name}: could not create a temp file in ${LOCAL_BACKUP_DIR}"; return 1; }
   err="${tmp%.db}.err"
-  # Dotfiles, which the <name>_*.db prune glob never sees; a killed run's are swept under the
-  # lock. The suffix glob catches the snapshot's own -wal/-shm, created when the verification
-  # step below opens it.
+  # Dotfiles, which the <name>_*.db prune glob never sees, removed on EVERY return (a failure
+  # returns too — it never exits from in here); a killed run's are swept under the lock. The
+  # suffix glob catches the snapshot's own -wal/-shm, created when the verification step
+  # below opens it.
   cleanup_db() { rm -f "${tmp}" "${tmp}"-* "${err}"; }
   trap cleanup_db RETURN
-  snapshot_failed() { cleanup_db; die "$@"; }
+  failed() { log "ERROR: ${name}: $*"; }
 
   # Made AND checked inside the container, then streamed out on stdout into ${tmp}. The
   # program's LAST stderr line says what it sent ("SNAPSHOT <bytes> <sha256>"), so a stream
-  # cut short is caught even when the exec still exits 0. Paths go in via -e, never
-  # interpolated into the python source.
+  # that is not exactly that is caught even when the exec still exits 0. Paths go in via -e,
+  # never interpolated into the python source. Exit 3: no such DB; 4: no room on the tmpfs.
   docker exec -i -e SRC="${src}" -e NAME="${name}" -e SNAPDIR=/tmp "${CONTAINER}" \
     python3 - > "${tmp}" 2> "${err}" <<'PY' || rc=$?
-import glob, hashlib, os, sqlite3, sys, tempfile
+import glob, hashlib, os, shutil, sqlite3, sys, tempfile
 src, name, snapdir = os.environ["SRC"], os.environ["NAME"], os.environ["SNAPDIR"]
+# FIRST, clear every snapshot temp an earlier exec left on the tmpfs (only a SIGKILLed one
+# can: every other exit removes its own, below). All of them, not just old ones: the host's
+# run lock means no snapshot is being made now, and a leftover must never eat the room this
+# one is about to measure. (The orphan of a killed host run, if still running, loses only a
+# result nobody is waiting for.)
+for stale in glob.glob(os.path.join(snapdir, "*_snap.*.db*")):
+    try:
+        os.remove(stale)
+    except OSError:
+        pass
 # The host-side precondition checks a HOST path; this is the path actually read. Without
 # this guard sqlite3.connect() would CREATE the missing file and .backup() would faithfully
 # copy an empty DB — a snapshot that passes integrity_check and rotates every good copy out.
 if not os.path.isfile(src):
     sys.stderr.write("source DB not found inside the container at %s\n" % src)
     sys.exit(3)
-# An exec killed mid-snapshot leaves its temp on the tmpfs (RAM) until the container
-# restarts. The host's run lock means none of these is in use now: clear them.
-for stale in glob.glob(os.path.join(snapdir, "*_snap.*.db*")):
-    try:
-        os.remove(stale)
-    except OSError:
-        pass
+# Room on the tmpfs for the copy (the DB and its WAL, which the backup folds in), plus 10%,
+# plus 8 MiB left for the app, which spools uploads in the same /tmp. Failing here names the
+# limit; otherwise SQLite's "database or disk is full" would be the only clue.
+need = sum(os.path.getsize(p) for p in (src, src + "-wal") if os.path.exists(p))
+want = need + need // 10 + 8 * 1024 * 1024
+usage = shutil.disk_usage(snapdir)
+if usage.free < want:
+    mib = lambda n: "%.1f MiB" % (n / 1048576.0)
+    sys.stderr.write(
+        "no room in the container's %s (a %s tmpfs, %s free) for %s (%s; needs %s with "
+        "headroom) — raise the /tmp tmpfs size in docker-compose.yml\n"
+        % (snapdir, mib(usage.total), mib(usage.free), os.path.basename(src), mib(need),
+           mib(want)))
+    sys.exit(4)
 fd, dst = tempfile.mkstemp(prefix=name + "_snap.", suffix=".db", dir=snapdir)
 os.close(fd)
 try:
@@ -385,16 +416,23 @@ finally:
         except OSError:
             pass
 PY
-  if (( rc == 3 )); then
-    log "${name}: $(tail -n 1 "${err}")"
-    return 2
-  elif (( rc != 0 )); then
-    snapshot_failed "the ${name} snapshot inside ${CONTAINER} failed (exit ${rc}): $(grep -v '^SNAPSHOT ' "${err}" | tail -n 3 | tr '\n' ' ')"
-  fi
+  case "${rc}" in
+    0) ;;
+    3) log "${name}: $(tail -n 1 "${err}")"; return 2 ;;
+    4) failed "$(tail -n 1 "${err}")"; return 1 ;;
+    *) failed "the snapshot inside ${CONTAINER} failed (exit ${rc}): $(grep -v '^SNAPSHOT ' "${err}" | tail -n 3 | tr '\n' ' ')"
+       return 1 ;;
+  esac
   sent="$(grep '^SNAPSHOT ' "${err}" | tail -n 1 || true)"
-  got="SNAPSHOT $(wc -c < "${tmp}" | tr -d '[:space:]') $(sha256_of "${tmp}")"
-  [[ -n "${sent}" && "${sent}" == "${got}" ]] \
-    || snapshot_failed "the ${name} snapshot stream from ${CONTAINER} was incomplete (sent: ${sent#SNAPSHOT }; received: ${got#SNAPSHOT })"
+  read -r _ sent_size sent_sha <<<"${sent}"
+  got_size="$(wc -c < "${tmp}" | tr -d '[:space:]')"
+  if [[ -z "${sent}" ]]; then
+    failed "the container did not declare what it sent"; return 1
+  elif [[ "${got_size}" != "${sent_size}" ]]; then
+    failed "the snapshot stream from ${CONTAINER} did not match the declared size (declared ${sent_size} bytes, received ${got_size})"; return 1
+  elif [[ "$(sha256_of "${tmp}")" != "${sent_sha}" ]]; then
+    failed "the snapshot stream from ${CONTAINER} did not match the declared sha256"; return 1
+  fi
 
   # Re-verify the HOST copy — the file we actually keep and push: integrity, schema, and the
   # wiped-DB guard. Everything downstream only sha256s this file.
@@ -402,9 +440,11 @@ PY
   rc=0
   python3 "${SCRIPT_DIR}/verify_snapshot.py" "${tmp}" "${prev}" "${ALLOW_EMPTY_SNAPSHOT}" || rc=$?
   if (( rc == 3 )); then
-    snapshot_failed "refusing the ${name} snapshot: every table is empty while ${prev##*/} has data — the live DB looks wiped. Investigate before the good copies rotate out; set ALLOW_EMPTY_SNAPSHOT=1 if it really was emptied on purpose"
+    failed "refusing the snapshot: every table is empty while ${prev##*/} has data — the live DB looks wiped. Investigate before the good copies rotate out; set ALLOW_EMPTY_SNAPSHOT=1 if it really was emptied on purpose"
+    return 1
   elif (( rc != 0 )); then
-    snapshot_failed "${name} snapshot failed verification after it was streamed out of the container"
+    failed "the snapshot failed verification after it was streamed out of the container"
+    return 1
   fi
 
   SNAPSHOT_CKSUM="$(sha256_of "${tmp}")"
@@ -420,7 +460,7 @@ PY
     # 1-second resolution: the timer and a manual run in the same second would collide and
     # `mv` would destroy the first. "_N" still sorts after the bare name ("_" > ".").
     while [[ -e "${dest}" ]]; do dest="${LOCAL_BACKUP_DIR}/${name}_${ts}_${n}.db"; n=$((n+1)); done
-    mv "${tmp}" "${dest}"
+    mv "${tmp}" "${dest}" || { failed "could not keep the snapshot as ${dest}"; return 1; }
     printf '%s\n' "${SNAPSHOT_CKSUM}" > "${ck_file}"
     SNAPSHOT_PATH="${dest}"
     log "${name}: saved ${dest##*/} (sha ${SNAPSHOT_CKSUM:0:12})"
@@ -821,7 +861,7 @@ delete_remote_extras() {  # <local dir> <remote dir> <mirrored count>
 }
 
 # --- run -----------------------------------------------------------------------------
-declare -a PUSHABLE=()
+declare -a PUSHABLE=() FAILED=()
 SNAPSHOTS=0
 for pair in ${CONTAINER_DBS}; do
   name="${pair%%:*}"; src="${pair#*:}"
@@ -832,11 +872,19 @@ for pair in ${CONTAINER_DBS}; do
     # fail the unit — but a run where NONE of them produced a snapshot must.
     log "WARN: ${name} (${src}) could not be snapshotted — skipping it this run"
     continue
+  elif (( rc != 0 )); then
+    # Already logged as an ERROR naming it, nothing partial kept. One DB's problem never
+    # stops the others or the audio: carry on, and fail the run at the very end.
+    FAILED+=("${name}")
+    continue
   fi
   SNAPSHOTS=$((SNAPSHOTS+1))
   PUSHABLE+=("${name}|${SNAPSHOT_PATH}|${SNAPSHOT_CKSUM}")
 done
-(( SNAPSHOTS > 0 )) || die "no DB could be snapshotted (checked: ${CONTAINER_DBS})"
+if (( SNAPSHOTS == 0 && ${#FAILED[@]} == 0 )); then
+  log "ERROR: no DB could be snapshotted (checked: ${CONTAINER_DBS})"
+  FAILED+=("(none found)")
+fi
 
 PUSH_RC=0
 if rclone_ready; then
@@ -845,7 +893,7 @@ if rclone_ready; then
   if (( (NOW - LAST) / 60 < DRIVE_PUSH_INTERVAL_MIN )); then
     log "last Drive push was $(( (NOW - LAST) / 60 ))min ago (< ${DRIVE_PUSH_INTERVAL_MIN}min); skipping"
   else
-    for entry in "${PUSHABLE[@]}"; do
+    for entry in ${PUSHABLE[@]+"${PUSHABLE[@]}"}; do
       IFS='|' read -r name path cksum <<<"${entry}"
       push_db "${name}" "${path}" "${cksum}" || PUSH_RC=1
     done
@@ -857,6 +905,10 @@ fi
 if (( PUSH_RC != 0 )); then
   log "Drive push did not complete (rc=${PUSH_RC}); local snapshots are unaffected"
   exit "${PUSH_RC}"
+fi
+if (( ${#FAILED[@]} > 0 )); then
+  log "ERROR: no snapshot this run for: ${FAILED[*]} — everything else ran; failing the run so the heartbeat does"
+  exit 1
 fi
 # Copy mode keeps no copy on the box. After a FULLY successful run, remove what mirror mode
 # left there — its box copy and its brake state (a later switch back to mirror takes its

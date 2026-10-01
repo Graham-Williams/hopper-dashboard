@@ -758,11 +758,16 @@ there is no default URL in the code, by design.
   (there is no flag to install the timer without the heartbeat — an unmonitored backup is the exact failure
   this repo exists to catch). Snapshots `dashboard.db` AND `inbox.db` from INSIDE the container via
   `docker exec` (WAL sidecars are uid 10001; a host-side online backup fails "attempt to write a readonly
-  database") and STREAMS each checked snapshot out on the exec's stdout — never `docker cp`, which cannot
+  database"), on the container's 64 MiB tmpfs `/tmp` after a room check (DB + WAL + 10% + 8 MiB for the
+  app) and a sweep of every `*_snap.*.db*` there (under the run lock), and STREAMS each checked snapshot
+  out on the exec's stdout — never `docker cp`, which cannot
   read the container's tmpfs `/tmp` (the fake docker refuses it exactly like the daemon; CI runs the step
   for real against the image with `--read-only --tmpfs /tmp`) — checks the received bytes and sha256
-  against what the container says it sent, sha256-dedupes, keeps a local ring + a `daily/` tier, and pushes with **`rclone copy`, never
-  `sync`** for the two DBs. **The audio tree is ADD-ONLY by default too: `BACKUP_AUDIO_MODE=copy`**
+  against what the container says it sent (a mismatch is reported as size or sha256), sha256-dedupes,
+  keeps a local ring + a `daily/` tier, and pushes with **`rclone copy`, never `sync`** for the two DBs.
+  A failed DB snapshot is an ERROR naming the DB; the run carries on with the other DB and the audio
+  and exits 1 at the end (`FAILED`), so one DB never stops the rest.
+  **The audio tree is ADD-ONLY by default too: `BACKUP_AUDIO_MODE=copy`**
   (Graham's call 2026-09-29, reversing 2026-09-19): `rclone copy --immutable --exclude '*.part'` straight
   from a staging dir that is removed after — never a remote delete, and NO copy of the audio on the box
   (so no shrink brake and no false alarms). A note deleted in the Hub loses its recording from the Hub at

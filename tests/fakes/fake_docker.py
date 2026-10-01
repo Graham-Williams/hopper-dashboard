@@ -24,12 +24,25 @@ Fault injection, all opt-in via the environment:
                                  the program's stdout through — a stream cut short.
   FAKE_DOCKER_EXEC_RC=<n>        ...and then exits n (default: the program's own exit code, so
                                  a cut-short stream can also EXIT 0 and look like a success).
+  FAKE_DOCKER_EXEC_STDOUT_EXTRA=<text>
+                                 ...appends these bytes to the program's stdout (too LONG).
+  FAKE_DOCKER_EXEC_STDOUT_FLIP=<offset>
+                                 ...flips the byte at that offset (same size, different bytes).
+  FAKE_DOCKER_EXEC_KILLED=1      the exec dies as if SIGKILLed mid-snapshot: exit 137, nothing
+                                 on stdout, and the temp it had made LEFT on the container's /tmp.
+  FAKE_DOCKER_EXEC_ONLY=<name>   apply the four faults above only to the snapshot of that DB
+                                 (the exec's NAME); default: every one.
+  FAKE_DOCKER_TMPFS_BYTES=<n>    the size of the container's /tmp tmpfs (default 64 MiB, as in
+                                 docker-compose.yml): disk_usage() on it reports n in total and
+                                 what its files really hold as used.
 
 Faithful to the real container where it matters: the app's container is `read_only: true`
 with a TMPFS on /tmp (docker-compose.yml), and `docker cp` cannot read a file on a tmpfs
 mount — the daemon answers "Could not find the file ... in container". So `docker cp` FROM
 any path under /tmp fails here exactly as it does on the box (it is how every real backup
-run failed while this fake let it pass).
+run failed while this fake let it pass). Each container has its OWN /tmp (<root>/tmp, where
+a program's TMPDIR points too), so anything a snapshot leaves there is visible to a test,
+and that /tmp has the tmpfs's size limit.
 """
 import os
 import shutil
@@ -48,6 +61,26 @@ def host(path):
 
 #: Mounted as tmpfs in the real container; `docker cp` cannot read from it.
 TMPFS = ("/tmp",)
+
+#: Loaded into every program the fake runs "in the container" (via PYTHONPATH): it makes
+#: shutil.disk_usage() report the container /tmp as a tmpfs of FAKE_DOCKER_TMPFS_BYTES.
+SITECUSTOMIZE = """
+import collections, os, shutil
+_tmpfs = os.environ.get("FAKE_DOCKER_TMPFS_DIR")
+if _tmpfs:
+    _limit = int(os.environ.get("FAKE_DOCKER_TMPFS_BYTES", str(64 * 1024 * 1024)))
+    _real = shutil.disk_usage
+    _usage = collections.namedtuple("usage", "total used free")
+
+    def _disk_usage(path, _real=_real):
+        if os.path.realpath(path) != os.path.realpath(_tmpfs):
+            return _real(path)
+        used = sum(os.path.getsize(os.path.join(d, f))
+                   for d, _, files in os.walk(_tmpfs) for f in files)
+        return _usage(_limit, used, max(0, _limit - used))
+
+    shutil.disk_usage = _disk_usage
+"""
 
 
 def on_tmpfs(path):
@@ -149,8 +182,15 @@ def main(argv):
         for key in ("SRC", "DST", "DIR", "SNAPDIR"):
             if key in env:
                 env[key] = host(env[key])
-        if "SNAPDIR" in env:
-            os.makedirs(env["SNAPDIR"], exist_ok=True)
+        # This container's own /tmp: where SNAPDIR and TMPDIR point, sized like the tmpfs.
+        os.makedirs(host("/tmp"), exist_ok=True)
+        env["TMPDIR"] = host("/tmp")
+        env["FAKE_DOCKER_TMPFS_DIR"] = host("/tmp")
+        site_dir = os.path.join(ROOT, ".fake-site")
+        os.makedirs(site_dir, exist_ok=True)
+        with open(os.path.join(site_dir, "sitecustomize.py"), "w") as fh:
+            fh.write(SITECUSTOMIZE)
+        env["PYTHONPATH"] = site_dir
         if len(rest) >= 3 and rest[1] == "-c":
             override = os.environ.get("FAKE_DOCKER_AUDIO_COUNT")
             if override is not None:
@@ -158,12 +198,29 @@ def main(argv):
                 return 0
             return subprocess.call([sys.executable, "-c", rest[2]], env=env)
         if len(rest) >= 2 and rest[1] == "-":
-            limit = os.environ.get("FAKE_DOCKER_EXEC_STDOUT_LIMIT")
-            if limit is None:
+            faults = [k for k in ("FAKE_DOCKER_EXEC_STDOUT_LIMIT", "FAKE_DOCKER_EXEC_STDOUT_EXTRA",
+                                  "FAKE_DOCKER_EXEC_STDOUT_FLIP", "FAKE_DOCKER_EXEC_KILLED")
+                      if k in os.environ]
+            only = os.environ.get("FAKE_DOCKER_EXEC_ONLY")
+            if not faults or (only and env.get("NAME") != only):
                 return subprocess.call([sys.executable, "-"], env=env, stdin=sys.stdin)
             child = subprocess.run([sys.executable, "-"], env=env, stdin=sys.stdin,
                                    stdout=subprocess.PIPE)
-            sys.stdout.buffer.write(child.stdout[:int(limit)])
+            if os.environ.get("FAKE_DOCKER_EXEC_KILLED"):
+                # What a SIGKILL between the temp's creation and its cleanup leaves behind.
+                left = os.path.join(env["SNAPDIR"], "%s_snap.k1ll3d.db" % env.get("NAME", "x"))
+                with open(left, "wb") as fh:
+                    fh.write(b"half a snapshot" * 64)
+                return 137
+            data = child.stdout
+            if "FAKE_DOCKER_EXEC_STDOUT_LIMIT" in os.environ:
+                data = data[:int(os.environ["FAKE_DOCKER_EXEC_STDOUT_LIMIT"])]
+            if "FAKE_DOCKER_EXEC_STDOUT_EXTRA" in os.environ:
+                data += os.environ["FAKE_DOCKER_EXEC_STDOUT_EXTRA"].encode()
+            if "FAKE_DOCKER_EXEC_STDOUT_FLIP" in os.environ:
+                at = int(os.environ["FAKE_DOCKER_EXEC_STDOUT_FLIP"])
+                data = data[:at] + bytes([data[at] ^ 0xFF]) + data[at + 1:]
+            sys.stdout.buffer.write(data)
             sys.stdout.buffer.flush()
             return int(os.environ.get("FAKE_DOCKER_EXEC_RC", child.returncode))
     sys.stderr.write("fake docker exec: unsupported %r\n" % (rest,))
