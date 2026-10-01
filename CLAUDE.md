@@ -47,7 +47,7 @@ roles in one process for local dev.
 ```
 uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -r requirements-dev.txt
 # (or: python3.12 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt)
-.venv/bin/python -m pytest -q                         # ~1180 tests, no network, ~3 min
+.venv/bin/python -m pytest -q                         # ~1200 tests, no network, ~3 min
 /usr/bin/python3 -m pytest -o addopts="" tests/test_probes_*.py -q   # ~220 probe tests, MUST pass stdlib-only
 /usr/bin/python3 -m compileall -qf probes/             # 3.9 syntax gate (CI also RUNS the probe tests on 3.9)
 
@@ -395,12 +395,20 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   in TWO nowrap groups — [Edit draft][Reviewed] and, right-aligned, [Close/Reopen][Delete] (Delete LAST),
   all ≥44px — so at 390 px the second pair wraps as a unit; Close and Reopen share a min-width, so a state
   flip never reflows the row. A CLOSED note shows only the second group (reopen before editing or
-  reviewing). Then the meta line. Close/Reopen (`.toggle-state`, notes only) and the Reviewed tick PATCH
-  and reload on success (tiles and badges are server-rendered); a 409 shows the server's reason and
-  reloads. EVERY post-action reload goes through `reloadSafely()`: with unsaved input on the page (a take
-  not yet added, text in the capture box, an open draft editor with changes) it does NOT reload but
-  writes "Saved — refresh to update the counts" into `#action-status`. A control stays disabled from the
-  tap until the reload; only a failure re-enables it (a double tap can never send the opposite PATCH).
+  reviewing). Then the meta line. NO row action reloads the page: the Reviewed tick, Close/Reopen
+  (`.toggle-state`, notes only), a draft save and Delete update the row IN PLACE from the answer. PATCH
+  and DELETE answer with `item_json` plus fresh `counts` (the same `counts()` the tiles render), and
+  `applyItem`/`applyCounts` in inbox.js flip `hidden`, classes and data-* and set textContent — so the
+  template renders BOTH states of everything that can change (both toggle buttons, every badge, the draft
+  lines, the Reviewed label, the first action group), the one not in force `hidden`, and app.css's
+  `[hidden] { display: none !important; }` keeps a hidden badge or group off screen. Keep `applyItem` and
+  the template's conditions in step. A refusal or failure says "Not saved — <reason>" in the row's
+  `.row-error` and leaves every control showing the true state (a tick is reverted). Every control on a
+  row is disabled only while one of its requests is in flight (no double taps, no out-of-order answers).
+  Capture save is the one action that reloads (the new row needs Jinja), and only when nothing else is
+  unsaved — a take recording, starting (permission prompt open) or held, capture text, a dirty draft
+  editor; otherwise it resets what it sent, gives Add back and says "Added — refresh to see it in the
+  list" (`#capture-done`). A `beforeunload` guard asks before leaving while any of that exists.
   Delete's confirmation says "and its recording" only while the note still has one here
   (`data-has-audio`; otherwise "Any backed-up copy of the recording stays in Google Drive …"), and always
   names the Drive copy (`data-drive-path`) for a voice note. Delete is for NOTES only (`inbox.deletable`, `item_json["deletable"]`): a github or backlog row
@@ -437,8 +445,9 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   `'self'`, so an external `<script src>` works ONLY if it also carries the nonce; do not add `'self'`.
   `inbox.js` uses `textContent`, never `innerHTML`, and the rows are rendered server-side — it only
   shows/hides/reorders DOM that is already there, so the table works with JS off. The draft edit form is
-  rendered hidden in each voice row; the script shows it, PATCHes the three fields and reloads.
-  `tests/test_inbox_js.py` RUNS the file in node against a fake DOM (capture and draft editing).
+  rendered hidden in each voice row; the script shows it, PATCHes the three fields and updates the row
+  in place. `tests/test_inbox_js.py` RUNS the file in node against fake DOMs (capture, draft editing,
+  Close/Reopen, and the in-place row and tile updates).
 - Tests must stay network-free: mock `probes.probe_job` / `subprocess.run` and use `RecordingNotifier`.
   `run_probe_cycle` passes `timeout=` to `probe_job`, so a stub must accept it (`lambda job, **kw: …`).
 - Test fixtures pin `jobs.created_at` to 2030 (`conftest.pin_created_at`) so the never-pinged → LATE rule

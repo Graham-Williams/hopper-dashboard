@@ -5,6 +5,7 @@ markup."""
 from __future__ import annotations
 
 import json
+from html.parser import HTMLParser
 
 import pytest
 
@@ -1507,14 +1508,59 @@ def _row(html, item):
     return html.split(f'id="item-{item}"', 1)[1].split("</li>", 1)[0]
 
 
+class _Shown(HTMLParser):
+    """What a rendered fragment SHOWS: text and classes outside every element marked
+    `hidden`. Rows carry both states of whatever an action can change (inbox.js flips
+    `hidden` from the server's answer), so "is it in the HTML" no longer says "is it on
+    screen"."""
+
+    VOID = frozenset({"area", "base", "br", "col", "embed", "hr", "img", "input", "link",
+                      "meta", "source", "track", "wbr"})
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.stack, self.text, self.classes = [], [], set()
+
+    def _hidden(self):
+        return any(hidden for _, hidden in self.stack)
+
+    def handle_starttag(self, tag, attrs):
+        hidden = self._hidden() or any(k == "hidden" for k, _ in attrs)
+        if not hidden:
+            self.classes.update((dict(attrs).get("class") or "").split())
+        if tag not in self.VOID:
+            self.stack.append((tag, hidden))
+
+    def handle_endtag(self, tag):
+        while self.stack:
+            if self.stack.pop()[0] == tag:
+                break
+
+    def handle_data(self, data):
+        if not self._hidden():
+            self.text.append(data)
+
+
+def _shown(fragment):
+    """(visible text, visible classes) of a fragment from `_row` or `_actions`, which start
+    part-way through an opening tag."""
+    if not fragment.lstrip().startswith("<"):
+        fragment = fragment.split(">", 1)[1]
+    parser = _Shown()
+    parser.feed(fragment)
+    parser.close()
+    return " ".join(" ".join(parser.text).split()), parser.classes
+
+
 def test_a_voice_row_shows_draft_transcript_player_and_a_hidden_edit_form(authed, bot):
     item = _drafted(authed, bot)
     row = _row(authed.get("/inbox").data.decode(), item)
     assert '<h3 class="item-title">Fix the sticky wheel</h3>' in row
     assert 'class="item-body draft-body">It sticks.\nOften.</p>' in row
     assert "<details class=\"transcript\">" in row and "the wheel on km tracker sticks" in row
-    assert 'class="player"' in row and 'class="review-box"' in row
-    assert "needs review" in row and 'data-needs-review="1"' in row
+    text, classes = _shown(row)
+    assert 'class="player"' in row and "review-box" in classes
+    assert "needs review" in text and 'data-needs-review="1"' in row
     form = row.split('<form class="draft-edit"', 1)[1].split("</form>", 1)[0]
     assert " hidden>" in form.split("\n", 1)[0]
     assert 'name="draft_title"' in form and 'value="Fix the sticky wheel"' in form
@@ -1531,8 +1577,10 @@ def test_draft_states_are_visible(authed, bot):
         bot.post(f"/api/v1/inbox/items/{failed}/draft", headers=machine(),
                  json={"failed": True, "src_sha": sha})
     html = authed.get("/inbox").data.decode()
-    assert "Drafting…" in _row(html, pending)
-    assert "Couldn't draft — edit to write one" in _row(html, failed)
+    assert "Drafting…" in _shown(_row(html, pending))[0]
+    assert "Couldn't draft" not in _shown(_row(html, pending))[0]
+    assert "Couldn't draft — edit to write one" in _shown(_row(html, failed))[0]
+    assert "Drafting…" not in _shown(_row(html, failed))[0]
     assert 'data-needs-review="1"' in _row(html, failed)
 
 
@@ -1626,7 +1674,7 @@ def test_a_recording_pruned_before_it_was_transcribed_lands_in_needs_review(
                         bot.get("/api/v1/inbox/transcribe/queue", headers=machine())
                         .get_json()["items"]]
     html = _row(authed.get("/inbox").data.decode(), item)
-    assert "Recording expired before it was transcribed" in html
+    assert "Recording expired before it was transcribed" in _shown(html)[0]
     assert "<audio" not in html and "the audio is still here" not in html
 
 
@@ -1638,14 +1686,14 @@ def test_a_missing_recording_is_labelled_and_never_offers_a_dead_player(
     os.remove(os.path.join(settings.inbox_audio_dir, _audio_path(settings, item)))
     # Before the hourly sweep (W-04): no player that would only 410, and a clear label.
     html = _row(authed.get("/inbox").data.decode(), item)
-    assert "Recording missing" in html and "<audio" not in html
+    assert "Recording missing" in _shown(html)[0] and "<audio" not in html
     # The sweep records it on the row (P-14), and the note lands in Needs review.
     assert audio_mod.prune_audio(settings)["cleared"] == 1
     row = _listed(authed, item)
     assert row["audio_missing_at"] and row["transcript_status"] == "failed"
     assert row["needs_review"] is True and row["has_audio"] is False
     html = _row(authed.get("/inbox").data.decode(), item)
-    assert "Recording missing" in html and "<audio" not in html
+    assert "Recording missing" in _shown(html)[0] and "<audio" not in html
     assert "Recording expired" not in html
 
 
@@ -1657,10 +1705,14 @@ def test_notes_get_a_close_or_reopen_button_and_mirrored_rows_do_not(authed, bot
     authed.patch(f"/api/v1/inbox/items/{typed}", json={"state": "closed"})
     gh, bl = _github_row(settings), _backlog_row(authed, bot)
     html = authed.get("/inbox").data.decode()
-    close = _row(html, voice).split('class="toggle-state', 1)[1].split("</button>", 1)[0]
-    assert 'data-to="closed"' in close and "hidden" in close and close.endswith(">Close")
-    reopen = _row(html, typed).split('class="toggle-state', 1)[1].split("</button>", 1)[0]
-    assert 'data-to="open"' in reopen and reopen.endswith(">Reopen")
+    # BOTH buttons on every note, hidden until inbox.js shows the one for the row's state
+    # (and swaps them in place after a PATCH).
+    for note in (voice, typed):
+        buttons = _row(html, note).split('class="toggle-state')[1:]
+        close, reopen = (b.split("</button>", 1)[0] for b in buttons)
+        assert 'data-to="closed"' in close and "hidden" in close and close.endswith(">Close")
+        assert 'data-to="open"' in reopen and "hidden" in reopen and reopen.endswith(">Reopen")
+    assert 'data-state="closed"' in html.split(f'id="item-{typed}"', 1)[1].split(">", 1)[0]
     for mirrored in (gh, bl):
         assert "toggle-state" not in _row(html, mirrored)
     # Delete stays LAST in the action row.
@@ -1691,7 +1743,7 @@ def test_the_action_row_is_two_groups_and_the_second_wraps_as_a_unit(authed, bot
     voice = _drafted(authed, bot)
     actions = _actions(authed.get("/inbox").data.decode(), voice)
     first, second = actions.split('class="action-group action-end"', 1)
-    assert 'class="action-group"' in first
+    assert 'class="action-group action-start"' in first
     assert "edit-draft" in first and "review-box" in first
     assert "toggle-state" in second and "delete-item" in second
     assert second.index("toggle-state") < second.index("delete-item")      # Delete LAST
@@ -1708,11 +1760,17 @@ def test_a_closed_note_offers_reopen_and_delete_but_no_edit_or_review(authed, bo
     voice = _drafted(authed, bot)
     authed.patch(f"/api/v1/inbox/items/{voice}", json={"state": "closed"})
     actions = _actions(authed.get("/inbox").data.decode(), voice)
-    assert "edit-draft" not in actions and "review-box" not in actions
+    # Edit draft and Reviewed are in the first group, and a closed note's is hidden.
+    start = actions.split('class="action-group action-start"', 1)[1].split("</span>\n", 1)[0]
+    assert "hidden" in start.split(">", 1)[0]
+    assert "edit-draft" in start and "review-box" in start
+    assert "review-box" not in _shown(actions)[1]
     assert ">Reopen<" in actions and "delete-item" in actions
     authed.patch(f"/api/v1/inbox/items/{voice}", json={"state": "open"})
     actions = _actions(authed.get("/inbox").data.decode(), voice)
-    assert "edit-draft" in actions and "review-box" in actions
+    start = actions.split('class="action-group action-start"', 1)[1]
+    assert "hidden" not in start.split(">", 1)[0]
+    assert "review-box" in _shown(actions)[1]
 
 
 def test_the_delete_button_says_whether_the_note_still_has_its_recording(authed, bot, settings):
@@ -1729,6 +1787,51 @@ def test_the_delete_button_says_whether_the_note_still_has_its_recording(authed,
     assert 'data-has-audio="1"' in button(live)
     assert "data-has-audio" not in button(lost) and "data-drive-path" in button(lost)
     assert 'title="Delete this note"' in button(lost)
+
+
+# --- in-place updates: the server answers with everything the row and tiles need --- #
+
+def test_patch_and_delete_answer_with_the_derived_fields_and_fresh_counts(authed, bot):
+    voice = _drafted(authed, bot)
+    body = authed.patch(f"/api/v1/inbox/items/{voice}", json={"reviewed": True}).get_json()
+    for key in ("state", "reviewed", "needs_review", "awaiting_filing", "deletable", "draft",
+                "can_tick_reviewed", "title", "project"):
+        assert key in body, key
+    assert body["counts"] == authed.get("/api/v1/inbox/items").get_json()["counts"]
+    gone = authed.delete(f"/api/v1/inbox/items/{voice}").get_json()
+    assert gone["counts"] == authed.get("/api/v1/inbox/items").get_json()["counts"]
+
+
+def _tag(row, cls):
+    """The opening tag of the first element carrying `cls` in a rendered row."""
+    at = row.index(cls)
+    return row[row.rindex("<", 0, at):row.index(">", at) + 1]
+
+
+def test_both_states_of_everything_that_toggles_are_pre_rendered(authed, bot):
+    """inbox.js only flips `hidden`, classes and data-*: every state a PATCH can move a row to
+    must already be in the DOM, server-rendered and escaped."""
+    voice = _drafted(authed, bot)                               # open, needs review
+    pending = _voice_note(authed)["id"]                         # no draft yet: no tick
+    closed = _drafted(authed, bot)
+    authed.patch(f"/api/v1/inbox/items/{closed}", json={"state": "closed"})
+    html = authed.get("/inbox").data.decode()
+    row = _row(html, voice)
+    assert "hidden" not in _tag(row, "badge-review")
+    assert "hidden" in _tag(row, "badge-filing") and "hidden" in _tag(row, "badge-closed")
+    close = _tag(row, 'data-to="closed"')
+    reopen = _tag(row, 'data-to="open"')
+    assert "toggle-state" in close and "toggle-state" in reopen   # both, wired by inbox.js
+    assert "hidden" not in _tag(row, "action-start")
+    assert "hidden" in _tag(row, "row-error")
+    assert "hidden" in _tag(_row(html, pending), 'class="review"')   # rendered, not offered
+    crow = _row(html, closed)
+    assert "hidden" not in _tag(crow, "badge-closed")
+    assert "hidden" in _tag(crow, "action-start")               # reopen first
+    # The tiles carry what the counts update.
+    for key in ("needs_review", "open", "total"):
+        assert f'data-count="{key}"' in html
+    assert 'id="action-status"' not in html                     # no "Saved — refresh" line
 
 
 # --- ?state=archived: rows whose upstream is gone are findable (B-03) --------- #
@@ -1760,8 +1863,8 @@ def test_a_voice_note_cannot_be_reviewed_before_it_has_a_draft(authed, bot):
     assert not listed[pending]["reviewed"] and not listed[drafting]["awaiting_filing"]
     # No Reviewed box to tick, either, until there is something to review.
     html = authed.get("/inbox").data.decode()
-    assert 'class="review-box"' not in _row(html, pending)
-    assert 'class="review-box"' not in _row(html, drafting)
+    assert "review-box" not in _shown(_row(html, pending))[1]
+    assert "review-box" not in _shown(_row(html, drafting))[1]
 
 
 def test_a_failed_draft_can_be_reviewed_once_graham_writes_one(authed, bot):
@@ -2265,7 +2368,8 @@ def test_a_failed_transcript_says_why_on_the_board(authed, bot, settings):
     body = authed.get("/api/v1/inbox/items?awaiting=review").get_json()
     assert [i["id"] for i in body["items"]] == [item] and body["items"][0]["needs_review"]
     row = _row(authed.get("/inbox").data.decode(), item)
-    assert "Whisper couldn't transcribe this" in row and "Drafting…" not in row
+    text = _shown(row)[0]
+    assert "Whisper couldn't transcribe this" in text and "Drafting…" not in text
 
 
 def test_a_failed_draft_post_needs_its_src_sha(authed, bot, settings):

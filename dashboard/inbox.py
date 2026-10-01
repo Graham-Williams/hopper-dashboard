@@ -679,7 +679,11 @@ def patch_item(item_id: str):
         if row is None:
             return _err("no such item", 404)
         issues = inbox_db.issues_for(conn, [row["id"]]).get(row["id"], [])
-        return jsonify(item_json(row, issues))
+        # The page updates the row and the tiles IN PLACE from this answer (no reload): the
+        # item's derived fields, and the same counts() the tiles are rendered from.
+        body = item_json(row, issues)
+        body["counts"] = inbox_db.counts(conn)
+        return jsonify(body)
     finally:
         conn.close()
 
@@ -720,6 +724,7 @@ def delete_item(item_id: str):
                 current["source"], "only a voice or typed note can be deleted"), 409)
         with conn:
             row = inbox_db.delete_item(conn, item_id)
+        counts = inbox_db.counts(conn)          # for the page's tiles (no reload)
     finally:
         conn.close()
     if row is None:
@@ -734,7 +739,7 @@ def delete_item(item_id: str):
             log.warning("inbox: deleted item %s but its audio file remains; "
                         "the orphan sweep will collect it", row["id"])
     return jsonify({"deleted": row["id"], "had_audio": bool(row["audio_path"]),
-                    "audio_removed": audio_removed})
+                    "audio_removed": audio_removed, "counts": counts})
 
 
 @bp.get("/inbox/audio/<item_id>")

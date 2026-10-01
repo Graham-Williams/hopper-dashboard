@@ -645,6 +645,16 @@ transcript and the audio prune depends on it being Whisper's. Rules:
   also matches the draft title and body.
 - `PATCH /api/v1/inbox/items/<id>` accepts `draft_title`, `draft_body`, `draft_project` (voice only; same
   session / Origin / limiter rules).
+- PATCH answers with the item AND fresh `counts`; DELETE answers `{deleted, had_audio, audio_removed,
+  counts}` — the same `counts()` the tiles are rendered from. That is what lets the page update in place:
+  **no row action reloads it** (the Reviewed tick, Close, Reopen, a draft save, Delete). Each row is
+  rendered with both states of everything an action can change, the one not in force `hidden`, and
+  inbox.js flips `hidden`, classes and data-* from the answer (never markup). A refusal shows "Not saved —
+  <reason>" on the row and leaves every control showing the true state. Capture save still reloads — the
+  new row needs server rendering — but never over input that is not saved anywhere (a take recording,
+  starting or held, capture text, an open draft editor with changes): then it resets what it sent and
+  says "Added — refresh to see it in the list". A `beforeunload` guard asks before leaving while any of
+  that exists.
 - `GET /api/v1/inbox/draft/queue` (INBOX_TOKEN) → `{items: [{id, transcript, manual_title, project, sha}],
   known_projects, max_attempts, max_title, max_body}`. Oldest first; includes the backfill (transcribed
   notes with no draft) and notes whose draft is stale. `known_projects` = the repo names of

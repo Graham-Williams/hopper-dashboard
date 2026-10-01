@@ -42,6 +42,10 @@
 }
 
 * { box-sizing: border-box; }
+/* `hidden` always wins. inbox.js shows and hides pre-rendered elements by flipping the
+   attribute, and one whose class sets `display` (a badge, an action group, the Reviewed
+   pill) would otherwise stay on screen with it set. */
+[hidden] { display: none !important; }
 html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
 body {
   margin: 0; background: var(--ground); color: var(--ink);
@@ -270,10 +274,7 @@ details.about-recordings summary { min-height: 44px; display: flex; align-items:
 .item .player { display: block; width: 100%; height: 40px; margin-top: .5rem; }
 .item-actions { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem;
                 margin-top: .6rem; }
-/* Stays in view while scrolling the list, so the note an action was taken on is not the
-   only place "refresh to update the counts" could be read. */
-.action-status { position: sticky; top: 3.75rem; z-index: 1; margin: 0 0 .5rem;
-  padding: .35rem .6rem; border-radius: 6px; background: var(--panel-2); }
+.row-error { margin: .4rem 0 0; }
 
 /* Two groups, each kept together; the second (Close/Reopen + Delete) is right-aligned and
    wraps as a unit, so the row never splits a pair at 390 px. */
@@ -377,7 +378,6 @@ details.transcript summary { cursor: pointer; color: var(--link); min-height: 44
 details.transcript .item-body { color: var(--muted); margin-top: 0; }
 .draft-edit { display: flex; flex-direction: column; gap: .5rem; margin-top: .6rem;
               padding: .7rem; border-radius: 8px; background: var(--panel-2); }
-.draft-edit[hidden] { display: none; }
 .edit-actions { display: flex; gap: .5rem; }
 .edit-actions button { flex: 1 1 0; }
 button.secondary { background: transparent; color: var(--link); border: 1px solid var(--rule); }

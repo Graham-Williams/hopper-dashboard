@@ -18,10 +18,12 @@
 
    Three rules this file may not break, all of them load-bearing:
 
-   1. It NEVER assigns innerHTML and is never handed a JSON blob of transcripts.
-      Every row is rendered server-side by Jinja; this script only shows, hides
-      and re-labels DOM that already exists. Text it writes goes through
-      textContent.
+   1. It NEVER assigns innerHTML and is never handed a JSON blob of transcripts
+      inside the page. Every row is rendered server-side by Jinja, with BOTH states
+      of everything an action can change already in it; after a tick, Close, Reopen,
+      Delete or a draft save this script updates the row IN PLACE from the server's
+      answer: it flips `hidden`, classes and data-* attributes, and writes text
+      through textContent. It never builds markup.
    2. It NEVER plays audio from a `blob:` URL. That would need `media-src blob:`
       in the CSP, and the CSP is not being loosened for a preview — playback
       happens from /inbox/audio/<id> after the note is saved.
@@ -73,33 +75,36 @@
     setText(errEl, message);
   }
 
-  /* ONE way to reload after an action (a tick, Close, Reopen, a 409, a saved draft or
-     note), and it never throws away what is on the page but not saved: a recorded take not
-     yet added, text in the capture box, or an open draft editor with changes. Then the
-     action still happened; the page says so and waits for a manual refresh. */
-  var actionStatusEl = document.getElementById('action-status');
+  /* "Added — refresh to see it in the list": a capture save that could not reload. */
+  var doneEl = document.getElementById('capture-done');
+  function done(message) {
+    setText(doneEl, message);
+  }
+
+  /* Everything on this page that is NOT saved anywhere yet: a take being recorded or
+     about to be (a permission prompt is open), a take recorded but not yet added, text in
+     the capture box, and an open draft editor with changes. Nothing may reload over it:
+     a capture save holds back its reload and the beforeunload guard asks first. */
   function unsavedInput() {
+    if (starting) { return true; }
+    if (recorder && recorder.state === 'recording') { return true; }
     if (recordedBlob) { return true; }
     if (textEl && String(textEl.value || '').trim()) { return true; }
     var editForms = document.querySelectorAll('form.draft-edit');
     for (var f = 0; f < editForms.length; f++) {
-      var editForm = editForms[f];
-      if (editForm.hidden || !editForm.querySelectorAll) { continue; }
-      var fields = editForm.querySelectorAll('input, textarea');
-      for (var k = 0; k < fields.length; k++) {
-        if (String(fields[k].value || '') !== String(fields[k].defaultValue || '')) {
-          return true;
-        }
-      }
+      if (!editForms[f].hidden && formIsDirty(editForms[f])) { return true; }
     }
     return false;
   }
-  function reloadSafely() {
-    if (unsavedInput()) {
-      setText(actionStatusEl, 'Saved — refresh to update the counts');
-      return;
+
+  function formIsDirty(formEl) {
+    var fields = formEl.querySelectorAll ? formEl.querySelectorAll('input, textarea') : [];
+    for (var k = 0; k < fields.length; k++) {
+      if (String(fields[k].value || '') !== String(fields[k].defaultValue || '')) {
+        return true;
+      }
     }
-    window.location.reload();
+    return false;
   }
 
   /* ------------------------------------------------------------------ */
@@ -468,56 +473,297 @@
     }
   }
 
+  /* A refresh, pull-to-refresh, a filter's Apply or closing the tab would silently lose a
+     take or typing that lives nowhere but this page: the browser asks first instead. */
+  window.addEventListener('beforeunload', function (event) {
+    if (!unsavedInput()) { return undefined; }
+    if (event.preventDefault) { event.preventDefault(); }
+    event.returnValue = '';
+    return '';
+  });
+
   /* ------------------------------------------------------------------ */
   /* Submit                                                             */
   /* ------------------------------------------------------------------ */
 
+  /* The answer to any fetch here, read ONCE: {ok, status, body}. A body that is not JSON
+     (a proxy's error page) is {}. Rejects only when the request never got an answer. */
+  function readAnswer(response) {
+    var parsed;
+    try { parsed = response.json(); } catch (e) { parsed = null; }
+    return Promise.resolve(parsed).catch(function () { return null; }).then(function (body) {
+      return {ok: !!response.ok, status: response.status,
+              body: (body && typeof body === 'object') ? body : {}};
+    });
+  }
+
+  /* The reason a save was refused, in the server's words when it gave any. */
+  function reasonOf(answer) {
+    var error = answer && answer.body && answer.body.error;
+    if (typeof error === 'string' && error) { return error; }
+    return 'the server answered ' + ((answer && answer.status) || 'with an error');
+  }
+  var OFFLINE = 'check your connection';
+
+  /* The capture form's own fields, as they were sent. */
+  function captureFields() {
+    var names = ['text', 'project', 'title'];
+    var out = [];
+    for (var i = 0; i < names.length; i++) {
+      var input = form.querySelector ? form.querySelector('[name="' + names[i] + '"]') : null;
+      if (!input && names[i] === 'text') { input = textEl; }
+      if (input) { out.push({el: input, value: String(input.value || '')}); }
+    }
+    return out;
+  }
+
   if (form && window.fetch && window.FormData) {
     form.addEventListener('submit', function (event) {
       event.preventDefault();
+      if (submitBtn && submitBtn.disabled) { return; }   // one request per tap
       fail('');
+      done('');
       var data = new FormData(form);
-      if (recordedBlob) {
-        data.set('audio', recordedBlob, 'note.' + extensionFor(recordedBlob.type));
+      /* What THIS request carries. A take recorded or text typed while it is in flight
+         is not part of it, and must still be here afterwards. */
+      var sentBlob = recordedBlob;
+      var sentFields = captureFields();
+      if (sentBlob) {
+        data.set('audio', sentBlob, 'note.' + extensionFor(sentBlob.type));
         data.set('audio_secs', String(recordedSecs));
       }
-      if (!recordedBlob && !String(data.get('text') || '').trim()) {
+      if (!sentBlob && !String(data.get('text') || '').trim()) {
         fail('Say something or type something first.');
         if (textEl) { textEl.focus(); }
         return;
       }
       if (submitBtn) { submitBtn.disabled = true; }
+      var heldStatus = statusEl ? statusEl.textContent : '';
       status('Saving…');
+      function restoreStatus() {
+        if (statusEl && statusEl.textContent === 'Saving…') { status(heldStatus); }
+      }
       window.fetch(form.action, {
         method: 'POST',
         body: data,
         credentials: 'same-origin',
         headers: {'Accept': 'application/json'}
-      }).then(function (response) {
-        return response.json().catch(function () { return {}; }).then(function (body) {
-          if (!response.ok) {
-            throw new Error(body.error || ('save failed (' + response.status + ')'));
-          }
-          /* Say it landed BEFORE reloading. A voice note has no transcript yet
-             (nothing leaves this box, so Whisper on the Mac does it on its next
-             pass), and "did that even record?" is the question this page has to
-             answer out loud. */
-          status(recordedBlob
-                 ? 'Saved — transcribing… Whisper picks it up within a few minutes.'
-                 : 'Saved.');
-          /* What was just saved is no longer unsaved input. */
-          recordedBlob = null;
-          if (textEl) { textEl.value = ''; }
-          /* Reload rather than building a row here: rows are server-rendered,
-             and that is the rule that keeps untrusted text out of the DOM by
-             any path but Jinja's escaping. The query string (the filters) is
-             preserved. */
-          window.setTimeout(reloadSafely, 700);
-        });
-      }).catch(function (err) {
+      }).then(readAnswer).then(function (answer) {
+        /* Add is given back on EVERY outcome: it is disabled only while this is in flight. */
         if (submitBtn) { submitBtn.disabled = false; }
-        status('');
-        fail(err && err.message ? err.message : 'Could not save — try again.');
+        if (!answer.ok) {
+          /* Nothing was saved, so nothing is cleared: the take and the text are still
+             here for another press of Add. */
+          restoreStatus();
+          fail('Not saved — ' + reasonOf(answer));
+          return;
+        }
+        added(sentBlob, sentFields);
+      }, function () {
+        if (submitBtn) { submitBtn.disabled = false; }
+        restoreStatus();
+        fail('Not saved — ' + OFFLINE + '. The note is still here: press “Add to inbox” ' +
+             'to try again.');
+      });
+    });
+  }
+
+  /* A capture save landed. The new row needs server rendering, so this is the ONE action
+     that reloads — but never over input that is not saved yet. */
+  function added(sentBlob, sentFields) {
+    /* What was sent is saved: clear exactly that, and nothing typed or recorded since. */
+    if (sentBlob && recordedBlob === sentBlob) {
+      recordedBlob = null;
+      recordedSecs = 0;
+      recordedBytes = 0;
+      updateLevel();
+    }
+    for (var i = 0; i < sentFields.length; i++) {
+      if (String(sentFields[i].el.value || '') === sentFields[i].value) {
+        sentFields[i].el.value = '';
+      }
+    }
+    /* Say it landed. A voice note has no transcript yet (nothing leaves this box, so
+       Whisper on the Mac does it on its next pass), and "did that even record?" is the
+       question this page has to answer out loud. */
+    if (statusEl && statusEl.textContent === 'Saving…') {
+      status(sentBlob
+             ? 'Saved — transcribing… Whisper picks it up within a few minutes.'
+             : 'Saved.');
+    }
+    /* Reload rather than building a row here: rows are server-rendered, and that is the
+       rule that keeps untrusted text out of the DOM by any path but Jinja's escaping. The
+       query string (the filters) is preserved. Checked when the moment comes, so a take
+       started in the meantime is not reloaded over either. */
+    window.setTimeout(function () {
+      if (unsavedInput()) {
+        done('Added — refresh to see it in the list');
+        return;
+      }
+      window.location.reload();
+    }, 700);
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* A row, updated in place                                            */
+  /* ------------------------------------------------------------------ */
+
+  /* Every row action (the Reviewed tick, Close, Reopen, a draft save, Delete) answers
+     with the item's derived fields and fresh `counts`, and the page is updated from that
+     answer — never reloaded. The row already holds both states of everything that can
+     change (the template renders the one not in force `hidden`), so this only flips
+     `hidden`, classes and data-*, and sets textContent. */
+
+  function rowOf(control) {
+    var id = control && control.getAttribute ? control.getAttribute('data-id') : null;
+    return id ? document.getElementById('item-' + id) : null;
+  }
+
+  function each(root, selector, fn) {
+    var found = root && root.querySelectorAll ? root.querySelectorAll(selector) : [];
+    for (var i = 0; i < found.length; i++) { fn(found[i]); }
+  }
+
+  function show(root, selector, visible) {
+    each(root, selector, function (node) { node.hidden = !visible; });
+  }
+
+  /* "Not saved — <reason>", on the row itself. A row without its error line (an old
+     cached page) falls back to the capture panel's. */
+  function rowError(row, message) {
+    var line = row && row.querySelector ? row.querySelector('.row-error') : null;
+    if (line) {
+      setText(line, message);
+    } else if (message) {
+      fail(message);
+    }
+  }
+
+  /* A control is disabled ONLY while a request is in flight, and while one is, every
+     control on that row is: two answers about one row can never land out of order. */
+  var ROW_CONTROLS = '.review-box, .toggle-state, .delete-item, .edit-save';
+  function setBusy(row, busy, control) {
+    each(row, ROW_CONTROLS, function (node) { node.disabled = busy; });
+    if (control) { control.disabled = busy; }
+  }
+
+  /* One request about one item. Resolves to readAnswer's {ok, status, body}; rejects
+     only when no answer came back at all. */
+  function send(id, method, payload) {
+    var init = {method: method, credentials: 'same-origin',
+                headers: {'Accept': 'application/json'}};
+    if (payload !== undefined) {
+      init.headers['Content-Type'] = 'application/json';
+      init.body = JSON.stringify(payload);
+    }
+    return window.fetch('/api/v1/inbox/items/' + encodeURIComponent(id), init)
+      .then(readAnswer);
+  }
+
+  /* Close shows on an open note, Reopen on a closed one; never both. */
+  function toggleShown(state, to) {
+    return (state === 'open' && to === 'closed') || (state === 'closed' && to === 'open');
+  }
+
+  function showToggles(row, state) {
+    each(row, '.toggle-state', function (btn) {
+      btn.hidden = !toggleShown(state, btn.getAttribute('data-to'));
+    });
+  }
+
+  /* The tiles: Needs review, Open and the item total, from the same counts() the page
+     was rendered with. */
+  function applyCounts(counts) {
+    if (!counts || typeof counts !== 'object') { return; }
+    Object.keys(counts).forEach(function (key) {
+      var n = counts[key];
+      if (typeof n !== 'number') { return; }
+      each(document, '[data-count="' + key + '"]', function (node) {
+        node.textContent = String(n);
+        var tile = node.parentNode;
+        if (tile && tile.classList && tile.classList.contains('tile')) {
+          tile.classList.toggle('zero', n === 0);
+        }
+      });
+      each(document, '[data-plural-of="' + key + '"]', function (node) {
+        node.textContent = n === 1 ? 'item' : 'items';
+      });
+    });
+  }
+
+  /* The row, from the item as the server now has it (inbox.item_json). The same rules
+     the template renders it with — keep the two in step. */
+  function applyItem(row, item) {
+    if (!item || typeof item !== 'object') { return; }
+    applyCounts(item.counts);
+    if (!row || !item.id) { return; }
+    var draft = item.draft || {};
+    var voice = item.source === 'voice';
+    var closed = item.state === 'closed';
+    var needsReview = !!item.needs_review;
+    var filing = !needsReview && !!item.awaiting_filing;
+
+    /* data-*: what the live filters read. */
+    row.setAttribute('data-state', item.archived_at ? 'archived' : item.state);
+    row.setAttribute('data-reviewed', item.reviewed ? '1' : '0');
+    row.setAttribute('data-needs-review', needsReview ? '1' : '0');
+    row.setAttribute('data-awaiting-filing', item.awaiting_filing ? '1' : '0');
+    row.setAttribute('data-awaiting-transcription', item.awaiting_transcription ? '1' : '0');
+    row.setAttribute('data-project', item.project || '');
+    row.setAttribute('data-text', [item.title || '', item.body || '', item.project || '',
+                                   draft.title || '', draft.body || ''].join(' ').toLowerCase());
+    row.classList.toggle('item-review', needsReview);
+    row.classList.toggle('item-filing', filing);
+    row.classList.toggle('state-open', item.state === 'open');
+    row.classList.toggle('state-closed', closed);
+
+    /* Badges. */
+    show(row, '.badge-review', needsReview);
+    show(row, '.badge-filing', filing);
+    show(row, '.badge-closed', closed);
+    each(row, '.head-project', function (node) {
+      node.textContent = item.project || '';
+      node.hidden = !item.project;
+    });
+
+    /* The title: a voice note shows its draft's until it is reviewed. */
+    each(row, '.item-title', function (node) {
+      node.textContent = (voice && draft.title && !item.reviewed) ? draft.title : item.title;
+    });
+
+    /* The draft and its one status line (the same order as the template). */
+    each(row, '.draft-body', function (node) {
+      node.textContent = draft.body || '';
+      node.hidden = !draft.body;
+    });
+    each(row, '.draft-project', function (node) { node.textContent = draft.project || ''; });
+    show(row, '.draft-project-line', !!draft.project && draft.project !== item.project);
+    var noTranscript = row.querySelector('.no-transcript');
+    var noTranscriptOn = !!noTranscript && !item.reviewed && !draft.body;
+    if (noTranscript) { noTranscript.hidden = !noTranscriptOn; }
+    var pendingOn = !noTranscriptOn && draft.status === 'pending' && !item.reviewed;
+    show(row, '.draft-pending', pendingOn);
+    show(row, '.draft-failed-line', !noTranscriptOn && !pendingOn &&
+                                    draft.status === 'failed' && !draft.edited_at);
+
+    /* Controls: a closed note offers only Reopen and Delete. */
+    show(row, '.action-start', !closed);
+    show(row, 'label.review', !!item.can_tick_reviewed);
+    each(row, '.review-box', function (box) { box.checked = !!item.reviewed; });
+    showToggles(row, item.state);
+
+    /* The editor's fields follow the saved draft, unless they hold changes of Graham's
+       that are not saved yet. */
+    each(row, 'form.draft-edit', function (formEl) {
+      if (formIsDirty(formEl)) { return; }
+      var values = {draft_title: draft.title, draft_body: draft.body,
+                    draft_project: draft.project};
+      Object.keys(values).forEach(function (name) {
+        var input = formEl.querySelector('[name="' + name + '"]');
+        if (input) {
+          input.value = values[name] || '';
+          input.defaultValue = values[name] || '';
+        }
       });
     });
   }
@@ -526,216 +772,191 @@
   /* Reviewed checkbox                                                  */
   /* ------------------------------------------------------------------ */
 
-  var boxes = document.querySelectorAll('.review-box');
-  for (var b = 0; b < boxes.length; b++) {
-    (function (box) {
-      box.addEventListener('change', function () {
-        if (box.disabled) { return; }      // one request per tap
-        var id = box.getAttribute('data-id');
-        var wanted = box.checked;
-        /* Disabled from here until the reload; only a failure gives it back, so a
-           second tap can never send the opposite PATCH. */
-        box.disabled = true;
-        window.fetch('/api/v1/inbox/items/' + encodeURIComponent(id), {
-          method: 'PATCH',
-          credentials: 'same-origin',
-          headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
-          body: JSON.stringify({reviewed: wanted})
-        }).then(function (response) {
-          if (response.status === 409) {
-            /* The row changed underneath the tick (a new draft landed): the server
-               wrote nothing. Say why, then reload so Graham reviews what is really
-               there — the same message path the draft editor uses. */
-            return response.json().catch(function () { return {}; }).then(function (body) {
-              box.checked = !wanted;
-              fail(body.error || 'That item changed — reloading.');
-              window.setTimeout(reloadSafely, 1500);
-            });
-          }
-          if (!response.ok) { throw new Error('save failed'); }
-          /* Reload, like Close/Reopen: the badge, the Needs review tile and the Hub
-             counts are all server-rendered (BR-04). */
-          reloadSafely();
-        }).catch(function () {
-          /* Put the box back and SAY so. A checkbox that silently un-ticks
-             itself on the next page load is how a review decision gets lost. */
+  each(document, '.review-box', function (box) {
+    box.addEventListener('change', function () {
+      if (box.disabled) { return; }      // one request per tap
+      var row = rowOf(box);
+      var wanted = !!box.checked;
+      rowError(row, '');
+      setBusy(row, true, box);
+      send(box.getAttribute('data-id'), 'PATCH', {reviewed: wanted}).then(function (answer) {
+        setBusy(row, false, box);
+        if (!answer.ok) {
+          /* Nothing was written (a 409: a new draft landed, or there is nothing to
+             review yet). The box goes back to what is TRUE, and the row says why. */
           box.checked = !wanted;
-          box.disabled = false;
-          fail('Could not save that review tick — check your connection.');
-        });
+          rowError(row, 'Not saved — ' + reasonOf(answer));
+          return;
+        }
+        applyItem(row, answer.body);
+      }, function () {
+        /* Put the box back and SAY so. A checkbox that silently un-ticks itself on the
+           next page load is how a review decision gets lost. */
+        setBusy(row, false, box);
+        box.checked = !wanted;
+        rowError(row, 'Not saved — ' + OFFLINE);
       });
-    })(boxes[b]);
-  }
+    });
+  });
 
   /* ------------------------------------------------------------------ */
   /* Close / Reopen a note                                              */
   /* ------------------------------------------------------------------ */
 
-  /* The existing PATCH state. On success the page reloads: the badge, the
-     tiles, the filters and which rows are hidden are all server-rendered. */
-  var toggles = document.querySelectorAll('.toggle-state');
-  for (var tg = 0; tg < toggles.length; tg++) {
-    (function (btn) {
-      btn.hidden = false;          // only shown once it actually works
-      btn.addEventListener('click', function () {
-        if (btn.disabled) { return; }      // one request per tap
-        var id = btn.getAttribute('data-id');
-        var to = btn.getAttribute('data-to') === 'open' ? 'open' : 'closed';
-        /* Disabled until the reload; only a failure gives it back. */
-        btn.disabled = true;
-        fail('');
-        window.fetch('/api/v1/inbox/items/' + encodeURIComponent(id), {
-          method: 'PATCH',
-          credentials: 'same-origin',
-          headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
-          body: JSON.stringify({state: to})
-        }).then(function (response) {
-          if (response.status === 409) {
-            /* The server wrote nothing: say why, then show what is really there. */
-            return response.json().catch(function () { return {}; }).then(function (body) {
-              fail(body.error || 'That item changed — reloading.');
-              window.setTimeout(reloadSafely, 1500);
-            });
-          }
-          if (!response.ok) { throw new Error('save failed'); }
-          reloadSafely();
-        }).catch(function () {
-          btn.disabled = false;
-          fail('Could not ' + (to === 'closed' ? 'close' : 'reopen') +
-               ' that item — check your connection.');
-        });
+  /* Both buttons are rendered, hidden (they need this script); the one for the row's
+     state is shown here, and an answer swaps them. */
+  each(document, '.toggle-state', function (btn) {
+    var row = rowOf(btn);
+    var state = row ? row.getAttribute('data-state')
+                    : (btn.getAttribute('data-to') === 'open' ? 'closed' : 'open');
+    var to = btn.getAttribute('data-to') === 'open' ? 'open' : 'closed';
+    btn.hidden = !toggleShown(state, to);
+    btn.addEventListener('click', function () {
+      if (btn.disabled) { return; }      // one request per tap
+      rowError(row, '');
+      setBusy(row, true, btn);
+      send(btn.getAttribute('data-id'), 'PATCH', {state: to}).then(function (answer) {
+        setBusy(row, false, btn);
+        if (!answer.ok) {
+          rowError(row, 'Not saved — ' + reasonOf(answer));
+          return;
+        }
+        applyItem(row, answer.body);
+        /* The pressed button is now hidden: keep the focus on the row's other one. */
+        if (btn.hidden && row) {
+          var other = row.querySelector('.toggle-state[data-to="' +
+                                        (to === 'closed' ? 'open' : 'closed') + '"]');
+          if (other && !other.hidden && other.focus) { other.focus(); }
+        }
+      }, function () {
+        setBusy(row, false, btn);
+        rowError(row, 'Not saved — ' + OFFLINE);
       });
-    })(toggles[tg]);
-  }
+    });
+  });
 
   /* ------------------------------------------------------------------ */
   /* Edit a voice note's draft                                          */
   /* ------------------------------------------------------------------ */
 
   /* The form is rendered server-side, hidden, inside each voice row. This only
-     shows/hides it and PATCHes its three fields; on success the page reloads so
-     the row is re-rendered by Jinja (the same rule capture follows). Nothing
-     here builds markup or reads a value back into the DOM. */
-  var editors = document.querySelectorAll('.edit-draft');
-  for (var ed = 0; ed < editors.length; ed++) {
-    (function (btn) {
-      var id = btn.getAttribute('data-id');
-      var formEl = document.getElementById('edit-' + id);
-      if (!formEl) { return; }
-      btn.hidden = false;          // only shown once it actually works
-      var cancel = formEl.querySelector('.edit-cancel');
-      var save = formEl.querySelector('.edit-save');
-      function field(name) {
-        var input = formEl.querySelector('[name="' + name + '"]');
-        return input ? String(input.value || '') : '';
-      }
-      function close() {
-        formEl.hidden = true;
-        btn.hidden = false;
-        btn.setAttribute('aria-expanded', 'false');
-      }
-      btn.addEventListener('click', function () {
-        formEl.hidden = false;
-        btn.hidden = true;
-        btn.setAttribute('aria-expanded', 'true');
-        var first = formEl.querySelector('[name="draft_title"]');
-        if (first && first.focus) { first.focus(); }
+     shows/hides it and PATCHes its three fields; the answer updates the row in place.
+     Nothing here builds markup. */
+  each(document, '.edit-draft', function (btn) {
+    var id = btn.getAttribute('data-id');
+    var formEl = document.getElementById('edit-' + id);
+    if (!formEl) { return; }
+    btn.hidden = false;          // only shown once it actually works
+    var cancel = formEl.querySelector('.edit-cancel');
+    var save = formEl.querySelector('.edit-save');
+    function field(name) {
+      var input = formEl.querySelector('[name="' + name + '"]');
+      return input ? String(input.value || '') : '';
+    }
+    function close() {
+      formEl.hidden = true;
+      btn.hidden = false;
+      btn.setAttribute('aria-expanded', 'false');
+    }
+    btn.addEventListener('click', function () {
+      formEl.hidden = false;
+      btn.hidden = true;
+      btn.setAttribute('aria-expanded', 'true');
+      var first = formEl.querySelector('[name="draft_title"]');
+      if (first && first.focus) { first.focus(); }
+    });
+    if (cancel) {
+      cancel.addEventListener('click', function () {
+        /* Put the fields back to the saved draft, so a cancelled edit cannot be saved
+           by accident later. */
+        if (formEl.reset) { formEl.reset(); }
+        close();
       });
-      if (cancel) {
-        cancel.addEventListener('click', function () {
-          /* Put the fields back to what the server rendered, so a cancelled
-             edit cannot be saved by accident later. */
-          if (formEl.reset) { formEl.reset(); }
-          close();
-        });
-      }
-      formEl.addEventListener('submit', function (event) {
-        event.preventDefault();
-        fail('');
-        if (save && save.disabled) { return; }   // one request per tap
-        var project = field('draft_project').trim();
-        /* Disabled until the reload; only a failure gives it back. */
-        if (save) { save.disabled = true; }
-        window.fetch('/api/v1/inbox/items/' + encodeURIComponent(id), {
-          method: 'PATCH',
-          credentials: 'same-origin',
-          headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
-          body: JSON.stringify({draft_title: field('draft_title'),
-                                draft_body: field('draft_body'),
-                                draft_project: project || null})
-        }).then(function (response) {
-          return response.json().catch(function () { return {}; }).then(function (body) {
-            if (!response.ok) {
-              throw new Error(body.error || ('save failed (' + response.status + ')'));
-            }
-            /* Saved: these values are no longer unsaved input. */
-            var saved = formEl.querySelectorAll ? formEl.querySelectorAll('input, textarea') : [];
-            for (var sv = 0; sv < saved.length; sv++) { saved[sv].defaultValue = saved[sv].value; }
-            close();
-            reloadSafely();
-          });
-        }).catch(function (err) {
-          /* Keep the form open with what was typed: an edit is never thrown
-             away because the network blinked. */
-          if (save) { save.disabled = false; }
-          fail('Could not save that draft — ' +
-               (err && err.message ? err.message : 'check your connection.'));
-        });
+    }
+    formEl.addEventListener('submit', function (event) {
+      event.preventDefault();
+      if (save && save.disabled) { return; }   // one request per tap
+      var row = rowOf(btn);
+      rowError(row, '');
+      var project = field('draft_project').trim();
+      setBusy(row, true, save);
+      send(id, 'PATCH', {draft_title: field('draft_title'),
+                         draft_body: field('draft_body'),
+                         draft_project: project || null}).then(function (answer) {
+        setBusy(row, false, save);
+        if (!answer.ok) {
+          /* Keep the form open with what was typed: an edit is never thrown away. */
+          rowError(row, 'Not saved — ' + reasonOf(answer));
+          return;
+        }
+        /* Saved: these values are no longer unsaved input. */
+        each(formEl, 'input, textarea', function (input) { input.defaultValue = input.value; });
+        close();
+        applyItem(row, answer.body);
+      }, function () {
+        setBusy(row, false, save);
+        rowError(row, 'Not saved — ' + OFFLINE);
       });
-    })(editors[ed]);
-  }
+    });
+  });
 
   /* ------------------------------------------------------------------ */
   /* Delete (the only way a recording of Graham's voice leaves the box)  */
   /* ------------------------------------------------------------------ */
 
-  var deleters = document.querySelectorAll('.delete-item');
-  for (var d = 0; d < deleters.length; d++) {
-    (function (btn) {
-      btn.hidden = false;          // only shown once it actually works
-      btn.addEventListener('click', function () {
-        var id = btn.getAttribute('data-id');
-        var drivePath = btn.getAttribute('data-drive-path');
-        /* A confirm step, because this destroys the row AND its audio and
-           there is no undo. `confirm` is deliberate: a bespoke modal would be
-           more DOM for no more safety. It names what Delete does NOT reach: the
-           Drive backup of the recording is add-only. */
-        /* "and its recording" only while the note still has one HERE (an expired or
-           missing recording is already gone) — but its Drive copy may still exist. */
-        var hasAudio = btn.getAttribute('data-has-audio') === '1';
-        var question = drivePath
-          ? (hasAudio
-               ? 'Delete this note and its recording from the Hub? This cannot be undone.' +
-                 '\n\nA copy of its recording already backed up stays in Google Drive ('
-               : 'Delete this note from the Hub? This cannot be undone.' +
-                 '\n\nAny backed-up copy of the recording stays in Google Drive (') +
-            drivePath + ' in the backup folder) until you remove it there by hand.'
-          : 'Delete this note? This cannot be undone.';
-        if (!window.confirm(question)) { return; }
-        btn.disabled = true;
-        window.fetch('/api/v1/inbox/items/' + encodeURIComponent(id), {
-          method: 'DELETE',
-          credentials: 'same-origin',
-          headers: {'Accept': 'application/json'}
-        }).then(function (response) {
-          if (!response.ok && response.status !== 404) {
-            throw new Error('delete failed');
-          }
-          var row = document.getElementById('item-' + id);
-          if (row && row.parentNode) { row.parentNode.removeChild(row); }
-        }).catch(function () {
-          btn.disabled = false;
-          fail('Could not delete that item — check your connection.');
-        });
+  var shownEl = document.getElementById('items-shown');
+
+  each(document, '.delete-item', function (btn) {
+    btn.hidden = false;          // only shown once it actually works
+    btn.addEventListener('click', function () {
+      if (btn.disabled) { return; }      // one request per tap
+      var id = btn.getAttribute('data-id');
+      var drivePath = btn.getAttribute('data-drive-path');
+      /* A confirm step, because this destroys the row AND its audio and
+         there is no undo. `confirm` is deliberate: a bespoke modal would be
+         more DOM for no more safety. It names what Delete does NOT reach: the
+         Drive backup of the recording is add-only. */
+      /* "and its recording" only while the note still has one HERE (an expired or
+         missing recording is already gone) — but its Drive copy may still exist. */
+      var hasAudio = btn.getAttribute('data-has-audio') === '1';
+      var question = drivePath
+        ? (hasAudio
+             ? 'Delete this note and its recording from the Hub? This cannot be undone.' +
+               '\n\nA copy of its recording already backed up stays in Google Drive ('
+             : 'Delete this note from the Hub? This cannot be undone.' +
+               '\n\nAny backed-up copy of the recording stays in Google Drive (') +
+          drivePath + ' in the backup folder) until you remove it there by hand.'
+        : 'Delete this note? This cannot be undone.';
+      if (!window.confirm(question)) { return; }
+      var row = rowOf(btn);
+      rowError(row, '');
+      setBusy(row, true, btn);
+      send(id, 'DELETE').then(function (answer) {
+        /* 404: it is already gone, which is what was asked for. */
+        if (!answer.ok && answer.status !== 404) {
+          setBusy(row, false, btn);
+          rowError(row, 'Not saved — ' + reasonOf(answer));
+          return;
+        }
+        if (row && row.parentNode) { row.parentNode.removeChild(row); }
+        applyCounts(answer.body.counts);
+        if (shownEl) {
+          shownEl.textContent = String(Math.max(0, (parseInt(shownEl.textContent, 10) || 1) - 1));
+        }
+        recount();
+      }, function () {
+        setBusy(row, false, btn);
+        rowError(row, 'Not saved — ' + OFFLINE);
       });
-    })(deleters[d]);
-  }
+    });
+  });
 
   /* ------------------------------------------------------------------ */
   /* Live filtering (over rows that are already on the page)            */
   /* ------------------------------------------------------------------ */
 
-  var rows = document.querySelectorAll('#items .item');
+  /* Read afresh each time: Delete removes rows. */
+  function allRows() { return document.querySelectorAll('#items .item'); }
   var q = document.getElementById('filter-q');
   var source = document.getElementById('filter-source');
   var state = document.getElementById('filter-state');
@@ -759,22 +980,30 @@
     return true;
   }
 
-  function applyFilter() {
+  /* "N of M shown", from the rows as they stand. A row an action just changed is NOT
+     re-filtered away: it stays in view, so the change can be undone from it. */
+  function recount() {
+    if (!countEl) { return; }
+    var rows = allRows();
     var shown = 0;
     for (var i = 0; i < rows.length; i++) {
-      var ok = matches(rows[i]);
-      rows[i].hidden = !ok;
-      if (ok) { shown++; }
+      if (!rows[i].hidden) { shown++; }
     }
-    if (countEl) {
-      countEl.textContent = shown === rows.length
-        ? ''
-        : shown + ' of ' + rows.length + ' shown — press Apply to search every item.';
-      countEl.hidden = !countEl.textContent;
-    }
+    countEl.textContent = shown === rows.length
+      ? ''
+      : shown + ' of ' + rows.length + ' shown — press Apply to search every item.';
+    countEl.hidden = !countEl.textContent;
   }
 
-  if (rows.length) {
+  function applyFilter() {
+    var rows = allRows();
+    for (var i = 0; i < rows.length; i++) {
+      rows[i].hidden = !matches(rows[i]);
+    }
+    recount();
+  }
+
+  if (allRows().length) {
     if (q) { q.addEventListener('input', applyFilter); }
     if (source) { source.addEventListener('change', applyFilter); }
     if (state) { state.addEventListener('change', applyFilter); }

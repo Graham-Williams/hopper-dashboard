@@ -13,13 +13,14 @@
 <section class="summary inbox-summary" aria-label="Inbox summary">
   <a class="tile tile-behind tile-link {% if not c.needs_review %}zero{% endif %}"
      href="{{ url_for('inbox.board', awaiting='review', _anchor='items') }}">
-    <span class="n">{{ c.needs_review }}</span><span class="l">Needs review</span>
+    <span class="n" data-count="needs_review">{{ c.needs_review }}</span><span class="l">Needs review</span>
   </a>
   <div class="tile tile-ok {% if not c.open %}zero{% endif %}">
-    <span class="n">{{ c.open }}</span><span class="l">Open</span>
+    <span class="n" data-count="open">{{ c.open }}</span><span class="l">Open</span>
   </div>
   <div class="tile meta">
-    <span class="l">{{ c.total }} item{{ '' if c.total == 1 else 's' }} · generated {{ when(page.generated_at, now) }}</span>
+    {#- data-count: inbox.js rewrites these numbers from each action's answer (no reload). -#}
+    <span class="l"><span data-count="total">{{ c.total }}</span> <span data-plural-of="total">item{{ '' if c.total == 1 else 's' }}</span> · generated {{ when(page.generated_at, now) }}</span>
   </div>
 </section>
 
@@ -70,6 +71,9 @@
       <button type="submit" id="capture-submit">Add to inbox</button>
     </div>
     <p id="capture-error" class="hint bad" hidden></p>
+    {#- "Added — refresh to see it in the list": a save that could not reload because
+        something else on the page is not saved yet (inbox.js). -#}
+    <p id="capture-done" class="hint muted" role="status" hidden></p>
     {#- One collapsed block, so the list is not pushed a screen down on a phone.
         The privacy wording is pinned by tests/test_inbox.py (AUDIO_PRIVACY) and
         repeated in README, DESIGN, DEPLOY and the probes' docstrings — change
@@ -149,9 +153,7 @@
 </section>
 
 <section class="group" aria-labelledby="items-h">
-  <h2 id="items-h">Items <span class="muted">{{ page["items"]|length }} shown</span></h2>
-  {#- inbox.js's reloadSafely() writes here instead of reloading over unsaved input. -#}
-  <p id="action-status" class="action-status muted small" role="status" hidden></p>
+  <h2 id="items-h">Items <span class="muted"><span id="items-shown">{{ page["items"]|length }}</span> shown</span></h2>
   {% if not page["items"] %}
   <p class="muted">Nothing here yet. Record a note or type one above.</p>
   {% endif %}
@@ -170,11 +172,17 @@
         data-text="{{ (it.title ~ ' ' ~ it.body ~ ' ' ~ (it.project or '') ~ ' ' ~ (d.title or '') ~ ' ' ~ (d.body or ''))|lower }}">
       <div class="item-main">
         <div class="item-head">
+          {#- BOTH states of everything an action can change are rendered here, the one not
+              in force `hidden`: inbox.js updates a row IN PLACE from the server's answer by
+              flipping `hidden`, classes and data-*, and setting textContent — it never builds
+              markup. -#}
           <span class="badge badge-{{ it.source }}">{{ it.source }}</span>
-          {% if it.project %}<span class="badge badge-project">{{ it.project }}</span>{% endif %}
-          {% if it.needs_review %}<span class="badge badge-review">needs review</span>
-          {% elif it.awaiting_filing %}<span class="badge badge-filing">awaiting filing</span>{% endif %}
-          {% if it.state == 'closed' %}<span class="badge badge-closed">closed</span>{% endif %}
+          <span class="badge badge-project head-project"{% if not it.project %} hidden{% endif %}>{{ it.project or '' }}</span>
+          {% if it.deletable %}
+          <span class="badge badge-review"{% if not it.needs_review %} hidden{% endif %}>needs review</span>
+          <span class="badge badge-filing"{% if it.needs_review or not it.awaiting_filing %} hidden{% endif %}>awaiting filing</span>
+          {% endif %}
+          <span class="badge badge-closed"{% if it.state != 'closed' %} hidden{% endif %}>closed</span>
           {% if it.archived_at %}<span class="badge badge-archived">archived upstream</span>{% endif %}
         </div>
         {# Autoescaped, like everything else here: a transcript containing
@@ -184,25 +192,26 @@
             it is reviewed; the review copies the draft title across, so after
             that `title` is the same text. The transcript is one tap away. -#}
         <h3 class="item-title">{{ d.title if (d.title and not it.reviewed) else it.title }}</h3>
-        {#- No recording AND no transcript: nothing to play, nothing to draft from (P-12/P-14). -#}
-        {% if it.audio_missing and not it.body and not it.reviewed and not d.body %}
-        <p class="draft-state draft-failed small"><span aria-hidden="true">✕</span> Recording missing — write the draft from memory, or delete the note</p>
-        {% elif it.audio_pruned_at and not it.body and not it.reviewed and not d.body %}
-        <p class="draft-state draft-failed small"><span aria-hidden="true">✕</span> Recording expired before it was transcribed — write the draft from memory, or delete the note</p>
-        {% elif it.transcript_status == 'failed' and not it.reviewed and not d.body %}
-        <p class="draft-state draft-failed small"><span aria-hidden="true">✕</span> Whisper couldn't transcribe this — play it and write the draft</p>
-        {% elif d.status == 'pending' and not it.reviewed %}
-        <p class="draft-state draft-pending small">Drafting…</p>
-        {% elif d.status == 'failed' and not d.edited_at %}
-        <p class="draft-state draft-failed small"><span aria-hidden="true">✕</span> Couldn't draft — edit to write one</p>
+        {#- At most ONE status line shows, in this order: no transcript to draft from
+            (P-12/P-14), then "Drafting…", then "Couldn't draft". Each is rendered whenever
+            it could apply and `hidden` unless it is the one in force; inbox.js re-applies
+            the same order after an edit or a tick (applyItem). -#}
+        {% set nt_on = ((it.audio_missing and not it.body) or (it.audio_pruned_at and not it.body)
+                        or it.transcript_status == 'failed') and not it.reviewed and not d.body %}
+        {% set pending_on = not nt_on and d.status == 'pending' and not it.reviewed %}
+        {% set failed_on = not nt_on and not pending_on and d.status == 'failed' and not d.edited_at %}
+        {% if it.audio_missing and not it.body %}
+        <p class="draft-state draft-failed no-transcript small"{% if not nt_on %} hidden{% endif %}><span aria-hidden="true">✕</span> Recording missing — write the draft from memory, or delete the note</p>
+        {% elif it.audio_pruned_at and not it.body %}
+        <p class="draft-state draft-failed no-transcript small"{% if not nt_on %} hidden{% endif %}><span aria-hidden="true">✕</span> Recording expired before it was transcribed — write the draft from memory, or delete the note</p>
+        {% elif it.transcript_status == 'failed' %}
+        <p class="draft-state draft-failed no-transcript small"{% if not nt_on %} hidden{% endif %}><span aria-hidden="true">✕</span> Whisper couldn't transcribe this — play it and write the draft</p>
         {% endif %}
-        {% if d.body %}
+        <p class="draft-state draft-pending small"{% if not pending_on %} hidden{% endif %}>Drafting…</p>
+        <p class="draft-state draft-failed draft-failed-line small"{% if not failed_on %} hidden{% endif %}><span aria-hidden="true">✕</span> Couldn't draft — edit to write one</p>
         {#- pre-line keeps the model's line breaks; still autoescaped, never |safe. -#}
-        <p class="item-body draft-body">{{ d.body }}</p>
-        {% endif %}
-        {% if d.project and d.project != it.project %}
-        <p class="item-meta small">Project: <span class="badge badge-project">{{ d.project }}</span></p>
-        {% endif %}
+        <p class="item-body draft-body"{% if not d.body %} hidden{% endif %}>{{ d.body or '' }}</p>
+        <p class="item-meta small draft-project-line"{% if not (d.project and d.project != it.project) %} hidden{% endif %}>Project: <span class="badge badge-project draft-project">{{ d.project or '' }}</span></p>
         {% if it.body %}
         <details class="transcript">
           <summary>Transcript</summary>
@@ -225,25 +234,26 @@
         {#- ONE action row: Edit draft and the Reviewed toggle side by side (each
             >= 44px), and Delete last as a quiet text button — it destroys the
             row and the recording, so it must never look like the main action.
-            A mirrored row (github, backlog) has none of the three, so it gets no
+            A mirrored row (github, backlog) has none of them, so it gets no
             row at all: it is acted on upstream (see the link/hint below). -#}
-        {% if (voice and it.state == 'open') or it.can_tick_reviewed or it.deletable %}
+        {% if voice or it.reviewable or it.deletable %}
         <div class="item-actions">
           {#- TWO groups, each nowrap: [Edit draft][Reviewed] and [Close/Reopen][Delete].
               At 390 px the second pair wraps as a unit, right-aligned, and Close and
               Reopen share a min-width, so flipping one never reflows the row. A CLOSED
-              note offers only the second group: reopen it before editing or reviewing. -#}
-          {% set open_note = it.state == 'open' %}
-          {% if open_note and (voice or it.can_tick_reviewed) %}
-          <span class="action-group">
+              note shows only the second group (the first is rendered, `hidden`): reopen
+              it before editing or reviewing. -#}
+          {% if voice or it.reviewable %}
+          <span class="action-group action-start"{% if it.state == 'closed' %} hidden{% endif %}>
           {% if voice %}
           <button type="button" class="edit-draft secondary" data-id="{{ it.id }}" hidden>Edit draft</button>
           {% endif %}
           {#- Voice notes, plus an OLDER typed note (inbox.reviewable); the PATCH
-              applies the same rule. A voice note gets the box only once it has a
-              draft to review (inbox.can_tick_reviewed; the PATCH 409s before that). -#}
-          {% if it.can_tick_reviewed %}
-          <label class="review">
+              applies the same rule. A voice note's box is OFFERED only once it has a
+              draft to review (inbox.can_tick_reviewed; the PATCH 409s before that) —
+              rendered either way, so a draft saved in place can reveal it. -#}
+          {% if it.reviewable %}
+          <label class="review"{% if not it.can_tick_reviewed %} hidden{% endif %}>
             <input type="checkbox" class="review-box" data-id="{{ it.id }}"
                    {% if it.reviewed %}checked{% endif %}>
             <span>Reviewed</span>
@@ -253,12 +263,11 @@
           {% endif %}
           {% if it.deletable %}
           <span class="action-group action-end">
-          {#- Close / Reopen, notes only (C-12): the existing PATCH state. A hand change
-              clears closed_by, so it sticks until the next upstream change. Hidden
-              until inbox.js wires it, like Delete. A mirrored row has neither: it
-              follows GitHub / backlog.txt. -#}
-          <button type="button" class="toggle-state secondary" data-id="{{ it.id }}"
-                  data-to="{{ 'open' if it.state == 'closed' else 'closed' }}" hidden>{{ 'Reopen' if it.state == 'closed' else 'Close' }}</button>
+          {#- Close AND Reopen, both rendered and `hidden` (the page needs JS to use them);
+              inbox.js shows the one for the row's state and swaps them in place. Notes only
+              (C-12); a mirrored row follows GitHub / backlog.txt. -#}
+          <button type="button" class="toggle-state secondary" data-id="{{ it.id }}" data-to="closed" hidden>Close</button>
+          <button type="button" class="toggle-state secondary" data-id="{{ it.id }}" data-to="open" hidden>Reopen</button>
           {#- Needs JS (it is a DELETE), so it is hidden until inbox.js wires it and is
               never a button that does nothing. Notes only: the server refuses it on a
               mirrored row. A voice note's recording may already be in the add-only Drive
@@ -274,6 +283,8 @@
           </span>
           {% endif %}
         </div>
+        {#- Where an action on this row says "Not saved — <reason>" (never a reload). -#}
+        <p class="row-error bad small" role="alert" hidden></p>
         {% endif %}
         {% if voice %}
         {#- The edit form is rendered HERE, hidden; inbox.js only shows/hides it
