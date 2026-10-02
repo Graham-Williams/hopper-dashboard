@@ -114,6 +114,41 @@ jobs:
           grep -q 'must be an existing non-root user' /tmp/root-run
           docker logs hd
           docker rm -f hd
+      - name: backup.sh snapshots the real container (read_only + tmpfs /tmp, like the box)
+        # The box's container is read_only with a TMPFS /tmp, and `docker cp` cannot read a
+        # tmpfs: every real backup run failed while the fakes let the suite pass. This runs
+        # backup.sh's DB snapshot for real against the built image with the same settings, on
+        # its local-only path (no RCLONE_DEST), and checks what it kept.
+        run: |
+          set -eu
+          cp jobs.example.yml jobs.yml
+          docker run -d --name hdb --read-only --tmpfs /tmp:mode=1777,size=64m -v /app/data \
+            -v "$PWD/jobs.yml:/app/jobs.yml:ro" \
+            -e INGEST_TOKEN=ci-token -e READ_TOKEN=ci-read -e APP_PASSWORD=ci-pass -e SESSION_SECRET=ci-secret \
+            -e DASHBOARD_NO_SCHEDULER=1 hopper-dashboard:ci
+          for i in $(seq 1 30); do
+            if docker exec hdb test -f /app/data/inbox.db && docker exec hdb test -f /app/data/dashboard.db; then
+              break
+            fi
+            sleep 1
+          done
+          BACKUP_CONTAINER=hdb BACKUP_ROOT="$RUNNER_TEMP/backups" BACKUP_AUDIO=0 deploy/box/backup.sh
+          snaps="$RUNNER_TEMP/backups/snapshots"
+          test "$(ls "$snaps"/dashboard_*.db | wc -l)" -eq 1
+          test "$(ls "$snaps"/inbox_*.db | wc -l)" -eq 1
+          test -z "$(ls -A "$snaps" | grep '^\.' || true)"
+          for f in "$snaps"/*.db; do
+            python3 -c 'import sqlite3, sys; c = sqlite3.connect("file:%s?mode=ro&immutable=1" % sys.argv[1], uri=True); assert c.execute("PRAGMA integrity_check").fetchone()[0] == "ok"; assert c.execute("SELECT count(*) FROM sqlite_master").fetchone()[0] > 0' "$f"
+          done
+          # Nothing left on the container's tmpfs.
+          test -z "$(docker exec hdb ls -A /tmp)"
+          # The audio tree IS copied with docker cp: that works because it is on the data volume.
+          docker exec hdb sh -c 'mkdir -p /app/data/inbox/audio/2026/09 && echo x > /app/data/inbox/audio/2026/09/ci.webm'
+          mkdir -p "$RUNNER_TEMP/audio"
+          docker cp hdb:/app/data/inbox/audio/. "$RUNNER_TEMP/audio/"
+          test -f "$RUNNER_TEMP/audio/2026/09/ci.webm"
+          docker logs hdb
+          docker rm -fv hdb
       - name: HTTPS upgrade must actually be exercised (APP_HOST set)
         # The container above runs WITHOUT APP_HOST, which DISABLES the http->https
         # redirect — so its `/` = 302 and `/static/app.css` = 404 checks pass for the

@@ -180,17 +180,18 @@ def test_a_resync_never_untickets_a_reviewed_row(conn):
     assert row["reviewed"] == 1 and row["state"] == "closed"
 
 
-def test_repo_number_uniqueness_stops_a_duplicate_item(conn):
-    """The rule that stops the repo scan cloning a voice row Hopper already
-    filed: an issue belongs to exactly ONE item."""
+def test_one_link_per_note_and_issue_but_many_notes_per_issue(conn):
+    """G-20: two notes about the same bug can both link it. What stays unique is one link
+    per (note, issue) — and the scan's "is it linked at all?" lookup finds either."""
     voice = inbox_db.create_item(conn, source="voice", text="spoken", now=NOW)
     other = inbox_db.create_item(conn, source="voice", text="also spoken", now=NOW)
     inbox_db.link_issue(conn, voice, repo="a/b", number=7,
                         url="https://github.com/a/b/issues/7", now=NOW)
     again = inbox_db.link_issue(conn, other, repo="a/b", number=7,
                                 url="https://github.com/a/b/issues/7", now=NOW)
-    assert again["item_id"] == voice                   # still the first item
-    assert conn.execute("SELECT COUNT(*) FROM inbox_issues").fetchone()[0] == 1
+    assert again["item_id"] == other
+    assert conn.execute("SELECT COUNT(*) FROM inbox_issues").fetchone()[0] == 2
+    assert inbox_db.linked_issue(conn, "a/b", 7) is not None
     with pytest.raises(Exception):
         conn.execute("INSERT INTO inbox_issues (item_id, repo, number, url,"
                      " linked_at) VALUES (?,?,?,?,?)",
@@ -226,11 +227,12 @@ def test_an_item_closes_only_when_every_linked_issue_is_closed(conn):
     item = inbox_db.create_item(conn, source="voice", text="spoken", now=NOW)
     inbox_db.link_issue(conn, item, repo="a/b", number=1, url="u1", now=NOW)
     inbox_db.link_issue(conn, item, repo="c/d", number=2, url="u2", now=NOW)
-    inbox_db.mark_issues_closed(conn, "a/b", open_numbers=[], now=NOW)
-    inbox_db.close_items_whose_issues_all_closed(conn, "a/b", now=NOW)
-    assert inbox_db.get_item(conn, item)["state"] == "open"   # c/d#2 still open
-    inbox_db.mark_issues_closed(conn, "c/d", open_numbers=[], now=NOW)
-    inbox_db.close_items_whose_issues_all_closed(conn, "c/d", now=NOW)
+    for repo in ("a/b", "c/d"):
+        before = inbox_db.issue_states(conn, repo)
+        inbox_db.mark_issues_closed(conn, repo, open_numbers=[], now=NOW)
+        inbox_db.apply_issue_transitions(conn, repo, before=before, now=NOW)
+        if repo == "a/b":
+            assert inbox_db.get_item(conn, item)["state"] == "open"   # c/d#2 still open
     assert inbox_db.get_item(conn, item)["state"] == "closed"
 
 
@@ -679,14 +681,16 @@ def test_a_review_that_raced_a_new_draft_is_a_conflict(conn, monkeypatch):
     assert inbox_db.get_item(conn, item)["reviewed"] == 0
 
 
-def test_a_filed_copy_shows_again_once_its_note_is_closed(conn):
+def test_a_filed_copy_stays_hidden_while_its_note_exists_and_shows_once_deleted(conn):
     item = inbox_db.create_item(conn, source="typed", text="chore", reviewed=True)
     inbox_db.upsert_mirror_item(conn, mirror_key="backlog:x", source="backlog",
                                 title="chore", body=f"chore (voice {item[:8]})")
     inbox_db.mark_filed_backlog(conn, item, line=f"chore (voice {item[:8]})")
     assert [r["source"] for r in inbox_db.list_items(conn)] == ["typed"]
     inbox_db.update_item(conn, item, {"state": "closed"})
-    assert sorted(r["source"] for r in inbox_db.list_items(conn)) == ["backlog", "typed"]
+    assert [r["source"] for r in inbox_db.list_items(conn)] == ["typed"]
+    inbox_db.delete_item(conn, item)
+    assert [r["source"] for r in inbox_db.list_items(conn)] == ["backlog"]
 
 
 def test_the_migration_backfills_draft_copied_at_for_reviewed_voice_notes(tmp_path):
@@ -716,3 +720,217 @@ def test_the_migration_backfills_draft_copied_at_for_reviewed_voice_notes(tmp_pa
     assert c.execute("SELECT draft_copied_at FROM inbox_items WHERE id=?",
                      ("a" * 32,)).fetchone()[0] == "2026-09-09T00:00:00Z"
     c.close()
+
+
+# --------------------------------------------------------------------------- #
+# The backlog push, as one unit (inbox_db.apply_backlog_push)
+# --------------------------------------------------------------------------- #
+
+def _entries(*texts):
+    return [(inbox_db.normalise_backlog_key(inbox_db.what_line(t)), t, None) for t in texts]
+
+
+def _filed_note(conn, line_suffix=""):
+    note = inbox_db.create_item(conn, source="typed", text="spoken", now=NOW, reviewed=True)
+    inbox_db.mark_filed_backlog(conn, note, line=f"x (voice {note[:8]})", now=NOW)
+    return note, f"Fix it{line_suffix} (voice {note[:8]})"
+
+
+def test_upsert_clears_closed_by_whenever_the_text_sets_the_state(conn):
+    key = inbox_db.normalise_backlog_key("Chore")
+    row = inbox_db.upsert_mirror_item(conn, mirror_key=key, source="backlog", title="Chore",
+                                      body="Chore", now=NOW, state="open")
+    conn.execute("UPDATE inbox_items SET state='closed', closed_by='issues' WHERE id=?", (row,))
+    inbox_db.upsert_mirror_item(conn, mirror_key=key, source="backlog", title="Chore",
+                                body="Chore", now=NOW, state="open")
+    got = inbox_db.get_item(conn, row)
+    assert (got["state"], got["closed_at"], got["closed_by"]) == ("open", None, None)
+
+
+def test_an_unchanged_backlog_push_writes_nothing(conn):
+    """A push of the same file must not touch inbox.db at all — no updated_at or
+    mirror_seen_at churn, no counter ticking — or the 5-minute backup re-snapshots it and
+    re-uploads it to Drive every time (about 96 times a day)."""
+    kept, kept_line = _filed_note(conn)
+    gone, _ = _filed_note(conn, " too")
+    entries = _entries(kept_line, "✅ DONE — a finished chore", "Open chore\nWhy: because")
+    for _ in range(3):                  # settle: the absent note closes after two pushes
+        inbox_db.apply_backlog_push(conn, entries, complete=True, now=NOW)
+    assert inbox_db.get_item(conn, gone)["state"] == "closed"
+    before = conn.total_changes
+    out = inbox_db.apply_backlog_push(conn, entries, complete=True, now="2026-09-19T13:00:00Z")
+    assert conn.total_changes == before, "an unchanged push wrote to inbox.db"
+    assert (out["archived"], out["closed_notes"], out["reopened_notes"]) == (0, 0, 0)
+
+
+def test_a_backlog_push_is_atomic(conn, monkeypatch):
+    """`with conn:` is not a transaction on these autocommit connections; the push is one
+    real transaction, so a failure part-way leaves nothing behind."""
+    inbox_db.apply_backlog_push(conn, _entries("One"), complete=True, now=NOW)
+    before = [dict(r) for r in conn.execute("SELECT * FROM inbox_items ORDER BY id")]
+
+    def boom(*a, **kw):
+        raise RuntimeError("disk full, say")
+    monkeypatch.setattr(inbox_db, "archive_missing", boom)
+    with pytest.raises(RuntimeError):
+        inbox_db.apply_backlog_push(conn, _entries("Two", "✅ DONE — One"), complete=True,
+                                    now=NOW)
+    assert [dict(r) for r in conn.execute("SELECT * FROM inbox_items ORDER BY id")] == before
+
+
+def _index_columns(c, name):
+    return [r["name"] for r in c.execute(f"PRAGMA index_info({name})")]
+
+
+def test_the_issue_link_index_migrates_to_one_link_per_note_and_survives_a_rollback(tmp_path):
+    """G-20 lets many notes link one issue: unique on (item_id, repo, number), not (repo,
+    number). The index KEEPS ITS OLD NAME on purpose — an older image's start-up runs
+    `CREATE UNIQUE INDEX IF NOT EXISTS inbox_issues_repo_number ON inbox_issues (repo, number)`,
+    which is a no-op while that name exists. Under a new name it would try to build the old
+    index over duplicate links, fail, and restart-loop the rolled-back container."""
+    import sqlite3
+    path = str(tmp_path / "inbox.db")
+    old = sqlite3.connect(path)
+    old.executescript(inbox_db.INBOX_SCHEMA.replace(
+        "inbox_issues_repo_number\n    ON inbox_issues (item_id, repo, number)",
+        "inbox_issues_repo_number\n    ON inbox_issues (repo, number)"))
+    old.close()
+    c = inbox_db.connect(path)
+    assert _index_columns(c, "inbox_issues_repo_number") == ["repo", "number"]   # the old one
+    inbox_db.init_inbox_schema(c)
+    inbox_db.init_inbox_schema(c)                         # idempotent
+    assert _index_columns(c, "inbox_issues_repo_number") == ["item_id", "repo", "number"]
+    a = inbox_db.create_item(c, source="typed", text="one", now=NOW)
+    b = inbox_db.create_item(c, source="typed", text="two", now=NOW)
+    inbox_db.link_issue(c, a, repo="a/b", number=1, url="u", now=NOW)
+    inbox_db.link_issue(c, b, repo="a/b", number=1, url="u", now=NOW)
+    inbox_db.link_issue(c, b, repo="a/b", number=1, url="u", now=NOW)   # still idempotent
+    assert c.execute("SELECT COUNT(*) FROM inbox_issues").fetchone()[0] == 2
+    # The rollback: the older image's schema statement must not fail over the duplicates.
+    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS inbox_issues_repo_number"
+              " ON inbox_issues (repo, number)")
+    c.close()
+
+
+def test_the_migration_sends_stranded_pending_notes_to_needs_review(tmp_path):
+    """Voice notes left 'pending' for ever by the old prune/sweep (their recording went
+    before Whisper ran) are marked failed — and a lost file is recorded as missing."""
+    import sqlite3
+    path = str(tmp_path / "inbox.db")
+    old = sqlite3.connect(path)
+    old.executescript(inbox_db.INBOX_SCHEMA)
+    rows = [("a" * 32, None, NOW),                       # pruned before transcription
+            ("b" * 32, None, None),                      # file lost, path cleared
+            ("c" * 32, "2026/09/" + "c" * 32 + ".webm", None)]   # still has its audio
+    for i, audio_path, pruned in rows:
+        old.execute("INSERT INTO inbox_items (id, source, title, created_at, updated_at,"
+                    " transcript_status, audio_path, audio_pruned_at, audio_bytes)"
+                    " VALUES (?, 'voice', 't', ?, ?, 'pending', ?, ?, 100)",
+                    (i, NOW, NOW, audio_path, pruned))
+    old.commit()
+    old.close()
+    c = inbox_db.connect(path)
+    inbox_db.init_inbox_schema(c)
+    got = {r["id"][0]: (r["transcript_status"], r["audio_missing_at"]) for r in
+           c.execute("SELECT id, transcript_status, audio_missing_at FROM inbox_items")}
+    assert got == {"a": ("failed", None), "b": ("failed", NOW), "c": ("pending", None)}
+    c.close()
+
+
+def test_a_transaction_whose_commit_fails_is_rolled_back_not_left_open(conn):
+    """COMMIT inside the try: a COMMIT that fails (here a deferred foreign key) must roll
+    back, or the connection is left mid-transaction and every later BEGIN fails."""
+    conn.execute("CREATE TABLE p (id INTEGER PRIMARY KEY)")
+    conn.execute("CREATE TABLE c (pid INTEGER REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)")
+    with pytest.raises(Exception):
+        with inbox_db.transaction(conn):
+            conn.execute("INSERT INTO c (pid) VALUES (99)")
+    assert conn.in_transaction is False
+    with inbox_db.transaction(conn):
+        conn.execute("INSERT INTO p (id) VALUES (1)")
+    assert conn.execute("SELECT COUNT(*) FROM c").fetchone()[0] == 0
+
+
+def test_a_transaction_never_masks_the_real_error_with_a_rollback_error(conn):
+    class Boom(Exception):
+        pass
+    with pytest.raises(Boom):
+        with inbox_db.transaction(conn):
+            conn.execute("ROLLBACK")          # already gone, as some SQLite errors do
+            raise Boom()
+    assert conn.in_transaction is False
+
+
+def test_the_migration_archives_a_live_mirror_row_whose_issue_a_note_links(tmp_path):
+    """Old duplicates (made before linking archived the mirror row) are repaired once."""
+    import sqlite3
+    path = str(tmp_path / "inbox.db")
+    old = sqlite3.connect(path)
+    old.executescript(inbox_db.INBOX_SCHEMA.replace(
+        "inbox_issues_repo_number\n    ON inbox_issues (item_id, repo, number)",
+        "inbox_issues_repo_number\n    ON inbox_issues (repo, number)"))
+    old.execute("INSERT INTO inbox_items (id, source, title, created_at, updated_at,"
+                " mirror_key) VALUES (?, 'github', 'dup', ?, ?, ?)",
+                ("a" * 32, NOW, NOW, inbox_db.github_key("a/b", 7)))
+    old.execute("INSERT INTO inbox_items (id, source, title, created_at, updated_at)"
+                " VALUES (?, 'voice', 'note', ?, ?)", ("b" * 32, NOW, NOW))
+    old.execute("INSERT INTO inbox_items (id, source, title, created_at, updated_at,"
+                " mirror_key) VALUES (?, 'github', 'unlinked', ?, ?, ?)",
+                ("c" * 32, NOW, NOW, inbox_db.github_key("a/b", 8)))
+    old.execute("INSERT INTO inbox_issues (item_id, repo, number, url, linked_at)"
+                " VALUES (?, 'a/b', 7, 'u', ?)", ("b" * 32, NOW))
+    old.commit()
+    old.close()
+    c = inbox_db.connect(path)
+    inbox_db.init_inbox_schema(c)
+    inbox_db.startup_repairs(c, ("a/b",))
+    assert inbox_db.get_item(c, "a" * 32)["archived_at"] is not None
+    assert inbox_db.get_item(c, "c" * 32)["archived_at"] is None
+    c.close()
+
+
+def test_canonicalisation_runs_before_the_duplicate_repair(conn):
+    """A link stored under another spelling cannot match its mirror row's key until it is
+    canonicalised — so the repair must come second, or the duplicate survives."""
+    dup = inbox_db.upsert_mirror_item(conn, mirror_key=inbox_db.github_key("Owner/km-tracker", 7),
+                                      source="github", title="dup")
+    note = inbox_db.create_item(conn, source="voice", text="x", now=NOW)
+    conn.execute("INSERT INTO inbox_issues (item_id, repo, number, url, linked_at)"
+                 " VALUES (?, 'owner/KM-tracker', 7, 'u', ?)", (note, NOW))
+    inbox_db.startup_repairs(conn, ("Owner/km-tracker",))
+    assert conn.execute("SELECT repo FROM inbox_issues").fetchone()[0] == "Owner/km-tracker"
+    assert inbox_db.get_item(conn, dup)["archived_at"] is not None
+
+
+def test_boot_forgets_every_stored_github_etag(conn):
+    """Changes made while an older image ran (a rollback window) must be seen: the first
+    scan after every boot is a full one."""
+    inbox_db.set_mirror_state(conn, "github:a/b", etag='W/"x"', last_status="ok")
+    inbox_db.set_mirror_state(conn, "github:c/d", etag='W/"y"', last_status="ok")
+    inbox_db.startup_repairs(conn, ("a/b", "c/d"))
+    assert [r["etag"] for r in conn.execute("SELECT etag FROM inbox_mirror_state")] == [None, None]
+
+
+def test_link_repo_spellings_are_canonicalised_to_the_watched_one(conn):
+    """Links stored under another spelling of a watched repo were never refreshed (the scan
+    matches the configured spelling exactly). Canonicalised at start-up, merging a note's
+    two links to one issue into one."""
+    a = inbox_db.create_item(conn, source="typed", text="a", now=NOW)
+    b = inbox_db.create_item(conn, source="typed", text="b", now=NOW)
+    conn.execute("INSERT INTO inbox_issues (item_id, repo, number, url, linked_at)"
+                 " VALUES (?, 'owner/KM-tracker', 3, 'u', ?)", (a, NOW))
+    conn.execute("INSERT INTO inbox_issues (item_id, repo, number, url, linked_at)"
+                 " VALUES (?, 'Owner/km-tracker', 4, 'u', ?)", (b, NOW))
+    conn.execute("INSERT INTO inbox_issues (item_id, repo, number, url, linked_at)"
+                 " VALUES (?, 'OWNER/km-tracker', 4, 'u', ?)", (b, NOW))
+    conn.execute("INSERT INTO inbox_issues (item_id, repo, number, url, linked_at)"
+                 " VALUES (?, 'someone/else', 5, 'u', ?)", (a, NOW))
+    conn.execute("UPDATE inbox_issues SET state='closed' WHERE repo='Owner/km-tracker'")
+    assert inbox_db.canonicalise_issue_repos(conn, ("Owner/km-tracker",)) == 2
+    got = {(r["item_id"], r["repo"], r["number"], r["state"]) for r in
+           conn.execute("SELECT item_id, repo, number, state FROM inbox_issues")}
+    # The MERGED link is open again: the forced full scan must see the real state and fire
+    # the transition (keeping the old 'closed' would hide it for ever).
+    assert got == {(a, "Owner/km-tracker", 3, "open"), (a, "someone/else", 5, "open"),
+                   (b, "Owner/km-tracker", 4, "open")}
+    assert inbox_db.canonicalise_issue_repos(conn, ("Owner/km-tracker",)) == 0   # idempotent

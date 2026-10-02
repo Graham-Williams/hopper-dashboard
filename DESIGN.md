@@ -160,10 +160,30 @@ Outputs:
   board).
 - ntfy (a third party) receives only `job_id: FROM → TO` — never the free-text reason (container names,
   client notes, rclone stderr stay on the board).
-- **A voice note's AUDIO never reaches a third party; its TRANSCRIPT and TITLE go to Anthropic.** (Changed
-  2026-09-28 with drafting — see "Drafts, Needs review and the Hub".) The page says: "Audio stays on this box
-  and your Mac. The transcript and title (not the audio) are sent from the Mac to Anthropic (Claude) to
-  draft the item." (Also sent: the project hint and the list of project names.) The browser still talks to nothing but this origin. The browser uploads audio to the box and does
+- **A voice note's AUDIO never goes to Anthropic or any speech service; its TRANSCRIPT and TITLE go to
+  Anthropic, with the setup brief.** (Changed 2026-09-28 with drafting — see "Drafts, Needs review and the
+  Hub"; the brief was added 2026-09-29.) The audio lives on the box, on the Mac only while it is being
+  transcribed (a temp file, removed after), and add-only in Graham's Google Drive backup, where it is kept
+  even after Delete or the retention prune until removed by hand. The page says: "Audio never goes to
+  Anthropic or any speech service. It lives on this box, on your Mac only while it is being transcribed, and
+  in the Google Drive backup, which only ever adds: a recording stays there after Delete or the retention
+  prune until you remove it by hand. The transcript, the title and a short brief of your setup are sent from
+  the Mac to Anthropic (Claude) to draft the item." (Also sent: the project hint and the list of project
+  names.) The setup
+  brief is `INBOX_DRAFT_CONTEXT_FILE` on the Mac — a page Graham (or Hopper) keeps describing his projects
+  and their nicknames, so the drafter can tell what "the backup thing" means. It rides stdin as a
+  `context` field marked as reference data, never argv; the system prompt says to use it to pick the
+  project and word the description and never to copy it into the output. It is read fresh each run
+  (`inbox_draft.read_context`): opened `O_NOFOLLOW|O_NONBLOCK` and `fstat`ed on the descriptor read, at
+  most 256 KiB, NULs stripped BEFORE the 6000-character cap, decoded with `errors="replace"` (a bad byte
+  or a cut character never drops the brief), and marked only when something was cut. Refused, with no
+  brief and one log line (not systemic, burns nothing): missing, unreadable, a symlink, not a regular
+  file, not owned by the worker's user, group/world-WRITABLE, more than one hard link, empty, the claude
+  TOKEN file or the worker's own ENV file (same `st_dev`/`st_ino`), or a brief whose text contains a
+  credential (INBOX_TOKEN, INGEST_TOKEN or the claude token — compared in memory, never logged). Writable-by-others is refused because anyone who
+  can write it can steer every draft; readable-by-others (0644) is allowed because, unlike the OAuth
+  token, it is not a secret. Its text never reaches the log or the heartbeat — only a character count or
+  the warning's path and reason. The browser still talks to nothing but this origin. The browser uploads audio to the box and does
   nothing else with it: there is deliberately no in-browser speech recognition, because the Web Speech API
   streams the microphone to Google's or Apple's servers to do the work — inherent to it, not a setting.
   Transcription instead happens on Graham's own Mac, by mlx-whisper running locally. So the full path of a
@@ -218,7 +238,10 @@ inbox_items(id TEXT PK,                     -- uuid4 hex; opaque, appears in URL
   -- added 2026-09-28 through INBOX_COLUMNS (the additive migration's first real use):
   draft_title, draft_body, draft_project, draft_status, draft_at, draft_attempts,
   draft_model, draft_src_sha, draft_edited_at,
-  filed_backlog_at, filed_backlog_line)       -- issue #33
+  filed_backlog_at, filed_backlog_line,       -- issue #33
+  draft_copied_at,
+  closed_by,                                  -- 'backlog' | 'issues' when that rule closed it, else NULL
+  backlog_absent_pushes)                      -- a filed note: consecutive complete pushes without its tag
 inbox_issues(id INTEGER PK, item_id → inbox_items(id), repo, number, url, title,
   state, linked_at, checked_at, closed_at)
 inbox_mirror_state(key PK, etag, last_sync_at, last_status, last_error,
@@ -236,13 +259,92 @@ Two unique indexes carry most of the correctness:
   `probes/` is stdlib-only and cannot import Flask — and `tests/test_backlog_mirror.py` imports both and
   pins their agreement. Drift there is not cosmetic: it would archive every mirrored row on the next sync
   and re-create it under a new key, losing its reviewed tick and its linked issues.
-- `UNIQUE(repo, number)` on `inbox_issues` — one GitHub issue belongs to exactly ONE row. This is what stops
-  the repo mirror cloning a voice note Hopper has already filed as an issue.
+- `UNIQUE(item_id, repo, number)` on `inbox_issues` — one LINK per (note, issue); several notes may link
+  the same issue (G-20: two notes about one bug), and each closes and reopens with it. What stops the repo
+  mirror cloning a note Hopper has already filed as an issue is the scan's lookup (`linked_issue`, on a
+  plain `(repo, number)` index): a linked issue is never mirrored, and linking one that already had a
+  mirror row archives that row (G-19). The unique index KEEPS the name it had when it was
+  `UNIQUE(repo, number)` (`inbox_issues_repo_number`; the migration swaps the definition once): an older
+  image's start-up `CREATE UNIQUE INDEX IF NOT EXISTS inbox_issues_repo_number ON (repo, number)` is then
+  a no-op, instead of failing over duplicate links and restart-looping a rolled-back container.
 
 `transcript_status` has **five** values, not two: `pending` (audio, nothing transcribed yet) · `whisper` ·
 `typed` · `failed` (Whisper gave up after 3 attempts) · `live` (legacy; no longer produced — see the privacy
 note under Security posture). Without `pending` and `failed` the board cannot tell "transcribing…" from
 "this will never transcribe", and the Mac worker has nothing to back off from.
+
+### Item lifecycle: what "closed" and "archived" mean
+
+Every kind of item is a row in ONE table, `inbox_items`, and they share two independent flags: `state`
+(`open` | `closed`, with `closed_at`) and `archived_at` (NULL = live). **Closed** means the work is done and
+the row stays on the board with a badge (the state filter shows it). **Archived** means the thing it
+mirrored no longer exists upstream (or a note now represents it); archived rows are left out of the
+default list and every count, and the State filter's `archived` option (`?state=archived`) lists them with
+their "archived upstream" badge — in the API too, so `GET /api/v1/inbox/items?state=archived` is readable
+with `READ_TOKEN`, like the rest of the list. Nothing is ever deleted except by Delete — which
+exists for voice and typed notes only: on a `github` or `backlog` row the page shows no Delete and the
+server answers 409 with where to act instead ("This mirrors GitHub — close the issue there" / "This
+mirrors backlog.txt — remove or ✅ DONE the line there"), because deleting a view cannot touch what it
+mirrors and the row would come back on a later sync. "By hand"
+below means the Close / Reopen button every voice and typed note has in its action row (C-12; mirrored
+rows have none — they follow upstream), which is `PATCH /api/v1/inbox/items/<id> {"state": …}` with a
+session. A hand change clears `closed_by`, so it sticks until the next upstream change.
+
+| source | becomes closed | becomes archived | reopens | who |
+|---|---|---|---|---|
+| `voice` | (1) by hand; (2) the ISSUES rule: a complete scan moves its LAST open linked issue to closed (edge-triggered: the stored `inbox_issues.state` before vs after the scan; `closed_by='issues'`; every note linking that issue follows it — many notes may link one issue; a link merged by the boot-time spelling canonicalisation is reset to 'open', so the first full scan fires its real transition); (3) the BACKLOG rule: it was filed to backlog.txt and its `(voice <id8>)` line was marked ✅ DONE/RESOLVED (closes on that push) or has been missing from 2 consecutive COMPLETE pushes (`backlog_absent_pushes`; `closed_by='backlog'`) | never | by hand; or automatically, ONLY by the rule that closed it: `issues` when a scan moves any linked issue from closed to open, `backlog` when a tagged What: line is live and open again. A note closed by hand is never reopened automatically, and a hand reopen sticks until the next real change upstream | (1) by hand, (2)(3) automatic |
+| `typed` | the same as `voice` | never | the same as `voice` | the same as `voice` |
+| `github` (mirrored issue) | automatically, when a complete open-issue scan of its repo no longer lists it (closed, transferred or deleted upstream); a hand state change is refused (409 "This mirrors GitHub — close or reopen the issue there") | automatically: (a) when a note LINKS its issue (`POST /issues`, G-19 — the note represents it now; every scan that meets a linked issue also archives a live mirror row of it, and a start-up migration repaired old duplicates); (b) when its repo is no longer in `INBOX_GITHUB_REPOS` (G-22, on every sync, even one with no repos) | automatically, on every complete scan that lists it as open; un-archived on a complete scan of its (again watched) repo once no note links it. A LOCAL change that affects a repo — unwatched, a link made, a linking note deleted — forgets that repo's stored ETag, so the next scan is a full one and a 304 can never strand an archived row; and every BOOT forgets every ETag, so a change made while an older image ran is caught too | automatic, on EVERY scan, by design: the row is a VIEW of the issue, so upstream always wins (act on it on GitHub — the row links there; it has no Delete) |
+| `backlog` (mirrored line), also a VIEW of upstream (no Delete; edit backlog.txt) | automatically, when its What: line carries a done marker anywhere (`inbox_db.BACKLOG_DONE_RE`: `✅️?\s*(DONE\|RESOLVED)\b`, case-insensitive — "✅ DONE 2026-08-21 — …", "… — ✅ DONE 2026-07-08 via …", "✅ RESOLVED"): the state is set from the text on EVERY upsert, complete push or not (and `closed_by` cleared); a hand state change is refused (409 "This mirrors backlog.txt — ✅ DONE, remove or restore the line there") | automatically, when a COMPLETE push no longer has that exact What: line — removed, or edited: any What: edit (adding or removing ✅ DONE or ⭐ included) is a new key, so the old row archives and a new one appears | by the text: taking ✅ DONE off posts the unmarked line again, which un-archives its earlier open row (or creates a new one) | automatic: the text wins |
+
+Removal is ARCHIVE, not close, for a backlog row: the file is the only record, and "removed" and "done"
+are different facts (the ✅ DONE convention keeps done entries in the file, but a shipped entry is often
+just deleted). For a FILED NOTE both mean done, and both close it.
+
+A backlog row whose What: line carries a filed note's tag is HIDDEN from the default list and the counts
+WHENEVER that note exists, in any state (see "Filing to backlog.txt" below) — it is the same piece of
+work, and the note is where its state shows. It shows again only if the note is deleted. A tag counts
+only in the What: line (anywhere in it) — never under Why:/Notes:/Context: — in all three matchers
+(`filed_line_status`, `backlog_copies`, `_FILED_COPY_SQL`, via `backlog_tags` / `WHAT_LINE_SQL`).
+
+The backlog rule runs once per COMPLETE push, after the whole push is applied (never per row), so an edit
+that swaps keys within one push never flaps a note. Done acts on the transition into done (a hand reopen
+of a done note sticks); removal needs the tag missing from TWO consecutive complete pushes (a capped
+count on the note), so one truncated read of the file, or a filing call that beat its line into the
+file, closes nothing — and a note whose line was added and removed between two pushes still closes. The issues rule is edge-triggered the same way, per scan
+(`inbox_db.apply_issue_transitions`, fed the stored `inbox_issues` states from before the scan): a hand
+reopen of a note whose issues are all closed sticks until an issue next changes upstream, and a change
+that happened during a mirror outage is caught by the first good scan, because it compares stored state,
+not the previous scan's answer (a 304 "nothing changed" answer is not a scan and changes nothing).
+Mirrored rows are the opposite on purpose: `github` and `backlog` rows are views of upstream, so every
+scan or push re-applies what upstream says — which is why PATCH `state` on one is a 409 saying where to
+act (C-04/05/06), like Delete.
+
+**Known limits, documented rather than fixed:**
+
+- **G-25 — a change on page 2+ of a big repo waits for page 1.** A scan sends `If-None-Match` with the
+  FIRST page's ETag, and a 304 ends it. In a repo with more than 100 open issues, an old issue that closes
+  (it lives on page 2+) does not change page 1, so the scan is a 304 and the close is picked up only by the
+  first scan after something on page 1 changes. Every watched repo is far below 100 open issues today. The
+  fix, if one ever is: send `If-None-Match` only when the previous listing fit on one page (or keep
+  per-page ETags).
+- **X-05 — the tag is 8 hex characters of a uuid4.** Two FILED notes whose ids share the first 8 would
+  share one backlog line: only one reports it as its copy, the copy stays hidden while either exists, and
+  both follow that line. The chance is about n²/2³³ over n filed notes (≈1e-4 at a thousand). Negligible;
+  the fix, if it ever matters, is a longer tag.
+- **B-05 — any edit to a backlog What: line is a new row.** The key is the What: line, so a typo fix
+  archives the old row and creates a new one; a review tick or manual title on the old row stays with it
+  (findable under `?state=archived`). A FILED note is unaffected: its tag moves with the line.
+- **B-14 — a truncated read of backlog.txt archives the entries after the cut** until the next complete
+  push (an hour later) brings them back with the same ids. Filed notes do not flap on it (the two-push
+  grace period).
+- **A merged link can re-close a note Graham reopened by hand.** When the boot-time spelling
+  canonicalisation merges a note's two links to one issue, the kept link is reset to 'open' (so the first
+  full scan fires the real transition). If that issue was already closed and Graham had reopened the note
+  by hand, the scan sees open → closed and closes the note again. It needs links stored under two
+  spellings of one repo, which only pre-upgrade data can have, so it is rare; reopen the note again.
+- **G-26 — a repo with more than 1000 open issues mirrors nothing** (the listing is treated as partial, so
+  nothing is upserted or closed). Far beyond any watched repo.
 
 ### Three credentials, and why it is three and not one
 
@@ -302,9 +404,20 @@ tolerable at all. The **privacy ceiling** then deletes any audio at TWICE that a
 That second rule is not redundant: the first one is satisfiable only by Graham's own action, so a note he
 never reviews, or one Whisper failed three times on, would otherwise keep its recording of his voice
 forever — the setting would read like a maximum and behave like a minimum.
+(Both rules act on the box. Since 2026-09-29 the Drive backup of the audio is add-only by default, so a
+recording already backed up outlives both on Drive until removed by hand — see "Mirror mode" below.)
 
-`DELETE /api/v1/inbox/items/<id>` (session only, Origin-pinned, write-limited) removes a row and its
-audio immediately. It exists because the one class of data here that is unambiguously personal is the one
+**A recording that goes before it was transcribed** can never be transcribed, so the note must not sit
+at "pending" in no queue for ever (P-12/P-14). Pruning it (the ceiling) or the hourly sweep finding its
+FILE gone flips a `pending` transcript to `failed`, which puts the note in Needs review; the sweep also
+stamps `audio_missing_at`. The row says which: "Recording expired before it was transcribed" (pruned) or
+"Recording missing" (lost) — write the draft from memory, or delete it. The page never renders a player
+for a file that is gone: before the sweep has noticed, the board `stat`s each recording it lists (W-04).
+The migration applies the same rule to notes already stranded that way.
+
+`DELETE /api/v1/inbox/items/<id>` (session only, Origin-pinned, write-limited) removes a note and its
+audio immediately (voice and typed notes only; a mirrored row is a 409 — see "Item lifecycle"; the item
+JSON carries `deletable`). It exists because the one class of data here that is unambiguously personal is the one
 class a user must be able to retract without `docker exec` and hand-written SQL — a recording that caught
 a background conversation, or a password read aloud. The row goes first and the file second; the orphan
 sweep makes that ordering safe.
@@ -314,13 +427,27 @@ re-derivable and it had no off-box backup — verified on the box: only `km-back
 `todoist-points-backup.timer` existed. `inbox.db` and the audio tree changed that, so
 `deploy/box/backup.sh` + `hopper-dashboard-backup.{service,timer}` now snapshot BOTH DBs from inside the
 container (the WAL sidecars are owned by uid 10001; a host-side online backup fails "attempt to write a
-readonly database") and push them to Drive with **`rclone copy`** into a retention ring plus a `daily/`
+readonly database"), stream each checked snapshot out on the exec's stdout (never `docker cp`: the
+container's `/tmp` is a tmpfs, which `docker cp` cannot read), re-check it on the host, and push them to
+Drive with **`rclone copy`** into a retention ring plus a `daily/`
 tier. The upload itself never deletes; the ring and the daily tier prune by COUNT, deliberately, so a
 snapshot leaves Drive only when enough newer ones have replaced it. Nothing that happens to the live DB
 can remove an off-box DB snapshot.
 
-**The audio tree is the deliberate exception: it MIRRORS the container, deletions included.** Graham's
-decision, 2026-09-19, after a reviewer pointed out that an additive audio backup quietly defeats both
+**The audio tree is ADD-ONLY by default (`BACKUP_AUDIO_MODE=copy`, Graham's decision 2026-09-29).**
+Recordings on Drive are only ever added (`rclone copy --immutable --exclude '*.part'` straight from a
+staging dir that is removed after: a recording that differs on Drive is refused, never overwritten; an
+in-flight upload is skipped), and the box keeps NO copy of the audio: a note deleted in the Hub (or aged
+out by the prune) loses its recording from the Hub at once, and a copy already backed up stays in Drive
+until removed there by hand. With no box copy there is nothing for a shrink brake to guard, so none can
+false-alarm; a successful copy-mode run removes a box copy and brake state left by mirror mode. That
+reverses the 2026-09-19 decision below, which is kept as `BACKUP_AUDIO_MODE=mirror`, and the brakes
+described next are mirror mode's. Every run holds `flock -n` on `state/backup.lock` (an overlapping run
+exits 0 and does nothing) and, under it, sweeps every leftover `.audio.*` staging dir. The rest of this
+section up to "What Delete does" describes mirror mode.
+
+**Mirror mode: the recordings MIRROR the container, deletions included.** Graham's
+decision, 2026-09-19 (no longer the default), after a reviewer pointed out that an additive audio backup quietly defeats both
 controls above — Delete is sold here as the way to retract "a password read aloud", and the privacy
 ceiling is sold as a maximum age, and neither is true if every recording lives on Drive forever. So both
 hops mirror: each run `docker cp`s the tree into a FRESH staging directory (an additive `docker cp` into a
@@ -354,14 +481,31 @@ the exact count the purge should leave behind (`AUDIO_ALLOW_MASS_DELETE=7`), so 
 `.env.backup` authorises a state that has already happened — which is to say, nothing. Only a clean
 mirror updates the remembered count. Details and the restore procedure in DEPLOY.md §2b.
 
-**What Delete does and does not reach.** Delete removes the row and the recording immediately, and the
-recording is gone from Drive within one backup cycle (≤5 min). **The transcript TEXT is not retracted
-from backups already taken.** Every `inbox_*.db` snapshot on Drive — the ring plus the `daily/` tier —
-still contains whatever was said, and those age out on `DAILY_RETENTION`, i.e. **up to 30 days**. That is
+**What Delete does and does not reach.** Delete removes the note and its recording from the Hub (the
+container's store) immediately; in the default copy mode the box keeps no other copy of the audio, and
+**a recording already backed up stays in Drive** until removed there by hand (in mirror mode it is gone
+from Drive, and from mirror mode's box copy, at the next successful backup run). The page says: "Delete
+removes a note and its recording from the Hub at once; the box keeps no other copy of the audio, and a copy
+already in Google Drive stays there until you remove it by hand." The Delete confirmation names the file:
+`…/audio/<yyyy>/<mm>/<note id>.*` in the backup folder. **The
+transcript TEXT is not retracted from backups already taken.** Every `inbox_*.db` snapshot — the local ring,
+the Drive ring and the `daily/` tier — still contains whatever was said. Each tier has an age cap on top of
+its count cap (`SNAPSHOT_MAX_AGE_DAYS`, 30), so those snapshots are **removed within about 30 days**, and a
+removed Drive file may then sit in Drive's trash for up to 30 more days. The age cap cannot empty a tier:
+the newest snapshot always stays; so does the STATE AS OF A WEEK AGO — the newest snapshot stamped more
+than 7 days back — whatever its age or the count cap (a bad change is undone from it, and later writes such
+as a review tick or a boot's ETag forget, each a new snapshot, can never push it out early); at most 5 go
+by age per tier per run; and
+a clock that reads earlier than the last run, or more than 7 days after it, skips age removal for that
+run. Every run that reaches Drive prunes both Drive tiers for every DB, uploaded or not (a quiet DB was
+never pruned there, BK-19). The page says: "Database backups already taken still hold the transcript text;
+they are removed within about 30 days (the state as of a week ago is always kept, so a bad change can be
+undone), and may then sit in Google Drive's trash for up to 30 more days." That is
 the correct trade: rewriting historical database snapshots to erase a row would mean a backup that can be
 edited after the fact, which is not a backup. But the claim has to be stated honestly rather than sold as
-"deleted everywhere" — the audio is deleted everywhere; the words persist for up to 30 days in dated
-database backups.
+"deleted everywhere" — the words persist for about 30 days in dated database backups (plus Drive's
+trash), and (in copy mode) the recording persists in Drive
+until removed by hand.
 
 ### What the Inbox adds to the board
 
@@ -466,6 +610,12 @@ transcript and the audio prune depends on it being Whisper's. Rules:
 - Graham editing any draft field stamps `draft_edited_at`: from then on no machine draft may overwrite it
   (409), and the draft is `ready`. A manual title typed at capture is forced into `draft_title`, and the
   capture form's project seeds `draft_project`.
+- **A voice note can be ticked Reviewed only once it has a draft** (R-03): a draft title that is `ready`
+  (the machine's, or Graham's own edit), or one written in the same request. Before that the PATCH is a
+  409 ("nothing to review yet — wait for the draft, or write one with Edit draft") and the page shows no
+  Reviewed box (`inbox.can_tick_reviewed`): ticking a note that is still transcribing used to hand Hopper's
+  filing loop an "(untitled)" note with an empty body. Unticking is always allowed; typed and legacy
+  notes are unchanged.
 - **Ticking Reviewed on a voice note copies the draft**: `title := draft_title` (made `manual`; only over a
   still-derived title, or a draft edited in the same request, so a re-tick never takes back a rename) and
   `project := draft_project` — only on the FIRST copy (`draft_copied_at IS NULL`; `reviewed_at` cannot say
@@ -497,6 +647,33 @@ transcript and the audio prune depends on it being Whisper's. Rules:
   also matches the draft title and body.
 - `PATCH /api/v1/inbox/items/<id>` accepts `draft_title`, `draft_body`, `draft_project` (voice only; same
   session / Origin / limiter rules).
+- PATCH answers with the item AND fresh `counts`; DELETE answers `{deleted, had_audio, audio_removed,
+  counts}` — the same `counts()` the tiles are rendered from — and a DELETE of a note that is already
+  gone is a 404 that still carries `counts`. The page shows an answer's counts at once, then **settles
+  to the server's counts after each burst**: whenever an action request settles (success, 409, 404 or
+  no answer at all) and no other is in flight — a capture save counts as one — it waits ~300 ms, then
+  makes ONE `GET /api/v1/inbox/counts` (session or READ_TOKEN, `{counts}`) and applies it as the final
+  word, unless another action has started since. Answers can land out of order (two gunicorn workers,
+  two rows) and a refusal carries no counts, so the tiles may be briefly wrong in between; the settle
+  read is what makes them right. (No per-answer stamps: a stamp read apart from the SELECT could not
+  order two answers truthfully.) That is what lets the page update in place:
+  **no row action reloads it** (the Reviewed tick, Close, Reopen, a draft save, Delete). Each row is
+  rendered with both states of everything an action can change, the one not in force `hidden`, and
+  inbox.js flips `hidden`, classes and data-* from the answer (never markup). A refusal shows "Not saved —
+  <reason>" on the row and leaves every control showing the true state. Capture save still reloads — the
+  new row needs server rendering — but never over input that is not saved anywhere (a take recording,
+  starting or held, capture text, an open draft editor with changes): then it resets what it sent and
+  says "Added — refresh to see it in the list". A `beforeunload` guard asks before leaving while any of
+  that exists.
+- A CLOSED note's [Edit draft][Reviewed] group keeps its slot and shows nothing (`.dormant`,
+  `visibility: hidden`), so Reopen sits exactly where Close was, and is `inert`, so nothing in it takes
+  focus or a tap even if app.css never loads. Closing a note closes its draft editor
+  if it holds no changes; one with changes stays open (it is unsaved input), but its Save reads "Reopen
+  to save" and stays disabled until the note is open again.
+- The "nothing to review yet" 409 on a Reviewed tick carries `code: "nothing_to_review"` and `item`, the
+  row as it is now, so the page hides the box and shows "Drafting…" or the failed-draft line instead of
+  an unticked box that would only be refused again. (Not "not_reviewable": every voice note IS
+  `reviewable`; it just has no draft yet.)
 - `GET /api/v1/inbox/draft/queue` (INBOX_TOKEN) → `{items: [{id, transcript, manual_title, project, sha}],
   known_projects, max_attempts, max_title, max_body}`. Oldest first; includes the backfill (transcribed
   notes with no draft) and notes whose draft is stale. `known_projects` = the repo names of
@@ -511,18 +688,70 @@ transcript and the audio prune depends on it being Whisper's. Rules:
 awaiting filing (`?awaiting=filing`: reviewed, open, local, no linked issue, not filed to the backlog) and
 files it from `title`, `project` and `draft.body`: repo work becomes a GitHub issue recorded with
 `POST /api/v1/inbox/items/<id>/issues`; anything else (Hopper itself, the Mac or box, a chore) becomes ONE
-`backlog.txt` line in Hopper's own words ending `(voice <first 8 chars of id>)`, recorded with
+`backlog.txt` ENTRY in Hopper's own words whose What: line ends `(voice <first 8 chars of id>)` (the
+format is pinned below), recorded with
 `POST /api/v1/inbox/items/<id>/filed-backlog {"line": …}` (INBOX_TOKEN; the note must be reviewed, open
 and not archived, else 409; one line, `clean_text`, ≤ `MAX_BACKLOG_LINE` = 500, must carry the tag;
 idempotent — the first `filed_backlog_at` is kept). The note
-then leaves awaiting-filing, and the backlog-mirror row that line comes back as (matched by the tag,
-whichever arrives first) is **hidden from the default list and the counts while that note is not closed
-or archived** (shown again once it is) — the simpler of hiding or
+then leaves awaiting-filing, and the backlog-mirror row that entry comes back as (matched by the tag in
+its What: line, whichever arrives first) is **hidden from the default list and the counts whenever that
+note exists** (shown again only if the note is deleted) — the simpler of hiding or
 nesting — and linked as `filed_backlog.mirror_key` on the note. `?source=backlog` still lists it.
+
+**Removing the line, or marking it done, closes the note** (the backlog twin of "all linked issues
+closed → close"). One push is ONE transaction (`inbox_db.apply_backlog_push`; these connections are
+autocommit, so `with conn:` would not be one). It first sets each row's state from its What: line (done
+marker → closed, otherwise open; `closed_by` cleared). Then, ONLY for a COMPLETE push and only after all
+of it — every upsert and the archive — `inbox_db.apply_filed_backlog_rule` looks at each filed note's tag
+in the What: lines: `open` (some live tagged row is open), `done` (live tagged rows, all closed) or none
+live. `done` closes an open note on the push it becomes done; none live counts the push in the note's
+`backlog_absent_pushes` (capped at 2) and closes it on the SECOND consecutive one; `open` resets the count
+and reopens a note with `closed_by='backlog'`. Nothing else is touched: a note closed by hand has
+`closed_by` NULL (every hand state change clears it) and the issues rule (`apply_issue_transitions`) writes
+`issues`. Every write is by primary key. What this means in practice:
+
+- a push is ALL OR NOTHING: `POST /api/v1/inbox/mirror/backlog` validates the whole payload before it
+  writes anything, so a 400 (a non-object item, a bad project) changes nothing at all — it used to commit
+  every item upserted before the bad one — and the writes themselves are one transaction. A push whose
+  entries are all blank after cleaning is refused like an empty one (a complete one would otherwise archive
+  every row). The route has its own 1 MB body allowance (the real file is ~45 KB of JSON, 69% of the 64 KB
+  global cap that every other route keeps; the probe has no smaller cap of its own);
+- each key is DERIVED from the entry's What: line on the server, and a client `key` that differs refuses
+  the WHOLE push with a 400 (B-30). Intended: a mismatch means the probe and the server disagree about
+  identity, and applying the rest would archive and re-create rows — so it is loud instead (the
+  `inbox-backlog` heartbeat fails until the two agree; `tests/test_backlog_mirror.py` pins them together);
+- an UNCHANGED push writes nothing at all (no `updated_at`/`mirror_seen_at` churn, the absence count is
+  capped), so the 5-minute backup does not re-snapshot and re-upload `inbox.db` for nothing;
+- a partial (`complete: false`), refused or failed push closes, reopens and counts nothing;
+- a reworded line that keeps the tag, or the tag moving to another entry's What: line, closes nothing
+  (the tag is still on a live open row at the end of the push); a tag only under Why:/Notes:/Context:
+  does not count;
+- two lines with the same tag, one done and one open, keep the note open; both done closes it;
+- a filed note whose line never reached the mirror (Hopper's filing call and the hourly push can land in
+  either order; the line may be added and removed between pushes) closes after two complete pushes
+  without it, like a removal; one truncated read of the file (only the first N entries) closes nothing.
+
+**The filing format** Hopper writes is a proper entry, appended with its own separator:
+
+```
+---
+What: <what to do, in Hopper's words> (voice <id8>)
+```
+
+A bare line appended without `---` becomes a continuation of the PREVIOUS entry's last field, not an
+entry of its own: it links nothing and the note would close after two pushes. The tag may sit anywhere in
+the What: line (a later "— ✅ DONE <date>" suffix is fine) but must not be moved to another field.
+
+Why a column (`closed_by`) rather than inferring from timestamps: it is the one fact each reopen needs
+("did this rule close it?"), and a hand close in the same second as a push would otherwise be
+indistinguishable. The push response adds `closed_notes` and `reopened_notes`; the GitHub sync result
+adds `reopened_items`. Rows closed before the column existed have `closed_by` NULL, so they are treated as
+closed by hand: no rule reopens them.
 
 **The `claude -p` call** is locked down: `--safe-mode --setting-sources "" --tools "" --strict-mcp-config
 --no-session-persistence --disable-slash-commands --output-format json --json-schema … --model sonnet
---system-prompt …`, the transcript as JSON on stdin framed as data, an empty temp cwd, an allowlisted env
+--system-prompt …`, the transcript (and the optional setup brief as a `context` field — see the privacy
+bullet above) as JSON on stdin framed as data, an empty temp cwd, an allowlisted env
 plus `CLAUDE_CODE_OAUTH_TOKEN` from a 0600 file. Never `--bare` (it ignores OAuth). The result envelope was
 recorded from the real CLI: success is `is_error:false` with the object in `structured_output`; every API
 problem is `is_error:true`, `terminal_reason:"api_error"`, `api_error_status` = HTTP status or null, and

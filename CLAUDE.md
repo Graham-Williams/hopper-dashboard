@@ -47,8 +47,8 @@ roles in one process for local dev.
 ```
 uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -r requirements-dev.txt
 # (or: python3.12 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt)
-.venv/bin/python -m pytest -q                         # ~970 tests, no network, ~2 min
-/usr/bin/python3 -m pytest -o addopts="" tests/test_probes_*.py -q   # ~180 probe tests, MUST pass stdlib-only
+.venv/bin/python -m pytest -q                         # ~1200 tests, no network, ~3 min
+/usr/bin/python3 -m pytest -o addopts="" tests/test_probes_*.py -q   # ~220 probe tests, MUST pass stdlib-only
 /usr/bin/python3 -m compileall -qf probes/             # 3.9 syntax gate (CI also RUNS the probe tests on 3.9)
 
 cp jobs.example.yml jobs.yml                          # local only; gitignored
@@ -295,7 +295,10 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   the two together — change both or neither.
 - `inbox_audio.py` — the audio file store (mime allow-list + a MAGIC-BYTE check, sha256, path built from the
   server-generated id only, never the client filename) and the scheduler's prune + orphan reconcile. The
-  prune needs ALL THREE of `transcript_status='whisper'`, `reviewed=1`, and older than the retention. It
+  prune needs ALL THREE of `transcript_status='whisper'`, `reviewed=1`, and older than the retention (or the
+  2x ceiling). A prune, or the sweep finding a file gone (`audio_missing_at`), turns a `pending` transcript
+  into `failed` → Needs review, labelled "Recording expired…"/"Recording missing"; the board `stat`s each
+  listed recording so it never renders a dead player. It
   lives here rather than in `inbox.py` because `inbox.py` imports `web` → `views` → `services`, and the
   scheduler importing that would close a cycle.
 - **Drafts (2026-09-28).** Voice notes get an AI draft in `draft_*` columns (the first real
@@ -304,7 +307,9 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   `draft_project` → `project` only on the first copy (`draft_copied_at`) or when it is in the same
   PATCH; editing the draft after review also writes `title`/`project`. Needs review = voice, open,
   unreviewed, draft `ready`|`failed` OR a failed transcript; it sorts first and has a tile, a filter
-  (`?awaiting=review`) and a count. Reviewed is voice-only plus LEGACY typed notes, ticked or not
+  (`?awaiting=review`) and a count. A voice note can be ticked only once it has a draft title (`ready`, or
+  written in the same PATCH) — else 409 `NOTHING_TO_REVIEW`, and no box (`can_tick_reviewed`) (R-03).
+  Reviewed is voice-only plus LEGACY typed notes, ticked or not
   (`inbox.reviewable`: typed and `reviewed_at != created_at` — a note born reviewed has the two equal
   from the same INSERT); new typed notes are created `reviewed=1`. The migration backfills
   `draft_copied_at = reviewed_at` for already-reviewed voice notes (NULLs only). A Graham edit stamps `draft_edited_at`
@@ -319,6 +324,36 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   while the note is not closed or archived (`_FILED_COPY_SQL`; `?source=backlog` still shows it). The
   route needs a reviewed, open note (409). An older image ignores these columns, so a rollback brings
   filed notes back as awaiting filing — DEPLOY.md Rollback has the check. The tag is the ONLY link — keep the convention.
+  **The backlog rule** (`inbox_db.apply_filed_backlog_rule`, inside `apply_backlog_push` — one real
+  transaction; `with conn:` is NOT one on these autocommit connections): every push sets a backlog row's
+  state from its What: line (`BACKLOG_DONE_RE` `✅️?\s*(DONE|RESOLVED)\b` anywhere → closed; `closed_by`
+  cleared); after a COMPLETE push (upserts + archive, never per row) a filed note closes with
+  `closed_by='backlog'` when its tagged What: line becomes done (at once) or is missing from 2
+  consecutive complete pushes (`backlog_absent_pushes`, capped), and reopens only if that rule closed it
+  and a tagged line is open again. A tag counts ONLY in the What: line (first line of the text; anywhere in
+  it) in all three matchers — `backlog_tags`/`WHAT_LINE_SQL`, pinned together by a test. The filed copy
+  is hidden whenever its note exists (any state). An unchanged push writes NOTHING (`upsert_mirror_item`
+  only writes a real change). **The issues rule**
+  (`inbox_db.apply_issue_transitions`, notes only) is edge-triggered too: `github_mirror` snapshots the
+  stored `inbox_issues` states (`issue_states`) at the start of a complete scan, and a note closes
+  (`closed_by='issues'`) only when the scan moves its LAST open issue to closed, and reopens only if that
+  rule closed it and the scan moved an issue closed → open. Mirrored github/backlog rows are VIEWS and
+  follow upstream every scan/push. Every hand state change clears `closed_by`.
+- `?state=archived` (`inbox_db.ARCHIVED_FILTER`) lists archived rows with their badge — on the page and
+  in `GET /api/v1/inbox/items`, which `READ_TOKEN` can read like the rest of the list; it is a FILTER
+  value only (PATCH still takes open/closed), and counts stay live-only.
+- **Item lifecycle** — what closed/archived/reopen mean per source (voice, typed, github, backlog), and which
+  of them is automatic: the table in DESIGN.md "Item lifecycle". One table (`inbox_items`), `state`
+  open/closed plus `archived_at`. Update the table when any close/archive/reopen rule changes. Its "Known
+  limits" (G-25 page-2 changes in a >100-issue repo wait for page 1; X-05 an 8-hex tag collision; B-05 a
+  What: edit is a new row; B-14 a truncated read archives rows for an hour; G-26 >1000 open issues mirror
+  nothing; a merged pre-upgrade link reset to 'open' can re-close a note reopened by hand) are
+  documented, not fixed. A backlog tag counts anywhere in the What: line (B-29, accepted).
+- **`with conn:` is NOT a transaction here.** Both stores connect with `isolation_level=None`
+  (autocommit), so every statement commits as it runs and `with conn:` rolls nothing back. Validate the
+  whole request before the first write (the backlog push does: a 400 on one item used to keep the items
+  ahead of it), and put anything that must land whole in `inbox_db.transaction(conn)` (`BEGIN IMMEDIATE`).
+  `tests/test_inbox.py` also pins "no `return` inside `with conn:`" with an `ast` guard over `dashboard/`.
 - `inbox.py` — the blueprint. `MACHINE_ENDPOINTS` is what scopes `INBOX_TOKEN` (now including
   `inbox.draft_queue` and `inbox.post_draft`); the create route raises
   `request.max_content_length` PER REQUEST (the global 64 KB cap in `__init__.py` protects every other
@@ -328,10 +363,67 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
 - `github_mirror.py` — `sync(conn, repos, now, fetch)` with `fetch` injected for tests. ETag-conditional,
   skips anything with a `pull_request` key, honours `X-RateLimit-Reset`/`Retry-After` into `backoff_until`,
   and closes items ONLY after a complete, error-free repo fetch (a partial page must never close anything).
+  A complete scan is ONE `inbox_db.transaction`. Every sync first archives rows of repos no longer in
+  `INBOX_GITHUB_REPOS` (`archive_unwatched`, G-22 — Core runs it even with no repos); a complete scan
+  un-archives its repo's archived rows that no note links (`unarchive_unlinked_github`), and archives a
+  LIVE mirror row of any linked issue it meets (old duplicates; a start-up migration repairs existing
+  ones). Anything that changes a repo LOCALLY — unwatching it, a new link, deleting a linking note —
+  `forget_etag`s it: a 304 against the old ETag would skip exactly the scan that applies the change. The
+  test fake answers a matching If-None-Match with a 304, like GitHub. Every boot runs
+  `inbox_db.startup_repairs` IN ORDER: canonicalise link spellings to the watched one (a merged link is
+  set back to 'open', so the forced scan fires the real transition), THEN archive live duplicates of
+  linked issues (it matches on the canonical spelling), THEN forget every stored ETag (the first scan
+  after a boot is full — a rollback window's changes are caught; it stores only the new ETags when
+  nothing changed). Two spellings of one repo in `INBOX_GITHUB_REPOS` fail config load. An UNCHANGED
+  sync (a 304, or a 200 with the same answer) writes NOTHING: `upsert_mirror_item`, `refresh_issue` and
+  `set_mirror_state` write only a real change (so `mirror_seen_at`, `checked_at` and `last_sync_at` mean
+  "last changed"; a 304 is stored as `ok`) — otherwise the backup re-uploads `inbox.db` every cycle.
+- **`POST /api/v1/inbox/items/<id>/issues`** has filed-backlog's 409s (voice/typed only; reviewed, open,
+  not archived) plus `NOT_WATCHED` for a repo outside `INBOX_GITHUB_REPOS` (the link would never be
+  refreshed, so the note could never close) — all checked INSIDE the write transaction (refusals are
+  raised as `_Refused` and answered outside it). The repo is stored under the WATCHED spelling (matched
+  case-insensitively) and the URL is the canonical one built from it and the number, never the
+  client's. `GET /api/v1/inbox/items` carries `watched_repos` so the filing loop can check BEFORE
+  `gh issue create` (a 409 after it would mean a duplicate issue on retry).
+- PATCH `state` on a github or backlog row is a 409 (`MIRROR_STATE_REFUSALS`, worded like Delete's): a
+  mirrored row's state is upstream's. The backlog push DERIVES each key from the entry's What: line and
+  400s a client key that differs (`tests/test_backlog_mirror.py` pins the probe to the same derivation). Many notes may link one issue (`UNIQUE(item_id, repo, number)`, same index name
+  as the old `UNIQUE(repo, number)` — keep it, it is what makes a rollback safe); linking an issue that
+  had a mirror row archives that row (G-19).
 - `templates/inbox.html`, `static/inbox.js` — see the JS convention above. Rows are ONE column at every
   width (phone-first): badges, draft title/body, Transcript `<details>`, the player, one action row
-  (Edit draft · the Reviewed pill toggle · Delete as a quiet danger text button, all ≥44px), then the meta
-  line. The two capture notes sit in one collapsed "About recordings and privacy" `<details>`. Needs
+  in TWO nowrap groups — [Edit draft][Reviewed] and, right-aligned, [Close/Reopen][Delete] (Delete LAST),
+  all ≥44px — so at 390 px the second pair wraps as a unit; Close and Reopen share a min-width, so a state
+  flip never reflows the row. A CLOSED note shows only the second group, in the same place (reopen
+  before editing or reviewing). Then the meta line. NO row action reloads the page: the Reviewed tick, Close/Reopen
+  (`.toggle-state`, notes only), a draft save and Delete update the row IN PLACE from the answer. PATCH
+  and DELETE answer with `item_json` plus fresh `counts` (the same `counts()` the tiles render), and
+  `applyItem`/`applyCounts` in inbox.js flip `hidden`, classes and data-* and set textContent — so the
+  template renders BOTH states of everything that can change (both toggle buttons, every badge, the draft
+  lines, the Reviewed label), the one not in force `hidden`, and app.css's
+  `[hidden] { display: none !important; }` keeps a hidden badge or group off screen. Keep `applyItem` and
+  the template's conditions in step. A refusal or failure says "Not saved — <reason>" in the row's
+  `.row-error` and leaves every control showing the true state (a tick is reverted). Every control on a
+  row is disabled only while one of its requests is in flight (no double taps, no out-of-order answers).
+  An answer's counts are applied at once, then the tiles SETTLE: every action request (`send()`, and the
+  capture save) is counted in flight, and when one settles — any outcome — with none left, a ~300 ms
+  debounce makes ONE `GET /api/v1/inbox/counts`, applied unless another action started since
+  (`countsSeq`). No stamps. A DELETE answered 404 still drops the row. A closed note's first group keeps
+  its slot (`.dormant`, visibility: hidden — never `hidden`, which would move Reopen up a line) and is
+  `inert` (template and `applyItem`); closing closes an unchanged draft editor,
+  and a changed one stays open with Save locked to "Reopen to save" (`lockSave`; `setBusy` keeps it
+  locked). The "nothing to review yet" 409 has `code: "nothing_to_review"` plus `item`, which the page
+  applies (no unticked box left behind).
+  Capture save is the one action that reloads (the new row needs Jinja), and only when nothing else is
+  unsaved — a take recording, starting (permission prompt open) or held, capture text, a dirty draft
+  editor; otherwise it resets what it sent, gives Add back and says "Added — refresh to see it in the
+  list" (`#capture-done`). A `beforeunload` guard asks before leaving while any of that exists.
+  Delete's confirmation says "and its recording" only while the note still has one here
+  (`data-has-audio`; otherwise "Any backed-up copy of the recording stays in Google Drive …"), and always
+  names the Drive copy (`data-drive-path`) for a voice note. Delete is for NOTES only (`inbox.deletable`, `item_json["deletable"]`): a github or backlog row
+  renders no action row at all, the server 409s a DELETE on one with where to act
+  (`MIRROR_DELETE_REFUSALS`), a github row links its issue ("owner/repo#n on GitHub") and a backlog row
+  says "Lives in backlog.txt". The two capture notes sit in one collapsed "About recordings and privacy" `<details>`. Needs
   review links go to `/inbox?awaiting=review#items`; `#items`/`.item` carry `scroll-margin-top` for the
   sticky nav. Check phone layout with a real 390px viewport, not a narrowed desktop window.
 - Scheduler: `Scheduler.step()` carries `last_github` and `last_prune`, each re-armed from its own END clock
@@ -362,8 +454,9 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
   `'self'`, so an external `<script src>` works ONLY if it also carries the nonce; do not add `'self'`.
   `inbox.js` uses `textContent`, never `innerHTML`, and the rows are rendered server-side — it only
   shows/hides/reorders DOM that is already there, so the table works with JS off. The draft edit form is
-  rendered hidden in each voice row; the script shows it, PATCHes the three fields and reloads.
-  `tests/test_inbox_js.py` RUNS the file in node against a fake DOM (capture and draft editing).
+  rendered hidden in each voice row; the script shows it, PATCHes the three fields and updates the row
+  in place. `tests/test_inbox_js.py` RUNS the file in node against fake DOMs (capture, draft editing,
+  Close/Reopen, and the in-place row and tile updates).
 - Tests must stay network-free: mock `probes.probe_job` / `subprocess.run` and use `RecordingNotifier`.
   `run_probe_cycle` passes `timeout=` to `probe_job`, so a stub must accept it (`lambda job, **kw: …`).
 - Test fixtures pin `jobs.created_at` to 2030 (`conftest.pin_created_at`) so the never-pinged → LATE rule
@@ -640,8 +733,18 @@ there is no default URL in the code, by design.
     out last run too — `draft-state.json` next to `state.json`). A 409 is skipped. Never put the CLI's
     stdout in an error message: it can be model output, and those messages reach the heartbeat. The CLI's
     error envelope still says `subtype: "success"` — decide on `is_error` + `api_error_status`, never
-    `subtype`. The TRANSCRIPT and TITLE go to Anthropic; the audio never does. Tests run a FAKE `claude`
+    `subtype`. The TRANSCRIPT and TITLE go to Anthropic, plus the optional SETUP BRIEF
+    (`INBOX_DRAFT_CONTEXT_FILE`, a `context` field on stdin, capped at `MAX_CONTEXT` = 6000 chars, read fresh
+    each run by `read_context` — O_NOFOLLOW + fstat, owner = this user, not group/world-writable, one hard
+    link only, never the token file or the worker's own env file (st_dev/st_ino), never a brief whose TEXT
+    holds INBOX_TOKEN/INGEST_TOKEN/the claude token (compared in memory, never logged), NULs stripped before
+    the cap, bad UTF-8 replaced not refused; a refused brief
+    = no brief + one log warning, never systemic; its
+    text never reaches the log or heartbeat; example `deploy/mac/draft-context.example.md`); the audio never does. Tests run a FAKE `claude`
     executable (argv, stdin, cwd and env are observed, not assumed).
+  - The worker sweeps `hopper-inbox-*` temp recordings older than an hour at start (a killed run's), and
+    turns SIGTERM (launchd stopping the agent) into SystemExit so the `finally` that removes the one being
+    transcribed still runs; the previous handler is restored on exit.
   - `INBOX_URL` must be the Hub host. The probe HTTP client refuses cross-host redirects
     (`common._SameOriginRedirects`), so an old `dashboard…` URL fails every run instead of following the
     legacy 307.
@@ -655,12 +758,39 @@ there is no default URL in the code, by design.
   (there is no flag to install the timer without the heartbeat — an unmonitored backup is the exact failure
   this repo exists to catch). Snapshots `dashboard.db` AND `inbox.db` from INSIDE the container via
   `docker exec` (WAL sidecars are uid 10001; a host-side online backup fails "attempt to write a readonly
-  database"), sha256-dedupes, keeps a local ring + a `daily/` tier, and pushes with **`rclone copy`, never
-  `sync`** for the two DBs. The audio tree is the deliberate EXCEPTION: it MIRRORS deletions (copy, then an
-  explicit logged delete pass for remote extras) so that Delete and the unconditional privacy ceiling
-  actually reach the off-box copy — Graham's call 2026-09-19, because DESIGN.md sells Delete as the way to
-  retract a recording that caught something private, and an additive backup silently broke that promise.
-  Guarded against mirroring a wipe by THREE independent brakes, any one of which refuses and fails the run
+  database"), on the container's 64 MiB tmpfs `/tmp` after a room check (DB + WAL + 10% + 8 MiB for the
+  app) and a sweep of every `*_snap.*.db*` there (under the run lock), and STREAMS each checked snapshot
+  out on the exec's stdout — never `docker cp`, which cannot
+  read the container's tmpfs `/tmp` (the fake docker refuses it exactly like the daemon; CI runs the step
+  for real against the image with `--read-only --tmpfs /tmp`) — checks the received bytes and sha256
+  against what the container says it sent (a mismatch is reported as size or sha256), sha256-dedupes,
+  keeps a local ring + a `daily/` tier, and pushes with **`rclone copy`, never `sync`** for the two DBs.
+  A failed DB snapshot is an ERROR naming the DB; the run carries on with the other DB and the audio
+  and exits 1 at the end (`FAILED`), so one DB never stops the rest.
+  **The audio tree is ADD-ONLY by default too: `BACKUP_AUDIO_MODE=copy`**
+  (Graham's call 2026-09-29, reversing 2026-09-19): `rclone copy --immutable --exclude '*.part'` straight
+  from a staging dir that is removed after — never a remote delete, and NO copy of the audio on the box
+  (so no shrink brake and no false alarms). A note deleted in the Hub loses its recording from the Hub at
+  once; Drive keeps it until removed by hand, and the Inbox page says so. A fully successful copy run
+  removes mirror mode's leftover box copy and brake state. Every run holds `flock -n` on
+  `state/backup.lock` via `flock -n -E 75 9`: the holder writes `state/last_run.epoch` right after
+  taking it; a run that finds it held exits 0 ONLY while EITHER `last_run.epoch` or
+  `last_complete.epoch` is 0–3599 s old (each judged on its own, so a missing, unreadable, old or
+  future stamp never hides a fresh one; neither fresh exits 1 — a stuck run must page), and docker/rclone
+  run through wrappers that close fd 9 (`9>&-`) so no orphan can hold the lock. Under the lock it sweeps
+  ALL `.audio.*` staging dirs and `.snapshot.*` DB temps; mirror mode first restores a box copy left as
+  `audio.old` by a killed swap. `AUDIO_COPY_DONE` starts at 0 (never from the environment) and the
+  leftover cleanup also requires copy mode. The copy-mode upload uses `--checksum` (an identical file
+  with a new mtime is a no-op, not `--immutable`'s exit 6). DB snapshots: count caps plus an age cap
+  (`SNAPSHOT_MAX_AGE_DAYS`, 30) in every tier via `retention_victims` — index 0 always kept, the state
+  as of a week ago (the newest snapshot stamped before `WEEK_CUTOFF`) protected from BOTH caps, ≤5 age
+  removals per tier per run, and a clock guard (the previous `state/last_run.epoch`: earlier than now,
+  or >7 days before, skips age removal once).
+  Every run that reaches Drive prunes both Drive tiers for every DB, uploaded or not (BK-19). The copy-mode RETURN trap resets itself (`trap '…; trap - RETURN' RETURN`)
+  — a RETURN trap set in a function outlives it. `BACKUP_AUDIO_MODE=mirror` keeps the old behaviour:
+  it MIRRORS deletions (copy, then an explicit logged delete pass for remote extras) so that Delete and the
+  unconditional privacy ceiling reach the off-box copy. Any other value dies before the run. Mirror mode is
+  guarded against mirroring a wipe by THREE independent brakes, any one of which refuses and fails the run
   loudly: proportional (`AUDIO_MAX_DROP_PCT`, default 50, **validated 1–99** — `require_positive_int` was
   the wrong validator, since 100 makes the comparison never true and silently disables the brake, 200
   inverts it, and a leading zero would be read as octal), absolute (`AUDIO_MAX_DROP_FILES`, default 25 —
@@ -674,12 +804,14 @@ there is no default URL in the code, by design.
   run that cannot list the remote deletes nothing and records no baseline. `AUDIO_ALLOW_MASS_DELETE` is
   **one-shot by construction**: it carries the exact resulting count (`AUDIO_ALLOW_MASS_DELETE=7`), so a
   value left in `.env.backup` cannot authorise a later, different purge. Only a clean mirror advances the
-  stored count. ⚠️ **Delete removes the row and the recording everywhere (Drive included, within one
-  5-minute cycle), but the transcript TEXT stays in the `inbox_*.db` snapshots already on Drive for up to
-  30 days (`DAILY_RETENTION`)** — rewriting historical snapshots would not be a backup, so the claim is
+  stored count. ⚠️ **In mirror mode Delete removes the row and the recording everywhere (Drive included,
+  within one 5-minute cycle); in copy mode Drive keeps the recording. Either way the transcript TEXT stays in the `inbox_*.db` snapshots already taken for up to about
+  30 days (`SNAPSHOT_MAX_AGE_DAYS`), then possibly in Drive's trash for up to 30 more** — rewriting historical snapshots would not be a backup, so the claim is
   documented honestly instead. All of this is pinned by a real behavioural harness in
   `tests/test_deploy_backup.py` (fake `docker`/`rclone` on PATH, the real script, assertions on the
-  resulting fake remote) — the string-matching tests it replaced caught none of these.
+  resulting fake remote and, via `FAKE_RCLONE_LOG`, on every rclone verb issued) — the string-matching
+  tests it replaced caught none of these. The harness runs in MIRROR mode unless a test sets
+  `box.audio_mode`/`BACKUP_AUDIO_MODE` (None = unset, the script default).
   `deploy/box/verify_snapshot.py` holds the all-empty-snapshot guard (rc 3) so it is testable in
   Python rather than only in bash.
 - Manual jobs: `probes/ping.sh <job_id> <ok|fail|skipped> [note]`. `minecraft-offload` needs one seed ping

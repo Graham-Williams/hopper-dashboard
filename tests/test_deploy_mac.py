@@ -74,3 +74,33 @@ def test_a_dash_leaves_drafting_off(tmp_path):
     r = _run(tmp_path, "-")
     assert r.returncode == 0
     assert "INBOX_CLAUDE_BIN=\n" in (tmp_path / "env").read_text()
+
+
+@pytest.mark.skipif(not os.path.exists("/bin/bash"), reason="needs bash")
+def test_the_setup_brief_key_defaults_to_hoppers_brief_only_when_it_exists(tmp_path):
+    # No brief on this "Mac": the key is written EMPTY (no brief sent), not a dangling path.
+    r = _run(tmp_path, "-")
+    assert r.returncode == 0, r.stderr
+    assert "INBOX_DRAFT_CONTEXT_FILE=\n" in (tmp_path / "env").read_text()
+    # An existing install is left alone on a re-run, even once the brief appears.
+    brief = tmp_path / "personal-assistant" / "docs" / "voice-context.md"
+    brief.parent.mkdir(parents=True)
+    brief.write_text("- repo: purpose\n")
+    _run(tmp_path, "")
+    assert (tmp_path / "env").read_text().count("INBOX_DRAFT_CONTEXT_FILE=") == 1
+
+
+@pytest.mark.skipif(not os.path.exists("/bin/bash"), reason="needs bash")
+def test_an_install_that_already_drafts_still_gets_the_brief_key(tmp_path):
+    brief = tmp_path / "personal-assistant" / "docs" / "voice-context.md"
+    brief.parent.mkdir(parents=True)
+    brief.write_text("- repo: purpose\n")
+    env_file = tmp_path / "env"
+    env_file.write_text("DASHBOARD_URL=x\nINBOX_TOKEN=y\nINBOX_CLAUDE_BIN=\n")
+    env_file.chmod(0o600)
+    r = _run(tmp_path, "")
+    assert r.returncode == 0, r.stderr
+    text = env_file.read_text()
+    assert "INBOX_DRAFT_CONTEXT_FILE=%s\n" % brief in text
+    assert text.count("INBOX_CLAUDE_BIN=") == 1
+    assert stat.S_IMODE(env_file.stat().st_mode) == 0o600

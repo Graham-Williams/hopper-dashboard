@@ -5,6 +5,7 @@ markup."""
 from __future__ import annotations
 
 import json
+from html.parser import HTMLParser
 
 import pytest
 
@@ -19,6 +20,8 @@ M4A = b"\x00\x00\x00\x20" + b"ftyp" + b"M4A " + b"\x00" * 4096
 @pytest.fixture
 def settings(settings):
     settings.inbox_token = INBOX_TOKEN
+    # POST /issues refuses a repo the mirror does not watch (the note could never close).
+    settings.inbox_github_repos = ("a/b", "Graham-Williams/km-tracker")
     return settings
 
 
@@ -200,17 +203,18 @@ def test_the_origin_pin_now_covers_patch(settings, registry, notifier):
                           headers={"Origin": base, "Accept": "application/json"})
     assert created.status_code == 201
     item = created.get_json()["id"]
+    change = {"project": "km-tracker"}
     # No Origin, no Referer → refused.
-    assert client.patch(f"/api/v1/inbox/items/{item}", json={"reviewed": True},
+    assert client.patch(f"/api/v1/inbox/items/{item}", json=change,
                         base_url=base).status_code == 403
     # A foreign Origin → refused.
-    assert client.patch(f"/api/v1/inbox/items/{item}", json={"reviewed": True},
+    assert client.patch(f"/api/v1/inbox/items/{item}", json=change,
                         base_url=base,
                         headers={"Origin": "https://evil.example"}).status_code == 403
     # The app's own Origin → allowed.
-    ok = client.patch(f"/api/v1/inbox/items/{item}", json={"reviewed": True},
+    ok = client.patch(f"/api/v1/inbox/items/{item}", json=change,
                       base_url=base, headers={"Origin": base})
-    assert ok.status_code == 200 and ok.get_json()["reviewed"] is True
+    assert ok.status_code == 200 and ok.get_json()["project"] == "km-tracker"
 
 
 def test_a_session_plus_a_machine_token_is_still_csrf_pinned(
@@ -442,9 +446,10 @@ def test_patch_validates_and_rejects_unknown_fields(authed):
                         json={"title": "   "}).status_code == 400
     assert authed.patch("/api/v1/inbox/items/" + "0" * 32,
                         json={"reviewed": True}).status_code == 404
+    # A draft title written in the same request is what a voice note's tick needs (R-03).
     ok = authed.patch(f"/api/v1/inbox/items/{item}",
                       json={"reviewed": True, "project": "km-tracker",
-                            "state": "closed"})
+                            "state": "closed", "draft_title": "Fix it"})
     body = ok.get_json()
     assert body["reviewed"] and body["project"] == "km-tracker"
     assert body["state"] == "closed" and body["closed_at"]
@@ -658,7 +663,8 @@ def test_the_backlog_mirror_refuses_to_archive_on_an_empty_list(bot, authed):
          "text": "Other thing"}]}
     r = bot.post("/api/v1/inbox/mirror/backlog", json=payload, headers=machine())
     assert r.status_code == 200 and r.get_json() == {
-        "synced": 2, "archived": 0, "complete": True}
+        "synced": 2, "archived": 0, "complete": True, "closed_notes": 0,
+        "reopened_notes": 0}
     # An unreadable file and an emptied backlog look identical here.
     r = bot.post("/api/v1/inbox/mirror/backlog",
                   json={"complete": True, "items": []}, headers=machine())
@@ -669,7 +675,8 @@ def test_the_backlog_mirror_refuses_to_archive_on_an_empty_list(bot, authed):
     r = bot.post("/api/v1/inbox/mirror/backlog",
                   json={"complete": True, "items": [payload["items"][0]]},
                   headers=machine())
-    assert r.get_json() == {"synced": 1, "archived": 1, "complete": True}
+    assert r.get_json() == {"synced": 1, "archived": 1, "complete": True,
+                            "closed_notes": 0, "reopened_notes": 0}
     page = authed.get("/api/v1/inbox/items?source=backlog").get_json()
     assert len(page["items"]) == 1
     # A PARTIAL sync archives nothing.
@@ -773,7 +780,7 @@ def test_the_table_renders_every_row_with_js_off(authed, bot):
            for n in range(5)]
     bot.post("/api/v1/inbox/mirror/backlog",
              json={"complete": True,
-                   "items": [{"key": inbox_db.normalise_backlog_key("mirrored"),
+                   "items": [{"key": inbox_db.normalise_backlog_key("mirrored backlog entry"),
                               "text": "mirrored backlog entry"}]},
              headers=machine())
     html = authed.get("/inbox").data.decode()
@@ -974,6 +981,172 @@ def test_the_board_offers_a_delete_control_per_row(authed):
     assert f'class="delete-item" data-id="{item}"' in html
 
 
+# --- POST /issues: the filed-backlog gate, a watched repo, many notes per issue --- #
+
+LINK = {"repo": "a/b", "number": 1, "url": "https://github.com/a/b/issues/1"}
+
+
+def _link(bot, item, **over):
+    return bot.post(f"/api/v1/inbox/items/{item}/issues", json={**LINK, **over},
+                    headers=machine())
+
+
+def test_linking_an_issue_needs_a_reviewed_open_note(authed, bot, settings):
+    unreviewed = _transcribed(authed, bot)                 # voice, NOT reviewed (R-08)
+    r = _link(bot, unreviewed)
+    assert r.status_code == 409 and "reviewed, open" in r.get_json()["error"]
+    closed = post_note(authed).get_json()["id"]
+    authed.patch(f"/api/v1/inbox/items/{closed}", json={"state": "closed"})
+    assert _link(bot, closed).status_code == 409
+    for mirrored in (_github_row(settings), _backlog_row(authed, bot)):    # R-09
+        r = _link(bot, mirrored)
+        assert r.status_code == 409 and "voice or typed" in r.get_json()["error"]
+    assert inbox_db.linked_issue(inbox_db.connect(settings.inbox_db_path), "a/b", 1) is None
+    fine = post_note(authed).get_json()["id"]
+    assert _link(bot, fine).status_code == 201
+
+
+def test_linking_an_issue_in_a_repo_the_mirror_does_not_watch_is_refused(authed, bot,
+                                                                        settings):
+    item = post_note(authed).get_json()["id"]
+    r = _link(bot, item, repo="a/unwatched", url="https://github.com/a/unwatched/issues/1")
+    assert r.status_code == 409
+    assert r.get_json()["error"] == ("not watched — add it to INBOX_GITHUB_REPOS or the note "
+                                     "can never close")
+    # GitHub names are case-insensitive; the link is stored under the WATCHED spelling, or
+    # the scans (which match on it exactly) would never see it.
+    r = _link(bot, item, repo="graham-williams/KM-TRACKER", number=5,
+              url="https://github.com/graham-williams/KM-TRACKER/issues/5")
+    assert r.status_code == 201
+    assert r.get_json()["issue"]["repo"] == "Graham-Williams/km-tracker"
+
+
+def test_two_notes_can_be_linked_to_the_same_issue(authed, bot):
+    """G-20: two notes about the same bug. Both link; neither is left awaiting filing."""
+    a = post_note(authed, text="the wheel sticks").get_json()["id"]
+    b = post_note(authed, text="wheel is sticky again").get_json()["id"]
+    for item in (a, b):
+        r = _link(bot, item)
+        assert r.status_code == 201
+        assert [(i["repo"], i["number"]) for i in r.get_json()["item"]["issues"]] == [("a/b", 1)]
+    filing = authed.get("/api/v1/inbox/items?awaiting=filing").get_json()["items"]
+    assert filing == []
+
+
+def test_a_link_stores_the_canonical_issue_url_not_the_clients(authed, bot):
+    item = post_note(authed).get_json()["id"]
+    r = _link(bot, item, repo="graham-williams/KM-TRACKER", number=5,
+              url="https://github.com/graham-williams/KM-TRACKER/issues/555")
+    assert r.status_code == 201
+    assert r.get_json()["issue"]["url"] == "https://github.com/Graham-Williams/km-tracker/issues/5"
+
+
+def test_the_link_checks_and_the_write_are_one_transaction(authed, bot, settings, monkeypatch):
+    """The 409 checks run INSIDE the write transaction: a note closed between the check and
+    the link (by a browser tab, say) must not end up linked anyway."""
+    import sqlite3
+
+    from dashboard import inbox as inbox_mod
+    item = post_note(authed).get_json()["id"]
+    real = inbox_mod.watched_repo
+    seen = {}
+
+    def racing(repo):
+        # Between the checks and the write: another connection closes the note.
+        other = sqlite3.connect(settings.inbox_db_path, timeout=0)
+        try:
+            other.execute("UPDATE inbox_items SET state='closed' WHERE id=?", (item,))
+            other.commit()
+            seen["raced"] = True
+        except sqlite3.OperationalError:
+            seen["raced"] = False                 # blocked: the checks still hold
+        finally:
+            other.close()
+        return real(repo)
+    monkeypatch.setattr(inbox_mod, "watched_repo", racing)
+    assert _link(bot, item).status_code == 201
+    assert seen == {"raced": False}
+
+
+def test_the_item_list_says_which_repos_are_watched(authed, bot, settings):
+    """Hopper's filing loop checks this BEFORE `gh issue create`: the NOT_WATCHED 409 comes
+    after the issue already exists, and a retry would file it twice."""
+    for client, headers in ((authed, {}), (bot, reader())):
+        body = client.get("/api/v1/inbox/items", headers=headers).get_json()
+        assert body["watched_repos"] == ["a/b", "Graham-Williams/km-tracker"]
+
+
+# --- mirrored rows have no Delete: they would only come back ------------------ #
+
+GH_URL = "https://github.com/Owner/km-tracker/issues/12"
+
+
+def _github_row(settings):
+    conn = inbox_db.connect(settings.inbox_db_path)
+    try:
+        with conn:
+            return inbox_db.upsert_mirror_item(
+                conn, mirror_key=inbox_db.github_key("Owner/km-tracker", 12),
+                source="github", title="Wheel spins twice", body="on iOS only",
+                url=GH_URL)
+    finally:
+        conn.close()
+
+
+def _backlog_row(authed, bot):
+    assert bot.post("/api/v1/inbox/mirror/backlog", headers=machine(), json={
+        "complete": True, "items": [{"text": "Tidy the box"}]}).status_code == 200
+    return authed.get("/api/v1/inbox/items?source=backlog").get_json()["items"][0]["id"]
+
+
+def test_delete_is_refused_on_mirrored_rows_and_says_where_to_act(authed, bot, settings):
+    gh, bl = _github_row(settings), _backlog_row(authed, bot)
+    r = authed.delete(f"/api/v1/inbox/items/{gh}")
+    assert r.status_code == 409
+    assert r.get_json()["error"] == "This mirrors GitHub — close the issue there"
+    r = authed.delete(f"/api/v1/inbox/items/{bl}")
+    assert r.status_code == 409
+    assert r.get_json()["error"] == "This mirrors backlog.txt — remove or ✅ DONE the line there"
+    listed = {i["id"]: i for i in authed.get("/api/v1/inbox/items").get_json()["items"]}
+    assert gh in listed and bl in listed                   # both untouched
+    assert listed[gh]["deletable"] is False and listed[bl]["deletable"] is False
+    note = post_note(authed).get_json()
+    assert note["deletable"] is True                       # notes are unchanged
+    assert authed.delete(f"/api/v1/inbox/items/{note['id']}").status_code == 200
+
+
+def test_a_state_change_on_a_mirrored_row_is_refused_and_says_where_to_act(authed, bot,
+                                                                           settings):
+    gh, bl = _github_row(settings), _backlog_row(authed, bot)
+    r = authed.patch(f"/api/v1/inbox/items/{gh}", json={"state": "closed"})
+    assert r.status_code == 409
+    assert r.get_json()["error"] == "This mirrors GitHub — close or reopen the issue there"
+    r = authed.patch(f"/api/v1/inbox/items/{bl}", json={"state": "closed"})
+    assert r.status_code == 409
+    assert r.get_json()["error"] == ("This mirrors backlog.txt — ✅ DONE, remove or restore "
+                                     "the line there")
+    listed = {i["id"]: i for i in authed.get("/api/v1/inbox/items").get_json()["items"]}
+    assert listed[gh]["state"] == listed[bl]["state"] == "open"
+    # Other fields are not the mirror's: they stay editable.
+    assert authed.patch(f"/api/v1/inbox/items/{gh}", json={"project": "km-tracker"}
+                        ).status_code == 200
+
+
+def test_mirrored_rows_have_no_delete_button_and_say_where_they_live(authed, bot, settings):
+    gh, bl = _github_row(settings), _backlog_row(authed, bot)
+    note = post_note(authed).get_json()["id"]
+    html = authed.get("/inbox").data.decode()
+    gh_row, bl_row = _row(html, gh), _row(html, bl)
+    for row in (gh_row, bl_row):
+        assert "delete-item" not in row
+        assert 'class="item-actions"' not in row           # no empty action row either
+    # The GitHub row's way to act on it: the issue, linked and labelled as such.
+    link = gh_row.split(f'href="{GH_URL}"', 1)[1].split("</a>", 1)[0]
+    assert "Owner/km-tracker#12 on GitHub" in link
+    assert "Lives in backlog.txt" in bl_row
+    assert 'class="delete-item"' in _row(html, note)       # a note keeps its Delete
+
+
 # --------------------------------------------------------------------------- #
 # Aggregate storage cap
 # --------------------------------------------------------------------------- #
@@ -1119,12 +1292,13 @@ def test_reviewed_true_is_refused_on_a_non_voice_row(authed, settings):
     assert r.status_code == 200 and r.get_json()["reviewed"] is False
     voice = _voice_note(authed)["id"]
     assert authed.patch(f"/api/v1/inbox/items/{voice}",
-                        json={"reviewed": True}).get_json()["reviewed"] is True
+                        json={"reviewed": True, "draft_title": "Fix it"}
+                        ).get_json()["reviewed"] is True
 
 
-def test_only_voice_rows_render_a_reviewed_checkbox(authed):
+def test_only_voice_rows_render_a_reviewed_checkbox(authed, bot):
     typed = post_note(authed, "typed row").get_json()["id"]
-    voice = _voice_note(authed)["id"]
+    voice = _drafted(authed, bot)
     html = authed.get("/inbox").data.decode()
 
     def row(item_id):
@@ -1321,7 +1495,7 @@ def test_a_draft_is_escaped_on_the_board(authed, bot):
 
 def _drafted(authed, bot, **draft):
     item = _transcribed(authed, bot)
-    sha = _queue(bot)["items"][0]["sha"]
+    sha = next(i for i in _queue(bot)["items"] if i["id"] == item)["sha"]
     body = {"title": "Fix the sticky wheel", "body": "It sticks.\nOften.",
             "src_sha": sha}
     body.update(draft)
@@ -1334,14 +1508,62 @@ def _row(html, item):
     return html.split(f'id="item-{item}"', 1)[1].split("</li>", 1)[0]
 
 
+class _Shown(HTMLParser):
+    """What a rendered fragment SHOWS: text and classes outside every element marked
+    `hidden`. Rows carry both states of whatever an action can change (inbox.js flips
+    `hidden` from the server's answer), so "is it in the HTML" no longer says "is it on
+    screen"."""
+
+    VOID = frozenset({"area", "base", "br", "col", "embed", "hr", "img", "input", "link",
+                      "meta", "source", "track", "wbr"})
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.stack, self.text, self.classes = [], [], set()
+
+    def _hidden(self):
+        return any(hidden for _, hidden in self.stack)
+
+    def handle_starttag(self, tag, attrs):
+        # `dormant` is app.css's `visibility: hidden`: the element keeps its slot (so Reopen
+        # lands where Close was) and shows nothing.
+        hidden = (self._hidden() or any(k == "hidden" for k, _ in attrs)
+                  or "dormant" in (dict(attrs).get("class") or "").split())
+        if not hidden:
+            self.classes.update((dict(attrs).get("class") or "").split())
+        if tag not in self.VOID:
+            self.stack.append((tag, hidden))
+
+    def handle_endtag(self, tag):
+        while self.stack:
+            if self.stack.pop()[0] == tag:
+                break
+
+    def handle_data(self, data):
+        if not self._hidden():
+            self.text.append(data)
+
+
+def _shown(fragment):
+    """(visible text, visible classes) of a fragment from `_row` or `_actions`, which start
+    part-way through an opening tag."""
+    if not fragment.lstrip().startswith("<"):
+        fragment = fragment.split(">", 1)[1]
+    parser = _Shown()
+    parser.feed(fragment)
+    parser.close()
+    return " ".join(" ".join(parser.text).split()), parser.classes
+
+
 def test_a_voice_row_shows_draft_transcript_player_and_a_hidden_edit_form(authed, bot):
     item = _drafted(authed, bot)
     row = _row(authed.get("/inbox").data.decode(), item)
     assert '<h3 class="item-title">Fix the sticky wheel</h3>' in row
     assert 'class="item-body draft-body">It sticks.\nOften.</p>' in row
     assert "<details class=\"transcript\">" in row and "the wheel on km tracker sticks" in row
-    assert 'class="player"' in row and 'class="review-box"' in row
-    assert "needs review" in row and 'data-needs-review="1"' in row
+    text, classes = _shown(row)
+    assert 'class="player"' in row and "review-box" in classes
+    assert "needs review" in text and 'data-needs-review="1"' in row
     form = row.split('<form class="draft-edit"', 1)[1].split("</form>", 1)[0]
     assert " hidden>" in form.split("\n", 1)[0]
     assert 'name="draft_title"' in form and 'value="Fix the sticky wheel"' in form
@@ -1358,8 +1580,10 @@ def test_draft_states_are_visible(authed, bot):
         bot.post(f"/api/v1/inbox/items/{failed}/draft", headers=machine(),
                  json={"failed": True, "src_sha": sha})
     html = authed.get("/inbox").data.decode()
-    assert "Drafting…" in _row(html, pending)
-    assert "Couldn't draft — edit to write one" in _row(html, failed)
+    assert "Drafting…" in _shown(_row(html, pending))[0]
+    assert "Couldn't draft" not in _shown(_row(html, pending))[0]
+    assert "Couldn't draft — edit to write one" in _shown(_row(html, failed))[0]
+    assert "Drafting…" not in _shown(_row(html, failed))[0]
     assert 'data-needs-review="1"' in _row(html, failed)
 
 
@@ -1376,11 +1600,43 @@ def test_needs_review_tile_and_filter_replace_waiting_on(authed, bot):
     assert "checked" in filtered.split('id="filter-review"', 1)[1].split(">", 1)[0]
 
 
-def test_the_privacy_note_says_the_transcript_goes_to_anthropic(authed):
+AUDIO_PRIVACY = ("Audio never goes to Anthropic or any speech service. It lives on this box, "
+                 "on your Mac only while it is being transcribed, and in the Google Drive "
+                 "backup, which only ever adds: a recording stays there after Delete or the "
+                 "retention prune until you remove it by hand.")
+
+
+def test_the_privacy_note_says_where_audio_lives_and_what_goes_to_anthropic(authed):
+    html = " ".join(authed.get("/inbox").data.decode().split())
+    assert AUDIO_PRIVACY in html
+    assert ("The transcript, the title and a short brief of your setup are sent from the Mac "
+            "to Anthropic (Claude) to draft the item.") in html
+    assert "Recordings never leave this box" not in html and "Audio stays on" not in html
+
+
+def test_the_capture_note_says_what_delete_and_the_prune_reach(authed):
+    html = " ".join(authed.get("/inbox").data.decode().split())
+    assert "including the off-box backup" not in html and "at once. The" not in html
+    assert "Audio is deleted from this box once" in html
+    # Copy mode keeps no copy of the audio on the box, so Delete has nothing else to reach
+    # there; the text in database backups goes with the backups' own 30-day age cap.
+    assert ("Delete removes a note and its recording from the Hub at once; the box keeps no "
+            "other copy of the audio, and a copy already in Google Drive stays there until you "
+            "remove it by hand.") in html
+    assert ("Database backups already taken still hold the transcript text; they are removed "
+            "within about 30 days (the state as of a week ago is always kept, so a bad change "
+            "can be undone), and may then sit in Google Drive's trash for up to 30 more "
+            "days.") in html
+
+
+def test_the_delete_button_carries_the_drive_path_of_a_recording(authed, bot):
+    voice = _voice_note(authed)
+    typed = post_note(authed).get_json()["id"]
     html = authed.get("/inbox").data.decode()
-    assert ("Audio stays on this box and your Mac. The transcript and title (not the audio) "
-            "are sent from the Mac to Anthropic (Claude) to draft the item.") in html
-    assert "Recordings never leave this box" not in html
+    button = _row(html, voice["id"]).split('class="delete-item"', 1)[1].split(">", 1)[0]
+    stamp = voice["created_at"]
+    assert f'data-drive-path="audio/{stamp[:4]}/{stamp[5:7]}/{voice["id"]}.*"' in button
+    assert "data-drive-path" not in _row(html, typed)       # no recording, nothing in Drive
 
 
 def test_known_projects_feed_the_datalist(authed, settings):
@@ -1390,12 +1646,296 @@ def test_known_projects_feed_the_datalist(authed, settings):
     assert '<option value="km-tracker">' in datalist
 
 
+# --- a voice note whose recording went before it was transcribed (P-12/P-14/W-04) --- #
+
+def _audio_path(settings, item):
+    conn = inbox_db.connect(settings.inbox_db_path)
+    try:
+        return inbox_db.get_item(conn, item)["audio_path"]
+    finally:
+        conn.close()
+
+
+def _listed(authed, item):
+    return next(i for i in authed.get("/api/v1/inbox/items").get_json()["items"]
+                if i["id"] == item)
+
+
+def test_a_recording_pruned_before_it_was_transcribed_lands_in_needs_review(
+        authed, bot, settings):
+    from dashboard import inbox_audio as audio_mod
+    item = _voice_note(authed)["id"]                        # Whisper never ran (P-12)
+    conn = inbox_db.connect(settings.inbox_db_path)
+    with conn:
+        conn.execute("UPDATE inbox_items SET created_at='2020-01-01T00:00:00Z' WHERE id=?",
+                     (item,))
+    conn.close()
+    assert audio_mod.prune_audio(settings)["pruned"] == 1    # the privacy ceiling
+    row = _listed(authed, item)
+    assert row["transcript_status"] == "failed" and row["needs_review"] is True
+    assert item not in [i["id"] for i in
+                        bot.get("/api/v1/inbox/transcribe/queue", headers=machine())
+                        .get_json()["items"]]
+    html = _row(authed.get("/inbox").data.decode(), item)
+    assert "Recording expired before it was transcribed" in _shown(html)[0]
+    assert "<audio" not in html and "the audio is still here" not in html
+
+
+def test_a_missing_recording_is_labelled_and_never_offers_a_dead_player(
+        authed, bot, settings):
+    import os
+    from dashboard import inbox_audio as audio_mod
+    item = _voice_note(authed)["id"]
+    os.remove(os.path.join(settings.inbox_audio_dir, _audio_path(settings, item)))
+    # Before the hourly sweep (W-04): no player that would only 410, and a clear label.
+    html = _row(authed.get("/inbox").data.decode(), item)
+    assert "Recording missing" in _shown(html)[0] and "<audio" not in html
+    # The sweep records it on the row (P-14), and the note lands in Needs review.
+    assert audio_mod.prune_audio(settings)["cleared"] == 1
+    row = _listed(authed, item)
+    assert row["audio_missing_at"] and row["transcript_status"] == "failed"
+    assert row["needs_review"] is True and row["has_audio"] is False
+    html = _row(authed.get("/inbox").data.decode(), item)
+    assert "Recording missing" in _shown(html)[0] and "<audio" not in html
+    assert "Recording expired" not in html
+
+
+# --- Close / Reopen on notes (C-12) ------------------------------------------ #
+
+def test_notes_get_a_close_or_reopen_button_and_mirrored_rows_do_not(authed, bot, settings):
+    voice = _drafted(authed, bot)
+    typed = post_note(authed, "typed row").get_json()["id"]
+    authed.patch(f"/api/v1/inbox/items/{typed}", json={"state": "closed"})
+    gh, bl = _github_row(settings), _backlog_row(authed, bot)
+    html = authed.get("/inbox").data.decode()
+    # BOTH buttons on every note, hidden until inbox.js shows the one for the row's state
+    # (and swaps them in place after a PATCH).
+    for note in (voice, typed):
+        buttons = _row(html, note).split('class="toggle-state')[1:]
+        close, reopen = (b.split("</button>", 1)[0] for b in buttons)
+        assert 'data-to="closed"' in close and "hidden" in close and close.endswith(">Close")
+        assert 'data-to="open"' in reopen and "hidden" in reopen and reopen.endswith(">Reopen")
+    assert 'data-state="closed"' in html.split(f'id="item-{typed}"', 1)[1].split(">", 1)[0]
+    for mirrored in (gh, bl):
+        assert "toggle-state" not in _row(html, mirrored)
+    # Delete stays LAST in the action row.
+    actions = _row(html, voice).split('class="item-actions"', 1)[1].split("</div>", 1)[0]
+    assert (actions.index('class="review"') < actions.index('class="toggle-state')
+            < actions.index('class="delete-item"'))
+
+
+def test_a_hand_close_and_reopen_through_the_route_clear_closed_by(authed, bot):
+    item, _ = _filed_with_line(authed, bot)
+    _gone_twice(bot, "Unrelated chore")
+    assert _state(authed, item)[0] == "closed"             # closed by the backlog rule
+    r = authed.patch(f"/api/v1/inbox/items/{item}", json={"state": "open"})
+    assert r.status_code == 200 and r.get_json()["state"] == "open"
+    r = authed.patch(f"/api/v1/inbox/items/{item}", json={"state": "closed"})
+    assert r.status_code == 200 and r.get_json()["closed_at"]
+    _sync_backlog(bot, f"Fix the Mac fan noise (voice {item[:8]})", "Unrelated chore")
+    assert _state(authed, item)[0] == "closed"             # a hand close: never reopened
+
+
+# --- the action row: two groups, and a closed note is reopened before it is edited --- #
+
+def _actions(html, item):
+    return _row(html, item).split('class="item-actions"', 1)[1].split("</div>", 1)[0]
+
+
+def test_the_action_row_is_two_groups_and_the_second_wraps_as_a_unit(authed, bot):
+    voice = _drafted(authed, bot)
+    actions = _actions(authed.get("/inbox").data.decode(), voice)
+    first, second = actions.split('class="action-group action-end"', 1)
+    assert 'class="action-group action-start"' in first
+    assert "edit-draft" in first and "review-box" in first
+    assert "toggle-state" in second and "delete-item" in second
+    assert second.index("toggle-state") < second.index("delete-item")      # Delete LAST
+    css = _code("dashboard/static/app.css")
+    group = css.split(".item-actions .action-group {", 1)[1].split("}", 1)[0]
+    assert "flex-wrap: nowrap" in group
+    assert "margin-left: auto" in css.split(".item-actions .action-end {", 1)[1].split("}", 1)[0]
+    # Close and Reopen take the same width, so flipping one never reflows the row.
+    toggle = css.split(".item-actions .toggle-state {", 1)[1].split("}", 1)[0]
+    assert "min-width:" in toggle
+
+
+def test_a_closed_note_offers_reopen_and_delete_but_no_edit_or_review(authed, bot):
+    voice = _drafted(authed, bot)
+    authed.patch(f"/api/v1/inbox/items/{voice}", json={"state": "closed"})
+    actions = _actions(authed.get("/inbox").data.decode(), voice)
+    # Edit draft and Reviewed are in the first group. A closed note's KEEPS ITS SLOT, shown
+    # as nothing (`dormant`: visibility hidden), so Reopen sits exactly where Close was.
+    opening = actions.split('class="action-group action-start', 1)[1].split(">", 1)[0]
+    assert "dormant" in opening and "hidden" not in opening
+    assert " inert" in opening            # no focus or tap even if app.css never loads
+    assert "review-box" not in _shown(actions)[1] and "edit-draft" not in _shown(actions)[1]
+    assert ">Reopen<" in actions and "delete-item" in actions
+    authed.patch(f"/api/v1/inbox/items/{voice}", json={"state": "open"})
+    actions = _actions(authed.get("/inbox").data.decode(), voice)
+    opening = actions.split('class="action-group action-start', 1)[1].split(">", 1)[0]
+    assert "dormant" not in opening and "hidden" not in opening and "inert" not in opening
+    assert "review-box" in _shown(actions)[1]
+    css = _code("dashboard/static/app.css")
+    assert "visibility: hidden" in css.split(".item-actions .action-start.dormant {", 1)[1] \
+        .split("}", 1)[0]
+
+
+def test_the_delete_button_says_whether_the_note_still_has_its_recording(authed, bot, settings):
+    import os
+    from dashboard import inbox_audio as audio_mod
+    live = _voice_note(authed)["id"]
+    lost = _voice_note(authed)["id"]
+    os.remove(os.path.join(settings.inbox_audio_dir, _audio_path(settings, lost)))
+    audio_mod.prune_audio(settings)
+    html = authed.get("/inbox").data.decode()
+
+    def button(item):
+        return _row(html, item).split('class="delete-item"', 1)[1].split(">", 1)[0]
+    assert 'data-has-audio="1"' in button(live)
+    assert "data-has-audio" not in button(lost) and "data-drive-path" in button(lost)
+    assert 'title="Delete this note"' in button(lost)
+
+
+# --- in-place updates: the server answers with everything the row and tiles need --- #
+
+def test_patch_and_delete_answer_with_the_derived_fields_and_fresh_counts(authed, bot):
+    voice = _drafted(authed, bot)
+    body = authed.patch(f"/api/v1/inbox/items/{voice}", json={"reviewed": True}).get_json()
+    for key in ("state", "reviewed", "needs_review", "awaiting_filing", "deletable", "draft",
+                "can_tick_reviewed", "title", "project"):
+        assert key in body, key
+    assert body["counts"] == authed.get("/api/v1/inbox/items").get_json()["counts"]
+    gone = authed.delete(f"/api/v1/inbox/items/{voice}").get_json()
+    assert gone["counts"] == authed.get("/api/v1/inbox/items").get_json()["counts"]
+
+
+def test_answers_carry_counts_and_the_counts_route_has_the_final_word(authed, bot):
+    """Every action answer carries the tiles' counts (shown at once), a DELETE of a note
+    already gone included; the page then settles to GET /api/v1/inbox/counts. No stamps:
+    a stamp read apart from the SELECT could order two answers wrongly."""
+    voice = _drafted(authed, bot)
+    typed = post_note(authed, "typed row").get_json()["id"]
+    listed = lambda: authed.get("/api/v1/inbox/items").get_json()["counts"]
+    answers = []
+    for item, change in ((voice, {"reviewed": True}), (typed, {"state": "closed"})):
+        answers.append(authed.patch(f"/api/v1/inbox/items/{item}", json=change))
+        assert answers[-1].get_json()["counts"] == listed()
+    gone = authed.delete(f"/api/v1/inbox/items/{typed}")
+    assert gone.get_json()["counts"] == listed()
+    again = authed.delete(f"/api/v1/inbox/items/{typed}")      # already gone: a 404...
+    assert again.status_code == 404 and again.get_json()["counts"] == listed()
+    counted = authed.get("/api/v1/inbox/counts")
+    assert counted.status_code == 200 and counted.get_json() == {"counts": listed()}
+    for body in [r.get_json() for r in answers] + [gone.get_json(), again.get_json(),
+                                                   counted.get_json()]:
+        assert "counts_at" not in body
+
+
+def test_the_counts_route_needs_a_session_or_the_read_token(authed, bot):
+    assert bot.get("/api/v1/inbox/counts").status_code == 401
+    assert bot.get("/api/v1/inbox/counts", headers=reader()).status_code == 200
+    assert bot.get("/api/v1/inbox/counts", headers=machine()).status_code == 401
+
+
+def _tag(row, cls):
+    """The opening tag of the first element carrying `cls` in a rendered row."""
+    at = row.index(cls)
+    return row[row.rindex("<", 0, at):row.index(">", at) + 1]
+
+
+def test_both_states_of_everything_that_toggles_are_pre_rendered(authed, bot):
+    """inbox.js only flips `hidden`, classes and data-*: every state a PATCH can move a row to
+    must already be in the DOM, server-rendered and escaped."""
+    voice = _drafted(authed, bot)                               # open, needs review
+    pending = _voice_note(authed)["id"]                         # no draft yet: no tick
+    closed = _drafted(authed, bot)
+    authed.patch(f"/api/v1/inbox/items/{closed}", json={"state": "closed"})
+    html = authed.get("/inbox").data.decode()
+    row = _row(html, voice)
+    assert "hidden" not in _tag(row, "badge-review")
+    assert "hidden" in _tag(row, "badge-filing") and "hidden" in _tag(row, "badge-closed")
+    close = _tag(row, 'data-to="closed"')
+    reopen = _tag(row, 'data-to="open"')
+    assert "toggle-state" in close and "toggle-state" in reopen   # both, wired by inbox.js
+    assert "hidden" not in _tag(row, "action-start")
+    assert "hidden" in _tag(row, "row-error")
+    assert "hidden" in _tag(_row(html, pending), 'class="review"')   # rendered, not offered
+    crow = _row(html, closed)
+    assert "hidden" not in _tag(crow, "badge-closed")
+    assert "dormant" in _tag(crow, "action-start")              # reopen first (slot kept)
+    # The tiles carry what the counts update.
+    for key in ("needs_review", "open", "total"):
+        assert f'data-count="{key}"' in html
+    assert 'id="action-status"' not in html                     # no "Saved — refresh" line
+
+
+# --- ?state=archived: rows whose upstream is gone are findable (B-03) --------- #
+
+def test_the_archived_state_filter_lists_archived_rows_with_their_badge(authed, bot):
+    _sync_backlog(bot, "Keep me", "Drop me")
+    _sync_backlog(bot, "Keep me")                          # "Drop me" is archived
+    live = [i["title"] for i in authed.get("/api/v1/inbox/items").get_json()["items"]]
+    assert live == ["Keep me"]
+    body = authed.get("/api/v1/inbox/items?state=archived").get_json()
+    assert [i["title"] for i in body["items"]] == ["Drop me"]
+    assert body["items"][0]["archived_at"] and body["counts"]["total"] == 1   # counts: live only
+    html = authed.get("/inbox?state=archived").data.decode()
+    assert '<option value="archived" selected>archived</option>' in html
+    row = _row(html, body["items"][0]["id"])
+    assert "archived upstream" in row and 'data-state="archived"' in html
+
+
+# --- R-03: a voice note can be ticked Reviewed only once there is a draft ---- #
+
+def test_a_voice_note_cannot_be_reviewed_before_it_has_a_draft(authed, bot):
+    pending = _voice_note(authed)["id"]                     # transcript still pending
+    r = authed.patch(f"/api/v1/inbox/items/{pending}", json={"reviewed": True})
+    assert r.status_code == 409 and "nothing to review yet" in r.get_json()["error"]
+    # Machine-readable, with the row as it is now: the page hides the box and shows why.
+    assert r.get_json()["code"] == "nothing_to_review"
+    now = r.get_json()["item"]
+    assert now["id"] == pending and now["can_tick_reviewed"] is False and not now["reviewed"]
+    drafting = _transcribed(authed, bot)                    # transcribed, draft pending
+    assert authed.patch(f"/api/v1/inbox/items/{drafting}",
+                        json={"reviewed": True}).status_code == 409
+    listed = {i["id"]: i for i in authed.get("/api/v1/inbox/items").get_json()["items"]}
+    assert not listed[pending]["reviewed"] and not listed[drafting]["awaiting_filing"]
+    # No Reviewed box to tick, either, until there is something to review.
+    html = authed.get("/inbox").data.decode()
+    assert "review-box" not in _shown(_row(html, pending))[1]
+    assert "review-box" not in _shown(_row(html, drafting))[1]
+
+
+def test_a_failed_draft_can_be_reviewed_once_graham_writes_one(authed, bot):
+    item = _transcribed(authed, bot)
+    sha = next(i for i in _queue(bot)["items"] if i["id"] == item)["sha"]
+    bot.post(f"/api/v1/inbox/items/{item}/draft", headers=machine(),
+             json={"failed": True, "final": True, "error": "x", "src_sha": sha})
+    assert authed.patch(f"/api/v1/inbox/items/{item}",
+                        json={"reviewed": True}).status_code == 409
+    # Writing the draft and ticking in ONE request is allowed (the edit supplies the title).
+    r = authed.patch(f"/api/v1/inbox/items/{item}",
+                     json={"draft_title": "Fix the fan", "reviewed": True})
+    assert r.status_code == 200 and r.get_json()["awaiting_filing"] is True
+
+
+def test_a_drafted_voice_note_and_a_legacy_typed_note_review_as_before(authed, bot, settings):
+    drafted = _drafted(authed, bot)
+    assert authed.patch(f"/api/v1/inbox/items/{drafted}",
+                        json={"reviewed": True}).status_code == 200
+    assert authed.patch(f"/api/v1/inbox/items/{drafted}",
+                        json={"reviewed": False}).status_code == 200       # untick: always
+    legacy = _legacy_typed(settings)
+    assert authed.patch(f"/api/v1/inbox/items/{legacy}",
+                        json={"reviewed": True}).status_code == 200
+
+
 # --------------------------------------------------------------------------- #
 # Filed to backlog.txt instead of an issue (issue #33)
 # --------------------------------------------------------------------------- #
 
 def _reviewed_voice(authed, bot):
-    item = _transcribed(authed, bot)
+    item = _drafted(authed, bot)                  # a voice note can be ticked once drafted
     assert authed.patch(f"/api/v1/inbox/items/{item}",
                         json={"reviewed": True}).status_code == 200
     return item
@@ -1498,6 +2038,341 @@ def test_the_backlog_line_cap_is_pinned():
     assert len(inbox_db.clean_text(line, inbox_db.MAX_BACKLOG_LINE)) == 500
 
 
+# --- a filed note closes when its backlog.txt line is removed or marked done -- #
+
+def _sync_backlog(bot, *texts, complete=True):
+    return bot.post("/api/v1/inbox/mirror/backlog", headers=machine(), json={
+        "complete": complete, "items": [{"text": t} for t in texts]})
+
+
+def _state(authed, item):
+    rows = (authed.get("/api/v1/inbox/items?state=closed").get_json()["items"]
+            + authed.get("/api/v1/inbox/items?state=open").get_json()["items"])
+    row = next(i for i in rows if i["id"] == item)
+    return row["state"], row["closed_at"]
+
+
+def _filed_with_line(authed, bot, what="Fix the Mac fan noise"):
+    item = _reviewed_voice(authed, bot)
+    line = f"{what} (voice {item[:8]})"
+    assert _file(bot, item, line=line).status_code == 200
+    assert _sync_backlog(bot, line, "Unrelated chore").status_code == 200
+    return item, line
+
+
+def _gone_twice(bot, *texts):
+    """A filed note's line counts as removed only after it has been missing from TWO
+    consecutive complete pushes (a truncated read of the file must not close anything)."""
+    first = _sync_backlog(bot, *texts).get_json()
+    second = _sync_backlog(bot, *texts).get_json()
+    return first, second
+
+
+def test_a_filed_note_closes_when_its_line_is_gone_from_two_pushes(authed, bot):
+    item, _ = _filed_with_line(authed, bot)
+    assert _sync_backlog(bot, "Unrelated chore").get_json()["closed_notes"] == 0
+    assert _state(authed, item) == ("open", None)
+    assert _sync_backlog(bot, "Unrelated chore").get_json()["closed_notes"] == 1
+    state, closed_at = _state(authed, item)
+    assert state == "closed" and closed_at
+
+
+def test_a_file_truncated_for_one_push_never_closes_the_note(authed, bot):
+    """B-14: a push read the file mid-write and missed the line; the next one has it."""
+    item, line = _filed_with_line(authed, bot)
+    for _ in range(3):
+        assert _sync_backlog(bot, "Unrelated chore").get_json()["closed_notes"] == 0
+        assert _sync_backlog(bot, line, "Unrelated chore").get_json()["closed_notes"] == 0
+    assert _state(authed, item) == ("open", None)
+
+
+def test_a_line_added_and_removed_between_pushes_still_closes_its_note(authed, bot):
+    """Filed, but the mirror never saw the line (added and removed within an hour): the
+    grace period, not a "never seen" exception, decides — it closes after two pushes."""
+    item = _reviewed_voice(authed, bot)
+    _file(bot, item, line=f"Fix the fan (voice {item[:8]})")
+    first, second = _gone_twice(bot, "Unrelated chore")
+    assert (first["closed_notes"], second["closed_notes"]) == (0, 1)
+    assert _state(authed, item)[0] == "closed"
+
+
+def test_the_rule_is_idempotent_across_repeated_pushes(authed, bot):
+    item, line = _filed_with_line(authed, bot)
+    for _ in range(3):                                   # line present: nothing happens
+        r = _sync_backlog(bot, line, "Unrelated chore").get_json()
+        assert (r["closed_notes"], r["reopened_notes"]) == (0, 0)
+    _gone_twice(bot, "Unrelated chore")
+    closed_at = _state(authed, item)[1]
+    for _ in range(3):                                   # line gone: closed once, stays put
+        r = _sync_backlog(bot, "Unrelated chore").get_json()
+        assert (r["closed_notes"], r["reopened_notes"]) == (0, 0)
+    assert _state(authed, item) == ("closed", closed_at)
+
+
+@pytest.mark.parametrize("done", [
+    "✅ DONE 2026-10-01 — {line}",               # prefix, the older style
+    "{line} — ✅ DONE 2026-10-01 via PR #3",     # suffix: the tag is mid-line now
+    "{line} — ✅️ RESOLVED",                     # the emoji's variation selector, RESOLVED
+])
+def test_marking_the_line_done_closes_the_note_at_once_and_unmarking_reopens_it(
+        authed, bot, done):
+    item, line = _filed_with_line(authed, bot)
+    r = _sync_backlog(bot, done.format(line=line), "Unrelated chore").get_json()
+    assert r["closed_notes"] == 1 and r["archived"] == 1          # the key changed with the text
+    assert _state(authed, item)[0] == "closed"
+    # The done line is a CLOSED backlog row, and it is not shown beside the closed note.
+    listed = authed.get("/api/v1/inbox/items").get_json()
+    assert sorted((i["source"], i["state"]) for i in listed["items"]) == [
+        ("backlog", "open"), ("voice", "closed")]
+    r = _sync_backlog(bot, line, "Unrelated chore").get_json()     # un-marked
+    assert r["reopened_notes"] == 1
+    assert _state(authed, item) == ("open", None)
+
+
+def test_a_backlog_rows_state_follows_its_done_marker(authed, bot):
+    _sync_backlog(bot, "✅ DONE 2026-09-12 — Landing page", "Open chore",
+                  "✅done lowercase-ish counts too", "Easier sign-in — ✅ DONE 2026-07-08 via #4",
+                  "Flaky probe ✅ RESOLVED")
+    rows = {i["title"]: i for i in
+            authed.get("/api/v1/inbox/items?source=backlog").get_json()["items"]}
+    states = {t[:12]: r["state"] for t, r in rows.items()}
+    assert states == {"✅ DONE 2026-": "closed", "Open chore": "open",
+                      "✅done lowerc": "closed", "Easier sign-": "closed",
+                      "Flaky probe ": "closed"}
+    # Done rows are not open: not in the Open count (the Inbox tile and the Hub card read it),
+    # not under the open filter; they are still listed, as closed.
+    listing = authed.get("/api/v1/inbox/items").get_json()
+    assert listing["counts"]["open"] == 1 and listing["counts"]["total"] == 5
+    assert [i["title"] for i in authed.get("/api/v1/inbox/items?state=open")
+            .get_json()["items"]] == ["Open chore"]
+    assert "1 open item<" in authed.get("/").data.decode().replace("\n", "")
+    # Only the WHAT line decides: a later line saying it does not.
+    _sync_backlog(bot, "Plain entry\nWhy: ✅ DONE is mentioned here")
+    plain = authed.get("/api/v1/inbox/items?source=backlog&state=open").get_json()["items"]
+    assert [i["title"] for i in plain] == ["Plain entry"]
+
+
+def test_a_tag_outside_the_what_line_links_nothing(authed, bot):
+    """Only the What: line carries the link. A tag quoted in Notes:/Context: (Hopper
+    cross-referencing a note, say) must not hide that entry, link it, or close anything."""
+    item, line = _filed_with_line(authed, bot)
+    tag = f"(voice {item[:8]})"
+    other = f"Different chore\nNotes: came up next to {tag}\nContext: see {tag}"
+    _sync_backlog(bot, line, other, "Unrelated chore")
+    listed = authed.get("/api/v1/inbox/items").get_json()["items"]
+    assert "Different chore" in [i["title"] for i in listed]      # not hidden as a copy
+    note = next(i for i in listed if i["id"] == item)
+    assert note["filed_backlog"]["mirror_key"] == inbox_db.normalise_backlog_key(line)
+    # The line itself goes; the Notes: mention must not keep the note open.
+    _gone_twice(bot, other, "Unrelated chore")
+    assert _state(authed, item)[0] == "closed"
+
+
+def test_the_what_line_tag_match_is_the_same_in_sql_and_python(settings):
+    """The three matchers must agree: _FILED_COPY_SQL (SQL) and filed_line_status /
+    backlog_copies (Python, via backlog_tags)."""
+    conn = inbox_db.connect(settings.inbox_db_path)
+    try:
+        corpus = ["Fix it (voice abcd1234)", "(voice abcd1234) Fix it", "Fix (voice abcd1234) — ✅ DONE",
+                  "Fix it\nNotes: (voice abcd1234)", "Fix it (voice abcd12345)",
+                  "Fix it (Voice abcd1234)", "", "Fix it (voice abcd1234)\n",
+                  "x (voice ffff0000) y (voice abcd1234)"]
+        for body in corpus:
+            py = "abcd1234" in inbox_db.backlog_tags(body)
+            sql = conn.execute(
+                "SELECT instr(" + inbox_db.WHAT_LINE_SQL.replace("inbox_items.body", "?")
+                + ", '(voice ' || ? || ')') > 0", (body, body, "abcd1234")).fetchone()[0]
+            assert bool(sql) == py, body
+    finally:
+        conn.close()
+
+
+def test_a_reworded_line_keeping_the_tag_never_flaps_the_note(authed, bot):
+    item, line = _filed_with_line(authed, bot)
+    tag = f"(voice {item[:8]})"
+    r = _sync_backlog(bot, f"Fix the loud fan on the Mac {tag}", "Unrelated chore").get_json()
+    assert r["archived"] == 1 and (r["closed_notes"], r["reopened_notes"]) == (0, 0)
+    assert _state(authed, item) == ("open", None)
+
+
+def test_the_tag_moving_to_a_different_entry_keeps_the_note_open(authed, bot):
+    item, line = _filed_with_line(authed, bot)
+    tag = f"(voice {item[:8]})"
+    r = _sync_backlog(bot, "Fix the Mac fan noise", f"Unrelated chore {tag}").get_json()
+    assert r["closed_notes"] == 0 and _state(authed, item) == ("open", None)
+    # ...and when that entry goes too, the note closes (after the grace push).
+    first, second = _gone_twice(bot, "Fix the Mac fan noise")
+    assert (first["closed_notes"], second["closed_notes"]) == (0, 1)
+
+
+def test_two_lines_with_the_same_tag_one_done_keep_the_note_open(authed, bot):
+    item, line = _filed_with_line(authed, bot)
+    tag = f"(voice {item[:8]})"
+    # Both orders: the verdict must not depend on which row the scan meets last.
+    for both in ([f"✅ DONE — part one {tag}", f"Part two {tag}"],
+                 [f"Part three {tag}", f"✅ DONE — part four {tag}"]):
+        assert _sync_backlog(bot, *both).get_json()["closed_notes"] == 0
+        assert _state(authed, item) == ("open", None)
+    r = _sync_backlog(bot, f"✅ DONE — part one {tag}", f"✅ DONE — part two {tag}")
+    assert r.get_json()["closed_notes"] == 1
+
+
+def test_a_partial_or_refused_push_changes_nothing(authed, bot):
+    item, line = _filed_with_line(authed, bot)
+    for _ in range(3):
+        assert _sync_backlog(bot, "Unrelated chore", complete=False).status_code == 200
+    assert _sync_backlog(bot, complete=True).status_code == 400          # empty: refused
+    bad = bot.post("/api/v1/inbox/mirror/backlog", headers=machine(), json={
+        "complete": True, "items": [{"text": "Unrelated chore"}, "not an object"]})
+    assert bad.status_code == 400
+    assert _state(authed, item) == ("open", None)
+    # ...and partial pushes do not count towards the grace period either.
+    assert _sync_backlog(bot, "Unrelated chore").get_json()["closed_notes"] == 0
+    # And the other way: a partial push with the line back does not reopen.
+    _sync_backlog(bot, "Unrelated chore")
+    assert _state(authed, item)[0] == "closed"
+    r = _sync_backlog(bot, line, complete=False).get_json()
+    assert r["reopened_notes"] == 0 and _state(authed, item)[0] == "closed"
+
+
+def _dump(settings):
+    conn = inbox_db.connect(settings.inbox_db_path)
+    try:
+        return [dict(r) for r in conn.execute("SELECT * FROM inbox_items ORDER BY id")]
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("bad", ["not an object",
+                                 {"text": "Bad project", "project": "has spaces"}])
+def test_a_backlog_push_with_a_bad_item_in_the_middle_changes_nothing(
+        authed, bot, settings, bad):
+    """All or nothing: a 400 on item 2 must not leave item 1 written."""
+    item, line = _filed_with_line(authed, bot)
+    before = _dump(settings)
+    r = bot.post("/api/v1/inbox/mirror/backlog", headers=machine(), json={
+        "complete": True, "items": [{"text": "✅ DONE — " + line},   # would close things
+                                    bad,
+                                    {"text": "A brand new entry"}]})
+    assert r.status_code == 400
+    assert _dump(settings) == before
+
+
+def test_no_route_returns_from_inside_a_write_transaction():
+    """A structural guard beside the behavioural tests, because the failure is silent. The
+    connections here are autocommit (`isolation_level=None`), so `with conn:` is NOT a
+    transaction: every statement commits as it runs, and an error response sent from inside
+    the block keeps every write made before it. Validate first, then write — atomically in
+    `inbox_db.transaction(conn)` when it is more than one statement."""
+    import ast
+    import pathlib
+    offenders = []
+    for path in sorted((pathlib.Path(__file__).resolve().parent.parent
+                        / "dashboard").glob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.With) and any(
+                    ast.unparse(i.context_expr).endswith(("conn", "conn)"))
+                    for i in node.items):
+                offenders += [f"{path.name}:{n.lineno}" for n in ast.walk(node)
+                              if isinstance(n, ast.Return)]
+    assert offenders == []
+
+
+def test_the_backlog_key_is_derived_server_side_and_a_wrong_one_is_refused(authed, bot,
+                                                                          settings):
+    _sync_backlog(bot, "Keep me")
+    before = _dump(settings)
+    for bad_key in ("backlog:0000000000000000", "backlog:" + "f" * 5000, 42):
+        r = bot.post("/api/v1/inbox/mirror/backlog", headers=machine(), json={
+            "complete": True, "items": [{"text": "Keep me"},
+                                        {"key": bad_key, "text": "New thing\nWhy: x"}]})
+        assert r.status_code == 400 and "key" in r.get_json()["error"]
+    assert _dump(settings) == before
+    good = inbox_db.normalise_backlog_key("New thing")
+    r = bot.post("/api/v1/inbox/mirror/backlog", headers=machine(), json={
+        "complete": True, "items": [{"text": "Keep me"},
+                                    {"key": good, "text": "New thing\nWhy: x"}]})
+    assert r.status_code == 200
+    keys = {i["mirror_key"] for i in
+            authed.get("/api/v1/inbox/items?source=backlog").get_json()["items"]}
+    assert good in keys
+
+
+def test_a_push_of_only_blank_entries_is_refused_like_an_empty_one(authed, bot, settings):
+    _sync_backlog(bot, "Keep me", "And me")
+    before = _dump(settings)
+    r = bot.post("/api/v1/inbox/mirror/backlog", headers=machine(), json={
+        "complete": True, "items": [{"text": "   "}, {"text": "\x00"}]})
+    assert r.status_code == 400 and "allow_empty" in r.get_json()["error"]
+    assert _dump(settings) == before
+
+
+def test_a_backlog_file_bigger_than_the_global_cap_still_syncs(authed, bot, settings):
+    """B-24: the real file is 45 KB of JSON, 69% of the 64 KB app-wide cap. This route gets
+    its own 1 MB allowance; every other route keeps the global cap."""
+    texts = [f"Entry {i}: " + "x" * 900 for i in range(80)]           # ~75 KB of JSON
+    r = _sync_backlog(bot, *texts)
+    assert r.status_code == 200 and r.get_json()["synced"] == 80
+    huge = [f"Entry {i}: " + "y" * 19000 for i in range(60)]          # > 1 MB
+    assert _sync_backlog(bot, *huge).status_code == 413
+    item = post_note(authed).get_json()["id"]
+    assert authed.patch(f"/api/v1/inbox/items/{item}",
+                        json={"title": "z" * 70000}).status_code == 413
+
+
+def test_a_note_closed_by_hand_is_never_reopened_by_the_backlog_rule(authed, bot):
+    item, line = _filed_with_line(authed, bot)
+    assert authed.patch(f"/api/v1/inbox/items/{item}",
+                        json={"state": "closed"}).status_code == 200
+    _gone_twice(bot, "Unrelated chore")
+    _sync_backlog(bot, line, "Unrelated chore")
+    assert _state(authed, item)[0] == "closed"
+    # Closed by hand while its line is still in the file: the copy STAYS hidden — it is the
+    # same piece of work as the note, whatever the note's state (only a Delete shows it).
+    listed = authed.get("/api/v1/inbox/items").get_json()["items"]
+    assert not any(i["source"] == "backlog" and "(voice" in i["title"] for i in listed)
+    # One the rule closed and Graham then re-closed by hand is his now.
+    item2, line2 = _filed_with_line(authed, bot, what="Tidy the box")
+    _gone_twice(bot, line, "Unrelated chore")
+    assert _state(authed, item2)[0] == "closed"
+    authed.patch(f"/api/v1/inbox/items/{item2}", json={"state": "open"})
+    authed.patch(f"/api/v1/inbox/items/{item2}", json={"state": "closed"})
+    _sync_backlog(bot, line, line2, "Unrelated chore")
+    assert _state(authed, item2)[0] == "closed"
+
+
+def test_a_note_reopened_by_hand_is_not_closed_again_while_its_line_stays_gone(authed, bot):
+    item, _ = _filed_with_line(authed, bot)
+    _gone_twice(bot, "Unrelated chore")
+    assert _state(authed, item)[0] == "closed"
+    authed.patch(f"/api/v1/inbox/items/{item}", json={"state": "open"})
+    for _ in range(3):
+        _sync_backlog(bot, "Unrelated chore", "Another chore")
+    assert _state(authed, item) == ("open", None)
+
+
+def test_a_hand_reopen_of_a_note_whose_line_is_done_sticks(authed, bot):
+    item, line = _filed_with_line(authed, bot)
+    done = "✅ DONE 2026-10-01 — " + line
+    _sync_backlog(bot, done, "Unrelated chore")
+    assert _state(authed, item)[0] == "closed"
+    authed.patch(f"/api/v1/inbox/items/{item}", json={"state": "open"})
+    for _ in range(3):
+        _sync_backlog(bot, done, "Unrelated chore")
+    assert _state(authed, item) == ("open", None)
+
+
+def test_the_filed_copy_is_hidden_until_its_note_is_deleted(authed, bot):
+    item, line = _filed_with_line(authed, bot)
+    for state in ("closed", "open"):
+        authed.patch(f"/api/v1/inbox/items/{item}", json={"state": state})
+        titles = [i["title"] for i in authed.get("/api/v1/inbox/items").get_json()["items"]]
+        assert line not in titles
+    assert authed.delete(f"/api/v1/inbox/items/{item}").status_code == 200
+    titles = [i["title"] for i in authed.get("/api/v1/inbox/items").get_json()["items"]]
+    assert line in titles
+
+
 # --------------------------------------------------------------------------- #
 # Security-gate fixes (routes)
 # --------------------------------------------------------------------------- #
@@ -1532,7 +2407,8 @@ def test_a_failed_transcript_says_why_on_the_board(authed, bot, settings):
     body = authed.get("/api/v1/inbox/items?awaiting=review").get_json()
     assert [i["id"] for i in body["items"]] == [item] and body["items"][0]["needs_review"]
     row = _row(authed.get("/inbox").data.decode(), item)
-    assert "Whisper couldn't transcribe this" in row and "Drafting…" not in row
+    text = _shown(row)[0]
+    assert "Whisper couldn't transcribe this" in text and "Drafting…" not in text
 
 
 def test_a_failed_draft_post_needs_its_src_sha(authed, bot, settings):
@@ -1546,7 +2422,7 @@ def test_a_failed_draft_post_needs_its_src_sha(authed, bot, settings):
 
 
 def test_filing_to_the_backlog_needs_a_reviewed_open_note(authed, bot, settings):
-    item = _transcribed(authed, bot)                 # voice, NOT reviewed
+    item = _drafted(authed, bot)                     # voice, NOT reviewed
     assert _file(bot, item).status_code == 409
     authed.patch(f"/api/v1/inbox/items/{item}", json={"reviewed": True})
     authed.patch(f"/api/v1/inbox/items/{item}", json={"state": "closed"})
@@ -1619,9 +2495,9 @@ def test_a_voice_row_is_one_column_in_the_designed_order(authed, bot):
                                     'class="item-meta muted small"')]
     assert order == sorted(order), order
     actions = row.split('class="item-actions"', 1)[1].split("</div>", 1)[0]
-    # Edit draft, the Reviewed toggle, then Delete LAST, all in the one row.
+    # Edit draft, the Reviewed toggle, Close, then Delete LAST, all in the one row.
     assert (actions.index('class="edit-draft') < actions.index('class="review"')
-            < actions.index('class="delete-item"'))
+            < actions.index('class="toggle-state') < actions.index('class="delete-item"'))
     assert "item-controls" not in row
 
 
@@ -1629,7 +2505,7 @@ def test_the_capture_notes_are_one_collapsed_details(authed):
     html = authed.get("/inbox").data.decode()
     block = html.split('<details class="about-recordings">', 1)[1].split("</details>", 1)[0]
     assert "<summary>About recordings and privacy</summary>" in block
-    assert "Audio stays on this box and your Mac." in block
+    assert AUDIO_PRIVACY in " ".join(block.split())
     assert "minutes of speech" in block and "about 30 days" in block
     assert " open" not in html.split('<details class="about-recordings"', 1)[1].split(">", 1)[0]
 
@@ -1639,7 +2515,9 @@ def test_the_phone_layout_css_rules():
     css = _code("dashboard/static/app.css")
     delete = css.split(".item-actions button.delete-item {", 1)[1].split("}", 1)[0]
     assert "background: transparent" in delete and "var(--fail)" in delete
-    assert "min-height: 44px" in delete and "margin-left: auto" in delete
+    assert "min-height: 44px" in delete
+    # Right-aligned as the second group's end, not by the button itself.
+    assert "margin-left: auto" in css.split(".item-actions .action-end {", 1)[1].split("}", 1)[0]
     review = css.split(".item-actions .review {", 1)[1].split("}", 1)[0]
     assert "min-height: 44px" in review and "border-radius: 999px" in review
     assert "min-height: 44px" in css.split(".item-actions .edit-draft {", 1)[1].split("}", 1)[0]

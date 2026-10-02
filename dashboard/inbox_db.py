@@ -36,6 +36,7 @@ import hashlib
 import re
 import sqlite3
 import uuid
+from contextlib import contextmanager
 from typing import Any, Iterable
 
 from .db import _add_column, enable_wal, now_iso, to_iso  # noqa: F401
@@ -51,6 +52,9 @@ LOCAL_SOURCES = ("voice", "typed")
 #: Mirrored sources — rows this app did not author and must not re-file.
 MIRROR_SOURCES = ("github", "backlog")
 ITEM_STATES = ("open", "closed")
+#: The list filter's third "state": archived rows (``?state=archived``). Not a state an item
+#: can be SET to — PATCH still takes only ITEM_STATES.
+ARCHIVED_FILTER = "archived"
 ISSUE_STATES = ("open", "closed")
 TITLE_SOURCES = ("derived", "manual")
 
@@ -113,11 +117,48 @@ DRAFTABLE_TRANSCRIPT_STATUSES = (TRANSCRIPT_WHISPER, TRANSCRIPT_LIVE)
 MAX_BACKLOG_LINE = 500
 #: The tag the filing loop ends that line with, and the ONLY link between a filed note and
 #: the backlog-mirror row the line later comes back as: ``(voice <first 8 chars of id>)``.
+#: It counts ANYWHERE in the entry's What: line — "Fix X (voice abcd1234) — ✅ DONE …" still
+#: links — and NOWHERE else (a tag quoted under Why:/Notes:/Context: links nothing). The What:
+#: line is the FIRST line of the mirrored text: ``probes/backlog.py`` folds the What: value's
+#: wrapped continuation onto it and puts every other field on the lines after. Every matcher
+#: goes through ``backlog_tags`` (Python) or ``WHAT_LINE_SQL`` (SQL); a test pins the two.
 VOICE_TAG_RE = re.compile(r"\(voice ([0-9a-f]{8})\)")
+#: The What: line of a mirrored backlog row, in SQL: everything before the first newline.
+WHAT_LINE_SQL = ("substr(inbox_items.body, 1,"
+                 " instr(inbox_items.body || char(10), char(10)) - 1)")
 
 
 def voice_tag(item_id: str) -> str:
     return "(voice %s)" % item_id[:8]
+
+
+def what_line(text: str | None) -> str:
+    """The What: line of a mirrored backlog entry: the first line of its text."""
+    return (text or "").split("\n", 1)[0]
+
+
+def backlog_tags(text: str | None) -> set[str]:
+    """The ``(voice <id8>)`` tags in a backlog entry's What: line — the only place one links."""
+    return set(VOICE_TAG_RE.findall(what_line(text)))
+
+
+@contextmanager
+def transaction(conn: sqlite3.Connection):
+    """A REAL transaction. ``connect`` opens autocommit connections (``isolation_level=None``),
+    on which ``with conn:`` is not one: every statement commits as it runs. Anything that
+    must land whole — the backlog push, a GitHub scan — runs inside this."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield conn
+        # Inside the try: a COMMIT that fails (a deferred constraint, SQLITE_BUSY) must roll
+        # back too, or the connection is left mid-transaction and every later BEGIN fails.
+        conn.execute("COMMIT")
+    except BaseException:
+        # Only if one is still open: some SQLite errors roll back by themselves, and a
+        # ROLLBACK then would raise and hide the error that actually happened.
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
 
 
 INBOX_SCHEMA = """
@@ -172,10 +213,15 @@ CREATE TABLE IF NOT EXISTS inbox_issues (
     checked_at TEXT,
     closed_at  TEXT
 );
--- One issue belongs to exactly ONE item. This is what stops the GitHub repo
--- scan cloning a voice row Hopper has already filed an issue for.
+-- One LINK per (note, issue): many notes may link the same issue (two notes about
+-- one bug), and every one of them closes and reopens with it. The index keeps the
+-- NAME it had when it was UNIQUE(repo, number) — see init_inbox_schema: an older
+-- image's `CREATE UNIQUE INDEX IF NOT EXISTS inbox_issues_repo_number ON (repo,
+-- number)` is then a no-op, instead of failing over duplicate links on a rollback.
 CREATE UNIQUE INDEX IF NOT EXISTS inbox_issues_repo_number
-    ON inbox_issues (repo, number);
+    ON inbox_issues (item_id, repo, number);
+-- The scans' lookup: is this issue linked to any note (then it is not mirrored)?
+CREATE INDEX IF NOT EXISTS inbox_issues_repo ON inbox_issues (repo, number);
 CREATE INDEX IF NOT EXISTS inbox_issues_item ON inbox_issues (item_id, id);
 CREATE TABLE IF NOT EXISTS inbox_mirror_state (
     key            TEXT PRIMARY KEY,   -- e.g. github:<owner>/<repo>
@@ -217,6 +263,19 @@ INBOX_COLUMNS: tuple[tuple[str, str], ...] = (
     # When a review first copied the draft into title/project. A re-tick copies the draft
     # project again only if this is NULL (``reviewed_at`` cannot say it: an untick clears it).
     ("draft_copied_at", "TEXT"),
+    # WHO closed the row, when a rule did: 'backlog' = its backlog.txt line was removed or
+    # marked ✅ DONE (``apply_filed_backlog_rule``); 'issues' = a scan closed its last open
+    # linked issue (``apply_issue_transitions``). NULL for a hand close; cleared by every hand
+    # state change — so each rule's reopen can only undo its own close.
+    ("closed_by", "TEXT"),
+    # A note filed to backlog.txt: how many consecutive COMPLETE pushes have not carried its
+    # tag (capped at BACKLOG_ABSENT_PUSHES). "Removed" needs two in a row, so one truncated
+    # read of the file (or a filing call that beat the line into the file) closes nothing.
+    ("backlog_absent_pushes", "INTEGER NOT NULL DEFAULT 0"),
+    # The hourly sweep found the recording's FILE gone (a disk fault, a restore from an old
+    # backup) and cleared audio_path — so the page can say "Recording missing" rather than
+    # showing no trace of it. Pruning stamps audio_pruned_at instead.
+    ("audio_missing_at", "TEXT"),
 )
 
 
@@ -259,6 +318,22 @@ def init_inbox_schema(conn: sqlite3.Connection) -> None:
         conn.execute("UPDATE inbox_items SET draft_copied_at = reviewed_at"
                      " WHERE source = 'voice' AND reviewed = 1"
                      " AND draft_copied_at IS NULL AND reviewed_at IS NOT NULL")
+        # A voice note whose recording went before Whisper ran can never be transcribed: send
+        # it to Needs review (transcript 'failed') instead of 'pending' for ever — see
+        # mark_audio_pruned / clear_audio_path. Idempotent; stamps a missing file's row.
+        conn.execute("UPDATE inbox_items SET audio_missing_at = COALESCE(audio_missing_at,"
+                     " updated_at) WHERE source = 'voice' AND transcript_status = 'pending'"
+                     " AND audio_path IS NULL AND audio_pruned_at IS NULL")
+        conn.execute("UPDATE inbox_items SET transcript_status = 'failed' WHERE source ="
+                     " 'voice' AND transcript_status = 'pending' AND audio_path IS NULL")
+        # G-20: UNIQUE(repo, number) → UNIQUE(item_id, repo, number), same index NAME (see
+        # INBOX_SCHEMA). Only when the old definition is found, so it runs once, and it
+        # cannot fail: no (item_id, repo, number) duplicate can exist under the old rule.
+        cols = [r["name"] for r in conn.execute("PRAGMA index_info(inbox_issues_repo_number)")]
+        if cols == ["repo", "number"]:
+            conn.execute("DROP INDEX inbox_issues_repo_number")
+            conn.execute("CREATE UNIQUE INDEX inbox_issues_repo_number"
+                         " ON inbox_issues (item_id, repo, number)")
     except Exception:
         conn.execute("ROLLBACK")
         raise
@@ -476,7 +551,9 @@ def update_item(conn: sqlite3.Connection, item_id: str, changes: dict,
             sets += ["reviewed=?", "reviewed_at=?"]
             args += [1 if value else 0, now if value else None]
         elif key == "state":
-            sets += ["state=?", "closed_at=?"]
+            # A hand close/reopen is Graham's decision: clearing closed_by stops the
+            # backlog rule from ever reopening (or re-closing on) what he did.
+            sets += ["state=?", "closed_at=?", "closed_by=NULL"]
             args += [value, now if value == "closed" else None]
 
     d_title = (clean_draft_title(changes["draft_title"])
@@ -696,8 +773,8 @@ def mark_filed_backlog(conn: sqlite3.Connection, item_id: str, *, line: str,
 
 
 def backlog_copies(conn: sqlite3.Connection, item_ids: Iterable[str]) -> dict[str, dict]:
-    """For filed notes, the backlog-mirror row carrying their ``(voice <id8>)`` tag, as
-    ``{note_id: {"id", "mirror_key"}}``. Matched in Python over the (few) backlog rows that
+    """For filed notes, the live backlog-mirror row whose What: line carries their
+    ``(voice <id8>)`` tag, as ``{note_id: {"id", "mirror_key"}}``. Matched in Python over the (few) backlog rows that
     carry any tag, so a line that arrives in the mirror before or after the filing call links
     either way."""
     wanted = {i[:8]: i for i in item_ids if isinstance(i, str) and len(i) >= 8}
@@ -707,7 +784,7 @@ def backlog_copies(conn: sqlite3.Connection, item_ids: Iterable[str]) -> dict[st
     for row in conn.execute(
             "SELECT id, mirror_key, body FROM inbox_items WHERE source = 'backlog'"
             " AND archived_at IS NULL AND body LIKE '%(voice %'"):
-        for tag in VOICE_TAG_RE.findall(row["body"] or ""):
+        for tag in sorted(backlog_tags(row["body"])):
             note = wanted.get(tag)
             if note and note not in out:
                 out[note] = {"id": row["id"], "mirror_key": row["mirror_key"]}
@@ -717,63 +794,178 @@ def backlog_copies(conn: sqlite3.Connection, item_ids: Iterable[str]) -> dict[st
 def link_issue(conn: sqlite3.Connection, item_id: str, *, repo: str,
                number: int, url: str, title: str | None = None,
                now: str | None = None) -> dict:
-    """Link a real GitHub issue to an item. Idempotent on ``(repo, number)``.
+    """Link a real GitHub issue to a note. Idempotent on ``(item_id, repo, number)``; MANY
+    notes may link one issue (G-20), and each closes and reopens with it.
 
-    The uniqueness is the load-bearing half: an issue Hopper filed FOR a voice
-    row must never also arrive as a fresh mirrored row when the repo is next
-    scanned.
+    The issue is then represented on the board by the note(s), so the scans never mirror it
+    as a row of its own (``linked_issue``), and a mirror row it ALREADY had is archived here
+    (G-19) — otherwise it would sit on the board next to the note and, because linked issues
+    are skipped by the scan, soon claim the still-open issue was closed.
     """
     now = now or now_iso()
     existing = conn.execute(
-        "SELECT * FROM inbox_issues WHERE repo=? AND number=?",
-        (repo, int(number))).fetchone()
+        "SELECT * FROM inbox_issues WHERE item_id=? AND repo=? AND number=?",
+        (item_id, repo, int(number))).fetchone()
     if existing is not None:
         conn.execute("UPDATE inbox_issues SET url=?, title=COALESCE(?, title), "
                      "checked_at=? WHERE id=?",
                      (url, title, now, existing["id"]))
-        return row_to_dict(conn.execute("SELECT * FROM inbox_issues WHERE id=?",
-                                        (existing["id"],)).fetchone())
-    conn.execute(
-        "INSERT INTO inbox_issues (item_id, repo, number, url, title, state,"
-        " linked_at, checked_at) VALUES (?,?,?,?,?, 'open', ?, ?)",
-        (item_id, repo, int(number), url, title, now, now))
-    conn.execute("UPDATE inbox_items SET updated_at=? WHERE id=?", (now, item_id))
+    else:
+        conn.execute(
+            "INSERT INTO inbox_issues (item_id, repo, number, url, title, state,"
+            " linked_at, checked_at) VALUES (?,?,?,?,?, 'open', ?, ?)",
+            (item_id, repo, int(number), url, title, now, now))
+        conn.execute("UPDATE inbox_items SET updated_at=? WHERE id=?", (now, item_id))
+        # The link starts 'open'; if the issue is closed already, only a FULL scan can say
+        # so — a 304 against the old ETag would leave the note open for ever.
+        forget_etag(conn, repo)
+    archive_mirror_row_of_linked_issue(conn, repo, number, now=now)
     return row_to_dict(conn.execute(
-        "SELECT * FROM inbox_issues WHERE repo=? AND number=?",
-        (repo, int(number))).fetchone())
+        "SELECT * FROM inbox_issues WHERE item_id=? AND repo=? AND number=?",
+        (item_id, repo, int(number))).fetchone())
+
+
+def forget_etag(conn: sqlite3.Connection, repo: str) -> None:
+    """Drop ``repo``'s stored ETag, so its next scan is a full 200 rather than a 304. Called
+    whenever what the board should show for that repo changes LOCALLY — a link made, a
+    linking note deleted, the repo unwatched — because only a full scan re-applies it, and
+    GitHub answers 304 for as long as nothing changed upstream."""
+    conn.execute("UPDATE inbox_mirror_state SET etag=NULL WHERE key=? AND etag IS NOT NULL",
+                 (f"{MIRROR_GITHUB}:{repo}",))
+
+
+def archive_mirror_row_of_linked_issue(conn: sqlite3.Connection, repo: str, number: int,
+                                       now: str | None = None) -> int:
+    """G-19: an issue a note links is represented by the note — its own mirror row, if it has
+    a live one, is archived (never deleted). Called when the link is made AND by every scan
+    that meets a linked issue, which also repairs duplicates made before this rule."""
+    now = now or now_iso()
+    return int(conn.execute("UPDATE inbox_items SET archived_at=?, updated_at=?"
+                            " WHERE mirror_key=? AND archived_at IS NULL",
+                            (now, now, github_key(repo, number))).rowcount or 0)
+
+
+def canonicalise_issue_repos(conn: sqlite3.Connection, repos: Iterable[str]) -> int:
+    """Rewrite each link's repo to the WATCHED spelling (``INBOX_GITHUB_REPOS``; GitHub names
+    are case-insensitive, the scans are not), merging a note's two links to one issue into
+    one. Run at start-up; returns how many link rows changed. Idempotent."""
+    by_lower = {r.lower(): r for r in repos}
+    changed = 0
+    with transaction(conn):
+        for row in conn.execute("SELECT id, item_id, repo, number FROM inbox_issues"
+                                " ORDER BY id").fetchall():
+            watched = by_lower.get(row["repo"].lower())
+            if watched is None or watched == row["repo"]:
+                continue
+            twin = conn.execute("SELECT id FROM inbox_issues WHERE item_id=? AND repo=?"
+                                " AND number=?", (row["item_id"], watched,
+                                                  row["number"])).fetchone()
+            if twin is not None:
+                conn.execute("DELETE FROM inbox_issues WHERE id=?", (row["id"],))
+                # The merged link is OPEN again: one of the two was never refreshed (a scan
+                # matches the watched spelling only), so neither's state can be trusted. The
+                # forced full scan then compares 'open' with the real state and fires the
+                # transition — a kept 'closed' would hide a close for ever.
+                conn.execute("UPDATE inbox_issues SET state='open', closed_at=NULL WHERE id=?",
+                             (twin["id"],))
+            else:
+                conn.execute("UPDATE inbox_issues SET repo=? WHERE id=?", (watched, row["id"]))
+            forget_etag(conn, watched)
+            changed += 1
+    return changed
+
+
+def repair_linked_duplicates(conn: sqlite3.Connection) -> int:
+    """Archive every LIVE mirror row of an issue a note links (a duplicate made before
+    linking archived it, or by a race): the note represents that issue. Only live rows
+    match, so once repaired this changes nothing. Run at start-up, AFTER
+    :func:`canonicalise_issue_repos` — a link under another spelling cannot match its
+    mirror row's key until it is canonicalised."""
+    with transaction(conn):
+        repaired = int(conn.execute(
+            "UPDATE inbox_items SET archived_at = updated_at WHERE source = 'github'"
+            " AND archived_at IS NULL AND mirror_key IN (SELECT 'github:' || repo || '#'"
+            " || number FROM inbox_issues)").rowcount or 0)
+    return repaired
+
+
+def forget_all_etags(conn: sqlite3.Connection) -> int:
+    """At every boot: the first scan of every repo is then a full one, so a change made while
+    an older image ran (a rollback window, when this image's rules were not being applied)
+    is seen. Costs one full listing per repo per boot, and the conditional writes make the
+    scan store nothing but the new ETags when nothing changed."""
+    with transaction(conn):
+        forgotten = int(conn.execute("UPDATE inbox_mirror_state SET etag=NULL"
+                                     " WHERE etag IS NOT NULL").rowcount or 0)
+    return forgotten
+
+
+def startup_repairs(conn: sqlite3.Connection, repos: Iterable[str]) -> None:
+    """What every boot runs after the schema migration, IN THIS ORDER: canonicalise link
+    spellings, THEN repair duplicates (it matches on the canonical spelling), then forget
+    every stored ETag."""
+    canonicalise_issue_repos(conn, repos)
+    repair_linked_duplicates(conn)
+    forget_all_etags(conn)
 
 
 def upsert_mirror_item(conn: sqlite3.Connection, *, mirror_key: str,
                        source: str, title: str, body: str = "",
                        project: str | None = None, url: str | None = None,
-                       now: str | None = None) -> str:
+                       now: str | None = None, state: str | None = None) -> str:
     """Insert-or-refresh a mirrored row, keyed on ``mirror_key``.
 
-    Refreshing deliberately does NOT touch ``reviewed`` or ``state``: those are
-    Graham's, and a re-sync that un-ticked a reviewed row would be the mirror
-    overwriting a decision.
+    Refreshing deliberately does NOT touch ``reviewed``: that is Graham's, and a
+    re-sync that un-ticked a reviewed row would be the mirror overwriting a
+    decision. ``state`` is left alone too UNLESS the caller passes one — the
+    backlog mirror does, because a backlog row's state IS its text (✅ DONE,
+    :func:`backlog_is_done`), and setting it from the text also clears
+    ``closed_by`` (no rule owns a state the text decides); the GitHub mirror has
+    its own close/reopen passes.
+
+    WRITES NOTHING when nothing changed — not even ``updated_at`` or
+    ``mirror_seen_at`` (which therefore means "last changed by the mirror"). An
+    unchanged sync must leave ``inbox.db`` byte-identical, or the backup re-snapshots
+    and re-uploads it on every cycle.
     """
     now = now or now_iso()
-    row = conn.execute("SELECT id, title_source FROM inbox_items WHERE mirror_key=?",
-                       (mirror_key,)).fetchone()
+    row = conn.execute(
+        "SELECT id, title, title_source, body, project, mirror_url, archived_at, state,"
+        " closed_at, closed_by FROM inbox_items WHERE mirror_key=?", (mirror_key,)).fetchone()
     title = clean_text(title, MAX_TITLE) or "(untitled)"
     body = clean_text(body, MAX_TEXT)
     if row is not None:
-        sets = ["body=?", "mirror_url=?", "mirror_seen_at=?", "updated_at=?",
-                "archived_at=NULL"]
-        args: list[Any] = [body, url, now, now]
-        if row["title_source"] != "manual":
+        sets: list[str] = []
+        args: list[Any] = []
+        if (row["body"] or "") != body:
+            sets.append("body=?")
+            args.append(body)
+        if row["mirror_url"] != url:
+            sets.append("mirror_url=?")
+            args.append(url)
+        if row["archived_at"] is not None:
+            sets.append("archived_at=NULL")
+        if row["title_source"] != "manual" and row["title"] != title:
             sets.append("title=?")
             args.append(title)
-        if project is not None:
+        if project is not None and row["project"] != project:
             sets.append("project=?")
             args.append(project)
-        args.append(row["id"])
-        conn.execute(f"UPDATE inbox_items SET {', '.join(sets)} WHERE id=?", args)
+        if state in ITEM_STATES and (row["state"] != state or row["closed_by"] is not None):
+            sets += ["state=?", "closed_at=?", "closed_by=NULL"]
+            args += [state, (row["closed_at"] or now) if state == "closed" else None]
+        if sets:
+            sets += ["mirror_seen_at=?", "updated_at=?"]
+            args += [now, now, row["id"]]
+            conn.execute(f"UPDATE inbox_items SET {', '.join(sets)} WHERE id=?", args)
         return row["id"]
-    return create_item(conn, source=source, text=body, title=title,
-                       title_source="derived", project=project, now=now,
-                       mirror_key=mirror_key, mirror_url=url)
+    item_id = create_item(conn, source=source, text=body, title=title,
+                          title_source="derived", project=project, now=now,
+                          mirror_key=mirror_key, mirror_url=url)
+    if state == "closed":
+        conn.execute("UPDATE inbox_items SET state='closed', closed_at=? WHERE id=?",
+                     (now, item_id))
+    return item_id
 
 
 #: SQLite's compile-time SQLITE_MAX_VARIABLE_NUMBER is 999 on older builds and
@@ -841,12 +1033,189 @@ def close_missing_mirror_items(conn: sqlite3.Connection, *, prefix: str,
     now = now or now_iso()
     seen = list(dict.fromkeys(seen_keys))
     sql = ("UPDATE inbox_items SET state='closed', closed_at=?, updated_at=? "
-           "WHERE state='open' AND mirror_key LIKE ? ESCAPE '\\'")
+           "WHERE state='open' AND archived_at IS NULL AND mirror_key LIKE ? ESCAPE '\\'")
     args: list[Any] = [now, now, _like_prefix(prefix)]
     clause, extra = _not_in_chunks("mirror_key", seen)
     sql += clause
     args += extra
     return int(conn.execute(sql, args).rowcount or 0)
+
+
+CLOSED_BY_BACKLOG = "backlog"
+CLOSED_BY_ISSUES = "issues"
+
+#: A backlog.txt entry is DONE when its What: line carries a done marker ANYWHERE — the
+#: file does both "✅ DONE 2026-08-21 — …" (prefix) and "… — ✅ DONE 2026-07-08 via …"
+#: (suffix), and "✅ RESOLVED". The emoji may carry its variation selector (U+FE0F);
+#: case-insensitive. Only the What: line counts (a "✅ DONE" under Why: is just words).
+BACKLOG_DONE_RE = re.compile(r"✅\ufe0f?\s*(DONE|RESOLVED)\b", re.IGNORECASE)
+#: Consecutive complete pushes a filed note's tag must be missing from before the note is
+#: treated as removed from backlog.txt (see ``backlog_absent_pushes``).
+BACKLOG_ABSENT_PUSHES = 2
+
+
+def backlog_is_done(text: str | None) -> bool:
+    """True when a backlog entry's What: line (the first line of its text) is marked done."""
+    return bool(BACKLOG_DONE_RE.search(what_line(text)))
+
+
+def filed_line_status(conn: sqlite3.Connection) -> dict[str, str]:
+    """For every ``(voice <id8>)`` tag in any backlog-mirror row's What: line: ``open`` (some
+    live tagged row is open), ``done`` (live tagged rows exist and all are closed — ✅ DONE),
+    or ``gone`` (only archived tagged rows: the line was removed). A tag no row has ever
+    carried is absent. Matched in Python (``backlog_tags``) over the few rows that mention a
+    tag at all."""
+    status: dict[str, str] = {}
+    for row in conn.execute(
+            "SELECT state, archived_at, body FROM inbox_items WHERE source = 'backlog'"
+            " AND body LIKE '%(voice %'"):
+        for tag in backlog_tags(row["body"]):
+            cur = status.get(tag, "gone")
+            if row["archived_at"] is None:
+                cur = "open" if (row["state"] == "open" or cur == "open") else "done"
+            status[tag] = cur
+    return status
+
+
+def apply_filed_backlog_rule(conn: sqlite3.Connection, *, before: dict[str, str],
+                             now: str | None = None) -> tuple[int, int]:
+    """Close / reopen notes filed to backlog.txt from the state of their line(s).
+
+    The backlog twin of the issues rule. Call ONLY at the end of a COMPLETE backlog push —
+    after every upsert AND the archive, never per row, so an edit that swaps keys within one
+    push cannot flap a note — with ``before`` = :func:`filed_line_status` taken at the start
+    of that push. For every filed note (voice or typed), by its tag's status now:
+
+    - ``open`` (a live tagged line that is not done): reset the absence count; REOPEN the
+      note only if this rule closed it (``closed_by='backlog'``).
+    - ``done`` (every live tagged line is ✅ DONE/RESOLVED): CLOSE it at once — on the
+      TRANSITION into done (``before`` was not done), so a hand reopen of a done note sticks.
+    - no live tagged line (removed, or it never reached the file): count the push in
+      ``backlog_absent_pushes``; CLOSE on the push that makes it BACKLOG_ABSENT_PUSHES (2) in
+      a row. One truncated read of the file, or a filing call that beat its line into the
+      file, therefore closes nothing. The count is capped, so a steady state writes nothing
+      and a note reopened by hand is not closed again until its line comes back and goes.
+
+    A closing rule never touches a closed note, and a reopen never touches one it did not
+    close: hand changes clear ``closed_by``, and the issues rule writes its own value. Every
+    write is by primary key. Returns ``(closed, reopened)``.
+    """
+    now = now or now_iso()
+    after = filed_line_status(conn)
+    closed = reopened = 0
+
+    def close(note_id: str) -> int:
+        return int(conn.execute(
+            "UPDATE inbox_items SET state='closed', closed_at=?, closed_by=?, updated_at=?"
+            " WHERE id=? AND state='open'",
+            (now, CLOSED_BY_BACKLOG, now, note_id)).rowcount or 0)
+
+    notes = conn.execute(
+        "SELECT id, state, closed_by, backlog_absent_pushes FROM inbox_items"
+        " WHERE filed_backlog_at IS NOT NULL AND source IN ('voice','typed')").fetchall()
+    for note in notes:
+        tag = note["id"][:8]
+        status = after.get(tag)
+        absent = int(note["backlog_absent_pushes"] or 0)
+        if status in ("open", "done"):
+            if absent:
+                conn.execute("UPDATE inbox_items SET backlog_absent_pushes=0 WHERE id=?",
+                             (note["id"],))
+            if status == "open":
+                if note["state"] == "closed" and note["closed_by"] == CLOSED_BY_BACKLOG:
+                    reopened += int(conn.execute(
+                        "UPDATE inbox_items SET state='open', closed_at=NULL, closed_by=NULL,"
+                        " updated_at=? WHERE id=? AND state='closed' AND closed_by=?",
+                        (now, note["id"], CLOSED_BY_BACKLOG)).rowcount or 0)
+            elif note["state"] == "open" and before.get(tag) != "done":
+                closed += close(note["id"])
+        elif absent < BACKLOG_ABSENT_PUSHES:
+            absent += 1
+            conn.execute("UPDATE inbox_items SET backlog_absent_pushes=? WHERE id=?",
+                         (absent, note["id"]))
+            if absent == BACKLOG_ABSENT_PUSHES and note["state"] == "open":
+                closed += close(note["id"])
+    return closed, reopened
+
+
+def apply_backlog_push(conn: sqlite3.Connection, entries: list[tuple[str, str, str | None]],
+                       *, complete: bool, now: str | None = None) -> dict:
+    """One backlog.txt push, ``entries`` = already-validated ``(key, text, project)``, as ONE
+    transaction: the upserts (each row's state from its What: line), then — only when the
+    caller read the WHOLE file (``complete``) — the archive of absent keys and the filed-note
+    rule. An unchanged push writes nothing (see :func:`upsert_mirror_item`)."""
+    now = now or now_iso()
+    seen: list[str] = []
+    archived = closed = reopened = 0
+    with transaction(conn):
+        # Taken BEFORE any upsert: the filed-note rule acts on what this whole push changed.
+        before = filed_line_status(conn) if complete else {}
+        for key, text, project in entries:
+            upsert_mirror_item(conn, mirror_key=key, source=MIRROR_BACKLOG,
+                               title=derive_title(text), body=text, project=project, now=now,
+                               state="closed" if backlog_is_done(text) else "open")
+            seen.append(key)
+        if complete:
+            archived = archive_missing(conn, prefix=MIRROR_BACKLOG + ":", seen_keys=seen,
+                                       now=now)
+            # After the WHOLE push (upserts + archive), never per row.
+            closed, reopened = apply_filed_backlog_rule(conn, before=before, now=now)
+    return {"synced": len(seen), "archived": archived, "complete": complete,
+            "closed_notes": closed, "reopened_notes": reopened}
+
+
+def _github_repo_of(mirror_key: str) -> str:
+    return mirror_key[len(MIRROR_GITHUB) + 1:].rsplit("#", 1)[0]
+
+
+def archive_unwatched_github(conn: sqlite3.Connection, repos: Iterable[str],
+                             now: str | None = None) -> int:
+    """G-22: archive every live mirrored issue row whose repo is no longer watched
+    (``INBOX_GITHUB_REPOS``) — it would otherwise claim to be open work for ever, never
+    updated again. :func:`unarchive_unlinked_github` brings them back if the repo returns.
+    Exact repo spelling, like the keys themselves."""
+    now = now or now_iso()
+    watched = set(repos)
+    gone = [r["id"] for r in conn.execute(
+        "SELECT id, mirror_key FROM inbox_items WHERE source = ? AND archived_at IS NULL"
+        " AND mirror_key IS NOT NULL", (MIRROR_GITHUB,))
+        if _github_repo_of(r["mirror_key"]) not in watched]
+    for item_id in gone:
+        conn.execute("UPDATE inbox_items SET archived_at=?, updated_at=? WHERE id=?",
+                     (now, now, item_id))
+    # Forget the ETag of every repo no longer watched: if it is watched again, its first
+    # scan must be a full one (a 304 would skip the un-archive and strand its rows).
+    for r in conn.execute("SELECT key FROM inbox_mirror_state WHERE key LIKE 'github:%'"
+                          " AND etag IS NOT NULL").fetchall():
+        if r["key"][len(MIRROR_GITHUB) + 1:] not in watched:
+            conn.execute("UPDATE inbox_mirror_state SET etag=NULL WHERE key=?", (r["key"],))
+    return len(gone)
+
+
+def unarchive_unlinked_github(conn: sqlite3.Connection, repo: str,
+                              now: str | None = None) -> int:
+    """During a COMPLETE scan of a watched ``repo``: un-archive its mirrored rows that are
+    archived but not linked to any note — the rows of a repo that was unwatched and is
+    watched again (G-22), or of an issue whose linking note was deleted (G-19). A row whose
+    issue is still linked stays archived: the note represents it."""
+    now = now or now_iso()
+    back = []
+    for r in conn.execute(
+            "SELECT id, mirror_key FROM inbox_items WHERE source = ?"
+            " AND archived_at IS NOT NULL AND mirror_key IS NOT NULL", (MIRROR_GITHUB,)):
+        key = r["mirror_key"]
+        if _github_repo_of(key) != repo:
+            continue
+        try:
+            number = int(key.rsplit("#", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        if linked_issue(conn, repo, number) is None:
+            back.append(r["id"])
+    for item_id in back:
+        conn.execute("UPDATE inbox_items SET archived_at=NULL, updated_at=? WHERE id=?",
+                     (now, item_id))
+    return len(back)
 
 
 def reopen_mirror_item(conn: sqlite3.Connection, mirror_key: str,
@@ -874,34 +1243,71 @@ def linked_issue(conn: sqlite3.Connection, repo: str,
 def refresh_issue(conn: sqlite3.Connection, repo: str, number: int, *,
                   title: str | None = None, url: str | None = None,
                   state: str = "open", now: str | None = None) -> None:
-    """Keep a linked issue's title/state current from a repo scan."""
+    """Keep every link to one issue current from a repo scan. Writes only a real change
+    (``checked_at`` therefore means "last changed"): an unchanged scan writes nothing."""
     now = now or now_iso()
     conn.execute(
         "UPDATE inbox_issues SET title=COALESCE(?, title), "
         "url=COALESCE(?, url), state=?, checked_at=?, "
         "closed_at=CASE WHEN ?='closed' THEN COALESCE(closed_at, ?) ELSE NULL END "
-        "WHERE repo=? AND number=?",
-        (title, url, state, now, state, now, repo, int(number)))
+        "WHERE repo=? AND number=? AND (state IS NOT ?"
+        " OR (? IS NOT NULL AND title IS NOT ?) OR (? IS NOT NULL AND url IS NOT ?))",
+        (title, url, state, now, state, now, repo, int(number), state,
+         title, title, url, url))
 
 
-def close_items_whose_issues_all_closed(conn: sqlite3.Connection,
-                                        repo: str,
-                                        now: str | None = None) -> int:
-    """Close every OPEN item all of whose linked issues are closed.
+def issue_states(conn: sqlite3.Connection, repo: str) -> dict[tuple[int, str], str]:
+    """``{(number, item_id): state}`` for every link to an issue in ``repo`` — the STORED
+    state that :func:`apply_issue_transitions` compares a scan against. Keyed per LINK:
+    several notes may link one issue."""
+    return {(int(r["number"]), r["item_id"]): r["state"] for r in conn.execute(
+        "SELECT number, state, item_id FROM inbox_issues WHERE repo=?", (repo,))}
 
-    "All", not "any": a voice note can spawn issues in two repos, and one of
-    them being done is not the note being done.
+
+def apply_issue_transitions(conn: sqlite3.Connection, repo: str, *,
+                            before: dict[tuple[int, str], str],
+                            now: str | None = None) -> tuple[int, int]:
+    """The issues rule for NOTES, EDGE-triggered. Returns ``(closed, reopened)``.
+
+    Call at the end of a COMPLETE scan of ``repo`` (after :func:`refresh_issue` and
+    :func:`mark_issues_closed`), with ``before`` = :func:`issue_states` taken at its start.
+    Only what THIS scan changed counts, read off the stored ``inbox_issues.state``, so a
+    transition that happened during a mirror outage is still seen by the first good scan:
+
+    - an issue moved open → closed, and the note now has NO open linked issue (in any
+      repo — "all", not "any": a note can spawn issues in two repos) → close it,
+      ``closed_by='issues'``;
+    - an issue moved closed → open → reopen the note, ONLY if this rule closed it.
+
+    Being edge-triggered is the point: a hand reopen of a note whose issues are all closed
+    sticks until an issue next changes upstream (it used to be re-closed by every scan), and
+    a hand close is never undone (hand changes clear ``closed_by``). An issue linked since
+    ``before`` was taken counts as open before (``link_issue`` inserts it open). Mirrored
+    ``github`` rows are not touched here: they follow upstream on every scan by design.
     """
     now = now or now_iso()
-    return int(conn.execute(
-        "UPDATE inbox_items SET state='closed', closed_at=?, updated_at=? "
-        "WHERE state='open' AND EXISTS ("
-        "   SELECT 1 FROM inbox_issues i WHERE i.item_id = inbox_items.id"
-        "     AND i.repo = ?)"
-        " AND NOT EXISTS ("
-        "   SELECT 1 FROM inbox_issues i WHERE i.item_id = inbox_items.id"
-        "     AND i.state != 'closed')",
-        (now, now, repo)).rowcount or 0)
+    closing: set[str] = set()
+    reopening: set[str] = set()
+    for (number, item_id), state in issue_states(conn, repo).items():
+        was = before.get((number, item_id), "open")
+        if was != "closed" and state == "closed":
+            closing.add(item_id)
+        elif was == "closed" and state != "closed":
+            reopening.add(item_id)
+    reopened = closed = 0
+    for item_id in sorted(reopening):
+        reopened += int(conn.execute(
+            "UPDATE inbox_items SET state='open', closed_at=NULL, closed_by=NULL, updated_at=?"
+            " WHERE id=? AND state='closed' AND closed_by=?",
+            (now, item_id, CLOSED_BY_ISSUES)).rowcount or 0)
+    for item_id in sorted(closing):
+        closed += int(conn.execute(
+            "UPDATE inbox_items SET state='closed', closed_at=?, closed_by=?, updated_at=?"
+            " WHERE id=? AND state='open' AND source IN ('voice','typed')"
+            " AND NOT EXISTS (SELECT 1 FROM inbox_issues i"
+            "   WHERE i.item_id = inbox_items.id AND i.state != 'closed')",
+            (now, CLOSED_BY_ISSUES, now, item_id)).rowcount or 0)
+    return closed, reopened
 
 
 def mark_issues_closed(conn: sqlite3.Connection, repo: str,
@@ -984,7 +1390,13 @@ def delete_item(conn: sqlite3.Connection, item_id: str) -> dict | None:
     row = get_item(conn, item_id)
     if row is None:
         return None
+    repos = [r["repo"] for r in conn.execute(
+        "SELECT DISTINCT repo FROM inbox_issues WHERE item_id=?", (item_id,))]
     conn.execute("DELETE FROM inbox_items WHERE id=?", (item_id,))
+    # Its links go with it (ON DELETE CASCADE), so an issue it linked may be a mirrored row
+    # again — which only a FULL scan can bring back.
+    for repo in repos:
+        forget_etag(conn, repo)
     return row
 
 
@@ -994,8 +1406,13 @@ def mark_audio_pruned(conn: sqlite3.Connection, item_id: str,
     purpose — "there was a 41 s recording and it was deleted on this date" is a
     better answer than a row that looks as if it never had audio."""
     now = now or now_iso()
-    conn.execute("UPDATE inbox_items SET audio_path=NULL, audio_pruned_at=?, "
-                 "updated_at=? WHERE id=?", (now, now, item_id))
+    # A transcript still PENDING can never happen now (P-12): the note goes to Needs review
+    # as 'failed', labelled "Recording expired before it was transcribed", not 'pending'
+    # for ever in no queue.
+    conn.execute("UPDATE inbox_items SET audio_path=NULL, audio_pruned_at=?, updated_at=?,"
+                 " transcript_status = CASE WHEN transcript_status = ? THEN ?"
+                 " ELSE transcript_status END WHERE id=?",
+                 (now, now, TRANSCRIPT_PENDING, TRANSCRIPT_FAILED, item_id))
 
 
 def audio_bytes_total(conn: sqlite3.Connection) -> int:
@@ -1031,8 +1448,12 @@ def clear_audio_path(conn: sqlite3.Connection, item_id: str,
     """The file is gone but the row still pointed at it — a 404 waiting to
     happen on the one control Graham taps to check a transcript."""
     now = now or now_iso()
-    conn.execute("UPDATE inbox_items SET audio_path=NULL, updated_at=? "
-                 "WHERE id=?", (now, item_id))
+    # Recorded on the row (P-14): "Recording missing" on the page, and a transcript that can
+    # no longer happen goes to Needs review as 'failed' instead of 'pending' for ever.
+    conn.execute("UPDATE inbox_items SET audio_path=NULL, audio_missing_at=?, updated_at=?,"
+                 " transcript_status = CASE WHEN transcript_status = ? THEN ?"
+                 " ELSE transcript_status END WHERE id=?",
+                 (now, now, TRANSCRIPT_PENDING, TRANSCRIPT_FAILED, item_id))
 
 
 # --------------------------------------------------------------------------- #
@@ -1069,14 +1490,14 @@ _NEEDS_REVIEW_SQL = (
     " AND reviewed = 0 AND (draft_status IN ('ready','failed')"
     " OR transcript_status = 'failed'))")
 
-# A backlog-mirror row that IS a filed note's line (it carries the note's voice tag). Hidden
-# from the default list and the counts, so a note filed to backlog.txt does not show twice;
-# still listed when the source filter is explicitly `backlog`.
+# A backlog-mirror row that IS a filed note's line (its What: line carries the note's voice
+# tag). Hidden from the default list and the counts WHENEVER that note exists, in any state —
+# it is the same piece of work, and the note is where its state is shown. Shown again only if
+# the note is deleted. Still listed when the source filter is explicitly `backlog`.
 _FILED_COPY_SQL = (
     "(source = 'backlog' AND EXISTS (SELECT 1 FROM inbox_items n"
     " WHERE n.filed_backlog_at IS NOT NULL AND n.source IN ('voice','typed')"
-    " AND n.state != 'closed' AND n.archived_at IS NULL"
-    " AND instr(inbox_items.body, '(voice ' || substr(n.id, 1, 8) || ')') > 0))")
+    f" AND instr({WHAT_LINE_SQL}, '(voice ' || substr(n.id, 1, 8) || ')') > 0))")
 
 MAX_LIMIT = 500
 _LIKE_ESCAPE = str.maketrans({"\\": "\\\\", "%": "\\%", "_": "\\_"})
@@ -1093,7 +1514,11 @@ def list_items(conn: sqlite3.Connection, *, q: str | None = None,
     ahead of awaiting-filing."""
     where = []
     args: list[Any] = []
-    if not include_archived:
+    if state == ARCHIVED_FILTER:
+        # Rows whose upstream is gone (a removed backlog line, an unwatched repo, an issue a
+        # note now represents): findable, never counted (`counts` stays live-only).
+        where.append("archived_at IS NOT NULL")
+    elif not include_archived:
         where.append("archived_at IS NULL")
     if source != "backlog":
         where.append(f"NOT {_FILED_COPY_SQL}")
@@ -1239,6 +1664,12 @@ def set_mirror_state(conn: sqlite3.Connection, key: str, **fields) -> None:
                "rate_remaining", "rate_reset_at", "backoff_until")
     values = {k: fields.get(k) for k in allowed if k in fields}
     if not values:
+        return
+    # Nothing but the clock changed → write NOTHING. `last_sync_at` therefore means "the
+    # last sync that changed this repo's stored state", and an unchanged sync (a 304, or
+    # a 200 with the same answer) leaves inbox.db byte-identical for the backup.
+    row = conn.execute("SELECT * FROM inbox_mirror_state WHERE key=?", (key,)).fetchone()
+    if row is not None and all(row[k] == v for k, v in values.items() if k != "last_sync_at"):
         return
     conn.execute("INSERT OR IGNORE INTO inbox_mirror_state (key) VALUES (?)",
                  (key,))

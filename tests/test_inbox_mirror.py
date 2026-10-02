@@ -31,17 +31,26 @@ def issue(number, title="An issue", body="", **extra):
 
 
 class FakeGitHub:
-    """Records every call and answers from a scripted list of responses."""
+    """Records every call and answers from a scripted list of responses — like GitHub, it
+    answers 304 when the request's If-None-Match equals the ETag of the answer it would give
+    (so a test can SEE a sync that never looked). ``honour_etag=False`` models a proxy that
+    ignores conditional requests."""
 
-    def __init__(self, pages=None):
+    def __init__(self, pages=None, honour_etag=True):
         self.pages = list(pages or [])
         self.calls: list[tuple[str, dict]] = []
+        self.honour_etag = honour_etag
 
     def __call__(self, url, headers):
         self.calls.append((url, headers))
         if not self.pages:
             return github_mirror.MirrorResponse(status=200, body=[])
-        return self.pages.pop(0)
+        resp = self.pages.pop(0)
+        sent = (headers or {}).get("If-None-Match")
+        if (self.honour_etag and sent and resp.status == 200
+                and resp.header("ETag") == sent):
+            return github_mirror.MirrorResponse(status=304, headers={"ETag": sent})
+        return resp
 
 
 def ok(items, etag='W/"etag-1"', **headers):
@@ -77,8 +86,10 @@ def test_a_clean_scan_mirrors_open_issues_and_skips_pull_requests(conn):
 
 
 def test_a_resync_is_idempotent(conn):
+    # A changed answer comes with a changed ETag, as it does on GitHub (the fake answers a
+    # matching If-None-Match with a 304).
     fetch = FakeGitHub([ok([issue(1, "Wheel spins twice")]),
-                        ok([issue(1, "Wheel spins twice (retitled)")])])
+                        ok([issue(1, "Wheel spins twice (retitled)")], etag='W/"etag-2"')])
     github_mirror.sync(conn, [REPO], now=NOW, fetch=fetch)
     github_mirror.sync(conn, [REPO], now=NOW + 900, fetch=fetch)
     rows = inbox_db.list_items(conn)
@@ -165,7 +176,8 @@ def test_a_failure_on_a_later_page_closes_nothing_either(conn):
     github_mirror.sync(conn, [REPO], now=NOW, fetch=fetch)
     assert len(inbox_db.list_items(conn, limit=500)) == github_mirror.PER_PAGE + 1
     # Page 1 is short this time, so it does not page again — reset the script.
-    fetch.pages = [ok(full), github_mirror.MirrorResponse(status=500, error="boom")]
+    fetch.pages = [ok(full, etag='W/"etag-3"'),
+                   github_mirror.MirrorResponse(status=500, error="boom")]
     out = github_mirror.sync(conn, [REPO], now=NOW + 900, fetch=fetch)
     assert out["results"][0]["status"] == "error"
     assert {r["state"] for r in inbox_db.list_items(conn, limit=500)} == {"open"}
@@ -270,6 +282,325 @@ def test_a_voice_item_closes_only_when_every_linked_issue_is_closed(conn):
     fetch = FakeGitHub([ok([], etag='W/"e2"'), ok([], etag='W/"e3"')])
     github_mirror.sync(conn, [REPO, other], now=NOW + 900, fetch=fetch)
     assert inbox_db.get_item(conn, spoken)["state"] == "closed"
+
+
+def test_an_item_closed_by_its_issues_reopens_when_one_reopens_upstream(conn):
+    spoken = inbox_db.create_item(conn, source="voice", text="the wheel sticks",
+                                  now="2026-09-01T00:00:00Z")
+    with conn:
+        inbox_db.link_issue(conn, spoken, repo=REPO, number=7, url="u7")
+    github_mirror.sync(conn, [REPO], now=NOW, fetch=FakeGitHub([ok([issue(7)])]))
+    github_mirror.sync(conn, [REPO], now=NOW + 900,
+                       fetch=FakeGitHub([ok([], etag='W/"e2"')]))       # #7 closed
+    row = inbox_db.get_item(conn, spoken)
+    assert row["state"] == "closed" and row["closed_by"] == "issues"
+    result = github_mirror.sync(conn, [REPO], now=NOW + 1800,
+                                fetch=FakeGitHub([ok([issue(7)], etag='W/"e3"')]))  # reopened
+    row = inbox_db.get_item(conn, spoken)
+    assert row["state"] == "open" and row["closed_at"] is None and row["closed_by"] is None
+    assert result["results"][0]["reopened_items"] == 1
+
+
+def test_an_item_closed_by_hand_stays_closed_when_its_issue_reopens(conn):
+    spoken = inbox_db.create_item(conn, source="voice", text="the wheel sticks",
+                                  now="2026-09-01T00:00:00Z")
+    with conn:
+        inbox_db.link_issue(conn, spoken, repo=REPO, number=7, url="u7")
+        inbox_db.update_item(conn, spoken, {"state": "closed"})
+    github_mirror.sync(conn, [REPO], now=NOW, fetch=FakeGitHub([ok([], etag='W/"e1"')]))
+    github_mirror.sync(conn, [REPO], now=NOW + 900,
+                       fetch=FakeGitHub([ok([issue(7)], etag='W/"e2"')]))
+    assert inbox_db.get_item(conn, spoken)["state"] == "closed"
+
+
+# --- the issues rule is EDGE-triggered, for notes -------------------------------- #
+# A note closes when a scan moves its LAST open linked issue to closed, and reopens (only if
+# that rule closed it) when a scan moves a linked issue from closed to open. Transitions are
+# read off the STORED inbox_issues.state before vs after the scan, so an outage cannot hide
+# one, and a hand close or reopen sticks until the next real change upstream.
+_ETAGS = iter(range(1, 1_000_000))
+
+
+def _scan(conn, *open_numbers, at=0):
+    """One complete, error-free scan of REPO in which exactly these issues are open."""
+    fetch = FakeGitHub([ok([issue(n) for n in open_numbers], etag=f'W/"s{next(_ETAGS)}"')])
+    return github_mirror.sync(conn, [REPO], now=NOW + at, fetch=fetch)["results"][0]
+
+
+def _outage(conn, at=0):
+    fetch = FakeGitHub([github_mirror.MirrorResponse(status=500, error="HTTP 500")])
+    assert github_mirror.sync(conn, [REPO], now=NOW + at,
+                              fetch=fetch)["results"][0]["status"] == "error"
+
+
+def _note_linked_to(conn, *numbers):
+    note = inbox_db.create_item(conn, source="voice", text="the wheel sticks",
+                                now="2026-09-01T00:00:00Z")
+    with conn:
+        for n in numbers:
+            inbox_db.link_issue(conn, note, repo=REPO, number=n, url=f"u{n}")
+    return note
+
+
+def _state(conn, note):
+    row = inbox_db.get_item(conn, note)
+    return row["state"], row["closed_by"]
+
+
+def test_a_hand_reopen_sticks_across_repeated_scans(conn):
+    note = _note_linked_to(conn, 7)
+    _scan(conn, 7)
+    _scan(conn, at=900)                                   # #7 closes upstream
+    assert _state(conn, note) == ("closed", "issues")
+    with conn:
+        inbox_db.update_item(conn, note, {"state": "open"})    # Graham: not done yet
+    for i in range(3):
+        _scan(conn, at=1800 + i * 900)                    # #7 is still closed upstream
+    assert _state(conn, note) == ("open", None)
+
+
+def test_a_later_real_close_upstream_closes_a_hand_reopened_note_again(conn):
+    note = _note_linked_to(conn, 7)
+    _scan(conn, 7)
+    _scan(conn, at=900)
+    with conn:
+        inbox_db.update_item(conn, note, {"state": "open"})
+    _scan(conn, at=1800)                                  # no change upstream: stays open
+    assert _state(conn, note) == ("open", None)
+    _scan(conn, 7, at=2700)                               # reopened upstream...
+    assert _state(conn, note) == ("open", None)
+    r = _scan(conn, at=3600)                              # ...and really closed again
+    assert r["closed_items"] == 1 and _state(conn, note) == ("closed", "issues")
+
+
+def test_a_transition_during_a_mirror_outage_is_caught_on_recovery(conn):
+    note = _note_linked_to(conn, 7)
+    _scan(conn, 7)
+    _outage(conn, at=900)                                 # #7 closes while GitHub is down
+    _outage(conn, at=1800)
+    assert _state(conn, note) == ("open", None)
+    assert _scan(conn, at=2700)["closed_items"] == 1      # the first good scan sees it
+    assert _state(conn, note) == ("closed", "issues")
+    _outage(conn, at=3600)                                # and the way back
+    assert _scan(conn, 7, at=4500)["reopened_items"] == 1
+    assert _state(conn, note) == ("open", None)
+
+
+def test_one_of_two_issues_reopening_reopens_the_note(conn):
+    note = _note_linked_to(conn, 1, 2)
+    _scan(conn, 1, 2)
+    _scan(conn, 2, at=900)
+    assert _state(conn, note) == ("open", None)           # #2 is still open
+    _scan(conn, at=1800)
+    assert _state(conn, note) == ("closed", "issues")
+    _scan(conn, 1, at=2700)                               # only #1 reopens
+    assert _state(conn, note) == ("open", None)
+
+
+def test_mirrored_github_rows_keep_following_upstream_every_scan(conn):
+    """The other half of the rule, and intended: a mirrored row is a VIEW of the issue."""
+    _scan(conn, 3)
+    row = inbox_db.list_items(conn)[0]
+    with conn:
+        inbox_db.update_item(conn, row["id"], {"state": "closed"})
+    _scan(conn, 3, at=900)
+    assert inbox_db.get_item(conn, row["id"])["state"] == "open"
+
+
+# --- one issue, many notes; linked issues are not mirrored twice (G-19, G-20) ---- #
+
+def test_two_notes_can_link_the_same_issue_and_both_follow_it(conn):
+    a, b = _note_linked_to(conn, 7), _note_linked_to(conn, 7)
+    links = inbox_db.issues_for(conn, [a, b])
+    assert len(links[a]) == 1 and len(links[b]) == 1
+    _scan(conn, 7)
+    r = _scan(conn, at=900)
+    assert r["closed_items"] == 2
+    assert _state(conn, a) == _state(conn, b) == ("closed", "issues")
+    r = _scan(conn, 7, at=1800)
+    assert r["reopened_items"] == 2
+    assert _state(conn, a) == _state(conn, b) == ("open", None)
+
+
+def test_linking_an_already_mirrored_issue_archives_its_mirror_row(conn):
+    """G-19: the note now represents that issue. Its mirror row goes (archived, never
+    deleted), stays gone across later scans, and never claims the open issue is closed."""
+    _scan(conn, 7)
+    mirror = inbox_db.get_item_by_mirror_key(conn, inbox_db.github_key(REPO, 7))["id"]
+    note = _note_linked_to(conn, 7)
+    assert inbox_db.get_item(conn, mirror)["archived_at"] is not None
+    for i in range(2):
+        _scan(conn, 7, at=900 + i * 900)                  # still open upstream
+    row = inbox_db.get_item(conn, mirror)
+    assert row["archived_at"] is not None and row["state"] == "open"
+    assert [r["id"] for r in inbox_db.list_items(conn)] == [note]
+    # If the note is deleted, the issue is a mirrored row again on the next complete scan.
+    with conn:
+        inbox_db.delete_item(conn, note)
+    _scan(conn, 7, at=2700)
+    row = inbox_db.get_item(conn, mirror)
+    assert row["archived_at"] is None and row["state"] == "open"
+
+
+# --- a repo that is no longer watched stops claiming open work (G-22) ------------- #
+OTHER = "Graham-Williams/taste-twin"
+
+
+def test_rows_of_an_unwatched_repo_are_archived_and_come_back_when_it_is_readded(conn):
+    fetch = FakeGitHub([ok([issue(1), issue(2)]), ok([issue(9)], etag='W/"o1"')])
+    github_mirror.sync(conn, [REPO, OTHER], now=NOW, fetch=fetch)
+    github_mirror.sync(conn, [REPO, OTHER], now=NOW + 900, fetch=FakeGitHub(
+        [ok([issue(1)], etag='W/"r2"'), ok([issue(9)], etag='W/"o2"')]))    # REPO#2 closes
+    github_mirror.sync(conn, [OTHER], now=NOW + 1800,                      # REPO removed
+                       fetch=FakeGitHub([ok([issue(9)], etag='W/"o3"')]))
+    live = {r["mirror_key"] for r in inbox_db.list_items(conn)}
+    assert live == {inbox_db.github_key(OTHER, 9)}
+    assert inbox_db.counts(conn)["open"] == 1
+    github_mirror.sync(conn, [REPO, OTHER], now=NOW + 2700, fetch=FakeGitHub(
+        [ok([issue(1)], etag='W/"r3"'), ok([issue(9)], etag='W/"o3"')]))    # re-added
+    by_key = {r["mirror_key"]: r for r in inbox_db.list_items(conn)}
+    assert by_key[inbox_db.github_key(REPO, 1)]["state"] == "open"
+    assert by_key[inbox_db.github_key(REPO, 2)]["state"] == "closed"      # back, as it was
+
+
+# --- a 304 can never strand an archived row (the ETag is forgotten on local change) -- #
+
+def test_a_rewatched_repo_comes_back_even_though_github_would_answer_304(conn):
+    body = [issue(9, "Still open")]
+    github_mirror.sync(conn, [REPO, OTHER], now=NOW, fetch=FakeGitHub(
+        [ok([], etag='W/"r1"'), ok(body, etag='W/"o1"')]))
+    github_mirror.sync(conn, [REPO], now=NOW + 900,                 # OTHER unwatched
+                       fetch=FakeGitHub([ok([], etag='W/"r1"')]))
+    assert inbox_db.list_items(conn) == []
+    # Re-watched, and nothing changed on GitHub: the old ETag would get a 304 and skip the
+    # scan that un-archives the rows. It was forgotten when the repo was unwatched.
+    out = github_mirror.sync(conn, [REPO, OTHER], now=NOW + 1800, fetch=FakeGitHub(
+        [ok([], etag='W/"r1"'), ok(body, etag='W/"o1"')]))
+    assert [r["status"] for r in out["results"]] == ["unchanged", "ok"]
+    assert [r["title"] for r in inbox_db.list_items(conn)] == ["Still open"]
+
+
+def test_deleting_a_linked_note_brings_its_open_issue_back_even_without_upstream_change(conn):
+    _scan(conn, 7)                                         # a mirrored row for #7
+    note = _note_linked_to(conn, 7)                        # linked: that row is archived
+    fetch = FakeGitHub([ok([issue(7)], etag='W/"steady"')])
+    github_mirror.sync(conn, [REPO], now=NOW + 900, fetch=fetch)
+    assert [r["id"] for r in inbox_db.list_items(conn)] == [note]
+    with conn:
+        inbox_db.delete_item(conn, note)
+    # Upstream is unchanged (same ETag), but the deletion forgot it: a full scan, not a 304.
+    out = github_mirror.sync(conn, [REPO], now=NOW + 1800,
+                             fetch=FakeGitHub([ok([issue(7)], etag='W/"steady"')]))
+    assert out["results"][0]["status"] == "ok"
+    assert [r["mirror_key"] for r in inbox_db.list_items(conn)] == [
+        inbox_db.github_key(REPO, 7)]
+
+
+def test_linking_an_issue_that_is_already_closed_closes_the_note_on_the_next_scan(conn):
+    github_mirror.sync(conn, [REPO], now=NOW,
+                       fetch=FakeGitHub([ok([issue(1)], etag='W/"steady"')]))
+    note = _note_linked_to(conn, 5)                        # #5 is closed upstream already
+    out = github_mirror.sync(conn, [REPO], now=NOW + 900,
+                             fetch=FakeGitHub([ok([issue(1)], etag='W/"steady"')]))
+    assert out["results"][0]["status"] == "ok"             # the link forgot the ETag
+    assert _state(conn, note) == ("closed", "issues")
+
+
+def test_a_live_mirror_row_of_a_linked_issue_is_archived_by_the_scan(conn):
+    """Duplicates made before linking archived the mirror row (or by a race) are repaired."""
+    _scan(conn, 7)
+    mirror = inbox_db.get_item_by_mirror_key(conn, inbox_db.github_key(REPO, 7))["id"]
+    note = inbox_db.create_item(conn, source="voice", text="x", now="2026-09-01T00:00:00Z")
+    conn.execute("INSERT INTO inbox_issues (item_id, repo, number, url, linked_at)"
+                 " VALUES (?, ?, 7, 'u', '2026-09-01T00:00:00Z')", (note, REPO))
+    assert inbox_db.get_item(conn, mirror)["archived_at"] is None      # the old duplicate
+    _scan(conn, 7, at=900)
+    assert inbox_db.get_item(conn, mirror)["archived_at"] is not None
+
+
+# --- boot: canonicalise, repair, forget every ETag ------------------------------ #
+
+def _seed_with_origin_main(tmp_path, script):
+    """Run ``script`` against a DB using origin/main's OWN code (the old schema, the old
+    link rules), in a subprocess so its `dashboard` package never meets this one."""
+    import subprocess
+    import sys
+    import tarfile
+    root = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True,
+                          text=True).stdout.strip()
+    archive = tmp_path / "main.tar"
+    got = subprocess.run(["git", "-C", root, "archive", "-o", str(archive), "origin/main",
+                          "dashboard"], capture_output=True)
+    if got.returncode != 0:
+        pytest.skip("origin/main is not available in this checkout")
+    tree = tmp_path / "main"
+    tree.mkdir()
+    with tarfile.open(archive) as tar:
+        tar.extractall(tree, filter="data")
+    proc = subprocess.run([sys.executable, "-c", script], cwd=str(tree), capture_output=True,
+                          text=True, env={**__import__("os").environ, "PYTHONPATH": str(tree)})
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    return proc.stdout.strip()
+
+
+def test_a_merged_link_seeded_by_origin_main_closes_its_note_on_the_first_scan(tmp_path):
+    path = str(tmp_path / "inbox.db")
+    note = _seed_with_origin_main(tmp_path, f"""
+from dashboard import inbox_db
+c = inbox_db.connect({path!r}); inbox_db.init_inbox_schema(c)
+n = inbox_db.create_item(c, source="voice", text="the wheel", now="2026-09-01T00:00:00Z")
+inbox_db.link_issue(c, n, repo="{REPO}", number=4, url="u")
+inbox_db.link_issue(c, n, repo="{REPO.upper()}", number=4, url="u")
+c.execute("UPDATE inbox_issues SET state='closed' WHERE repo=?", ("{REPO}",))
+inbox_db.set_mirror_state(c, "github:{REPO}", etag='W/"steady"', last_status="ok")
+c.commit(); print(n)
+""")
+    conn = inbox_db.connect(path)
+    try:
+        inbox_db.init_inbox_schema(conn)
+        inbox_db.startup_repairs(conn, (REPO,))
+        # Upstream: #4 is closed and nothing has changed since the stored ETag.
+        out = github_mirror.sync(conn, [REPO], now=NOW,
+                                 fetch=FakeGitHub([ok([], etag='W/"steady"')]))
+        assert out["results"][0]["status"] == "ok"            # a full scan, not a 304
+        assert _state(conn, note) == ("closed", "issues")
+    finally:
+        conn.close()
+
+
+def test_a_steady_state_boot_then_sync_writes_nothing_but_the_etags(conn):
+    note = _note_linked_to(conn, 7)
+    body = [issue(7), issue(8, "Mirrored")]
+    github_mirror.sync(conn, [REPO], now=NOW, fetch=FakeGitHub([ok(body, etag='W/"s"')]))
+    items = [dict(r) for r in conn.execute("SELECT * FROM inbox_items ORDER BY id")]
+    links = [dict(r) for r in conn.execute("SELECT * FROM inbox_issues ORDER BY id")]
+    inbox_db.startup_repairs(conn, (REPO,))                    # a boot
+    before = conn.total_changes
+    out = github_mirror.sync(conn, [REPO], now=NOW + 900,
+                             fetch=FakeGitHub([ok(body, etag='W/"s"')]))
+    assert out["results"][0]["status"] == "ok"                 # full: the ETag was forgotten
+    assert conn.total_changes - before == 1                    # the ETag row, nothing else
+    assert [dict(r) for r in conn.execute("SELECT * FROM inbox_items ORDER BY id")] == items
+    assert [dict(r) for r in conn.execute("SELECT * FROM inbox_issues ORDER BY id")] == links
+    assert _state(conn, note) == ("open", None)
+
+
+# --- a no-op sync writes nothing (item 11) --------------------------------------- #
+
+def test_an_unchanged_sync_writes_nothing(conn):
+    """No checked_at / updated_at / last_sync_at churn: an unchanged sync must leave
+    inbox.db byte-identical, or the 5-minute backup re-snapshots it and re-uploads it."""
+    note = _note_linked_to(conn, 7)
+    github_mirror.sync(conn, [REPO], now=NOW, fetch=FakeGitHub(
+        [ok([issue(7), issue(8, "Mirrored")], etag='W/"same"')]))
+    before = conn.total_changes
+    github_mirror.sync(conn, [REPO], now=NOW + 900, fetch=FakeGitHub(
+        [github_mirror.MirrorResponse(status=304, headers={"ETag": 'W/"same"'})]))
+    assert conn.total_changes == before, "a 304 wrote to inbox.db"
+    github_mirror.sync(conn, [REPO], now=NOW + 1800, fetch=FakeGitHub(
+        [ok([issue(7), issue(8, "Mirrored")], etag='W/"same"')], honour_etag=False))
+    assert conn.total_changes == before, "an unchanged 200 wrote to inbox.db"
+    assert _state(conn, note) == ("open", None)
 
 
 # --------------------------------------------------------------------------- #

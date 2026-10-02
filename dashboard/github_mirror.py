@@ -272,9 +272,11 @@ def _sync_repo(conn, repo: str, *, now: float, fetch, token: str) -> dict:
         resp = fetch(_issues_url(repo, page),
                      _headers(token, etag if page == 1 else None))
         if resp.status == 304:
-            with conn:
+            # Stored as "ok", like a 200: a 304 after a good sync then writes NOTHING (the
+            # result below still says "unchanged").
+            with inbox_db.transaction(conn):
                 inbox_db.set_mirror_state(conn, key, last_sync_at=now_text,
-                                          last_status="unchanged", last_error=None,
+                                          last_status="ok", last_error=None,
                                           backoff_until=None)
             # Nothing changed upstream, so the open set we already recorded is
             # still the open set. No close pass is needed and none is run.
@@ -283,7 +285,7 @@ def _sync_repo(conn, repo: str, *, now: float, fetch, token: str) -> dict:
             backoff = _backoff_from(resp, now)
             reason = _redact(resp.error or f"HTTP {resp.status}",
                              {"Authorization": f"Bearer {token}"} if token else None)[:200]
-            with conn:
+            with inbox_db.transaction(conn):
                 inbox_db.set_mirror_state(
                     conn, key, last_sync_at=now_text, last_status="error",
                     last_error=reason,
@@ -313,7 +315,7 @@ def _sync_repo(conn, repo: str, *, now: float, fetch, token: str) -> dict:
             break
     else:
         # Ran out of pages without the listing ending: treat as PARTIAL.
-        with conn:
+        with inbox_db.transaction(conn):
             inbox_db.set_mirror_state(
                 conn, key, last_sync_at=now_text, last_status="truncated",
                 last_error=f"more than {MAX_PAGES * PER_PAGE} open issues")
@@ -324,7 +326,12 @@ def _sync_repo(conn, repo: str, *, now: float, fetch, token: str) -> dict:
     seen_keys: list[str] = []
     open_numbers: list[int] = []
     mirrored = linked = 0
-    with conn:
+    # ONE real transaction (these connections are autocommit, so `with conn:` is not one):
+    # a scan lands whole or not at all, and `before` is read inside it.
+    with inbox_db.transaction(conn):
+        # The STORED state of every linked issue before this scan touches it: the issues
+        # rule acts on what this scan changes (edge-triggered), not on the end state.
+        before = inbox_db.issue_states(conn, repo)
         for raw in issues:
             number = raw.get("number")
             if not isinstance(number, int) or number <= 0:
@@ -337,6 +344,9 @@ def _sync_repo(conn, repo: str, *, now: float, fetch, token: str) -> dict:
                 # board. Refresh its label; do not mirror it as a second row.
                 inbox_db.refresh_issue(conn, repo, number, title=title or None,
                                        url=url, state="open", now=now_text)
+                # The note(s) represent it: a live mirror row of it is a duplicate (G-19),
+                # including old ones made before linking archived them.
+                inbox_db.archive_mirror_row_of_linked_issue(conn, repo, number, now=now_text)
                 linked += 1
                 continue
             item_key = inbox_db.github_key(repo, number)
@@ -348,13 +358,17 @@ def _sync_repo(conn, repo: str, *, now: float, fetch, token: str) -> dict:
             inbox_db.reopen_mirror_item(conn, item_key, now=now_text)
             seen_keys.append(item_key)
             mirrored += 1
+        # Rows archived while this repo was unwatched (G-22), or while a note linked their
+        # issue (G-19, the note since deleted), come back; close_missing then closes the
+        # ones that are closed upstream.
+        inbox_db.unarchive_unlinked_github(conn, repo, now=now_text)
         closed_rows = inbox_db.close_missing_mirror_items(
             conn, prefix=f"{inbox_db.MIRROR_GITHUB}:{repo}#",
             seen_keys=seen_keys, now=now_text)
         closed_issues = inbox_db.mark_issues_closed(conn, repo, open_numbers,
                                                     now=now_text)
-        closed_items = inbox_db.close_items_whose_issues_all_closed(
-            conn, repo, now=now_text)
+        closed_items, reopened_items = inbox_db.apply_issue_transitions(
+            conn, repo, before=before, now=now_text)
         inbox_db.set_mirror_state(
             conn, key, etag=new_etag or etag, last_sync_at=now_text,
             last_status="ok", last_error=None, backoff_until=None,
@@ -362,7 +376,7 @@ def _sync_repo(conn, repo: str, *, now: float, fetch, token: str) -> dict:
     return {"repo": repo, "status": "ok", "issues": len(issues),
             "mirrored": mirrored, "already_linked": linked,
             "closed_mirrored": closed_rows, "closed_issues": closed_issues,
-            "closed_items": closed_items}
+            "closed_items": closed_items, "reopened_items": reopened_items}
 
 
 def _int_or_none(value):
@@ -372,12 +386,29 @@ def _int_or_none(value):
         return None
 
 
+def archive_unwatched(conn, repos, *, now: float | None = None) -> int:
+    """G-22: mirrored issue rows of repos no longer in ``repos`` stop claiming to be open
+    work — archived (never deleted), and back on the first complete scan if the repo is
+    watched again. Config-driven, so it runs on every sync, even one with no repos."""
+    now = time.time() if now is None else now
+    with inbox_db.transaction(conn):
+        archived = inbox_db.archive_unwatched_github(conn, repos, now=inbox_db.to_iso(now))
+    return archived
+
+
 def sync(conn, repos, *, now: float | None = None, fetch=None,
          token: str = "") -> dict:
     """Sync every repo. One repo's failure never stops the others."""
     now = time.time() if now is None else now
     fetch = fetch or default_fetch
     results = []
+    try:
+        archive_unwatched(conn, repos, now=now)
+    except Exception as exc:                              # noqa: BLE001
+        # A locked DB here must not cost the repos their scan, or the cycle its heartbeat:
+        # the archive is re-tried by the next sync.
+        log.error("inbox github mirror: archiving unwatched repos failed: %s: %s",
+                  type(exc).__name__, str(exc)[:200])
     for repo in repos:
         if not GITHUB_REPO_RE.match(str(repo or "")):
             results.append({"repo": str(repo), "status": "invalid"})

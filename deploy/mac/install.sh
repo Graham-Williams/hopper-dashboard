@@ -12,6 +12,8 @@
 # It also prompts for INBOX_CLAUDE_BIN (the `claude` CLI that drafts each voice note; '-' =
 # drafting off) and checks the OAuth token file INBOX_CLAUDE_TOKEN_FILE is 0600 — it WARNS,
 # never fails, when the file is missing: make it once with `claude setup-token`.
+# It also sets INBOX_DRAFT_CONTEXT_FILE (the optional setup brief sent with each note) to
+# ~/personal-assistant/docs/voice-context.md when that exists, else leaves it empty.
 # It is opt-in because the transcription worker needs mlx-whisper in a venv on this Mac; the
 # probe needs nothing but the stock python3.
 #
@@ -43,7 +45,7 @@ while [[ $# -gt 0 ]]; do
     --inbox) WANT_INBOX=1; shift ;;
     --inbox-url) INBOX_URL="$2"; WANT_INBOX=1; shift 2 ;;
     --token|--inbox-token) echo "ERROR: $1 is not accepted (it would leak into shell history / ps); the script prompts with a hidden read" >&2; exit 2 ;;
-    -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -113,7 +115,8 @@ fi
 
 # --- 1c. Drafting keys (opt-in, with --inbox) ------------------------------------
 # The worker's second phase runs `claude -p` on each new transcript. The TRANSCRIPT and TITLE
-# are sent to Anthropic; the audio never is. Empty INBOX_CLAUDE_BIN = drafting stays off.
+# are sent to Anthropic, with the optional setup brief (INBOX_DRAFT_CONTEXT_FILE, below); the
+# audio never is. Empty INBOX_CLAUDE_BIN = drafting stays off.
 # The credential is an OAuth token from `claude setup-token`, in a 0600 FILE — never in the
 # env file and never on a command line. (Not `claude --bare`: it ignores OAuth.)
 if [[ -n "$WANT_INBOX" ]] && ! grep -q '^INBOX_CLAUDE_BIN=' "$ENV_FILE"; then
@@ -139,7 +142,8 @@ if [[ -n "$WANT_INBOX" ]] && ! grep -q '^INBOX_CLAUDE_BIN=' "$ENV_FILE"; then
   {
     echo
     echo "# --- Inbox drafting (phase two of com.hopper.inbox-transcribe) ---"
-    echo "# The transcript and title (not the audio) go to Anthropic (Claude) to draft each note."
+    echo "# The transcript, the title and the optional setup brief (not the audio) go to"
+    echo "# Anthropic (Claude) to draft each note."
     echo "# Empty INBOX_CLAUDE_BIN = drafting off. The token file is made once with"
     echo "# 'claude setup-token' and must be chmod 600."
     echo "INBOX_CLAUDE_BIN=$CLAUDE_BIN"
@@ -167,6 +171,25 @@ if [[ -n "$WANT_INBOX" ]]; then
       echo "claude token file OK ($TF, mode 600)"
     fi
   fi
+fi
+# The optional SETUP BRIEF: a plain-text description of Graham's projects and their
+# nicknames, sent with every note as reference data (so "the wheel page" can be placed).
+# Its own append, so an existing install that already has INBOX_CLAUDE_BIN still gets the key.
+# Default: Hopper's maintained brief when it exists on this Mac, else empty (no brief).
+# Shape: deploy/mac/draft-context.example.md. It is sent to Anthropic with each note.
+if [[ -n "$WANT_INBOX" ]] && ! grep -q '^INBOX_DRAFT_CONTEXT_FILE=' "$ENV_FILE"; then
+  CTX=""
+  [[ -f "$HOME/personal-assistant/docs/voice-context.md" ]] && CTX="$HOME/personal-assistant/docs/voice-context.md"
+  umask 077
+  {
+    echo "# Optional setup brief sent with each note as reference data (empty = none). The worker"
+    echo "# ignores a group/world-writable file. Example shape: deploy/mac/draft-context.example.md"
+    echo "INBOX_DRAFT_CONTEXT_FILE=$CTX"
+  } >> "$ENV_FILE"
+  umask 022
+  chmod 600 "$ENV_FILE"
+  if [[ -n "$CTX" ]]; then echo "drafting setup brief: $CTX"
+  else echo "no setup brief found; INBOX_DRAFT_CONTEXT_FILE left empty (see deploy/mac/draft-context.example.md)"; fi
 fi
 
 # --- 2. plists ------------------------------------------------------------------

@@ -427,6 +427,9 @@ class Core:
         conn = inbox_db.connect(self.settings.inbox_db_path)
         try:
             inbox_db.init_inbox_schema(conn)
+            # Canonicalise link spellings, THEN repair duplicates, then forget every stored
+            # ETag so the first scans are full (see inbox_db.startup_repairs).
+            inbox_db.startup_repairs(conn, self.settings.inbox_github_repos)
         finally:
             conn.close()
 
@@ -451,6 +454,17 @@ class Core:
         if not repos:
             summary = {"repos": 0, "ok": 0, "failed": 0, "issues": 0,
                        "results": []}
+            # Nothing to scan, but rows mirrored from repos that USED to be watched must
+            # still stop claiming to be open (G-22).
+            conn = self.inbox_connect()
+            try:
+                github_mirror.archive_unwatched(conn, (), now=now)
+            except Exception as exc:                      # noqa: BLE001
+                # Never at the heartbeat's expense; the next sync tries again.
+                log.error("inbox github mirror: archiving unwatched repos failed: %s: %s",
+                          type(exc).__name__, str(exc)[:200])
+            finally:
+                conn.close()
         else:
             conn = self.inbox_connect()
             try:

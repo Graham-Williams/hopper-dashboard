@@ -18,6 +18,7 @@ route                                        auth    notes
 ``PATCH /api/v1/inbox/items/<id>``           S       + origin pin + limiter
 ``DELETE /api/v1/inbox/items/<id>``          S       + origin pin + limiter
 ``GET  /api/v1/inbox/items``                 S | R   Hopper may read it
+``GET  /api/v1/inbox/counts``                S | R   the tiles' numbers
 ``GET  /inbox/audio/<id>``                   S | I
 ``GET  /api/v1/inbox/transcribe/queue``      I
 ``POST /api/v1/inbox/items/<id>/transcript`` I
@@ -38,8 +39,12 @@ GitHub, lines from backlog.txt. It is escaped at render (Jinja autoescape for
 HTML, ``jsonify`` for JSON) and the page's JS uses ``textContent`` only — there
 is no path from a stored string to markup.
 
-**Audio stays on this box and your Mac. The transcript and title (not the audio) are
-sent from the Mac to Anthropic (Claude) to draft the item.** Audio is
+**Audio never goes to Anthropic or any speech service: it lives on this box, on the Mac
+only while it is being transcribed, and add-only in the Google Drive backup (kept there
+after Delete or the retention prune until removed by hand). The transcript and title are
+sent from the Mac to Anthropic (Claude) to draft the item, with the optional setup brief
+(``INBOX_DRAFT_CONTEXT_FILE``, a page describing Graham's projects that lives on the Mac).**
+Audio is
 uploaded to this origin, stored as a file on the data volume, and transcribed
 locally by Whisper on Graham's Mac; the Mac then drafts a title and description
 from the transcript with ``claude -p`` (``probes/inbox_draft.py``) and posts the
@@ -82,6 +87,8 @@ MACHINE_ENDPOINTS = frozenset({
 #: Small on purpose: the point is to lift the body limit for ONE route by the
 #: least that works, never to raise the global 64 KB cap that protects the rest.
 MULTIPART_OVERHEAD = 64 * 1024
+#: The backlog push's own body allowance (the global cap stays 64 KB for every other route).
+BACKLOG_MAX_BODY_BYTES = 1024 * 1024
 
 #: The only URL shape an issue link may have. The board renders it as an
 #: ``href``, and Jinja's escaping does nothing about a ``javascript:`` scheme —
@@ -135,7 +142,7 @@ def _limited(name: str, key: str) -> bool:
 # --------------------------------------------------------------------------- #
 
 @bp.before_request
-def _lift_the_body_cap_for_the_create_route_only():
+def _lift_the_body_cap_for_the_two_routes_that_need_it():
     """Flask 3.1 lets ``max_content_length`` be set PER REQUEST, and that is the
     only reason a voice note (``INBOX_AUDIO_MAX_BYTES``, 2 MB by default) can
     reach a view at all: the app-wide ``MAX_CONTENT_LENGTH`` is 64 KB for both
@@ -150,6 +157,11 @@ def _lift_the_body_cap_for_the_create_route_only():
     if request.endpoint == "inbox.create_item":
         request.max_content_length = (_settings().inbox_audio_max_bytes
                                       + MULTIPART_OVERHEAD)
+    elif request.endpoint == "inbox.mirror_backlog":
+        # The whole of backlog.txt in one JSON body: the real file is ~45 KB of it, 69% of
+        # the global cap, and it only grows. The probe sends no more than MAX_BACKLOG_ITEMS
+        # entries of MAX_TEXT characters and has no cap of its own below this one.
+        request.max_content_length = BACKLOG_MAX_BODY_BYTES
 
 
 @bp.errorhandler(413)
@@ -241,6 +253,54 @@ def reviewable(row: dict) -> bool:
     return row["source"] == "typed" and row["reviewed_at"] != row["created_at"]
 
 
+#: R-03. A voice note's Reviewed tick means "I have read the draft and it is worth doing", and
+#: it is what hands the note to Hopper's filing loop — so it needs a draft to have read.
+NOTHING_TO_REVIEW = ("nothing to review yet — wait for the draft, or write one with Edit "
+                     "draft")
+#: The same refusal for a machine: the 409's ``code``. Not "not_reviewable" — every voice note
+#: IS ``reviewable`` (item_json says so); it just has no draft to review yet.
+NOTHING_TO_REVIEW_CODE = "nothing_to_review"
+
+
+def draft_to_review(row: dict, changes: dict | None = None) -> bool:
+    """Whether a voice note has a draft title Graham can review: the machine's (``ready``)
+    or his own (edited by hand — also ``ready``), or one written in this same request."""
+    changes = changes or {}
+    if "draft_title" in changes:
+        return bool(inbox_db.clean_draft_title(changes["draft_title"]))
+    return bool(row.get("draft_title")) and (row.get("draft_status") == inbox_db.DRAFT_READY
+                                             or bool(row.get("draft_edited_at")))
+
+
+def can_tick_reviewed(row: dict) -> bool:
+    """Whether the Reviewed box is offered: ``reviewable``, and for a voice note that is not
+    reviewed yet, only once there is a draft (a ticked box can always be unticked)."""
+    return reviewable(row) and (bool(row["reviewed"]) or row["source"] != "voice"
+                                or draft_to_review(row))
+
+
+#: Mirrored rows are VIEWS of something upstream, so Delete is refused on them: it could not
+#: remove the issue or the backlog.txt line, and the row would come back on the next sync.
+#: Each message says where to act instead. Voice and typed notes stay deletable.
+MIRROR_DELETE_REFUSALS = {
+    inbox_db.MIRROR_GITHUB: "This mirrors GitHub — close the issue there",
+    inbox_db.MIRROR_BACKLOG: "This mirrors backlog.txt — remove or ✅ DONE the line there",
+}
+
+
+#: A mirrored row's STATE is upstream's (a view — see DESIGN "Item lifecycle"): a hand close
+#: would only be undone by the next scan or push, so it is refused, saying where to act.
+MIRROR_STATE_REFUSALS = {
+    inbox_db.MIRROR_GITHUB: "This mirrors GitHub — close or reopen the issue there",
+    inbox_db.MIRROR_BACKLOG: "This mirrors backlog.txt — ✅ DONE, remove or restore the line there",
+}
+
+
+def deletable(row: dict) -> bool:
+    """Only a note authored here can be deleted; see ``MIRROR_DELETE_REFUSALS``."""
+    return row["source"] in inbox_db.LOCAL_SOURCES
+
+
 def item_json(row: dict, issues: list[dict] | None = None,
               backlog_copy: dict | None = None) -> dict:
     """One row, as both the JSON API and the template see it.
@@ -278,6 +338,8 @@ def item_json(row: dict, issues: list[dict] | None = None,
         "updated_at": row["updated_at"],
         "reviewed": bool(row["reviewed"]),
         "reviewable": reviewable(row),
+        "can_tick_reviewed": can_tick_reviewed(row),
+        "deletable": deletable(row),
         "reviewed_at": row["reviewed_at"],
         "state": row["state"],
         "closed_at": row["closed_at"],
@@ -287,6 +349,7 @@ def item_json(row: dict, issues: list[dict] | None = None,
         "transcribe_attempts": int(row["transcribe_attempts"] or 0),
         "has_audio": bool(row["audio_path"]),
         "audio_pruned_at": row["audio_pruned_at"],
+        "audio_missing_at": row.get("audio_missing_at"),
         "audio_secs": row["audio_secs"],
         "audio_bytes": row["audio_bytes"],
         "mirror_key": row["mirror_key"],
@@ -367,8 +430,17 @@ def board():
     try:
         page = _load_page(conn, _list_args(request.args))
         page["projects"] = known_projects(conn)     # the datalists' suggestions
+        # W-04: a file can vanish before the hourly sweep notices. Never render a player
+        # that would only 410 — say "Recording missing" instead (a stat per recording).
+        audio_dir = _settings().inbox_audio_dir
+        paths = {r["id"]: r["audio_path"] for r in conn.execute(
+            "SELECT id, audio_path FROM inbox_items WHERE audio_path IS NOT NULL")}
     finally:
         conn.close()
+    for it in page["items"]:
+        it["audio_missing"] = bool(it.get("audio_missing_at")) or bool(
+            it["has_audio"] and inbox_audio.open_path(audio_dir, paths.get(it["id"], ""))
+            is None)
     return render_template("inbox.html", page=page, now=time.time(),
                            filters=_list_args(request.args),
                            audio_max_bytes=_settings().inbox_audio_max_bytes,
@@ -380,10 +452,28 @@ def board():
 
 @bp.get("/api/v1/inbox/items")
 def list_items():
-    """S | R — Hopper reads this with the same bearer it reads the board with."""
+    """S | R — Hopper reads this with the same bearer it reads the board with.
+
+    ``watched_repos`` is the mirror's repo list (``INBOX_GITHUB_REPOS``): the filing loop
+    checks a repo against it BEFORE `gh issue create`, because POST /issues refuses an
+    unwatched repo only after the issue already exists (and a retry would file it twice)."""
     conn = _conn()
     try:
-        return jsonify(_load_page(conn, _list_args(request.args)))
+        page = _load_page(conn, _list_args(request.args))
+    finally:
+        conn.close()
+    page["watched_repos"] = list(_settings().inbox_github_repos or ())
+    return jsonify(page)
+
+
+@bp.get("/api/v1/inbox/counts")
+def get_counts():
+    """S | R — just the tiles' numbers. The page shows each action answer's counts at once,
+    then SETTLES to this: one GET ~300 ms after the last of a burst of actions settles, the
+    final word (two answers can land out of order; this read cannot)."""
+    conn = _conn()
+    try:
+        return jsonify({"counts": inbox_db.counts(conn)})
     finally:
         conn.close()
 
@@ -589,9 +679,19 @@ def patch_item(item_id: str):
         if changes.get("reviewed") is True and not reviewable(current):
             return _err("only a voice note (or an unticked older typed note) "
                         "can be marked reviewed")
+        if (changes.get("reviewed") is True and current["source"] == "voice"
+                and not current["reviewed"] and not draft_to_review(current, changes)):
+            # Machine-readable, with the row as it is NOW: the page hides the Reviewed box
+            # and shows why there is nothing to tick ("Drafting…", or the failed-draft line)
+            # rather than leaving an unticked box that can only be refused again.
+            issues = inbox_db.issues_for(conn, [current["id"]]).get(current["id"], [])
+            return jsonify({"error": NOTHING_TO_REVIEW, "code": NOTHING_TO_REVIEW_CODE,
+                            "item": item_json(current, issues)}), 409
         if (any(k in changes for k in inbox_db.DRAFT_FIELDS)
                 and current["source"] != "voice"):
             return _err("only a voice note has a draft")
+        if "state" in changes and current["source"] in MIRROR_STATE_REFUSALS:
+            return _err(MIRROR_STATE_REFUSALS[current["source"]], 409)
         try:
             with conn:
                 row = inbox_db.update_item(conn, item_id, changes)
@@ -600,7 +700,11 @@ def patch_item(item_id: str):
         if row is None:
             return _err("no such item", 404)
         issues = inbox_db.issues_for(conn, [row["id"]]).get(row["id"], [])
-        return jsonify(item_json(row, issues))
+        # The page updates the row and the tiles IN PLACE from this answer (no reload): the
+        # item's derived fields, and the same counts() the tiles are rendered from.
+        body = item_json(row, issues)
+        body["counts"] = inbox_db.counts(conn)
+        return jsonify(body)
     finally:
         conn.close()
 
@@ -618,9 +722,12 @@ def delete_item(item_id: str):
     the two) the file is an orphan, and the scheduler's existing sweep collects
     orphans — whereas a file deleted before its row would leave a row pointing
     at nothing until the reconcile noticed. Linked issues go with the row via
-    ``ON DELETE CASCADE``; the GitHub issues themselves are untouched, and a
-    mirrored row simply comes back on the next sync, which is correct — the
-    board mirrors GitHub, it does not own it.
+    ``ON DELETE CASCADE``; the GitHub issues themselves are untouched.
+
+    A MIRRORED row (github, backlog) is refused with a 409 that says where to act
+    (``MIRROR_DELETE_REFUSALS``): deleting it could not touch the issue or the
+    backlog.txt line, and the row would simply come back on a later sync — to
+    the person pressing Delete, a button that "does nothing".
     """
     denied = require_session()
     if denied is not None:
@@ -630,12 +737,21 @@ def delete_item(item_id: str):
     settings = _settings()
     conn = _conn()
     try:
+        current = inbox_db.get_item(conn, item_id)
+        if current is None:
+            # Already gone — which is what was asked for. The 404 still carries the counts,
+            # so the page can drop the row AND put the tiles right without a reload.
+            return jsonify({"error": "no such item", "counts": inbox_db.counts(conn)}), 404
+        if not deletable(current):
+            return _err(MIRROR_DELETE_REFUSALS.get(
+                current["source"], "only a voice or typed note can be deleted"), 409)
         with conn:
             row = inbox_db.delete_item(conn, item_id)
+        counts = inbox_db.counts(conn)          # for the page's tiles (no reload)
     finally:
         conn.close()
     if row is None:
-        return _err("no such item", 404)
+        return jsonify({"error": "no such item", "counts": counts}), 404
     audio_removed = False
     if row["audio_path"]:
         audio_removed = inbox_audio.delete(settings.inbox_audio_dir,
@@ -646,7 +762,7 @@ def delete_item(item_id: str):
             log.warning("inbox: deleted item %s but its audio file remains; "
                         "the orphan sweep will collect it", row["id"])
     return jsonify({"deleted": row["id"], "had_audio": bool(row["audio_path"]),
-                    "audio_removed": audio_removed})
+                    "audio_removed": audio_removed, "counts": counts})
 
 
 @bp.get("/inbox/audio/<item_id>")
@@ -786,7 +902,8 @@ def draft_queue():
     whose transcript changed since their draft (stale ``sha``).
 
     ``transcript`` is the note's body, and it is the ONLY note text that leaves
-    for Anthropic — the audio never does. ``sha`` must be echoed back on POST so
+    for Anthropic (with the title, and the Mac's own setup brief beside it) — the
+    audio never does. ``sha`` must be echoed back on POST so
     a draft made from an old transcript is refused rather than stored.
     """
     denied = _require_inbox_token()
@@ -894,11 +1011,45 @@ def post_draft(item_id: str):
         conn.close()
 
 
+#: POST /issues for a repo the GitHub mirror does not scan: the link would never be
+#: refreshed, so the note could never close by itself (G-18). Pinned by tests/test_inbox.py.
+NOT_WATCHED = "not watched — add it to INBOX_GITHUB_REPOS or the note can never close"
+
+
+class _Refused(Exception):
+    """Raised inside a write transaction to refuse the request: the transaction rolls back
+    and the route answers ``status`` outside it (never a return from inside one)."""
+
+    def __init__(self, message: str, status: int):
+        super().__init__(message)
+        self.message = message
+        self.status = status
+
+
+def github_mirror_url(repo: str, number: int) -> str:
+    return f"https://github.com/{repo}/issues/{int(number)}"
+
+
+def watched_repo(repo: str) -> str | None:
+    """The WATCHED spelling of ``repo`` (GitHub names are case-insensitive, but the scans
+    match links on the configured spelling exactly), or None if the mirror does not scan it."""
+    for configured in _settings().inbox_github_repos or ():
+        if configured.lower() == repo.lower():
+            return configured
+    return None
+
+
 @bp.post("/api/v1/inbox/items/<item_id>/issues")
 def post_issues(item_id: str):
-    """Hopper records the issue it filed for a reviewed row. Idempotent on
-    ``(repo, number)`` — which is also what stops the GitHub mirror later
-    cloning this same issue as a fresh row."""
+    """Hopper records the issue it filed for a reviewed note. Idempotent on
+    ``(item, repo, number)``; several notes may link the same issue (G-20), and
+    each closes and reopens with it. A mirror row the issue already had is
+    archived (G-19) — the note represents it now.
+
+    The same 409s as ``filed-backlog``: only a voice or typed note, and only a
+    reviewed, open one. And a repo the mirror does not watch is a 409 too
+    (``NOT_WATCHED``): nothing would ever refresh the link, so the note could
+    never close by itself."""
     denied = _require_inbox_token()
     if denied is not None:
         return denied
@@ -914,11 +1065,27 @@ def post_issues(item_id: str):
     title = inbox_db.clean_text(doc.get("title"), inbox_db.MAX_TITLE) or None
     conn = _conn()
     try:
-        if inbox_db.get_item(conn, item_id) is None:
-            return _err("no such item", 404)
-        with conn:
-            issue = inbox_db.link_issue(conn, item_id, repo=repo, number=number,
-                                        url=url, title=title)
+        try:
+            # The checks run INSIDE the write transaction (BEGIN IMMEDIATE), so a note closed
+            # between the check and the link — by a browser tab, say — cannot end up linked.
+            with inbox_db.transaction(conn):
+                row = inbox_db.get_item(conn, item_id)
+                if row is None:
+                    raise _Refused("no such item", 404)
+                if row["source"] not in inbox_db.LOCAL_SOURCES:
+                    raise _Refused("only a voice or typed note can be filed", 409)
+                if not row["reviewed"] or row["state"] != "open" or row["archived_at"]:
+                    raise _Refused("only a reviewed, open note can be filed", 409)
+                watched = watched_repo(repo)
+                if watched is None:
+                    raise _Refused(NOT_WATCHED, 409)
+                # The canonical URL, from the watched repo and the number — never the
+                # client's (it was only checked for shape).
+                issue = inbox_db.link_issue(conn, item_id, repo=watched, number=number,
+                                            url=github_mirror_url(watched, number),
+                                            title=title)
+        except _Refused as refused:
+            return _err(refused.message, refused.status)
         row = inbox_db.get_item(conn, item_id)
         issues = inbox_db.issues_for(conn, [item_id]).get(item_id, [])
         return jsonify({"item": item_json(row, issues), "issue": issue}), 201
@@ -979,10 +1146,18 @@ def mirror_backlog():
     ``{"complete": true, "items": [{"key": …, "text": …, "project": …}]}``
 
     ``complete`` is the caller asserting it read the entire file; only then may
-    keys that are absent be archived. An EMPTY list is refused outright unless
+    keys that are absent be archived, and only then does the filed-note rule
+    run (``inbox_db.apply_filed_backlog_rule``: a note filed to backlog.txt
+    closes when its line is removed or marked ✅ DONE, and reopens if the rule
+    closed it and the line is open again). Every upsert, complete or not, sets
+    a backlog row's state from its What: line (``backlog_is_done``). An EMPTY
+    list (or one whose entries are all blank) is refused outright unless
     ``allow_empty`` is set, because "the file was unreadable" and "Graham
     emptied the backlog" arrive looking identical and one of them must not
     archive every row.
+
+    All or nothing: the payload is validated in full before anything is
+    written, so a 400 leaves the store exactly as it was.
     """
     denied = _require_inbox_token()
     if denied is not None:
@@ -996,40 +1171,37 @@ def mirror_backlog():
     if len(items) > MAX_BACKLOG_ITEMS:
         return _err(f"more than {MAX_BACKLOG_ITEMS} items")
     complete = bool(doc.get("complete"))
-    if not items and not doc.get("allow_empty"):
+    # ALL OR NOTHING. The whole payload is validated here, before anything is written: these
+    # connections are autocommit, so a write made before an error response stays written —
+    # one bad item in the middle used to leave the items ahead of it in the store.
+    entries: list[tuple[str, str, str | None]] = []
+    for raw in items:
+        if not isinstance(raw, dict):
+            return _err("each item must be an object")
+        text = inbox_db.clean_text(raw.get("text"), inbox_db.MAX_TEXT)
+        if not text:
+            continue
+        # The key is DERIVED here (the probe's derivation: the What: line's), never trusted:
+        # a client key that is not exactly that is a 400, so no key can be made up or grow
+        # without bound.
+        key = inbox_db.normalise_backlog_key(inbox_db.what_line(text))
+        if "key" in raw and raw.get("key") != key:
+            return _err("key does not match the entry's What: line (it is derived from it)")
+        try:
+            project = clean_project(raw.get("project"))
+        except ValueError as exc:
+            return _err(str(exc))
+        entries.append((key, text, project))
+    # Checked on what survived cleaning, not on the raw list: a push of blank entries is
+    # just as empty, and a COMPLETE one would archive every row.
+    if not entries and not doc.get("allow_empty"):
         return _err("refusing to sync an empty backlog — an unreadable file and "
                     "an emptied one look identical here; pass allow_empty:true "
                     "if you really mean it")
-    now = inbox_db.now_iso()
-    seen: list[str] = []
     conn = _conn()
     try:
-        with conn:
-            for raw in items:
-                if not isinstance(raw, dict):
-                    return _err("each item must be an object")
-                text = inbox_db.clean_text(raw.get("text"), inbox_db.MAX_TEXT)
-                if not text:
-                    continue
-                key = raw.get("key")
-                if not isinstance(key, str) or not key.startswith(
-                        inbox_db.MIRROR_BACKLOG + ":"):
-                    key = inbox_db.normalise_backlog_key(text)
-                try:
-                    project = clean_project(raw.get("project"))
-                except ValueError as exc:
-                    return _err(str(exc))
-                inbox_db.upsert_mirror_item(
-                    conn, mirror_key=key, source="backlog",
-                    title=inbox_db.derive_title(text), body=text,
-                    project=project, now=now)
-                seen.append(key)
-            archived = 0
-            if complete:
-                archived = inbox_db.archive_missing(
-                    conn, prefix=inbox_db.MIRROR_BACKLOG + ":",
-                    seen_keys=seen, now=now)
-        return jsonify({"synced": len(seen), "archived": archived,
-                        "complete": complete})
+        # ONE transaction (inbox_db.apply_backlog_push): the upserts, the archive and the
+        # filed-note rule land together or not at all.
+        return jsonify(inbox_db.apply_backlog_push(conn, entries, complete=complete))
     finally:
         conn.close()

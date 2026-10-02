@@ -42,6 +42,10 @@
 }
 
 * { box-sizing: border-box; }
+/* `hidden` always wins. inbox.js shows and hides pre-rendered elements by flipping the
+   attribute, and one whose class sets `display` (a badge, an action group, the Reviewed
+   pill) would otherwise stay on screen with it set. */
+[hidden] { display: none !important; }
 html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
 body {
   margin: 0; background: var(--ground); color: var(--ink);
@@ -270,7 +274,19 @@ details.about-recordings summary { min-height: 44px; display: flex; align-items:
 .item .player { display: block; width: 100%; height: 40px; margin-top: .5rem; }
 .item-actions { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem;
                 margin-top: .6rem; }
+.row-error { margin: .4rem 0 0; }
+
+/* Two groups, each kept together; the second (Close/Reopen + Delete) is right-aligned and
+   wraps as a unit, so the row never splits a pair at 390 px. */
+.item-actions .action-group { display: inline-flex; flex-wrap: nowrap; align-items: center;
+  gap: .5rem; }
+.item-actions .action-end { margin-left: auto; }
+/* A closed note's [Edit draft][Reviewed]: the slot stays, nothing in it shows or takes a tap
+   or focus, so Close and Reopen sit at the same x AND y (no 52 px jump at 390 px). */
+.item-actions .action-start.dormant { visibility: hidden; }
 .item-actions .edit-draft { min-height: 44px; padding: 0 1rem; }
+/* The same width for Close and Reopen: flipping a note's state never reflows its row. */
+.item-actions .toggle-state { min-height: 44px; min-width: 6.25rem; padding: 0 1rem; }
 /* Reviewed reads as a TOGGLE: a pill that fills in when ticked. The whole pill is
    the 44px tap target; the checkbox inside it stays a real checkbox. */
 .item-actions .review { display: inline-flex; align-items: center; gap: .45rem;
@@ -281,7 +297,7 @@ details.about-recordings summary { min-height: 44px; display: flex; align-items:
 .item-actions .review:has(input:checked) { border-color: var(--ok); background: var(--panel-2); }
 /* Delete is deliberately QUIET: a small danger-coloured text button at the end of
    the row, never a primary-looking block — but still a 44px tap target. */
-.item-actions button.delete-item { margin-left: auto; min-height: 44px; padding: 0 .5rem;
+.item-actions button.delete-item { min-height: 44px; padding: 0 .5rem;
   background: transparent; color: var(--fail); border: 0; font-size: .88rem;
   font-weight: 500; }
 .item-actions button.delete-item:hover { text-decoration: underline; filter: none; }
@@ -365,7 +381,6 @@ details.transcript summary { cursor: pointer; color: var(--link); min-height: 44
 details.transcript .item-body { color: var(--muted); margin-top: 0; }
 .draft-edit { display: flex; flex-direction: column; gap: .5rem; margin-top: .6rem;
               padding: .7rem; border-radius: 8px; background: var(--panel-2); }
-.draft-edit[hidden] { display: none; }
 .edit-actions { display: flex; gap: .5rem; }
 .edit-actions button { flex: 1 1 0; }
 button.secondary { background: transparent; color: var(--link); border: 1px solid var(--rule); }

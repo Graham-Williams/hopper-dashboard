@@ -19,6 +19,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -328,6 +329,26 @@ _MKTEMP_SHIM = "\n".join([
     "",
 ])
 
+# util-linux `flock` is on the box; macOS has none. The shim locks the INHERITED descriptor,
+# which is the same open file description the script holds, so the lock outlives the shim.
+_FLOCK_SHIM = "\n".join([
+    "#!/usr/bin/env python3",
+    "import fcntl, sys",
+    "args = sys.argv[1:]",
+    "conflict = 1",
+    "if '-E' in args:",
+    "    conflict = int(args[args.index('-E') + 1])",
+    "    del args[args.index('-E'):args.index('-E') + 2]",
+    "fd = int([a for a in args if not a.startswith('-')][-1])",
+    "try:",
+    "    fcntl.flock(fd, fcntl.LOCK_EX | (fcntl.LOCK_NB if '-n' in args else 0))",
+    "except BlockingIOError:",
+    "    sys.exit(conflict)",
+    "except OSError:",
+    "    sys.exit(1)",
+    "",
+])
+
 _SHA256_SHIM = "\n".join([
     "#!/usr/bin/env python3",
     "import hashlib, sys",
@@ -352,6 +373,8 @@ class Box:
         self.bin = os.path.join(self.root, "bin")
         self.box = os.path.join(self.root, "box")
         self.audio = os.path.join(self.container, "app", "data", "inbox", "audio")
+        self.rclone_log = os.path.join(self.root, "rclone-calls.jsonl")
+        self.audio_mode = "mirror"
         for d in (self.audio, self.remote, self.bin, self.box):
             os.makedirs(d, exist_ok=True)
 
@@ -366,6 +389,7 @@ class Box:
         self._shim("rclone", os.path.join(FAKES, "fake_rclone.py"))
         self._write_exec(os.path.join(self.bin, "mktemp"), _MKTEMP_SHIM)
         self._write_exec(os.path.join(self.bin, "sha256sum"), _SHA256_SHIM)
+        self._write_exec(os.path.join(self.bin, "flock"), _FLOCK_SHIM)
 
         for name in ("dashboard", "inbox"):
             self._make_db(os.path.join(self.container, "app", "data", name + ".db"), name)
@@ -429,6 +453,17 @@ class Box:
         d = os.path.join(self.remote, "hopper-dashboard-backups", "daily")
         return sorted(os.listdir(d)) if os.path.isdir(d) else []
 
+    def rclone_calls(self):
+        import json
+        if not os.path.isfile(self.rclone_log):
+            return []
+        with open(self.rclone_log, encoding="utf-8") as fh:
+            return [json.loads(line) for line in fh]
+
+    def host_mirror(self):
+        d = os.path.join(self.backup_root, "audio")
+        return sorted(os.listdir(d)) if os.path.isdir(d) else []
+
     def stored_count(self):
         p = os.path.join(self.backup_root, "state", "last_audio_count")
         if not os.path.isfile(p):
@@ -449,7 +484,8 @@ class Box:
     def run(self, expect=None, **env):
         e = dict(os.environ)
         for stray in ("AUDIO_ALLOW_MASS_DELETE", "AUDIO_MAX_DROP_PCT",
-                      "AUDIO_MAX_DROP_FILES", "AUDIO_DROP_WINDOW_MIN", "BACKUP_AUDIO"):
+                      "AUDIO_MAX_DROP_FILES", "AUDIO_DROP_WINDOW_MIN", "BACKUP_AUDIO",
+                      "BACKUP_AUDIO_MODE"):
             e.pop(stray, None)
         e.update({
             "PATH": self.bin + os.pathsep + e.get("PATH", "/usr/bin:/bin"),
@@ -461,9 +497,16 @@ class Box:
             "BACKUP_ROOT": self.backup_root,
             "RCLONE_DEST": "gdrive:hopper-dashboard-backups",
             "DRIVE_PUSH_INTERVAL_MIN": "1",
+            "FAKE_RCLONE_LOG": self.rclone_log,
         })
+        # The deletion guards below are MIRROR-mode behaviour, so the harness runs in mirror
+        # mode unless a test says otherwise; None means "leave it unset" (the script default).
+        env.setdefault("BACKUP_AUDIO_MODE", self.audio_mode)
         for k, v in env.items():
-            e[k] = str(v)
+            if v is None:
+                e.pop(k, None)
+            else:
+                e[k] = str(v)
         # The 15-minute Drive throttle is real and deliberate, and it is not what any of
         # these tests are about: without this, a second run in the same minute would be a
         # no-op and every multi-run scenario below would be asserting on nothing.
@@ -497,6 +540,233 @@ def test_the_harness_really_drives_the_script(box):
     assert box.remote_audio() == ["a.webm", "b.webm"]
     assert len(box.remote_dbs()) == 2          # dashboard_*.db + inbox_*.db
     assert len(box.remote_daily()) == 2
+
+
+# --- the DB snapshot: made in the container, streamed out on stdout ----------------------
+def _local_snaps(box):
+    d = os.path.join(box.backup_root, "snapshots")
+    return sorted(n for n in os.listdir(d)) if os.path.isdir(d) else []
+
+
+def _container_tmp(box):
+    d = os.path.join(box.container, "tmp")
+    return sorted(os.listdir(d)) if os.path.isdir(d) else []
+
+
+def test_db_snapshots_stream_out_of_a_read_only_container_with_a_tmpfs(box):
+    """The box's container is read_only with a tmpfs /tmp, and `docker cp` cannot read a
+    tmpfs (the fake answers exactly like the daemon did on the box). The snapshot is made
+    and checked in the container, streamed out on stdout, and its temp is gone after."""
+    rc, out = box.run(expect=0, BACKUP_AUDIO=0)
+    snaps = _local_snaps(box)
+    assert [n.split("_")[0] for n in snaps] == ["dashboard", "inbox"], snaps
+    for n in snaps:                                   # complete, valid SQLite files
+        conn = sqlite3.connect(os.path.join(box.backup_root, "snapshots", n))
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        conn.close()
+    assert _container_tmp(box) == []
+    assert len(box.remote_dbs()) == 2
+
+
+def _snap_temps(box):
+    """Snapshot temps left on the container's /tmp (its tmpfs) or in the host's snapshot dir."""
+    return ([n for n in _container_tmp(box) if "_snap." in n]
+            + [n for n in _local_snaps(box) if n.startswith(".")])
+
+
+def _empty_live_db(box, name):
+    conn = sqlite3.connect(os.path.join(box.container, "app", "data", name + ".db"))
+    conn.execute("DELETE FROM %s" % name)
+    conn.commit()
+    conn.close()
+
+
+@pytest.mark.parametrize("exit_code", ["0", "137"])
+def test_a_snapshot_stream_cut_short_fails_loudly_and_keeps_nothing(box, exit_code):
+    """A stream cut short — whether the exec then exits 0 (looks like success) or not — must
+    fail the run and leave no partial file anywhere: not as a snapshot, not as a temp."""
+    box.run(expect=0, BACKUP_AUDIO=0)
+    before, pushed = _local_snaps(box), box.remote_dbs()
+    box._make_db(os.path.join(box.container, "app", "data", "inbox.db"), "inbox")  # a change
+    rc, out = box.run(BACKUP_AUDIO=0, FAKE_DOCKER_EXEC_STDOUT_LIMIT=1000,
+                      FAKE_DOCKER_EXEC_RC=exit_code)
+    assert rc == 1, out
+    if exit_code == "0":
+        assert "did not match the declared size" in out, out
+    else:
+        assert "exit 137" in out, out
+    assert _local_snaps(box) == before                # no partial file kept, no temp left
+    assert box.remote_dbs() == pushed
+    assert _container_tmp(box) == []
+
+
+@pytest.mark.parametrize("fault,said", [
+    ({"FAKE_DOCKER_EXEC_STDOUT_LIMIT": "1000"}, "did not match the declared size"),
+    ({"FAKE_DOCKER_EXEC_STDOUT_EXTRA": "trailing junk"}, "did not match the declared size"),
+    ({"FAKE_DOCKER_EXEC_STDOUT_FLIP": "200"}, "did not match the declared sha256"),
+])
+def test_a_stream_that_is_not_what_was_declared_says_how(box, fault, said):
+    """Too short, too long (both: the size), or the same size with other bytes (the sha)."""
+    rc, out = box.run(BACKUP_AUDIO=0, FAKE_DOCKER_EXEC_ONLY="inbox", **fault)
+    assert rc == 1 and "ERROR: inbox: " in out and said in out, out
+    assert "incomplete" not in out
+    assert [n.split("_")[0] for n in _local_snaps(box)] == ["dashboard"]
+
+
+KINDS = ["in-container", "cut-short", "too-long", "sha", "host-verify", "killed"]
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_no_failed_run_of_any_kind_leaks_a_snapshot_temp(box, kind):
+    """Every way a snapshot can fail, run three times over: nothing is left on the
+    container's tmpfs (shared RAM the app also spools uploads into) or on the host. A
+    killed exec cannot clean up after itself, so its temp IS left — and the next snapshot
+    sweeps it (under the run lock, so none is in use)."""
+    fault = {"cut-short": {"FAKE_DOCKER_EXEC_STDOUT_LIMIT": "1000"},
+             "too-long": {"FAKE_DOCKER_EXEC_STDOUT_EXTRA": "junk"},
+             "sha": {"FAKE_DOCKER_EXEC_STDOUT_FLIP": "200"},
+             "killed": {"FAKE_DOCKER_EXEC_KILLED": "1"}}.get(kind, {})
+    if kind == "in-container":
+        with open(os.path.join(box.container, "app", "data", "inbox.db"), "wb") as fh:
+            fh.write(b"this is not a database" * 200)
+    if kind == "host-verify":
+        box.run(expect=0, BACKUP_AUDIO=0)            # a snapshot with data to compare against
+        _empty_live_db(box, "inbox")                  # the wiped-DB guard refuses the next one
+    for _ in range(3):
+        rc, out = box.run(BACKUP_AUDIO=0, FAKE_DOCKER_EXEC_ONLY="inbox", **fault)
+        assert rc == 1 and "ERROR: inbox: " in out, out
+        if kind == "killed":
+            assert _snap_temps(box) == ["inbox_snap.k1ll3d.db"]   # really left behind...
+        else:
+            assert _snap_temps(box) == [], out
+    if kind == "in-container":                        # a sound DB again for the clean run
+        live = os.path.join(box.container, "app", "data", "inbox.db")
+        os.remove(live)
+        box._make_db(live, "inbox")
+    rc, out = box.run(BACKUP_AUDIO=0, ALLOW_EMPTY_SNAPSHOT=1)
+    assert rc == 0, out
+    assert _snap_temps(box) == []                     # ...and swept by the next snapshot
+
+
+def _grow_live_db(box, name, kib=400):
+    """Big enough that its snapshot cannot fit in a pipe buffer."""
+    conn = sqlite3.connect(os.path.join(box.container, "app", "data", name + ".db"))
+    conn.executemany("INSERT INTO %s (v) VALUES (?)" % name, [("x" * 1000,)] * kib)
+    conn.commit()
+    conn.close()
+
+
+def test_a_sigterm_mid_snapshot_leaves_no_temp(box):
+    """Python's default SIGTERM does not unwind, so a `finally` never runs: the temp stayed
+    on the tmpfs. The snapshot step turns SIGTERM into an exit that does unwind. Only a
+    SIGKILL can leave one, and the next run's sweep removes that."""
+    _grow_live_db(box, "inbox")
+    rc, out = box.run(BACKUP_AUDIO=0, FAKE_DOCKER_EXEC_SIGTERM=1, FAKE_DOCKER_EXEC_ONLY="inbox")
+    assert rc == 1, out
+    assert "ERROR: inbox: the snapshot inside fake-dashboard was terminated (exit 143)" in out
+    assert _snap_temps(box) == []
+    assert [n.split("_")[0] for n in _local_snaps(box)] == ["dashboard"]
+
+
+def test_an_exec_that_dies_without_a_word_says_how_it_died(box):
+    rc, out = box.run(BACKUP_AUDIO=0, FAKE_DOCKER_EXEC_KILLED=1, FAKE_DOCKER_EXEC_ONLY="inbox")
+    assert rc == 1
+    assert "ERROR: inbox: the snapshot inside fake-dashboard was killed (exit 137)" in out, out
+    assert "failed (exit 137): " not in out
+
+
+def test_a_corrupt_dashboard_db_never_stops_inbox_or_the_audio(box):
+    """One DB failing is logged as an ERROR naming it; the other DB and the audio are still
+    backed up, and only then does the run exit 1 (so the heartbeat fails)."""
+    box.add_audio("a.webm", "b.webm")
+    with open(os.path.join(box.container, "app", "data", "dashboard.db"), "wb") as fh:
+        fh.write(b"this is not a database" * 200)
+    rc, out = box.run()
+    assert rc == 1, out
+    assert "ERROR: dashboard: " in out
+    assert [n.split("_")[0] for n in _local_snaps(box)] == ["inbox"]
+    assert [n.split("_")[0] for n in box.remote_dbs()] == ["inbox"]
+    assert box.remote_audio() == ["a.webm", "b.webm"]
+    assert _snap_temps(box) == []
+
+
+def test_a_db_too_big_for_the_tmpfs_fails_that_db_with_a_clear_message(box):
+    """The snapshot is made on the container's tmpfs /tmp, which the app shares. A DB that
+    will not fit (with headroom) is failed up front, naming /tmp, its size and the DB's —
+    never SQLite's bare "database or disk is full". The other DB still goes."""
+    conn = sqlite3.connect(os.path.join(box.container, "app", "data", "dashboard.db"))
+    conn.executemany("INSERT INTO dashboard (v) VALUES (?)", [("x" * 1000,)] * 400)
+    conn.commit()
+    conn.close()
+    rc, out = box.run(BACKUP_AUDIO=0, FAKE_DOCKER_TMPFS_BYTES=str(8 * 1024 * 1024 + 150 * 1024))
+    assert rc == 1, out
+    line = next(l for l in out.splitlines() if "ERROR: dashboard: " in l)
+    assert "/tmp" in line and "tmpfs" in line and "8.1 MiB" in line, line
+    assert "dashboard.db (0.4 MiB" in line and "docker-compose.yml" in line, line
+    assert "database or disk is full" not in out
+    assert [n.split("_")[0] for n in _local_snaps(box)] == ["inbox"]
+    assert _snap_temps(box) == []
+
+
+def test_leftovers_are_swept_before_the_room_is_measured(box):
+    """A killed run's temp must not eat the headroom the next snapshot needs."""
+    tmp = os.path.join(box.container, "tmp")
+    os.makedirs(tmp, exist_ok=True)
+    with open(os.path.join(tmp, "inbox_snap.k1ll3d.db"), "wb") as fh:
+        fh.write(b"\0" * (1024 * 1024))
+    rc, out = box.run(BACKUP_AUDIO=0, FAKE_DOCKER_TMPFS_BYTES=str(8 * 1024 * 1024 + 500 * 1024))
+    assert rc == 0, out
+    assert _snap_temps(box) == []
+
+
+def test_a_db_not_in_the_container_yet_is_skipped_not_fatal(box):
+    os.remove(os.path.join(box.container, "app", "data", "inbox.db"))
+    rc, out = box.run(expect=0, BACKUP_AUDIO=0)
+    assert "inbox (/app/data/inbox.db) could not be snapshotted" in out
+    assert [n.split("_")[0] for n in _local_snaps(box)] == ["dashboard"]
+
+
+def test_a_live_db_that_fails_its_check_fails_the_run(box):
+    """Not a quiet skip: a live DB that cannot be snapshotted cleanly must page — and the
+    other DB is still backed up."""
+    with open(os.path.join(box.container, "app", "data", "inbox.db"), "wb") as fh:
+        fh.write(b"this is not a database" * 200)
+    rc, out = box.run(BACKUP_AUDIO=0)
+    assert rc == 1 and "ERROR: inbox: the snapshot inside fake-dashboard failed" in out, out
+    assert [n.split("_")[0] for n in _local_snaps(box)] == ["dashboard"]
+    assert _container_tmp(box) == []
+
+
+def test_a_snapshot_temp_left_in_the_containers_tmp_is_swept(box):
+    """An exec killed mid-snapshot leaves its temp on the tmpfs (RAM) until the container
+    restarts; the next snapshot clears it (the run lock means none is in use)."""
+    tmp = os.path.join(box.container, "tmp")
+    os.makedirs(tmp, exist_ok=True)
+    for name in ("inbox_snap.k1ll3d.db", "inbox_snap.k1ll3d.db-wal"):
+        with open(os.path.join(tmp, name), "w", encoding="utf-8") as fh:
+            fh.write("half a snapshot")
+    box.run(expect=0, BACKUP_AUDIO=0)
+    assert _container_tmp(box) == []
+
+
+@pytest.mark.parametrize("where", [
+    "/app/data", "/app/data/", "/app/data//inbox/audio", "/app/data/inbox/audio/",
+    "/app/data/./inbox", "/app/data/inbox/.", "/app/data/../tmp/audio", "/app/data/inbox/..",
+    "//app/data/inbox/audio", "/tmp/audio", "app/data/inbox/audio", "/app/database/audio",
+    "/app/data/inbox\n/../../etc", "/app/data/in\tbox/audio", "/app/data/inbox/audio\x01"])
+def test_the_audio_dir_must_be_on_the_data_volume(box, where):
+    """The audio is copied with `docker cp`, which only works off the data volume (not the
+    tmpfs /tmp, and nothing else in the read-only container persists): a plain path with at
+    least one segment under /app/data, no empty, `.` or `..` segment, no trailing slash."""
+    rc, out = box.run(CONTAINER_AUDIO_DIR=where)
+    assert rc == 1 and "CONTAINER_AUDIO_DIR" in out and "/app/data" in out, out
+    assert box.rclone_calls() == [] and _local_snaps(box) == []
+
+
+@pytest.mark.parametrize("where", ["/app/data/inbox/audio", "/app/data/x"])
+def test_a_plain_audio_dir_under_the_data_volume_is_accepted(box, where):
+    rc, out = box.run(CONTAINER_AUDIO_DIR=where)
+    assert rc == 0, out
 
 
 # --- the happy path ----------------------------------------------------------------
@@ -830,3 +1100,677 @@ def test_no_blunt_whole_tree_mirror_verb_exists_anywhere_in_the_script():
     assert len(calls) == 2, calls           # prune_remote's, and delete_remote_extras' own
     before_audio = body[:body.index("push_audio()")]
     assert "delete_remote_extras " not in before_audio
+
+
+# --- BACKUP_AUDIO_MODE=copy: add-only, the default since 2026-09-29 -----------------
+# Graham reversed the mirror decision: a note deleted in the Hub must NOT delete its
+# recording from Drive. So the default run may ADD to the remote audio tree and never take
+# anything away, by any verb, whatever the container looks like.
+_REMOVING_VERBS = {"sync", "bisync", "move", "moveto", "delete", "deletefile", "purge",
+                   "rmdir", "rmdirs", "cleanup"}
+
+
+def _audio_removals(box):
+    return [c for c in box.rclone_calls()
+            if c and c[0] in _REMOVING_VERBS and any("/audio" in a for a in c[1:])]
+
+
+@audio_harness
+def test_the_default_audio_mode_is_add_only(box):
+    box.add_audio("a.webm", "b.webm", "c.webm")
+    box.run(expect=0, BACKUP_AUDIO_MODE=None)                 # unset: the script's default
+    box.remove_audio("b.webm")
+    rc, out = box.run(expect=0, BACKUP_AUDIO_MODE=None)
+    assert box.remote_audio() == ["a.webm", "b.webm", "c.webm"]
+    assert "add-only" in out and "deleted b.webm" not in out
+    # No box copy at all in copy mode: nothing keeps a deleted recording on the box.
+    assert box.host_mirror() == []
+    assert not any(n.startswith(".audio.") for n in os.listdir(box.backup_root))
+    calls = box.rclone_calls()
+    assert any(c[0] == "copy" and c[-1].endswith("/audio") for c in calls)
+    assert not any(c[0] in ("sync", "bisync", "delete", "purge") for c in calls), calls
+    assert _audio_removals(box) == []
+
+
+@audio_harness
+@pytest.mark.parametrize("keep", [1, 0])
+def test_copy_mode_has_no_shrink_brake_to_false_alarm(box, keep):
+    """No box copy, so nothing to brake: deleting 2 of 3 notes, or the prune taking the last
+    one (or a burst over 25), is an ordinary run — and Drive keeps every recording."""
+    box.audio_mode = "copy"
+    box.add_audio_n(3)
+    box.run(expect=0)
+    box.keep_only(keep)
+    rc, out = box.run()
+    assert rc == 0 and "REFUSING" not in out and "NOT replacing" not in out
+    assert len(box.remote_audio()) == 3 and _audio_removals(box) == []
+    assert box.stored_count() is None
+
+
+@audio_harness
+def test_a_fully_successful_copy_run_clears_a_leftover_mirror_mode_box_copy(box):
+    box.add_audio("a.webm", "b.webm")
+    box.run(expect=0, BACKUP_AUDIO_MODE="mirror")             # leaves a box copy + brake state
+    state = os.path.join(box.backup_root, "state")
+    assert box.host_mirror() == ["a.webm", "b.webm"] and box.stored_count() == "2"
+    box.audio_mode = "copy"
+    rc, out = box.run(FAKE_RCLONE_COPY_FAIL="/audio")         # a FAILED run clears nothing
+    assert rc == 1 and box.host_mirror() == ["a.webm", "b.webm"]
+    rc, out = box.run(expect=0)
+    assert box.host_mirror() == [] and not os.path.exists(box.backup_root + "/audio.old")
+    assert box.stored_count() is None
+    assert not os.path.exists(os.path.join(state, "audio_high_water"))
+
+
+@audio_harness
+def test_a_changed_remote_recording_fails_loudly_and_is_never_overwritten(box):
+    """--immutable: a recording never changes after it is saved, so a remote copy that
+    differs is corruption or tampering — say so, and never overwrite it."""
+    box.audio_mode = "copy"
+    box.add_audio("a.webm", "b.webm")
+    box.seed_remote_audio("a.webm")
+    remote_a = os.path.join(box.remote, "hopper-dashboard-backups", "audio", "a.webm")
+    with open(remote_a, "w", encoding="utf-8") as fh:
+        fh.write("something else entirely")
+    rc, out = box.run()
+    assert rc == 1 and "rclone copy of the audio tree failed" in out
+    with open(remote_a, encoding="utf-8") as fh:
+        assert fh.read() == "something else entirely"
+    assert "b.webm" in box.remote_audio()              # the rest still went up
+    assert any(c[0] == "copy" and "--immutable" in c for c in box.rclone_calls())
+
+
+@audio_harness
+def test_in_flight_part_files_are_never_uploaded_in_copy_mode(box):
+    box.audio_mode = "copy"
+    box.add_audio("a.webm", "b.webm.part")
+    box.run(expect=0)
+    assert box.remote_audio() == ["a.webm"]
+
+
+@audio_harness
+@pytest.mark.parametrize("mode", ["copy", "mirror"])
+def test_every_leftover_staging_dir_is_swept_under_the_run_lock(box, mode):
+    """The lock makes every `.audio.*` dir at start a dead run's, however fresh."""
+    box.audio_mode = mode
+    box.add_audio("a.webm")
+    os.makedirs(box.backup_root, exist_ok=True)
+    for name in (".audio.KILLED1", ".audio.JUSTNOW"):
+        d = os.path.join(box.backup_root, name)
+        os.makedirs(d)
+        with open(os.path.join(d, "rec.webm"), "w", encoding="utf-8") as fh:
+            fh.write("a copy of a recording")
+    box.run(expect=0)
+    assert not any(n.startswith(".audio.") for n in os.listdir(box.backup_root))
+
+
+@audio_harness
+@pytest.mark.parametrize("mode", ["copy", "mirror"])
+def test_a_second_run_while_one_holds_the_lock_exits_0_and_does_nothing(box, mode):
+    """Exit 0 ONLY while the holder looks alive: a run completed within the hour."""
+    import fcntl
+    box.audio_mode = mode
+    box.add_audio("a.webm")
+    box.run(expect=0)                                      # a completed run: last_complete
+    calls_before = len(box.rclone_calls())
+    state = os.path.join(box.backup_root, "state")
+    with open(os.path.join(state, "backup.lock"), "w") as held:
+        fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+        rc, out = box.run()
+        assert rc == 0 and "another run in progress" in out
+        assert len(box.rclone_calls()) == calls_before      # it did nothing
+        # A holder that neither started (last_run) nor completed (last_complete) a run in the
+        # last hour is a stuck run: page.
+        for stamp in ("last_complete.epoch", "last_run.epoch"):
+            with open(os.path.join(state, stamp), "w") as fh:
+                fh.write(str(int(time.time()) - 2 * 3600))
+        rc, out = box.run()
+        assert rc == 1 and "stuck" in out
+        for stamp in ("last_complete.epoch", "last_run.epoch"):
+            os.remove(os.path.join(state, stamp))
+        rc, out = box.run()
+        assert rc == 1                                     # both stamps missing
+
+
+def _held_run(box, stamps):
+    """Run while the TEST holds the lock, with exactly these stamps in state/."""
+    import fcntl
+    state = os.path.join(box.backup_root, "state")
+    os.makedirs(state, exist_ok=True)
+    for name in ("last_complete.epoch", "last_run.epoch"):
+        path = os.path.join(state, name)
+        if os.path.exists(path):
+            os.remove(path)
+    for name, value in stamps.items():
+        with open(os.path.join(state, name), "w") as fh:
+            fh.write(value)
+    with open(os.path.join(state, "backup.lock"), "w") as held:
+        fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+        return box.run()
+
+
+@audio_harness
+def test_the_lock_exit_accepts_either_fresh_stamp(box):
+    """Exit 0 when EITHER stamp is 0 <= age < 3600; a stamp that is missing, unreadable, old
+    or in the future says nothing, so it can never hide a fresh one."""
+    now = int(time.time())
+    # A first-ever run still in progress: it wrote last_run right after taking the lock, and
+    # nothing has completed yet. Not stuck.
+    rc, out = _held_run(box, {"last_run.epoch": str(now - 60)})
+    assert rc == 0 and "another run in progress" in out
+    # A FUTURE last_complete (a clock that ran ahead) must not hide a fresh last_run...
+    rc, out = _held_run(box, {"last_run.epoch": str(now - 60),
+                              "last_complete.epoch": str(now + 3600)})
+    assert rc == 0 and "another run in progress" in out
+    # ...nor the other way round.
+    rc, out = _held_run(box, {"last_run.epoch": str(now + 3600),
+                              "last_complete.epoch": str(now - 60)})
+    assert rc == 0
+    # Neither fresh: both in the future, or both over an hour old.
+    rc, out = _held_run(box, {"last_run.epoch": str(now + 3600),
+                              "last_complete.epoch": str(now + 7200)})
+    assert rc == 1 and "stuck" in out
+    rc, out = _held_run(box, {"last_run.epoch": str(now - 7200),
+                              "last_complete.epoch": str(now - 3600)})
+    assert rc == 1
+    # An unreadable stamp falls through to the other one.
+    rc, out = _held_run(box, {"last_run.epoch": "garbage\n",
+                              "last_complete.epoch": str(now - 60)})
+    assert rc == 0
+    rc, out = _held_run(box, {"last_run.epoch": "garbage\n"})
+    assert rc == 1
+
+
+@audio_harness
+def test_the_holder_writes_last_run_right_after_taking_the_lock(box):
+    body = _read("backup.sh")
+    lock_at = body.index("flock -n -E 75 9")
+    stamp_at = body.index('> "${STATE_DIR}/last_run.epoch"')
+    snapshot_at = body.index("snapshot_db \"${name}\" \"${src}\"")
+    assert lock_at < stamp_at < snapshot_at
+
+
+@audio_harness
+def test_no_long_child_inherits_the_lock(box):
+    """docker and rclone run with fd 9 closed, so an orphaned child cannot keep holding the
+    lock after the script is gone (the fake rclone records its open descriptors)."""
+    box.add_audio("a.webm")
+    rc, out = box.run(expect=0, FAKE_RCLONE_FD_CHECK=9)
+    assert "fd 9 inherited" not in out
+    body = _read("backup.sh")
+    assert "docker() { command docker \"$@\" 9>&-; }" in body
+    assert "rclone() { command rclone \"$@\" 9>&-; }" in body
+
+
+@audio_harness
+def test_an_audio_copy_done_from_the_environment_never_triggers_the_cleanup(box):
+    """Only a copy-mode upload that fully succeeded may remove mirror mode's leftovers — never
+    a value inherited from the environment, in either mode."""
+    box.add_audio("a.webm")
+    box.run(expect=0, BACKUP_AUDIO_MODE="mirror")
+    rc, out = box.run(expect=0, BACKUP_AUDIO_MODE="mirror", AUDIO_COPY_DONE=1)
+    assert box.host_mirror() == ["a.webm"] and box.stored_count() == "1"
+    # Copy mode, but no audio uploaded this run (audio backup off): still nothing removed.
+    rc, out = box.run(expect=0, BACKUP_AUDIO_MODE="copy", BACKUP_AUDIO=0, AUDIO_COPY_DONE=1)
+    assert box.host_mirror() == ["a.webm"] and box.stored_count() == "1"
+
+
+@audio_harness
+def test_an_identical_recording_with_a_new_mtime_is_a_no_op_and_a_changed_one_fails(box):
+    """--checksum: size+content, not modtime, so a re-staged identical file never trips
+    --immutable (it used to be an exit 6 on every run)."""
+    box.audio_mode = "copy"
+    box.add_audio("a.webm")
+    box.run(expect=0)
+    remote_a = os.path.join(box.remote, "hopper-dashboard-backups", "audio", "a.webm")
+    os.utime(remote_a, (1_600_000_000, 1_600_000_000))       # same bytes, another mtime
+    rc, out = box.run()
+    assert rc == 0, out
+    assert any(c[0] == "copy" and "--checksum" in c for c in box.rclone_calls())
+    with open(remote_a, "w", encoding="utf-8") as fh:
+        fh.write("different bytes")
+    rc, out = box.run()
+    assert rc != 0
+
+
+@audio_harness
+def test_a_killed_runs_snapshot_temp_copies_are_swept_under_the_lock(box):
+    box.run(expect=0)
+    snaps = os.path.join(box.backup_root, "snapshots")
+    for name in (".snapshot.ABC123.db", ".snapshot.ABC123.db-wal", ".snapshot.ABC123.db-shm"):
+        with open(os.path.join(snaps, name), "w", encoding="utf-8") as fh:
+            fh.write("a half-written copy of inbox.db")
+    box.run(expect=0)
+    assert not [n for n in os.listdir(snaps) if n.startswith(".snapshot.")]
+
+
+@audio_harness
+def test_mirror_mode_restores_a_box_copy_left_as_old_by_a_killed_swap(box):
+    box.add_audio("a.webm", "b.webm")
+    box.run(expect=0, BACKUP_AUDIO_MODE="mirror")
+    mirror = os.path.join(box.backup_root, "audio")
+    os.rename(mirror, mirror + ".old")                        # killed between the two mv's
+    rc, out = box.run(BACKUP_AUDIO_MODE="mirror", FAKE_RCLONE_COPY_FAIL="/audio")
+    assert rc == 1 and "restored" in out
+    assert box.host_mirror() == ["a.webm", "b.webm"] and not os.path.exists(mirror + ".old")
+
+
+@audio_harness
+def test_switching_copy_to_mirror_deletes_within_the_brakes_and_refuses_beyond(box):
+    """What DEPLOY.md §2b promises about switching modes, driven for real."""
+    box.audio_mode = "copy"
+    names = box.add_audio_n(40)
+    box.run(expect=0)
+    box.remove_audio(*names[:3])                       # 3 notes deleted while in copy mode
+    box.run(expect=0)
+    assert len(box.remote_audio()) == 40
+    rc, out = box.run(BACKUP_AUDIO_MODE="mirror")     # within both brakes: deleted, logged
+    assert rc == 0 and len(box.remote_audio()) == 37
+    assert out.count("deleted rec00") == 3
+    # Beyond the brakes: refused until the purge is named.
+    box.audio_mode = "copy"
+    box.remove_audio(*names[3:33])                     # 30 more, in copy mode
+    box.run(expect=0)
+    rc, out = box.run(BACKUP_AUDIO_MODE="mirror")
+    assert rc == 1 and len(box.remote_audio()) == 37 and "REFUSING" in out
+    rc, out = box.run(BACKUP_AUDIO_MODE="mirror", AUDIO_ALLOW_MASS_DELETE=7)
+    assert rc == 0 and len(box.remote_audio()) == 7
+
+
+@audio_harness
+def test_copy_mode_still_fails_loudly_when_the_upload_fails(box):
+    box.audio_mode = "copy"
+    box.add_audio("a.webm")
+    rc, out = box.run(FAKE_RCLONE_COPY_FAIL="/audio")
+    assert rc == 1 and "rclone copy of the audio tree failed" in out
+
+
+@audio_harness
+def test_mirror_mode_is_still_there_and_still_deletes(box):
+    box.add_audio("a.webm", "b.webm")
+    box.run(expect=0, BACKUP_AUDIO_MODE="mirror")
+    box.remove_audio("b.webm")
+    rc, out = box.run(expect=0, BACKUP_AUDIO_MODE="mirror")
+    assert box.remote_audio() == ["a.webm"] and "deleted b.webm" in out
+    assert [c[0] for c in _audio_removals(box)].count("deletefile") == 1
+
+
+@audio_harness
+@pytest.mark.parametrize("bad", ["Copy", "sync", "", " mirror"])
+def test_an_unknown_audio_mode_is_refused_before_anything_runs(box, bad):
+    box.add_audio("a.webm")
+    rc, out = box.run(BACKUP_AUDIO_MODE=bad)
+    if bad == "":
+        # Empty is "unset" to ${VAR:-copy}: the default, not an error.
+        assert rc == 0 and box.remote_audio() == ["a.webm"]
+        return
+    assert rc != 0 and "must be copy or mirror" in out
+    assert box.remote_audio() == [] and box.rclone_calls() == []
+
+
+# --- DB snapshots: an age cap on top of the count caps, in every tier ------------------
+def _touch_db(path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("an old snapshot")
+
+
+def _days_ago(days):
+    return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(time.time() - days * 86400))
+
+
+def _tiers(box):
+    local = os.path.join(box.backup_root, "snapshots")
+    remote = os.path.join(box.remote, "hopper-dashboard-backups")
+    return local, remote, os.path.join(remote, "daily")
+
+
+def _names(d, prefix):
+    return sorted(n for n in os.listdir(d) if n.startswith(prefix))
+
+
+def _rename_newest(d, prefix, days):
+    newest = _names(d, prefix)[-1]
+    target = f"{prefix}{_days_ago(days)}.db"
+    os.rename(os.path.join(d, newest), os.path.join(d, target))
+    return target
+
+
+def _change_inbox(box):
+    conn = sqlite3.connect(os.path.join(box.container, "app", "data", "inbox.db"))
+    conn.execute("INSERT INTO inbox (v) VALUES (?)", (str(time.time()),))
+    conn.commit()
+    conn.close()
+
+
+@audio_harness
+def test_db_snapshots_older_than_30_days_go_in_every_tier_but_never_a_tiers_newest(box):
+    """A deleted note's words live on in the database snapshots: the age cap is what makes
+    "gone within about 30 days" true, whatever the count caps would keep."""
+    box.run(expect=0)
+    local, remote, daily = _tiers(box)
+    kept = _rename_newest(local, "dashboard_", 35)              # an UNCHANGED db's newest
+    for d, name in ((local, "dashboard_"), (remote, "inbox_"), (daily, "dashboard_")):
+        for days in (40, 45):
+            _touch_db(os.path.join(d, f"{name}{_days_ago(days)}.db"))
+    for n in os.listdir(os.path.join(box.backup_root, "state")):
+        if n.startswith("last_drive_"):                         # push again
+            os.remove(os.path.join(box.backup_root, "state", n))
+    box.run(expect=0)
+    assert _names(local, "dashboard_") == [kept]                # a tier's newest stays
+    # Drive ring and daily/: index 0 is fresh, so index 1 (the one before the latest change)
+    # is kept for a week; older ones go.
+    assert len(_names(remote, "inbox_")) == 2 and len(_names(daily, "dashboard_")) == 2
+
+
+@audio_harness
+def test_a_quiet_db_is_still_pruned_on_drive_on_every_run_that_reaches_it(box):
+    """BK-19: an unchanged inbox.db is not uploaded again — and its Drive tiers used to be
+    pruned only after an upload, so they were never pruned at all."""
+    box.run(expect=0)
+    _, remote, daily = _tiers(box)
+    newest = _names(remote, "inbox_")[-1]
+    stamps = {days: _days_ago(days) for days in (40, 45, 50)}
+    for stamp in stamps.values():
+        _touch_db(os.path.join(remote, f"inbox_{stamp}.db"))
+        _touch_db(os.path.join(daily, f"inbox_{stamp}.db"))
+    rc, out = box.run(expect=0)
+    assert "Drive already has this DB" in out                  # no upload happened
+    # Index 0 is the fresh one, index 1 (40 days) is kept for a week; the rest are pruned.
+    assert _names(remote, "inbox_") == sorted([newest, f"inbox_{stamps[40]}.db"])
+    assert len(_names(daily, "inbox_")) == 2
+
+
+@audio_harness
+def test_an_idle_month_then_one_change_keeps_the_snapshot_before_the_change(box):
+    """The snapshot just before the latest change is the one a bad change is undone from:
+    kept until the new one is a week old, however old it is. And no run removes more than
+    5 snapshots per tier by age."""
+    box.run(expect=0)
+    local, _, _ = _tiers(box)
+    before_change = _rename_newest(local, "inbox_", 40)       # a month of nothing
+    for days in range(41, 49):                                  # 8 older ones
+        _touch_db(os.path.join(local, f"inbox_{_days_ago(days)}.db"))
+    _change_inbox(box)
+    rc, out = box.run(expect=0)
+    names = _names(local, "inbox_")
+    assert before_change in names                               # index 1: kept for a week
+    assert len(names) == 2 + 3                                  # 8 old ones, 5 removed
+    rc, out = box.run(expect=0)                                 # the next run: 3 more
+    assert _names(local, "inbox_")[-2:] == sorted(names)[-2:] and len(_names(local, "inbox_")) == 2
+
+
+@audio_harness
+def test_later_writes_never_push_out_the_state_as_of_a_week_ago(box):
+    """Gate item 4: after an idle month, ONE change, then more writes (a review tick, a boot's
+    ETag forget — each one a new snapshot): the snapshot from before the change is the state
+    as of a week ago, and it must survive — positional 'index 1' let the second write age it
+    out at once."""
+    box.run(expect=0)
+    local, remote, _ = _tiers(box)
+    week_old_state = _rename_newest(local, "inbox_", 40)       # a month of nothing
+    for d in (remote,):
+        newest = _names(d, "inbox_")[-1]
+        os.rename(os.path.join(d, newest), os.path.join(d, week_old_state))
+    for _ in range(3):                                          # the change, then two writes
+        _change_inbox(box)
+        box.run(expect=0)
+    assert week_old_state in _names(local, "inbox_")
+    assert week_old_state in _names(remote, "inbox_")
+    assert len(_names(local, "inbox_")) == 4
+
+
+@audio_harness
+@pytest.mark.parametrize("jump", ["forward", "backward"])
+def test_a_clock_jump_skips_age_removal_for_that_run(box, jump):
+    box.run(expect=0)
+    local, _, _ = _tiers(box)
+    _rename_newest(local, "dashboard_", 60)
+    old = f"dashboard_{_days_ago(90)}.db"
+    _touch_db(os.path.join(local, old))
+    last = os.path.join(box.backup_root, "state", "last_run.epoch")
+    with open(last, "w") as fh:
+        fh.write(str(int(time.time()) + (86400 if jump == "backward" else -8 * 86400)))
+    rc, out = box.run(expect=0)
+    assert old in os.listdir(local), "an age removal ran on a clock it cannot trust"
+    assert "skipping age-based snapshot removal" in out
+    rc, out = box.run(expect=0)                                 # the next run is normal
+    assert old not in os.listdir(local)
+
+
+
+# --- DEPLOY.md's restore recipe, run in bash with stub commands ------------------------
+def _restore_block():
+    doc = open(os.path.join(REPO, "DEPLOY.md"), encoding="utf-8").read()
+    start = doc.index("docker volume inspect hopper-dashboard_hopper-dashboard-data")
+    start = doc.rindex("```bash", 0, start) + len("```bash")
+    return doc[start:doc.index("```", start)]
+
+
+#: Where the rclone stub puts the one recording, laid out like the real store and its Drive
+#: copy: inbox/audio/<yyyy>/<mm>/<id>.<ext>, five levels below the volume.
+AUDIO_REL = os.path.join("2026", "09", "a" * 32 + ".webm")
+
+
+def _run_restore(tmp_path, rclone_rc, stop_rc=0, ps_rc=0, running="", checkout=True,
+                 volume=None, find_fails=False, find_blind=False, shell="bash"):
+    """Run the recipe with stubs. docker answers `volume inspect` with the volume path,
+    `compose stop` with `stop_rc`, and `compose ps -q --status running` with `running` and
+    `ps_rc`; `checkout=False` leaves out ~/hopper-dashboard; `volume(vol)` prepares the
+    volume first; `find_fails` makes `find` exit 1, `find_blind` makes it see nothing (it is
+    the real find otherwise). `shell`:
+    the block run by `bash -c`, `zsh -f -c`, or ("zsh-i") PASTED into an interactive zsh
+    with default options — fed on stdin, where a `#` line is a command, not a comment."""
+    if shutil.which(shell.split("-")[0]) is None:
+        pytest.skip(f"{shell} is not installed")
+    home = tmp_path / "home"
+    home.mkdir()
+    if checkout:
+        (home / "hopper-dashboard").mkdir()
+    snaps = home / "hopper-dashboard-backups" / "snapshots"
+    snaps.mkdir(parents=True)
+    (snaps / "inbox_20260930T000000Z.db").write_text("a snapshot")
+    vol = tmp_path / "volume"
+    vol.mkdir()
+    if volume is not None:
+        volume(vol)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "calls.log"
+    stub = ('#!/bin/bash\necho "$(basename "$0") $*" >> "%s"\n' % log)
+    for name, body in (
+            ("docker", stub + (
+                'if [[ "$1" == volume ]]; then echo "%s"; fi\n'
+                'if [[ "$1 $2" == "compose stop" ]]; then exit %d; fi\n'
+                'if [[ "$1 $2" == "compose ps" ]]; then printf "%%s" "%s"; exit %d; fi\n')
+             % (vol, stop_rc, running, ps_rc)),
+            ("rclone", stub + ('if [[ "$1" == copy && %d == 0 ]]; then '
+                               'mkdir -p "$3/$(dirname "%s")"; echo audio > "$3/%s"; fi\n'
+                               'exit %d\n')
+             % (rclone_rc, AUDIO_REL, AUDIO_REL, rclone_rc)),
+            # cp: GNU's --remove-destination (each destination entry is unlinked, never
+            # written through), emulated, so the recipe runs the same on a BSD cp.
+            ("cp", stub + (
+                'args=(); rd=0\n'
+                'for a in "$@"; do if [[ "$a" == --remove-destination ]]; then rd=1; '
+                'else args+=("$a"); fi; done\n'
+                'if (( rd )); then n=${#args[@]}; src="${args[$((n-2))]}"; dst="${args[$((n-1))]}"\n'
+                '  (cd "$src" && /usr/bin/find . ! -type d) | while IFS= read -r rel; do\n'
+                '    if [[ -e "$dst/$rel" || -L "$dst/$rel" ]]; then rm -f "$dst/$rel"; fi; done\n'
+                'fi\n'
+                'exec /bin/cp "${args[@]}"\n')),
+            ("sudo", stub + 'exec "$@"\n'),
+            ("install", stub + (
+                'mode=""; dirs=()\n'
+                'while (( $# )); do case "$1" in -d) shift;; -o|-g) shift 2;; -m) mode="$2"; shift 2;;'
+                ' *) dirs+=("$1"); shift;; esac; done\n'
+                'for d in "${dirs[@]}"; do mkdir -p "$d"; [[ -z "$mode" ]] || chmod "$mode" "$d"; done\n')),
+            ("find", stub + ('exit 1\n' if find_fails else 'exit 0\n' if find_blind
+                             else 'exec /usr/bin/find "$@"\n')),
+            ("chown", stub)):
+        path = bin_dir / name
+        path.write_text(body)
+        path.chmod(0o755)
+    script = _restore_block().replace("<ts>", "20260930T000000Z")
+    argv = {"bash": ["bash", "-c", script], "zsh": ["zsh", "-f", "-c", script],
+            "zsh-i": ["zsh", "-f", "-i"]}[shell]
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=60,
+                          input=script if shell == "zsh-i" else None,
+                          env={"PATH": "%s:/usr/bin:/bin" % bin_dir, "HOME": str(home)})
+    calls = log.read_text().splitlines() if log.exists() else []
+    return proc, calls
+
+
+def test_the_restore_recipe_stops_before_cp_rm_and_up_when_rclone_fails(tmp_path):
+    proc, calls = _run_restore(tmp_path, rclone_rc=1)
+    assert proc.returncode != 0
+    assert any(c.startswith("rclone copy") for c in calls)
+    assert not any(c.startswith(("sudo cp -a", "docker compose up")) for c in calls), calls
+
+
+@pytest.mark.parametrize("shell", ["bash", "zsh", "zsh-i"])
+def test_the_restore_recipe_runs_through_when_rclone_succeeds(tmp_path, shell):
+    proc, calls = _run_restore(tmp_path, rclone_rc=0, shell=shell)
+    assert proc.returncode == 0, proc.stderr
+    first = lambda prefix: next(i for i, c in enumerate(calls) if c.startswith(prefix))
+    assert (first("docker compose stop") < first("docker compose ps -q --status running")
+            < first("sudo find") < first("sudo rm") < first("rclone copy")
+            < first("sudo cp -a") < first("docker compose up"))
+    assert calls[-1].startswith("docker compose up")
+    assert (tmp_path / "volume" / "inbox" / "audio" / AUDIO_REL).read_text() == "audio\n"
+    assert "RESTORE STOPPED" not in proc.stderr
+    # The copy into the volume REPLACES each destination entry, never writes through one
+    # (a second guard behind the symlink check).
+    assert any(c.startswith("sudo cp -a --remove-destination ") for c in calls), calls
+
+
+#: The recipe's last line on any stop. Neutral: after a missing checkout or a container that
+#: is still running, the app is NOT down, so it says what did not happen and where to look.
+STOPPED = "RESTORE STOPPED — up not run; check docker compose ps"
+
+#: What a restore that stopped must never have done.
+WRITES = ("sudo rm", "sudo cp", "sudo chown", "sudo install", "install", "chown", "rclone",
+          "docker compose up")
+
+
+def _symlinked_inbox_dir(vol):
+    elsewhere = vol.parent / "elsewhere"
+    elsewhere.mkdir()
+    os.symlink(elsewhere, vol / "inbox")
+
+
+def _symlinked_db(vol):
+    target = vol.parent / "elsewhere.db"
+    target.write_text("not the app's")
+    os.symlink(target, vol / "inbox.db")
+
+
+@pytest.mark.parametrize("shell", ["bash", "zsh"])
+@pytest.mark.parametrize("case", ["inbox-dir", "inbox-db", "find-fails"])
+def test_the_restore_recipe_refuses_a_volume_with_a_symlink(tmp_path, case, shell):
+    """The app (uid 10001) controls the volume. A symlink in it would point root's install,
+    cp and chown at a file of the app's choosing, so any symlink ANYWHERE in the volume (it
+    has no legitimate ones) stops the restore before anything is written — and so does a
+    `find` that fails."""
+    kwargs = {"inbox-dir": {"volume": _symlinked_inbox_dir},
+              "inbox-db": {"volume": _symlinked_db},
+              "find-fails": {"find_fails": True}}[case]
+    proc, calls = _run_restore(tmp_path, rclone_rc=0, shell=shell, **kwargs)
+    assert proc.returncode != 0
+    assert any(c.startswith("sudo find") for c in calls), calls
+    assert not any(c.startswith(WRITES) for c in calls), calls
+    assert STOPPED in proc.stderr
+    assert ("symlink in the volume — nothing touched" in proc.stderr) == (case != "find-fails")
+    if case == "inbox-dir":
+        assert not os.listdir(tmp_path / "elsewhere")              # nothing made through it
+    if case == "inbox-db":
+        assert (tmp_path / "elsewhere.db").read_text() == "not the app's"
+
+
+@pytest.mark.parametrize("shell", ["bash", "zsh", "zsh-i"])
+def test_the_restore_recipe_refuses_a_link_deep_in_the_audio_tree(tmp_path, shell):
+    """A recording lives five levels down (inbox/audio/<yyyy>/<mm>/<id>.<ext>). A link planted
+    at the exact path the restore copies a recording to must stop the restore before
+    anything is written. Checked on the WRITES, not the exit code: on macOS cp fails with
+    EACCES there, so an exit-code check would pass even with the guard missing."""
+    sentinel = tmp_path / "sensitive"
+    sentinel.write_text("do not overwrite")
+
+    def plant(vol):
+        link = vol / "inbox" / "audio" / AUDIO_REL
+        link.parent.mkdir(parents=True)
+        os.symlink(sentinel, link)
+
+    proc, calls = _run_restore(tmp_path, rclone_rc=0, shell=shell, volume=plant)
+    assert "symlink in the volume — nothing touched" in proc.stderr, proc.stderr
+    assert not any(c.startswith(WRITES) for c in calls), calls
+    assert sentinel.read_text() == "do not overwrite"
+    assert STOPPED in proc.stderr and proc.returncode != 0
+
+
+def test_the_audio_copy_replaces_a_link_rather_than_writing_through_it(tmp_path):
+    """The second guard, on its own: a link that appears AFTER the check (here, a `find` that
+    sees nothing) is replaced by the restored file — `cp --remove-destination` — and the file
+    it pointed at is untouched."""
+    sentinel = tmp_path / "sensitive"
+    sentinel.write_text("do not overwrite")
+
+    def plant(vol):
+        link = vol / "inbox" / "audio" / AUDIO_REL
+        link.parent.mkdir(parents=True)
+        os.symlink(sentinel, link)
+
+    proc, calls = _run_restore(tmp_path, rclone_rc=0, volume=plant, find_blind=True)
+    assert proc.returncode == 0, proc.stderr
+    restored = tmp_path / "volume" / "inbox" / "audio" / AUDIO_REL
+    assert not restored.is_symlink() and restored.read_text() == "audio\n"
+    assert sentinel.read_text() == "do not overwrite"
+
+
+def test_the_restore_block_has_no_comments():
+    """Paste-safe in any shell: an interactive zsh with default options runs a pasted `#`
+    line as a COMMAND, which stopped the restore after `compose stop` with the app down.
+    The explanations live in the prose above the block."""
+    for line in _restore_block().splitlines():
+        assert "#" not in line, line
+
+
+def test_the_restore_recipe_makes_the_audio_dirs_the_apps_on_a_fresh_volume(tmp_path):
+    """On a FRESH volume there is no inbox/ yet. `mkdir -p` under the recipe's umask 077 made
+    it root-owned 0700, and the chown that followed only fixed inbox/audio — so the app (uid
+    10001) could not even reach its own audio. Both are made by `install -d` as 10001, 0700."""
+    proc, calls = _run_restore(tmp_path, rclone_rc=0)
+    assert proc.returncode == 0, proc.stderr
+    vol = tmp_path / "volume"
+    made = [c for c in calls if c.startswith("install ")]
+    assert made == ["install -d -o 10001 -g 10001 -m 0700 %s/inbox %s/inbox/audio" % (vol, vol)]
+    assert not any(c.startswith(("sudo mkdir", "mkdir")) for c in calls), calls
+    for path in (vol / "inbox", vol / "inbox" / "audio"):
+        assert oct(path.stat().st_mode & 0o777) == "0o700", path
+    first = lambda prefix: next(i for i, c in enumerate(calls) if c.startswith(prefix))
+    assert first("rclone copy") < first("install -d") < first("sudo cp -a")
+
+
+@pytest.mark.parametrize("shell", ["bash", "zsh"])
+@pytest.mark.parametrize("failure", ["no-checkout", "stop-fails", "ps-fails", "still-running"])
+def test_the_restore_recipe_touches_nothing_unless_the_container_is_stopped(tmp_path, failure,
+                                                                             shell):
+    """The stop is INSIDE the strict subshell, and the container is checked to be stopped
+    before anything touches the volume: a failed `cd`, a failed stop, a failed `ps` or a
+    container still running ends the recipe there — no rm, no cp, no rclone, no `up`."""
+    kwargs = {"no-checkout": {"checkout": False}, "stop-fails": {"stop_rc": 1},
+              "ps-fails": {"ps_rc": 1}, "still-running": {"running": "3f2c1a"}}[failure]
+    proc, calls = _run_restore(tmp_path, rclone_rc=0, shell=shell, **kwargs)
+    assert proc.returncode != 0
+    assert not any(c.startswith(("sudo", "rclone", "install", "docker compose up"))
+                   for c in calls), calls
+    # It says so, in words, whichever step stopped it.
+    assert STOPPED in proc.stderr
+    assert ("still running — nothing touched" in proc.stderr) == (failure == "still-running")
+    if failure == "no-checkout":
+        assert not any(c.startswith("docker compose") for c in calls), calls
+    elif failure == "stop-fails":
+        assert calls[-1].startswith("docker compose stop"), calls     # nothing after it ran
+    else:
+        assert calls[-1].startswith("docker compose ps"), calls
+    assert not (tmp_path / "volume" / "inbox.db").exists()

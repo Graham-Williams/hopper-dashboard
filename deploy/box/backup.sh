@@ -16,19 +16,25 @@
 #      sidecars are owned by the container user (UID 10001). SQLite's online backup API must
 #      WRITE those sidecars to take its read lock, so running it host-side fails with
 #      "attempt to write a readonly database" — even opening mode=ro. So: snapshot + integrity
-#      check via `docker exec`, then `docker cp` the finished file out.
+#      check via `docker exec`, and the checked file STREAMED OUT on that exec's stdout. Never
+#      `docker cp`: the container is read_only with a TMPFS on /tmp (docker-compose.yml), and
+#      docker cp cannot read a tmpfs — every run failed with "Could not find the file
+#      /tmp/... in container". The host re-checks what it received (size, sha256, integrity).
 #   2. THE DATABASES ARE ADDITIVE. Their snapshots go up with `rclone copy`, so nothing that
 #      happens on the box — a prune bug, a wiped volume, a bad restore — can delete an
 #      off-box DB snapshot. (The ring and the daily/ tier DO delete, deliberately and by
 #      retention count, via prune_remote; "copy never deletes" describes the upload, not the
 #      whole script.)
 #
-# ⚠️ THE AUDIO TREE IS THE EXCEPTION, AND IT IS DELIBERATE. Graham's decision 2026-09-19: the
-# recordings MIRROR the container, deletions included, because an additive audio backup
-# silently defeats the Inbox's own Delete control and its 180-day privacy ceiling — the point
-# of Delete is that a password read aloud stops existing. Guarded by three independent
-# refuse-a-mass-deletion brakes (proportional, absolute, windowed) measured against what the
-# REMOTE actually holds; see push_audio. The two DATABASES are untouched and stay additive.
+# THE AUDIO TREE IS ADD-ONLY TOO, BY DEFAULT (BACKUP_AUDIO_MODE=copy). Graham's decision
+# 2026-09-29: recordings on Drive are add-only, and a note deleted in the Hub must NOT delete
+# its recording from Drive. Delete removes it from the Hub; copy mode keeps no copy of the
+# audio on the box at all; a copy already backed up stays in Drive until removed there by hand. That REVERSES the 2026-09-19 decision, which
+# made the recordings MIRROR the container, deletions included, so Delete and the 180-day
+# privacy ceiling would reach Drive. That behaviour is still here as BACKUP_AUDIO_MODE=mirror,
+# guarded by three independent refuse-a-mass-deletion brakes (proportional, absolute,
+# windowed) measured against what the REMOTE actually holds; see push_audio. In copy mode the
+# brakes have nothing to guard and are skipped. The two DATABASES stay additive either way.
 #
 # RESTORING IS NOT A `cp`. The stale -wal/-shm sidecars must be deleted and the file re-owned
 # to 10001 first, or SQLite replays the old WAL over the restored image and silently hands
@@ -125,12 +131,25 @@ RCLONE_DEST="${RCLONE_DEST:-}"                        # e.g. gdrive:hopper-dashb
 LOCAL_RETENTION="${LOCAL_RETENTION:-60}"
 DRIVE_RETENTION="${DRIVE_RETENTION:-30}"
 DAILY_RETENTION="${DAILY_RETENTION:-30}"
+# An AGE cap on every snapshot tier (local ring, Drive ring, daily/), on top of the count
+# caps: a deleted note's words live on in the database snapshots, and this is what makes
+# "removed within about 30 days" true whatever the counts would keep. It can never empty a
+# tier: the newest snapshot always stays, and so does the state as of a week ago (the newest
+# snapshot stamped more than 7 days back), at most 5 go by age per tier per run, and a jumped
+# clock skips age removal for a run — see retention_victims below.
+SNAPSHOT_MAX_AGE_DAYS="${SNAPSHOT_MAX_AGE_DAYS:-30}"
 DRIVE_PUSH_INTERVAL_MIN="${DRIVE_PUSH_INTERVAL_MIN:-15}"
 ALLOW_EMPTY_SNAPSHOT="${ALLOW_EMPTY_SNAPSHOT:-0}"
 BACKUP_AUDIO="${BACKUP_AUDIO:-1}"
+# copy (the default since 2026-09-29): `rclone copy` only — never a deletion on the remote.
+# mirror: the 2026-09-19 behaviour — copy, then a guarded, logged delete pass (see push_audio).
+BACKUP_AUDIO_MODE="${BACKUP_AUDIO_MODE:-copy}"
+# Set to 1 by a copy-mode upload that fully succeeded — and ONLY by that: never inherited from
+# the environment, because it authorises removing the box copy (see the end of the script).
+AUDIO_COPY_DONE=0
 # --- the audio brakes. THREE of them, and each can refuse on its own -------------------
 #
-# The audio tree MIRRORS deletions (see push_audio), so these are the only thing standing
+# In BACKUP_AUDIO_MODE=mirror the audio tree MIRRORS deletions (see push_audio), so these are the only thing standing
 # between a bug and the sole copy of Graham's recordings. They are deliberately independent:
 #
 #   PROPORTIONAL (AUDIO_MAX_DROP_PCT) — refuse when the count falls by more than this share.
@@ -159,9 +178,34 @@ AUDIO_ALLOW_MASS_DELETE="${AUDIO_ALLOW_MASS_DELETE:-}"
 require_positive_int LOCAL_RETENTION "${LOCAL_RETENTION}"
 require_positive_int DRIVE_RETENTION "${DRIVE_RETENTION}"
 require_positive_int DAILY_RETENTION "${DAILY_RETENTION}"
+require_positive_int SNAPSHOT_MAX_AGE_DAYS "${SNAPSHOT_MAX_AGE_DAYS}"
+# An unknown mode is a typo, and guessing either way is wrong: refuse before anything runs.
+[[ "${BACKUP_AUDIO_MODE}" == "copy" || "${BACKUP_AUDIO_MODE}" == "mirror" ]] \
+  || die "BACKUP_AUDIO_MODE='${BACKUP_AUDIO_MODE}' must be copy or mirror"
 require_percent AUDIO_MAX_DROP_PCT "${AUDIO_MAX_DROP_PCT}"
 require_positive_int AUDIO_MAX_DROP_FILES "${AUDIO_MAX_DROP_FILES}"
 require_positive_int AUDIO_DROP_WINDOW_MIN "${AUDIO_DROP_WINDOW_MIN}"
+# The audio tree is copied out with `docker cp`, which works only off the DATA VOLUME: the
+# container is read-only, and its /tmp is a tmpfs that docker cp cannot read. Refuse anything
+# else before a run starts, rather than fail (or copy from the wrong place) halfway through.
+# A plain path: /app/data/ plus at least one segment, none of them empty, `.` or `..`, no
+# trailing slash (so not /app/data itself, not //, not /app/data/../anything), and no newline
+# or other control character (a newline would end the `read` below early, so a second line
+# such as /../../etc would never be looked at).
+audio_dir_ok() {
+  local rest seg
+  local -a segs
+  [[ "$1" != *[[:cntrl:]]* ]] || return 1
+  [[ "$1" == /app/data/* ]] || return 1
+  rest="${1#/app/data/}"
+  [[ -n "${rest}" && "${rest}" != */ ]] || return 1
+  IFS=/ read -r -a segs <<<"${rest}"
+  for seg in "${segs[@]}"; do
+    [[ -n "${seg}" && "${seg}" != "." && "${seg}" != ".." ]] || return 1
+  done
+}
+audio_dir_ok "${CONTAINER_AUDIO_DIR}" \
+  || die "CONTAINER_AUDIO_DIR=$(printf '%q' "${CONTAINER_AUDIO_DIR}") must be a plain path under /app/data (the data volume) — /app/data/ plus at least one segment, none empty, . or .., no trailing slash: the container is read-only and docker cp cannot read its tmpfs /tmp"
 # Normalise to base 10 NOW, once, so no later `(( ))` can read a leading zero as octal.
 AUDIO_MAX_DROP_PCT=$((10#${AUDIO_MAX_DROP_PCT}))
 AUDIO_MAX_DROP_FILES=$((10#${AUDIO_MAX_DROP_FILES}))
@@ -172,68 +216,254 @@ AUDIO_DROP_WINDOW_MIN=$((10#${AUDIO_DROP_WINDOW_MIN}))
 # password; the on-box mirror should not be readable by every account on the box.
 install -d -m 0700 "${BACKUP_ROOT}"
 install -d -m 0700 "${LOCAL_BACKUP_DIR}" "${STATE_DIR}"
-command -v docker >/dev/null 2>&1 || die "docker not on PATH (the snapshot runs inside the container)"
+# ONE RUN AT A TIME, in both modes. The lock is on fd 9 for the life of the script (the kernel
+# drops it however the script ends), and every long child — docker, rclone — runs with fd 9
+# CLOSED (the wrappers below), so an orphaned child can never keep holding it.
+#
+# A run that finds the lock held (flock exits 75) exits 0 and does nothing — the holder does
+# the work and reports it — but ONLY while the holder looks alive: EITHER
+# state/last_run.epoch (written by every run right after it takes the lock) or
+# state/last_complete.epoch is between 0 and 3600 s old. Each is judged on its own (missing,
+# unreadable, old or future says nothing); neither fresh means exit 1 — a STUCK run must
+# page, so the heartbeat fails. Any other flock error is a failure too.
+type -P flock >/dev/null 2>&1 \
+  || die "flock is not on PATH (util-linux) — it is what keeps two runs from overlapping"
+exec 9>"${STATE_DIR}/backup.lock"
+LOCK_RC=0
+flock -n -E 75 9 || LOCK_RC=$?
+if (( LOCK_RC == 75 )); then
+  # The holder looks alive if EITHER stamp is 0 <= age < 3600: it started (last_run, written
+  # right after taking the lock) or completed (last_complete) a run within the hour. Each
+  # stamp is judged on its own, so one that is missing, unreadable, old or in the future
+  # (a clock that ran ahead) can never hide a fresh one.
+  NOW="$(date +%s)"
+  for stamp_file in last_run.epoch last_complete.epoch; do
+    stamp="$(cat "${STATE_DIR}/${stamp_file}" 2>/dev/null || true)"
+    stamp="${stamp//[[:space:]]/}"
+    [[ "${stamp}" =~ ^[0-9]{1,12}$ ]] || continue
+    HOLDER_AGE=$(( NOW - 10#${stamp} ))
+    if (( HOLDER_AGE >= 0 && HOLDER_AGE < 3600 )); then
+      log "another run in progress (${STATE_DIR}/backup.lock is held) — this run exits and does nothing"
+      exit 0
+    fi
+  done
+  die "another run holds ${STATE_DIR}/backup.lock and no run started or completed in the last hour — a stuck run? (check its process and journal)"
+elif (( LOCK_RC != 0 )); then
+  die "could not take the run lock ${STATE_DIR}/backup.lock (flock exited ${LOCK_RC})"
+fi
+# The holder's "I am alive" stamp, written right after taking the lock (an overlapping run
+# reads it, above). The previous value is kept for the clock guard further down.
+PREVIOUS_RUN="$(cat "${STATE_DIR}/last_run.epoch" 2>/dev/null || true)"
+date +%s > "${STATE_DIR}/last_run.epoch"
+docker() { command docker "$@" 9>&-; }
+rclone() { command rclone "$@" 9>&-; }
+# Under the lock, what a DEAD run (killed by TimeoutStartSec, OOM, a reboot) left behind is
+# swept, all of it: audio staging dirs (a whole copy of the recordings, outside every
+# retention rule) and half-written DB snapshot temps (.snapshot.*.db and their -wal/-shm).
+find "${BACKUP_ROOT}" -mindepth 1 -maxdepth 1 -type d -name '.audio.*' \
+  -exec rm -rf {} + 2>/dev/null || true
+find "${LOCAL_BACKUP_DIR}" -mindepth 1 -maxdepth 1 -name '.snapshot.*' \
+  -exec rm -f {} + 2>/dev/null || true
+type -P docker >/dev/null 2>&1 || die "docker not on PATH (the snapshot runs inside the container)"
 [[ "$(docker inspect -f '{{.State.Running}}' "${CONTAINER}" 2>/dev/null || echo false)" == "true" ]] \
   || die "container ${CONTAINER} is not running — cannot snapshot a WAL DB from the host (see the header)"
 
 sha256_of() { sha256sum "$1" | cut -d' ' -f1; }
 
-# --- one DB: snapshot inside the container, verify, dedupe, keep ---------------------
-# Sets SNAPSHOT_PATH / SNAPSHOT_CKSUM for the caller.
-snapshot_db() {
-  local name="$1" src="$2" tmp ctmp prev rc=0
-  tmp="$(mktemp "${LOCAL_BACKUP_DIR}/.snapshot.XXXXXX.db")"
-  ctmp=""
-  # Armed BEFORE the in-container mktemp so an early failure still reaps the host temp —
-  # it is a dotfile, which the <name>_*.db prune glob never sees. The suffix glob catches
-  # the snapshot's own -wal/-shm, created when the verification step below opens it.
-  cleanup_db() {
-    rm -f "${tmp}" "${tmp}"-*
-    [[ -n "${ctmp}" ]] && docker exec "${CONTAINER}" rm -f "${ctmp}" >/dev/null 2>&1 || true
-  }
-  trap cleanup_db RETURN
+# --- snapshot retention: count caps, and an AGE cap that cannot empty a tier ---------
+# The snapshot names carry their UTC stamp (<name>_YYYYMMDDTHHMMSSZ[_N].db), so age is read
+# from the NAME — the same on the box and on Drive, and immune to a copy resetting an mtime.
+# Per tier, newest first:
+#   * index 0 (the newest) always stays;
+#   * the STATE AS OF A WEEK AGO — the newest snapshot stamped before WEEK_CUTOFF
+#     (AGE_KEEP_PREVIOUS_DAYS, 7) — stays, whatever its age and whatever the count cap says:
+#     a bad change is undone from it, and later writes (a review tick, a boot's ETag forget —
+#     each a new snapshot) can never push it out early, as "index 1" let them;
+#   * at most AGE_REMOVALS_PER_RUN (5) are removed BY AGE per tier per run (the count caps
+#     still apply in full);
+#   * a CLOCK GUARD: if now is earlier than the last run (state/last_run.epoch), or more than
+#     7 days after it, no age removal happens this run — a clock that jumped (NTP, a bad RTC)
+#     cannot age every snapshot at once. Count retention still applies.
+stamp_of_epoch() { date -u -d "@$1" +%Y%m%dT%H%M%S 2>/dev/null || date -u -r "$1" +%Y%m%dT%H%M%S; }
+AGE_KEEP_PREVIOUS_DAYS=7
+AGE_REMOVALS_PER_RUN=5
+NOW_EPOCH="$(date +%s)"
+AGE_CUTOFF="$(stamp_of_epoch "$(( NOW_EPOCH - 10#${SNAPSHOT_MAX_AGE_DAYS} * 86400 ))")"
+WEEK_CUTOFF="$(stamp_of_epoch "$(( NOW_EPOCH - AGE_KEEP_PREVIOUS_DAYS * 86400 ))")"
+AGE_OK=1
+LAST_RUN="${PREVIOUS_RUN//[[:space:]]/}"
+if [[ "${LAST_RUN}" =~ ^[0-9]{1,12}$ ]]; then
+  if (( NOW_EPOCH < 10#${LAST_RUN} )); then
+    AGE_OK=0
+    log "WARN: the clock reads earlier than the last run's — skipping age-based snapshot removal this run (count retention still applies)"
+  elif (( NOW_EPOCH - 10#${LAST_RUN} > 7 * 86400 )); then
+    AGE_OK=0
+    log "WARN: more than 7 days since the last run (a clock jump, or the box was off) — skipping age-based snapshot removal this run (count retention still applies)"
+  fi
+fi
+stamp_before() {  # <file name> <prefix> <cutoff stamp> — true when its stamp is older
+  local stamp="${1#"$2"}"
+  stamp="${stamp:0:15}"
+  [[ "${stamp}" =~ ^[0-9]{8}T[0-9]{6}$ && "${stamp}" < "$3" ]]
+}
+# Print the names (newest first on the command line) that retention removes from one tier.
+retention_victims() {  # <count cap> <prefix> <name>…
+  local keep="$1" prefix="$2"; shift 2
+  local names=("$@") i aged=0 week_ago=""
+  # Newest first, so the first name stamped before the week cutoff is the state a week ago
+  # (index 0 itself when the DB has been quiet all week — it is kept anyway).
+  for (( i = 0; i < ${#names[@]}; i++ )); do
+    if stamp_before "${names[$i]}" "${prefix}" "${WEEK_CUTOFF}"; then week_ago="${names[$i]}"; break; fi
+  done
+  for (( i = 1; i < ${#names[@]}; i++ )); do
+    [[ "${names[$i]}" == "${week_ago}" ]] && continue        # protected from BOTH caps
+    if (( i >= keep )); then printf '%s\n' "${names[$i]}"; continue; fi
+    (( AGE_OK )) || continue
+    (( aged < AGE_REMOVALS_PER_RUN )) || continue
+    if stamp_before "${names[$i]}" "${prefix}" "${AGE_CUTOFF}"; then
+      printf '%s\n' "${names[$i]}"
+      aged=$((aged + 1))
+    fi
+  done
+}
 
-  ctmp="$(docker exec "${CONTAINER}" mktemp "/tmp/${name}_snap.XXXXXX.db")" \
-    || die "could not create a temp path inside ${CONTAINER}"
-  # Paths go in via -e, never interpolated into the python source.
-  docker exec -i -e SRC="${src}" -e DST="${ctmp}" "${CONTAINER}" python3 - <<'PY' || return 2
-import os, sqlite3, sys
-src, dst = os.environ["SRC"], os.environ["DST"]
+# --- one DB: snapshot inside the container, verify, dedupe, keep ---------------------
+# Sets SNAPSHOT_PATH / SNAPSHOT_CKSUM for the caller. Returns 0 when the snapshot is kept, 2
+# for a DB that is not in the container (yet), and 1 for ANY failure — logged as an ERROR
+# naming the DB, with nothing partial kept on the host or in the container. A failure never
+# stops the other DBs or the audio: the caller carries on and the run exits 1 at the end.
+# (Called as `snapshot_db … || rc=$?`, so errexit is OFF in here: every step is checked.)
+snapshot_db() {
+  local name="$1" src="$2" tmp err prev rc=0 sent sent_size sent_sha got_size
+  tmp="$(mktemp "${LOCAL_BACKUP_DIR}/.snapshot.XXXXXX.db")" \
+    || { log "ERROR: ${name}: could not create a temp file in ${LOCAL_BACKUP_DIR}"; return 1; }
+  err="${tmp%.db}.err"
+  # Dotfiles, which the <name>_*.db prune glob never sees, removed on EVERY return (a failure
+  # returns too — it never exits from in here); a killed run's are swept under the lock. The
+  # suffix glob catches the snapshot's own -wal/-shm, created when the verification step
+  # below opens it.
+  cleanup_db() { rm -f "${tmp}" "${tmp}"-* "${err}"; }
+  trap cleanup_db RETURN
+  failed() { log "ERROR: ${name}: $*"; }
+
+  # Made AND checked inside the container, then streamed out on stdout into ${tmp}. The
+  # program's LAST stderr line says what it sent ("SNAPSHOT <bytes> <sha256>"), so a stream
+  # that is not exactly that is caught even when the exec still exits 0. Paths go in via -e,
+  # never interpolated into the python source. Exit 3: no such DB; 4: no room on the tmpfs.
+  docker exec -i -e SRC="${src}" -e NAME="${name}" -e SNAPDIR=/tmp "${CONTAINER}" \
+    python3 - > "${tmp}" 2> "${err}" <<'PY' || rc=$?
+import glob, hashlib, os, shutil, signal, sqlite3, sys, tempfile
+src, name, snapdir = os.environ["SRC"], os.environ["NAME"], os.environ["SNAPDIR"]
+# FIRST, clear every snapshot temp an earlier exec left on the tmpfs. The `finally` below
+# removes this one's on every exit — an error, Ctrl-C, and SIGTERM or SIGHUP too (turned into
+# an exit that unwinds, further down); only a SIGKILL (or a crash of the interpreter itself)
+# can leave one behind, and this sweep is what removes it. All of them, not just old ones:
+# the host's run lock means no snapshot is being made now, and a leftover must never eat the
+# room this one is about to measure. (The orphan of a killed host run, if still running,
+# loses only a result nobody is waiting for.)
+for stale in glob.glob(os.path.join(snapdir, "*_snap.*.db*")):
+    try:
+        os.remove(stale)
+    except OSError:
+        pass
 # The host-side precondition checks a HOST path; this is the path actually read. Without
 # this guard sqlite3.connect() would CREATE the missing file and .backup() would faithfully
 # copy an empty DB — a snapshot that passes integrity_check and rotates every good copy out.
 if not os.path.isfile(src):
     sys.stderr.write("source DB not found inside the container at %s\n" % src)
-    sys.exit(1)
-s = sqlite3.connect(src)
+    sys.exit(3)
+# Room on the tmpfs for the copy (the DB and its WAL, which the backup folds in), plus 10%,
+# plus 8 MiB left for the app, which spools uploads in the same /tmp. Failing here names the
+# limit; otherwise SQLite's "database or disk is full" would be the only clue.
+need = sum(os.path.getsize(p) for p in (src, src + "-wal") if os.path.exists(p))
+want = need + need // 10 + 8 * 1024 * 1024
+usage = shutil.disk_usage(snapdir)
+if usage.free < want:
+    mib = lambda n: "%.1f MiB" % (n / 1048576.0)
+    sys.stderr.write(
+        "no room in the container's %s (a %s tmpfs, %s free) for %s (%s; needs %s with "
+        "headroom) — raise the /tmp tmpfs size in docker-compose.yml\n"
+        % (snapdir, mib(usage.total), mib(usage.free), os.path.basename(src), mib(need),
+           mib(want)))
+    sys.exit(4)
+# Python's default SIGTERM/SIGHUP end the process WITHOUT unwinding, so a `finally` never
+# runs; as SystemExit (128 + signal, as a shell reports it) they unwind like any other exit.
+for sig in (signal.SIGTERM, signal.SIGHUP):
+    signal.signal(sig, lambda signum, frame: sys.exit(128 + signum))
+fd, dst = tempfile.mkstemp(prefix=name + "_snap.", suffix=".db", dir=snapdir)
+os.close(fd)
 try:
-    d = sqlite3.connect(dst)
+    s = sqlite3.connect(src)
     try:
-        s.backup(d)
+        d = sqlite3.connect(dst)
+        try:
+            s.backup(d)
+        finally:
+            d.close()
     finally:
-        d.close()
+        s.close()
+    c = sqlite3.connect(dst)
+    try:
+        ok = c.execute("PRAGMA integrity_check").fetchone()[0]
+    finally:
+        c.close()
+    if ok != "ok":
+        sys.stderr.write("integrity_check failed: %s\n" % ok)
+        sys.exit(1)
+    digest, size, out = hashlib.sha256(), 0, sys.stdout.buffer
+    with open(dst, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            out.write(chunk)
+            digest.update(chunk)
+            size += len(chunk)
+    out.flush()
+    sys.stderr.write("SNAPSHOT %d %s\n" % (size, digest.hexdigest()))
 finally:
-    s.close()
-c = sqlite3.connect(dst)
-try:
-    ok = c.execute("PRAGMA integrity_check").fetchone()[0]
-finally:
-    c.close()
-if ok != "ok":
-    sys.stderr.write("integrity_check failed: %s\n" % ok)
-    sys.exit(1)
+    for path in (dst, dst + "-journal", dst + "-wal", dst + "-shm"):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 PY
-  docker cp "${CONTAINER}:${ctmp}" "${tmp}" || die "docker cp of the ${name} snapshot failed"
-  docker exec "${CONTAINER}" rm -f "${ctmp}" >/dev/null 2>&1 && ctmp="" || true
+  case "${rc}" in
+    0) ;;
+    3) log "${name}: $(tail -n 1 "${err}")"; return 2 ;;
+    4) failed "$(tail -n 1 "${err}")"; return 1 ;;
+    *) local why
+       why="$(grep -v '^SNAPSHOT ' "${err}" | tail -n 3 | tr '\n' ' ' | sed 's/ *$//')"
+       if [[ -n "${why}" ]]; then
+         failed "the snapshot inside ${CONTAINER} failed (exit ${rc}): ${why}"
+       elif (( rc == 137 )); then
+         failed "the snapshot inside ${CONTAINER} was killed (exit 137)"
+       elif (( rc == 143 )); then
+         failed "the snapshot inside ${CONTAINER} was terminated (exit 143)"
+       else
+         failed "the snapshot inside ${CONTAINER} failed (exit ${rc}) without saying why"
+       fi
+       return 1 ;;
+  esac
+  sent="$(grep '^SNAPSHOT ' "${err}" | tail -n 1 || true)"
+  read -r _ sent_size sent_sha <<<"${sent}"
+  got_size="$(wc -c < "${tmp}" | tr -d '[:space:]')"
+  if [[ -z "${sent}" ]]; then
+    failed "the container did not declare what it sent"; return 1
+  elif [[ "${got_size}" != "${sent_size}" ]]; then
+    failed "the snapshot stream from ${CONTAINER} did not match the declared size (declared ${sent_size} bytes, received ${got_size})"; return 1
+  elif [[ "$(sha256_of "${tmp}")" != "${sent_sha}" ]]; then
+    failed "the snapshot stream from ${CONTAINER} did not match the declared sha256"; return 1
+  fi
 
-  # Re-verify the HOST copy — the file we actually keep and push. A truncated `docker cp`
-  # would otherwise ship to Drive undetected, since everything downstream only sha256s this.
+  # Re-verify the HOST copy — the file we actually keep and push: integrity, schema, and the
+  # wiped-DB guard. Everything downstream only sha256s this file.
   prev="$(ls -1 "${LOCAL_BACKUP_DIR}/${name}"_*.db 2>/dev/null | sort | tail -n1 || true)"
+  rc=0
   python3 "${SCRIPT_DIR}/verify_snapshot.py" "${tmp}" "${prev}" "${ALLOW_EMPTY_SNAPSHOT}" || rc=$?
   if (( rc == 3 )); then
-    die "refusing the ${name} snapshot: every table is empty while ${prev##*/} has data — the live DB looks wiped. Investigate before the good copies rotate out; set ALLOW_EMPTY_SNAPSHOT=1 if it really was emptied on purpose"
+    failed "refusing the snapshot: every table is empty while ${prev##*/} has data — the live DB looks wiped. Investigate before the good copies rotate out; set ALLOW_EMPTY_SNAPSHOT=1 if it really was emptied on purpose"
+    return 1
   elif (( rc != 0 )); then
-    die "${name} snapshot failed verification after copy out of the container"
+    failed "the snapshot failed verification after it was streamed out of the container"
+    return 1
   fi
 
   SNAPSHOT_CKSUM="$(sha256_of "${tmp}")"
@@ -249,18 +479,19 @@ PY
     # 1-second resolution: the timer and a manual run in the same second would collide and
     # `mv` would destroy the first. "_N" still sorts after the bare name ("_" > ".").
     while [[ -e "${dest}" ]]; do dest="${LOCAL_BACKUP_DIR}/${name}_${ts}_${n}.db"; n=$((n+1)); done
-    mv "${tmp}" "${dest}"
+    mv "${tmp}" "${dest}" || { failed "could not keep the snapshot as ${dest}"; return 1; }
     printf '%s\n' "${SNAPSHOT_CKSUM}" > "${ck_file}"
     SNAPSHOT_PATH="${dest}"
     log "${name}: saved ${dest##*/} (sha ${SNAPSHOT_CKSUM:0:12})"
   fi
 
-  local snaps=()
-  while IFS= read -r f; do snaps+=("$f"); done \
+  local snaps=() victim
+  while IFS= read -r f; do snaps+=("${f##*/}"); done \
     < <(ls -1 "${LOCAL_BACKUP_DIR}/${name}"_*.db 2>/dev/null | sort -r || true)
-  if (( ${#snaps[@]} > LOCAL_RETENTION )); then
-    for old in "${snaps[@]:LOCAL_RETENTION}"; do rm -f "${old}"; log "${name}: pruned ${old##*/}"; done
-  fi
+  while IFS= read -r victim; do
+    [[ -n "${victim}" ]] || continue
+    rm -f "${LOCAL_BACKUP_DIR}/${victim}"; log "${name}: pruned ${victim}"
+  done < <(retention_victims "${LOCAL_RETENTION}" "${name}_" ${snaps[@]+"${snaps[@]}"})
 }
 
 # --- Drive (throttled, decoupled from the local snapshot) ---------------------------
@@ -269,7 +500,7 @@ PY
 # failing the unit every 5 minutes during setup teaches everyone to ignore it.
 rclone_ready() {
   [[ -n "${RCLONE_DEST}" ]] || { log "WARN: RCLONE_DEST not set — local snapshots only"; return 1; }
-  command -v rclone >/dev/null 2>&1 || { log "WARN: rclone not installed — local snapshots only"; return 1; }
+  type -P rclone >/dev/null 2>&1 || { log "WARN: rclone not installed — local snapshots only"; return 1; }
   rclone listremotes 2>/dev/null | grep -qx "${RCLONE_DEST%%:*}:" \
     || { log "WARN: rclone remote '${RCLONE_DEST%%:*}:' not configured — local snapshots only"; return 1; }
 }
@@ -281,40 +512,52 @@ prune_remote() {  # <dir> <glob> <keep>
   # --files-only is load-bearing: without it `lsf` also lists the daily/ SUBDIR, which
   # reverse-sorts last and lands in the delete slice on every run once the listing exceeds
   # the retention count (harmless, but it logs an rclone ERROR on every push for ever).
-  if (( ${#files[@]} > $3 )); then
-    for old in "${files[@]:$3}"; do
-      rclone deletefile "$1/${old}" && log "pruned ${1##*/}/${old}" || log "WARN: could not prune ${old}"
-    done
-  fi
+  # The same rules as the local tier (retention_victims). Drive keeps a deleted file in its
+  # trash for up to 30 days more; the docs say so.
+  local victim prefix="${2%\*.db}"
+  while IFS= read -r victim; do
+    [[ -n "${victim}" ]] || continue
+    rclone deletefile "$1/${victim}" && log "pruned ${1##*/}/${victim}" \
+      || log "WARN: could not prune ${victim}"
+  done < <(retention_victims "$3" "${prefix}" ${files[@]+"${files[@]}"})
 }
 
 push_db() {  # <name> <snapshot path> <checksum>
   local name="$1" path="$2" cksum="$3" ck_file="${STATE_DIR}/last_drive_${1}.sha256" last=""
   [[ -f "${ck_file}" ]] && last="$(cat "${ck_file}")"
   if [[ "${cksum}" == "${last}" ]]; then
-    log "${name}: Drive already has this DB (sha ${cksum:0:12})"; return 0
+    log "${name}: Drive already has this DB (sha ${cksum:0:12})"
+  else
+    log "${name}: pushing ${path##*/} to ${RCLONE_DEST}"
+    rclone copy "${path}" "${RCLONE_DEST}" || { log "ERROR: rclone copy failed for ${name}"; return 1; }
+    # Daily long-tail tier: the ring can rotate out within hours, so a logical corruption
+    # noticed a day later would have no clean copy left. At most one file per UTC day.
+    local today; today="$(date -u +%Y%m%d)"
+    if [[ -z "$(rclone lsf "${RCLONE_DEST}/daily" --files-only --include "${name}_${today}T*.db" 2>/dev/null | head -n1 || true)" ]]; then
+      rclone copy "${path}" "${RCLONE_DEST}/daily" || { log "ERROR: rclone copy to daily/ failed"; return 1; }
+      log "${name}: added today's daily snapshot"
+    fi
+    printf '%s\n' "${cksum}" > "${ck_file}"
   fi
-  log "${name}: pushing ${path##*/} to ${RCLONE_DEST}"
-  rclone copy "${path}" "${RCLONE_DEST}" || { log "ERROR: rclone copy failed for ${name}"; return 1; }
+  # BOTH tiers are pruned on EVERY run that reaches Drive, for every DB — upload or not. A
+  # quiet DB (no new snapshot for weeks) used to be pruned only after an upload, i.e. never,
+  # so its old snapshots — and the words in them — stayed past the age cap (BK-19).
   prune_remote "${RCLONE_DEST}" "${name}_*.db" "${DRIVE_RETENTION}"
-  # Daily long-tail tier: the ring above can rotate out within hours, so a logical corruption
-  # noticed a day later would have no clean copy left. At most one file per UTC day.
-  local today; today="$(date -u +%Y%m%d)"
-  if [[ -z "$(rclone lsf "${RCLONE_DEST}/daily" --files-only --include "${name}_${today}T*.db" 2>/dev/null | head -n1 || true)" ]]; then
-    rclone copy "${path}" "${RCLONE_DEST}/daily" || { log "ERROR: rclone copy to daily/ failed"; return 1; }
-    prune_remote "${RCLONE_DEST}/daily" "${name}_*.db" "${DAILY_RETENTION}"
-    log "${name}: added today's daily snapshot"
-  fi
-  printf '%s\n' "${cksum}" > "${ck_file}"
+  prune_remote "${RCLONE_DEST}/daily" "${name}_*.db" "${DAILY_RETENTION}"
 }
 
-# --- the audio tree: a MIRROR, deletions included ------------------------------------
+# --- the audio tree: add-only by default, or a MIRROR with deletions ------------------
 #
 # The audio tree is NOT in the DB (files on disk, by design — blobs would make every snapshot
 # byte-unique and defeat the sha256 dedupe above), so it needs its own path off-box.
 #
-# ⚠️ IT IS THE ONE THING HERE THAT PROPAGATES DELETIONS, DELIBERATELY. Graham's decision,
-# 2026-09-19: an additive audio backup quietly defeats both the Inbox's Delete control and its
+# BACKUP_AUDIO_MODE=copy (the default, Graham's decision 2026-09-29) is push_audio_copy below:
+# stage the tree, `rclone copy` it up, swap it in as the host mirror. Nothing on the remote is
+# ever deleted, so none of the brakes below apply. Everything from here to push_audio_copy is
+# BACKUP_AUDIO_MODE=mirror, kept as it was.
+#
+# ⚠️ MIRROR MODE PROPAGATES DELETIONS, DELIBERATELY. Graham's decision,
+# 2026-09-19 (reversed as the default on 2026-09-29, still available): an additive audio backup quietly defeats both the Inbox's Delete control and its
 # 180-day privacy ceiling — a recording he deletes (DESIGN.md sells Delete as the retraction
 # for "a password read aloud") would sit on Drive for ever. So Delete means deleted
 # everywhere, for AUDIO ONLY. The two DATABASES stay additive (`rclone copy` + the ring +
@@ -391,6 +634,16 @@ push_audio() {
     log "WARN: audio: ${CONTAINER_AUDIO_DIR} is not present in ${CONTAINER} — SKIPPING the audio sync entirely. A missing tree is never propagated as a deletion (fresh volume? wrong CONTAINER_AUDIO_DIR? wrong container?)"
     return 0
   }
+  if [[ "${BACKUP_AUDIO_MODE}" == "copy" ]]; then
+    push_audio_copy
+    return $?
+  fi
+  # A run killed between the swap's two `mv`s leaves the box copy as `.old` and nothing at
+  # AUDIO_MIRROR_DIR. Put it back first, so it is never the thing a later failure loses.
+  if [[ ! -e "${AUDIO_MIRROR_DIR}" && -d "${AUDIO_MIRROR_DIR}.old" ]]; then
+    mv "${AUDIO_MIRROR_DIR}.old" "${AUDIO_MIRROR_DIR}" \
+      && log "audio: restored the box copy from ${AUDIO_MIRROR_DIR}.old (a run was killed mid-swap)"
+  fi
 
   local remote="${RCLONE_DEST}/audio"
   local count prev="" deletions_allowed=1 rc=0 count_file="${STATE_DIR}/last_audio_count"
@@ -540,6 +793,42 @@ push_audio() {
   return "${rc}"
 }
 
+# BACKUP_AUDIO_MODE=copy: ADD-ONLY, and NO COPY ON THE BOX. The tree is staged from the
+# container and uploaded straight from the staging dir with `rclone copy --immutable --exclude
+# '*.part'` — it adds and never deletes, a recording that changed on Drive (corruption or
+# tampering: recordings never change once saved) is a loud failure and is never overwritten,
+# and an upload still in flight (`*.part`) is not backed up — then the staging dir goes.
+#
+# There is no host mirror in this mode, so there is no shrink brake to false-alarm (deleting
+# 2 of 3 notes, the prune taking the only one, a prune burst) and no third copy keeping a
+# deleted recording on the box. After a FULLY successful run, a box copy and brake state left
+# by mirror mode are removed (see the end of the script). Mirror mode is unchanged.
+push_audio_copy() {
+  local remote="${RCLONE_DEST}/audio" staged count
+  staged="$(mktemp -d "${BACKUP_ROOT}/.audio.XXXXXX")" \
+    || { log "ERROR: audio: could not create a staging directory under ${BACKUP_ROOT}"; return 1; }
+  # Checked explicitly: errexit is off inside a function called as `push_audio || ...`.
+  [[ -n "${staged}" && -d "${staged}" ]] \
+    || { log "ERROR: audio: staging directory is not usable"; return 1; }
+  cleanup_audio_copy() { [[ -z "${staged:-}" ]] || rm -rf "${staged}"; return 0; }
+  # The trap resets ITSELF: a RETURN trap set in a function outlives it, and would otherwise
+  # fire again as push_audio returns, where this function's locals are gone.
+  trap 'cleanup_audio_copy; trap - RETURN' RETURN
+
+  docker cp "${CONTAINER}:${CONTAINER_AUDIO_DIR}/." "${staged}/" \
+    || { log "ERROR: docker cp of the audio tree failed"; return 1; }
+  chmod -R go-rwx "${staged}" || log "WARN: audio: could not tighten the staged tree's modes"
+  count="$(find "${staged}" -type f ! -name '*.part' 2>/dev/null | wc -l | tr -d ' ')"
+
+  # --checksum: compare size + content, not modtime, so a re-staged identical recording is a
+  # no-op instead of an --immutable failure (rclone's exit 6) on every run.
+  rclone copy --immutable --checksum --exclude '*.part' "${staged}" "${remote}" \
+    || { log "ERROR: rclone copy of the audio tree failed (a recording that changed on the remote is refused, never overwritten — check ${remote})"; return 1; }
+  AUDIO_COPY_DONE=1
+  log "audio: ${count} recording(s) copied to ${remote} (add-only: nothing is deleted off-box; no copy is kept on the box)"
+  return 0
+}
+
 # Delete files under <remote dir> that <local dir> no longer has. The mirroring half of
 # push_audio, kept separate so the delete list is visible and logged one file at a time.
 delete_remote_extras() {  # <local dir> <remote dir> <mirrored count>
@@ -591,7 +880,7 @@ delete_remote_extras() {  # <local dir> <remote dir> <mirrored count>
 }
 
 # --- run -----------------------------------------------------------------------------
-declare -a PUSHABLE=()
+declare -a PUSHABLE=() FAILED=()
 SNAPSHOTS=0
 for pair in ${CONTAINER_DBS}; do
   name="${pair%%:*}"; src="${pair#*:}"
@@ -602,11 +891,19 @@ for pair in ${CONTAINER_DBS}; do
     # fail the unit — but a run where NONE of them produced a snapshot must.
     log "WARN: ${name} (${src}) could not be snapshotted — skipping it this run"
     continue
+  elif (( rc != 0 )); then
+    # Already logged as an ERROR naming it, nothing partial kept. One DB's problem never
+    # stops the others or the audio: carry on, and fail the run at the very end.
+    FAILED+=("${name}")
+    continue
   fi
   SNAPSHOTS=$((SNAPSHOTS+1))
   PUSHABLE+=("${name}|${SNAPSHOT_PATH}|${SNAPSHOT_CKSUM}")
 done
-(( SNAPSHOTS > 0 )) || die "no DB could be snapshotted (checked: ${CONTAINER_DBS})"
+if (( SNAPSHOTS == 0 && ${#FAILED[@]} == 0 )); then
+  log "ERROR: no DB could be snapshotted (checked: ${CONTAINER_DBS})"
+  FAILED+=("(none found)")
+fi
 
 PUSH_RC=0
 if rclone_ready; then
@@ -615,7 +912,7 @@ if rclone_ready; then
   if (( (NOW - LAST) / 60 < DRIVE_PUSH_INTERVAL_MIN )); then
     log "last Drive push was $(( (NOW - LAST) / 60 ))min ago (< ${DRIVE_PUSH_INTERVAL_MIN}min); skipping"
   else
-    for entry in "${PUSHABLE[@]}"; do
+    for entry in ${PUSHABLE[@]+"${PUSHABLE[@]}"}; do
       IFS='|' read -r name path cksum <<<"${entry}"
       push_db "${name}" "${path}" "${cksum}" || PUSH_RC=1
     done
@@ -628,4 +925,20 @@ if (( PUSH_RC != 0 )); then
   log "Drive push did not complete (rc=${PUSH_RC}); local snapshots are unaffected"
   exit "${PUSH_RC}"
 fi
+if (( ${#FAILED[@]} > 0 )); then
+  log "ERROR: no snapshot this run for: ${FAILED[*]} — everything else ran; failing the run so the heartbeat does"
+  exit 1
+fi
+# Copy mode keeps no copy on the box. After a FULLY successful run, remove what mirror mode
+# left there — its box copy and its brake state (a later switch back to mirror takes its
+# baseline from the Drive listing again).
+if [[ "${BACKUP_AUDIO_MODE}" == "copy" && "${AUDIO_COPY_DONE}" == "1" ]]; then
+  if [[ -e "${AUDIO_MIRROR_DIR}" || -e "${AUDIO_MIRROR_DIR}.old" \
+        || -e "${STATE_DIR}/last_audio_count" || -e "${STATE_DIR}/audio_high_water" ]]; then
+    rm -rf "${AUDIO_MIRROR_DIR}" "${AUDIO_MIRROR_DIR}.old"
+    rm -f "${STATE_DIR}/last_audio_count" "${STATE_DIR}/audio_high_water"
+    log "audio: removed the box copy and brake state left by mirror mode (copy mode keeps no copy on the box)"
+  fi
+fi
+printf '%s\n' "$(date +%s)" > "${STATE_DIR}/last_complete.epoch"
 log "done (${SNAPSHOTS} DB snapshot(s))"

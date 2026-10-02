@@ -634,9 +634,17 @@ rclone listremotes | grep -qx 'gdrive:' || echo "STOP: no writer remote; the loc
 # hopper-dashboard backup config (gitignored, 0600). Every key is optional; these are the ones
 # that differ from the defaults in deploy/box/backup.sh.
 RCLONE_DEST=gdrive:hopper-dashboard-backups
+# Recordings on Drive are ADD-ONLY (Graham, 2026-09-29): copy never deletes off-box. The default;
+# written out so the choice is visible on the box. `mirror` = the old guarded delete pass.
+BACKUP_AUDIO_MODE=copy
 EOF
 )
 # Run it once by hand before trusting the timer. Expect two "saved …" lines and a Drive push.
+# ONE run at a time (flock on ~/hopper-dashboard-backups/state/backup.lock; `flock` is util-linux):
+# a hand run that finds the timer's run going exits 0 with "another run in progress" and does
+# NOTHING — read the log line, and run it again when that one has finished. (If it says the
+# lock is held with no run started or completed in the last hour instead, that holder is
+# stuck: find it.)
 deploy/box/backup.sh
 ls -la ~/hopper-dashboard-backups/snapshots/       # dashboard_<ts>.db + inbox_<ts>.db
 rclone lsf gdrive:hopper-dashboard-backups         # both, plus daily/ and audio/
@@ -650,19 +658,78 @@ What it does, and the two things that are non-negotiable about how:
   API. It cannot run host-side: both DBs are WAL-mode and their `-wal`/`-shm` sidecars are owned by the
   container's uid 10001, so the backup API — which must WRITE those sidecars to take its read lock — fails
   with *"attempt to write a readonly database"* even when the source is opened `mode=ro`. The finished file
-  is integrity-checked in the container, `docker cp`'d out, and **re-verified on the host** (a truncated copy
-  would otherwise reach Drive undetected, since everything downstream only sha256s the host file).
-- **The DB snapshots are additive; the AUDIO TREE IS A MIRROR.** The two databases go up with
-  `rclone copy` into a ring plus a `daily/` tier: the upload never deletes, and a snapshot leaves Drive
-  only when enough newer ones have pushed it out by retention count. Nothing that happens to the live DB
-  can remove an off-box DB snapshot.
-  The **audio tree is the deliberate exception** (Graham's decision, 2026-09-19): it mirrors the
-  container, deletions included, because an additive audio backup defeats both the Inbox's Delete control
-  — sold as the way to retract "a password read aloud" — and its 180-day privacy ceiling. Each run
-  `docker cp`s the tree into a **fresh** staging directory (copying into a persistent one would resurrect
-  deleted files, since `docker cp` only adds) and then `rclone copy`s it up and deletes the remote files
-  the container no longer has, one at a time, logged.
-- **The brakes on that mirror — three of them, and each can refuse on its own.** A mass deletion is far
+  is integrity-checked in the container and **streamed out on that same exec's stdout** — never
+  `docker cp`: the container is `read_only` with a **tmpfs `/tmp`** (docker-compose.yml), and `docker cp`
+  cannot read a tmpfs (*"Could not find the file /tmp/… in container"* — every run failed that way until
+  this changed). The program's last stderr line states the bytes and sha256 it sent; the host checks its
+  copy against both (a stream cut short fails the run even if the exec exited 0), then **re-verifies it**
+  (integrity, schema, the wiped-DB guard), since everything downstream only sha256s the host file. A
+  stream too long or too short is reported as not matching the declared size; the same size with other
+  bytes, the declared sha256. Any failure leaves no partial file on the host. The in-container temp is
+  removed on every exit — an error, and SIGTERM or SIGHUP too (the step turns them into an exit that
+  unwinds; Python's default does not) — except a SIGKILL, and the next run's sweep removes that one.
+  An exec that dies without a message is reported as "killed (exit 137)" or "terminated (exit 143)".
+  A DB not in the container yet (a fresh volume) is skipped
+  with a WARN. **Any other snapshot failure is an ERROR naming that DB, and the run carries on** with
+  the other DB and the audio, then exits 1 at the end so the heartbeat fails: a `dashboard.db` problem
+  never stops `inbox.db` or the recordings being backed up.
+- **The snapshot is made on the container's `/tmp`, a 64 MiB tmpfs** (`tmpfs: - /tmp:mode=1777,size=64m`
+  in docker-compose.yml) — RAM, shared with the app, which spools uploads there too. Before each
+  snapshot the step checks there is room for the DB (and its WAL) plus 10%, plus 8 MiB left for the
+  app; if not, it fails that DB up front with a message naming `/tmp`, the tmpfs size, its free space
+  and the DB's size, rather than leaving SQLite's "database or disk is full" as the only clue. With the
+  64 MiB default a DB up to roughly 50 MB fits (less whatever the app is spooling at that moment).
+  Check the sizes now:
+  `docker exec -u 10001 hopper-dashboard sh -c 'ls -la /app/data/*.db; df -h /tmp'`. To raise it, edit
+  `size=64m` there (it is RAM, so stay well under the container's `mem_limit`) and recreate the
+  container (`docker compose up -d`). Every snapshot first removes ALL `*_snap.*.db*` files on that
+  `/tmp`: only an exec killed mid-snapshot can leave one, the host's run lock means none is in use, and
+  a leftover must never eat the room being measured (an orphaned exec of a killed host run, if any,
+  loses only a result nobody is waiting for). `CONTAINER_AUDIO_DIR` must be under `/app/data`: the audio tree IS copied with
+  `docker cp`, which works only off the data volume. CI runs this step for real against the built image
+  with the same `--read-only --tmpfs /tmp` settings (`.github/workflows/ci.yml`, docker-build job).
+- **The DB snapshots are additive, and so is the AUDIO TREE by default (`BACKUP_AUDIO_MODE=copy`).** The
+  two databases go up with `rclone copy` into a ring plus a `daily/` tier: the upload never deletes, and a
+  snapshot leaves Drive only when enough newer ones have pushed it out by retention count. Nothing that
+  happens to the live DB can remove an off-box DB snapshot.
+  **Audio, `BACKUP_AUDIO_MODE=copy` (the default — Graham's decision 2026-09-29):** recordings on Drive
+  are add-only, and **the box keeps no copy of the audio at all**. Each run `docker cp`s the tree into a
+  fresh staging directory, uploads it straight from there with **`rclone copy --immutable --exclude
+  '*.part'`**, and removes the staging directory. Nothing on Drive is ever deleted, so a recording deleted in
+  the Hub (or aged out by the retention prune) is gone from the Hub at once but **stays in
+  `gdrive:hopper-dashboard-backups/audio/<yyyy>/<mm>/<note id>.<ext>` until removed there by hand**.
+  `--immutable`: a recording never changes once saved, so one that DIFFERS on Drive is corruption or
+  tampering — the run fails loudly and never overwrites it. `--exclude '*.part'`: an upload still in flight
+  is not backed up. There is no box copy, so there is no shrink brake to false-alarm (deleting 2 of 3 notes,
+  the prune taking the only one, a burst over 25) and no third copy keeping deleted recordings on the box.
+  After a FULLY successful copy-mode run, a box copy (`~/hopper-dashboard-backups/audio`, `.old`) and brake
+  state (`state/last_audio_count`, `state/audio_high_water`) left by mirror mode are removed.
+  **Removing a recording from Drive by hand** — meant as removal, so skip Drive's trash (a plain `deletefile`
+  moves it to the trash, where Google keeps it up to 30 more days):
+  `rclone deletefile --drive-use-trash=false gdrive:hopper-dashboard-backups/audio/<yyyy>/<mm>/<note id>.<ext>`.
+  **Audio, `BACKUP_AUDIO_MODE=mirror`:** the 2026-09-19 behaviour, kept available. It mirrors the
+  container, deletions included, so Delete and the 180-day privacy ceiling reach Drive. Each run `docker
+  cp`s the tree into a **fresh** staging directory (copying into a persistent one would resurrect deleted
+  files, since `docker cp` only adds) and then `rclone copy`s it up and deletes the remote files the
+  container no longer has, one at a time, logged. **Switching copy → mirror** after copy has been running:
+  Drive still holds every recording deleted from the box meanwhile, and **the first mirror run deletes
+  them from Drive** — without asking while that is within the brakes below (at most
+  `AUDIO_MAX_DROP_FILES` files and `AUDIO_MAX_DROP_PCT` of the baseline; measured: 3 of 40 went, logged
+  one by one); beyond them it refuses and needs `AUDIO_ALLOW_MASS_DELETE=<count it leaves>`. If that is
+  not what you want, list first: `rclone lsf gdrive:hopper-dashboard-backups/audio --recursive` against
+  the container's tree. The baseline comes from the Drive listing (a successful copy-mode run removed
+  mirror mode's stored count). Any other value of `BACKUP_AUDIO_MODE` is refused before the run starts.
+- **One run at a time.** The whole run holds `flock -n -E 75` on `state/backup.lock`. A second run (the
+  timer's and a hand run overlapping) exits 0 with "another run in progress" and does nothing — but ONLY
+  while the holder looks alive: EITHER `state/last_run.epoch` (each run writes it right after taking
+  the lock) or `state/last_complete.epoch` is 0–3599 s old. Each stamp is judged on its own, so one
+  that is missing, unreadable, old or from the future never hides a fresh one. Neither fresh — it is
+  a stuck run, and the overlapping run exits 1 so the heartbeat fails (check `ps`/the journal for the holder). docker and rclone run with the lock's descriptor closed, so an orphaned child cannot hold it.
+  Under the lock, every `~/hopper-dashboard-backups/.audio.*` staging directory and every
+  `snapshots/.snapshot.*` DB temp is a DEAD run's (left by a run killed mid-way) and all of them are swept
+  at the start, in both modes. In mirror mode, a box copy left as `audio.old` by a run killed between the swap's
+  two `mv`s is put back before anything else.
+- **The brakes on MIRROR mode — three of them, and each can refuse on its own.** A mass deletion is far
   likelier to be a wiped volume or a mis-set path than an intentional purge, so the run REFUSES to
   propagate one and exits non-zero (the heartbeat goes `fail`, the board pages after the job's threshold):
 
@@ -706,13 +773,20 @@ What it does, and the two things that are non-negotiable about how:
   Then remove it from the environment. Leaving it set is harmless but pointless: the next purge will have
   a different resulting count and will be refused.
 - **⚠️ Delete does not retract the TEXT from backups already taken.** Delete removes the row and the
-  recording immediately, and the recording leaves Drive within one backup cycle. But every `inbox_*.db`
-  snapshot already on Drive — the ring plus the `daily/` tier — still contains the transcript, and those
-  age out on `DAILY_RETENTION`, i.e. **up to 30 days**. Do not "fix" this by rewriting historical
+  recording from the Hub immediately (in copy mode the recording stays in Drive until removed by hand; in
+  mirror mode it leaves Drive within one backup cycle). Every `inbox_*.db` snapshot already taken — the
+  local ring, the Drive ring and the `daily/` tier — still contains the transcript. Each tier has an AGE
+  cap on top of its count cap (`SNAPSHOT_MAX_AGE_DAYS`, 30), so those snapshots are **removed within about
+  30 days**, and a removed Drive file may then sit in Drive's trash for up to 30 more days. The age cap
+  cannot empty a tier: its newest always stays, so does the state as of a week ago (the newest snapshot
+  stamped more than 7 days back, whatever its age or the count cap), at most 5 go by age per tier per run,
+  and a clock that reads earlier than the last
+  run (or more than 7 days after it, `state/last_run.epoch`) skips age removal for that run with a WARN.
+  Both Drive tiers are pruned for every DB on every run that reaches Drive, uploaded or not. Do not "fix" this by rewriting historical
   snapshots; a backup that can be edited after the fact is not a backup. Keeping the DB backups is
   correct, and the UI and DESIGN.md say so plainly instead of promising more than Delete delivers.
 - **Retention values are validated before anything is pruned.** `LOCAL_RETENTION`, `DRIVE_RETENTION`,
-  `DAILY_RETENTION`, `AUDIO_MAX_DROP_FILES` and `AUDIO_DROP_WINDOW_MIN` must each be an integer ≥ 1 (and
+  `DAILY_RETENTION`, `SNAPSHOT_MAX_AGE_DAYS`, `AUDIO_MAX_DROP_FILES` and `AUDIO_DROP_WINDOW_MIN` must each be an integer ≥ 1 (and
   at most 9 digits) or the run dies with a named error; `AUDIO_MAX_DROP_PCT` must be 1–99. A value of `0`
   (or `" "`) is NOT caught by `${VAR:-60}` — it is non-empty — and would make every prune slice cover the
   whole list, deleting every snapshot on the box AND in `gdrive:hopper-dashboard-backups` on a single tick.
@@ -727,7 +801,8 @@ What it does, and the two things that are non-negotiable about how:
   recordings of Graham's voice; the on-box mirror should not be readable by every account on the box.
 
 Also: sha256 dedupe (an unchanged DB does not create a new file), a 60-deep local ring, a Drive push
-throttled to ~15 minutes, a `daily/` tier keeping one snapshot per UTC day for 30 days, and a guard that
+throttled to ~15 minutes, a `daily/` tier keeping one snapshot per UTC day for 30 days, an age cap of
+`SNAPSHOT_MAX_AGE_DAYS` (30) on every tier (each tier's newest always kept), and a guard that
 **refuses a snapshot in which every table is empty while the previous one had data** — the container runs its
 schema migration on every boot, so a `/app/data` remounted empty yields a valid, integrity-ok, completely
 empty DB, and snapshotting that would rotate every good copy out of the ring and both tiers. Override with
@@ -735,20 +810,70 @@ empty DB, and snapshotting that would rotate every good copy out of the ring and
 
 **Restoring is NOT a `cp`.** Stop the container, delete the live DB's stale `-wal`/`-shm` sidecars, copy the
 snapshot in, and re-own it to uid 10001 — otherwise SQLite replays the old WAL over the restored image and
-silently hands back the PRE-restore data, with no error, and the next checkpoint bakes it in:
+silently hands back the PRE-restore data, with no error, and the next checkpoint bakes it in. Replace
+`<ts>` with the snapshot's stamp, then paste the whole block. What each part is for (the block itself has
+NO comments, so it pastes safely into any shell — an interactive zsh with default options runs a pasted
+`#` line as a command, which used to stop the restore right after `compose stop` with the app down):
+
+- **One strict subshell** (`set -euo pipefail`): a failed or partial step stops everything after it — a
+  failed stop, a container still running, a symlink in the volume, an rclone copy that dies half-way —
+  so there is no `rm` or `cp` over the volume, no `rm` of the scratch copy and no `compose up`.
+- **The container must really be stopped.** `ps` is captured on its own line so a failing `ps` stops
+  the restore too ("still running — nothing touched").
+- **No symlinks anywhere in the volume.** The app (uid 10001) controls the volume, and the `install`,
+  `cp` and `chown` that follow run as root: a link — at any depth, down to the recordings at
+  `inbox/audio/<yyyy>/<mm>/<id>.<ext>` — would aim them at a file of the app's choosing. The volume has
+  no legitimate links, so `find "$V" -type l` finding any stops the restore ("symlink in the volume —
+  nothing touched"), as does a failing `find` (captured on its own line, like `ps`). As a second guard,
+  the audio copy uses `cp -a --remove-destination`: each destination entry is replaced, never written
+  through.
+- **The DB:** the stale sidecars go, the snapshot is copied in and re-owned to uid 10001.
+- **The audio, from Drive** (copy mode keeps no copy on the box), ALSO before the container starts (see
+  below). Its directories are made with `install -d -o 10001 -g 10001 -m 0700`, not `mkdir -p`: on a
+  fresh volume, mkdir under the subshell's umask 077 makes `inbox/` owned by root with mode 0700, and
+  the app could not reach its own audio.
+- **`docker compose up -d` LAST**, only once the DB and the audio are back.
+- **The last line** reports any stop: "RESTORE STOPPED — up not run; check docker compose ps".
 
 ```bash
-cd ~/hopper-dashboard && docker compose stop
-V=$(docker volume inspect hopper-dashboard_hopper-dashboard-data -f '{{.Mountpoint}}')
-sudo rm -f "$V/inbox.db-wal" "$V/inbox.db-shm"
-sudo cp ~/hopper-dashboard-backups/snapshots/inbox_<ts>.db "$V/inbox.db"
-sudo chown 10001:10001 "$V/inbox.db"
-docker compose up -d
+export V=$(docker volume inspect hopper-dashboard_hopper-dashboard-data -f '{{.Mountpoint}}')
+(
+  set -euo pipefail
+  umask 077
+  : "${V:?set V to the volume path}"
+  cd ~/hopper-dashboard
+  docker compose stop
+  running="$(docker compose ps -q --status running)"
+  [ -z "$running" ] || { echo "still running — nothing touched" >&2; exit 1; }
+  links="$(sudo find "$V" -type l)"
+  [ -z "$links" ] || { echo "symlink in the volume — nothing touched" >&2; exit 1; }
+  sudo rm -f "$V/inbox.db-wal" "$V/inbox.db-shm"
+  sudo cp ~/hopper-dashboard-backups/snapshots/inbox_<ts>.db "$V/inbox.db"
+  sudo chown 10001:10001 "$V/inbox.db"
+  rclone copy gdrive:hopper-dashboard-backups/audio ~/audio-restore
+  sudo install -d -o 10001 -g 10001 -m 0700 "$V/inbox" "$V/inbox/audio"
+  sudo cp -a --remove-destination ~/audio-restore/. "$V/inbox/audio/"
+  sudo chown -R 10001:10001 "$V/inbox/audio"
+  rm -rf ~/audio-restore
+  docker compose up -d
+)
+[ $? -eq 0 ] || { echo "RESTORE STOPPED — up not run; check docker compose ps" >&2; false; }
 ```
+Keep that last check on its OWN line. `( … ) || echo …` would put the subshell on the left of `||`,
+where the shell ignores `set -e` inside it: a failed stop would carry on to `rm`, `cp` and `up`.
+`tests/test_deploy_backup.py` runs this exact block — under bash, `zsh -f`, and pasted into an
+interactive default zsh — against stub commands, and checks every refusal by what was written, not
+by the exit code. Keep the block free of comments.
 
-Audio files are restored by copying them back under `/app/data/inbox/audio/<yyyy>/<mm>/` with the same
-ownership. A row whose `audio_path` points at a file that is not there is **not** a crash: the scheduler's
-reconcile clears the dangling path and the board shows the item with its transcript and no player.
+**⚠️ Restore the audio BEFORE `docker compose up -d`, never after.** The scheduler prunes within its first
+minute: a row whose recording is missing has its `audio_path` cleared (and, if it was never transcribed, is
+sent to Needs review as "Recording missing"), and the hourly orphan sweep then DELETES any file no row
+points at — so audio copied in after the start is thrown away again, and those notes lose their player for
+good. Measured against the app's own prune and sweep, with a real `rclone` and a local directory standing in
+for Drive: restored before the start, the rows kept their `audio_path` and the files survived; started
+first, the first prune cleared the path and the next sweep deleted the restored file as an orphan. If it
+has already happened, stop the container, restore the audio, and put each row's `audio_path` back
+(`<yyyy>/<mm>/<id>.<ext>`) before starting it again.
 
 ## 3. Cloudflare — public read side
 
@@ -824,11 +949,13 @@ preview the feature branch is checked out *there* (`git fetch && git checkout <b
 goes back to `main` (`git checkout main && git pull`). (`feature/dashboard-app` used to be named here; that
 branch is long merged and gone — do not go looking for it.)
 
-**⚠️ For THIS release the Mac side needs NOTHING — do not reinstall it.** The alert-threshold work is
-entirely app-side: `git diff origin/main...HEAD -- probes/ deploy/ docker-compose.yml Dockerfile
-entrypoint.sh` is **empty**, so the launchd plist, the probe scripts and the env file are all unchanged. A
-`git pull` in `~/code/hopper-dashboard` is enough to keep the checkout current; re-running
-`deploy/mac/install.sh` is unnecessary and is the step most likely to disturb a working probe. Do **not** install from a worktree
+**For the Hub follow-ups release the Mac side needs a `git pull`, and one optional key.** `probes/`
+(the drafter's setup brief, its hardened reader, the worker's temp-file sweep) and `deploy/mac/install.sh`
+changed; the launchd plists did not. A `git pull` in `~/code/hopper-dashboard` is enough for the code — the
+agents run from that checkout, so the next run picks it up. The setup brief is optional: add
+`INBOX_DRAFT_CONTEXT_FILE=<path>` to `~/.config/hopper-dashboard/env` by hand, or re-run
+`deploy/mac/install.sh --inbox`, which only appends keys that are missing. Check with `git diff
+origin/main...HEAD -- probes/ deploy/mac/` before each release rather than trusting this paragraph. Do **not** install from a worktree
 (e.g. `~/code/hopper-dashboard-app`): `deploy/mac/install.sh` bakes the **absolute repo directory** into the
 launchd plist at install time (`@@REPO@@` → the checkout it is run from), so a plist rendered from a worktree
 points at a directory that vanishes when the worktree is removed and the hourly probe dies silently
@@ -970,10 +1097,12 @@ item is intact, and the next run picks it up — but nobody can read or search w
 That is why it is on a 5-minute `StartInterval` and not the probe's hour.
 
 It also has a privacy consequence worth stating: because transcription happens here, on Graham's own Mac,
-**the audio of a voice note never leaves his own machines.** It goes browser → the box, and box → this Mac.
-No third party is ever sent the audio. **The transcript and title are**: with drafting on (§4c) the worker
-sends each new transcript (and a title Graham typed, if any) from this Mac to Anthropic (Claude) to draft
-the item. The page says so in the same words.
+**the audio of a voice note never goes to Anthropic or any speech service.** It goes browser → the box, box →
+this Mac (a temp file, only while it is being transcribed), and box → Graham's Google Drive backup, which is
+add-only: a recording is kept there even after Delete or the retention prune until removed by hand (§2b).
+**The transcript and title do go to a third party**: with drafting on (§4c) the worker sends each new
+transcript (and a title Graham typed, if any), plus the optional setup brief, from this Mac to Anthropic
+(Claude) to draft the item. The page says so.
 
 **Prerequisites on the Mac**, both of which the installer only WARNS about (it cannot fix them for you):
 
@@ -1046,10 +1175,11 @@ After transcribing, the same worker drafts each new voice note: a concise impera
 Mac and posts to `POST /api/v1/inbox/items/<id>/draft`. The draft is stored ALONGSIDE the note
 (`draft_*` columns); the note's `body` stays the transcript. Graham reads and edits it on `/inbox`, and
 **ticking Reviewed copies the draft into the note's title and project** — which is what Hopper's filing
-loop then reads. **The transcript and title go to Anthropic; the audio never does.**
+loop then reads. **The transcript, the title and the setup brief go to Anthropic; the audio never does.**
 
 Off until `INBOX_CLAUDE_BIN` is set. `deploy/mac/install.sh --inbox` prompts for it (`-` leaves it off) and
-appends four keys:
+appends four keys, plus `INBOX_DRAFT_CONTEXT_FILE` in its own step (so a re-run on an install that already
+drafts adds just that key):
 
 | key | what it is |
 |---|---|
@@ -1057,6 +1187,11 @@ appends four keys:
 | `INBOX_CLAUDE_TOKEN_FILE` | `~/.config/hopper-dashboard/claude-token`: ONE line, the OAuth token, **chmod 600** |
 | `INBOX_DRAFT_MODEL` | `sonnet` |
 | `INBOX_DRAFT_LIMIT` | notes drafted per 5-minute run, `5` |
+| `INBOX_DRAFT_CONTEXT_FILE` | optional setup brief sent with each note as reference data: `~/personal-assistant/docs/voice-context.md` when that exists at install time, else empty (no brief). Shape: `deploy/mac/draft-context.example.md`. Read fresh each run, cut at 6000 chars. Refused (no brief + one `warning:` line in the worker log, never a failed heartbeat): missing, a symlink, a hard-linked file, not yours, group/world-WRITABLE, empty, the claude token file or this env file, or a brief that contains one of the tokens. 0644 is fine; point it at the real file, not a link to it |
+
+To add or change the brief on an existing install: edit the env line by hand (or re-run `install.sh --inbox`
+if the key is absent), then check the next run's log for `setup brief: N chars` — a `warning:
+INBOX_DRAFT_CONTEXT_FILE …` line means it is being ignored and says why.
 
 **The token: Graham runs `claude setup-token` once** (it opens a browser and prints a long-lived OAuth token)
 and saves it in the token file:
@@ -1268,6 +1403,38 @@ print(f"{len(rows)} note(s) already filed to backlog.txt — do NOT file these a
 PY
 ```
 
+`closed_by` (added with the backlog and issues close/reopen rules) and `backlog_absent_pushes` are
+additive in the same way, and so is the issue-link index change (many notes per issue): the unique index
+keeps its old NAME, so the older image's `CREATE UNIQUE INDEX IF NOT EXISTS` is a no-op and it starts
+fine even with two notes linked to one issue (it just reports the first link, as it always did). While
+the older image runs, notes the rules closed stay closed and are not reopened, and a line marked ✅ DONE
+creates an OPEN row (the old image does not read the marker).
+
+**Roll-forward step — run it right after the newer image is back, before its first push or scan.** The
+older image never clears `closed_by`, so a note Graham closed or reopened by hand during the rollback can
+still carry `closed_by='backlog'`/`'issues'`, and a rule would later reopen (or keep) what he decided by
+hand. Treat every row changed during the rollback as changed by hand:
+
+```bash
+# ROLLBACK_AT = when the older image started, FORWARD_AT = when this one came back (UTC, stored format).
+docker exec -u 10001 -i hopper-dashboard python3 - <<'PY'
+import sqlite3
+ROLLBACK_AT, FORWARD_AT = "2026-10-01T09:00:00Z", "2026-10-01T12:00:00Z"   # ← edit both
+c = sqlite3.connect("/app/data/inbox.db")
+n = c.execute("UPDATE inbox_items SET closed_by = NULL WHERE closed_by IS NOT NULL"
+              " AND updated_at >= ? AND updated_at < ?", (ROLLBACK_AT, FORWARD_AT)).rowcount
+c.commit()
+print(f"closed_by cleared on {n} row(s) changed during the rollback")
+PY
+```
+
+Every boot also forgets every stored GitHub ETag, so the first scan of each repo after the roll-forward is a
+full one. What the rules still catch afterwards, with no step needed: a backlog line marked ✅ DONE while the older
+image ran closes its note on the FIRST push (the old image left that row open, so the push sees it become
+done), and a line REMOVED while it ran closes its note after TWO pushes (the absence count starts from
+zero). A GitHub issue that closed or reopened while it ran is caught on the first complete scan (the
+stored link state is compared, not the previous scan).
+
 The hostname move rolls back separately: restore the `.env` backup from §3a (an older image has no legacy
 redirect, so with `APP_HOST=hub…` the old `dashboard…` name would 403), and put the Mac's `INBOX_URL` back.
 
@@ -1380,7 +1547,7 @@ restore data; the dashboard's own SQLite is derived state that repopulates withi
 | `inbox-backlog` missing from the box `jobs.yml` while the Mac posts it (§1d-ii) | Exactly the same shape as the row above, in a worse place: it is a sub-probe of the HOURLY Mac probe, so a 404 makes `mac-probe` itself report a failed sub-probe every hour — and `mac-probe` is the job whose alert mutes its siblings | Run §1d-ii (it is idempotent). Until `INBOX_URL`/`INBOX_TOKEN` are in the Mac env file the sub-probe skips silently and cannot cause this, which is why §1d-ii comes BEFORE §4b |
 | The Mac transcription agent is unloaded, crashed, or was never installed (§4b) | Voice notes stay on the board reading "transcribing…" for ever. **Nothing is lost** — the audio is kept and a later run picks it up — but it is the ONLY path from a recording to text, and the page looks the same on minute one as on day ten | `inbox-transcribe` goes LATE after ~14 h (the mandatory Mac grace). A CRASHED worker is much faster: it posts its own `fail` and is red immediately. `launchctl list \| grep inbox-transcribe`; `~/Library/Logs/hopper-inbox-transcribe.log` |
 | `ffmpeg` not on the launchd agent's PATH (the plist's `PATH` line lost, Homebrew moved) | **The nastiest one here.** mlx-whisper runs a bare `ffmpeg` from PATH inside `load_audio`, so it fails as though every recording were corrupt — and only under launchd; run the same command in your own shell and it works | The worker checks PATH first and aborts the RUN with a diagnostic naming ffmpeg, rather than reporting per-item failures (three of those would mark every queued note permanently un-transcribable). `inbox-transcribe` goes FAIL with that note; `deploy/mac/install.sh` also refuses to install a plist missing the line |
-| The Inbox's audio prune deletes a file the backup has not copied yet | A recording is gone from both the box and Drive with nothing to say so | Bounded, not impossible — and deliberately so since 2026-09-19, because Delete must mean deleted everywhere. The prune needs the transcript to be Whisper-quality AND the item reviewed AND 90 days old, so by then the text has been in the DB snapshots for months. What the mirror cannot do is propagate a WIPE: a missing audio dir, a >50% drop in file count, or an empty tree against a non-empty Drive all refuse the deletion pass and fail the run loudly (`AUDIO_ALLOW_MASS_DELETE=1` overrides). The DB snapshots remain additive |
+| The Inbox's audio prune deletes a file the backup has not copied yet | A recording is gone from both the box and Drive with nothing to say so | Bounded, not impossible. In copy mode (the default) the recording stays in Drive once backed up — Delete and the prune reach only the Hub; the gap is a recording pruned before its first backup (every 15 min), which cannot happen to a 90-day-old note. In mirror mode it is deliberate that a deletion reaches Drive. The prune needs the transcript to be Whisper-quality AND the item reviewed AND 90 days old, so by then the text has been in the DB snapshots for months. What the mirror cannot do is propagate a WIPE: a missing audio dir, a >50% drop in file count, or an empty tree against a non-empty Drive all refuse the deletion pass and fail the run loudly (`AUDIO_ALLOW_MASS_DELETE=1` overrides). The DB snapshots remain additive |
 | `hopper-dashboard-backup` timer installed without its heartbeat drop-in | The backup runs (or stops running) and the board says nothing either way — an unbacked-up app with a green card, which is the exact failure this repo exists to catch | Can't happen via `deploy/box/install.sh`: the unit, timer and drop-in are installed in one loop iteration, a test asserts it, and `systemctl cat hopper-dashboard-backup.service` must show `heartbeat.conf` + its `ExecStopPost=` line |
 | The dashboard is left on the shared house password (§1c) | The word Graham gave friends for km-tracker opens a board that now holds recordings of his voice, and the apex page links straight to it | Try the house word at `/login` — it must be REFUSED. Nothing in the code enforces this; it is a value in the box `.env`, so the only check is the one you run |
 | Sibling Mac job pages "→ LATE" a tick before `mac-probe` does | Two alerts for one night's sleep | A sibling's `grace_s` dropped below `mac-probe`'s + 120 in `jobs.yml` (the probe posts siblings before itself). Restore the margin. |
