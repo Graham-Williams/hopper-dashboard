@@ -175,7 +175,7 @@ def test_probe_pa_backup_dedups_and_reports_missing_vs_differ(tmp_path, monkeypa
     assert "lag_bytes" not in m   # the ambiguous combined figure is gone for this job
     # the three destinations + their filter lists mirror the backup script
     dsts = [d for _, d, _ in seen]
-    assert dsts == ["gdrive:Backups/personal-assistant", "gdrive:Backups/hopper-memory", "gdrive:Backups/claude-config"]
+    assert dsts == ["gdrive:Hopper/Backups/personal-assistant", "gdrive:Hopper/Backups/hopper-memory", "gdrive:Hopper/Backups/claude-config"]
     assert seen[0][2] == tuple(mac_probe.rclone_check.PA_BACKUP_FILTERS)
     assert seen[1][2] == () and "- sessions/**" in seen[2][2] and "- *.key" in seen[2][2]
 
@@ -183,6 +183,14 @@ def test_probe_pa_backup_dedups_and_reports_missing_vs_differ(tmp_path, monkeypa
     state = backup_log.mark_reported(new_entry, {}, "now")
     pings2, new2 = mac_probe.probe_pa_backup(cfg, state, log)
     assert new2 is None and [p[1]["status"] for p in pings2] == ["metric"]
+
+
+def test_pa_remote_defaults_to_hopper_folder_and_env_file_overrides_it(tmp_path):
+    """The nightly backup lands under the top-level Hopper/ Drive folder; the env file still wins, so a
+    Mac whose checkout lags can carry PROBE_PA_REMOTE until it is pulled."""
+    assert mac_probe.load_settings(_env(tmp_path))["PROBE_PA_REMOTE"] == "gdrive:Hopper/Backups"
+    cfg = mac_probe.load_settings(_env(tmp_path, PROBE_PA_REMOTE="gdrive:Elsewhere/Backups"))
+    assert cfg["PROBE_PA_REMOTE"] == "gdrive:Elsewhere/Backups"
 
 
 def test_probe_pa_backup_one_tree_error_is_partial(tmp_path, monkeypatch):

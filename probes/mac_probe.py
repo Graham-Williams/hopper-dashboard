@@ -5,7 +5,7 @@ Computes, on the Mac, what only the Mac can see, and POSTs it to the dashboard's
 ingest port:
   pa-backup          last outcome of the nightly backup (log tail, reported once per run) +
                      destination lag for the three trees the script copies (personal-assistant,
-                     hopper-memory, claude-config) vs gdrive:Backups/<tree> (rclone check), split into
+                     hopper-memory, claude-config) vs gdrive:Hopper/Backups/<tree> (rclone check), split into
                      MISSING (never uploaded → stale) and DIFFER (edited since → informational)
   minecraft-offload  bytes/files under ~/minecraft-channel not yet on Drive, per pair + disk free
   mac-disk           free/total bytes of the data volume (the dashboard's disk gauge + thresholds)
@@ -79,7 +79,7 @@ def load_settings(env_path: str) -> Dict[str, str]:
         # point the tree list at a scratch $HOME.
         "PROBE_PA_LOG": os.path.join(home, "Library/Logs/hopper-backup.log"),
         "PROBE_PA_HOME": home,
-        "PROBE_PA_REMOTE": "gdrive:Backups",
+        "PROBE_PA_REMOTE": "gdrive:Hopper/Backups",
         # minecraft-offload
         "PROBE_MC_BASE": os.path.join(home, "minecraft-channel"),
         "PROBE_MC_REMOTE": "gdrive",

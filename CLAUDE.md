@@ -86,7 +86,7 @@ browser testing either leave `APP_PASSWORD` unset (gate OFF) or use curl with a 
 - `config.py` — `Settings` dataclass (`from_env()`); tests construct it directly.
 - `registry.py` — `jobs.yml` schema + strict validation → `Registry` of frozen `Job`s. Kinds, states,
   `PROBEABLE_KINDS` (`probe` block: required on db_snapshot, optional on rclone_copy_tree / manual — the
-  box's `gdrive-ro` remote can list `Backups/` and `Gremlins/`), and `DEST_FRESH_MULTIPLIER` (12) live here.
+  box's `gdrive-ro` remote can list `Hopper/` and `Gremlins/`), and `DEST_FRESH_MULTIPLIER` (12) live here.
   `probe.interval_s` (optional per-job probe cadence) is capped twice: semantically at half the freshness
   window on db_snapshot, the one kind whose STALE_DEST verdict reads the probe's newest-object time, and by
   magnitude at `MAX_PROBE_INTERVAL_S` (86400) on **every** kind. The second cap is not redundant — the
