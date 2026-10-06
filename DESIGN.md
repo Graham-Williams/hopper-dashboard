@@ -41,7 +41,7 @@ Inputs:
    `last_drive_push.epoch` can be cross-checked against the newest Drive object. Container probes for
    `container` type use `docker ps` output pushed by a tiny host-side heartbeat instead of a socket mount
    (NO docker socket in the container). ⚠️ SCOPE: the box's *writer* `gdrive:` remote sees ONLY
-   `km-tracker-backups/` and `todoist-points-backups/`, so the missing/differ verdicts for `Backups/` (Hopper
+   `Hopper/km-tracker-backups/` and `Hopper/todoist-points-backups/`, so the missing/differ verdicts for `Hopper/Backups/` (Hopper
    docs) and `Gremlins/` (Minecraft) run in the MAC probe (input 3) and arrive as metrics. The container's
    read-only `gdrive-ro` remote (scope `drive.readonly`, DEPLOY.md §1b) CAN list those folders, so a
    `rclone_copy_tree` or `manual` job may *optionally* carry `probe.rclone_path` (e.g. `gdrive-ro:Hopper/Backups`)
