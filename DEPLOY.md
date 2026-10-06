@@ -150,8 +150,8 @@ Verify on the box — it must **read** the backup folder and must **fail to writ
 
 ```bash
 RC=~/.config/rclone/dashboard-ro.conf
-RCLONE_CONFIG=$RC rclone lsf gdrive-ro:km-tracker-backups | head -2          # lists snapshot files
-RCLONE_CONFIG=$RC rclone lsf gdrive-ro:todoist-points-backups | head -2
+RCLONE_CONFIG=$RC rclone lsf gdrive-ro:Hopper/km-tracker-backups | head -2          # lists snapshot files
+RCLONE_CONFIG=$RC rclone lsf gdrive-ro:Hopper/todoist-points-backups | head -2
 # Prove read-only: a write must be refused (403 insufficientPermissions). If this SUCCEEDS the scope is
 # wrong — stop, delete the stray folder with the writer remote (`rclone rmdir gdrive:write-test`), redo step 1.
 RCLONE_CONFIG=$RC rclone mkdir gdrive-ro:write-test && echo "STOP: remote can WRITE" || echo "read-only confirmed"
@@ -633,7 +633,7 @@ rclone listremotes | grep -qx 'gdrive:' || echo "STOP: no writer remote; the loc
 ( umask 077; cat > deploy/box/.env.backup <<'EOF'
 # hopper-dashboard backup config (gitignored, 0600). Every key is optional; these are the ones
 # that differ from the defaults in deploy/box/backup.sh.
-RCLONE_DEST=gdrive:hopper-dashboard-backups
+RCLONE_DEST=gdrive:Hopper/hopper-dashboard-backups
 # Recordings on Drive are ADD-ONLY (Graham, 2026-09-29): copy never deletes off-box. The default;
 # written out so the choice is visible on the box. `mirror` = the old guarded delete pass.
 BACKUP_AUDIO_MODE=copy
@@ -647,7 +647,7 @@ EOF
 # stuck: find it.)
 deploy/box/backup.sh
 ls -la ~/hopper-dashboard-backups/snapshots/       # dashboard_<ts>.db + inbox_<ts>.db
-rclone lsf gdrive:hopper-dashboard-backups         # both, plus daily/ and audio/
+rclone lsf gdrive:Hopper/hopper-dashboard-backups         # both, plus daily/ and audio/
 systemctl start hopper-dashboard-backup.service    # and once through systemd, to prove the unit works
 journalctl -u hopper-dashboard-backup.service -n 20 --no-pager | grep -i curl   # the heartbeat line
 ```
@@ -697,7 +697,7 @@ What it does, and the two things that are non-negotiable about how:
   fresh staging directory, uploads it straight from there with **`rclone copy --immutable --exclude
   '*.part'`**, and removes the staging directory. Nothing on Drive is ever deleted, so a recording deleted in
   the Hub (or aged out by the retention prune) is gone from the Hub at once but **stays in
-  `gdrive:hopper-dashboard-backups/audio/<yyyy>/<mm>/<note id>.<ext>` until removed there by hand**.
+  `gdrive:Hopper/hopper-dashboard-backups/audio/<yyyy>/<mm>/<note id>.<ext>` until removed there by hand**.
   `--immutable`: a recording never changes once saved, so one that DIFFERS on Drive is corruption or
   tampering — the run fails loudly and never overwrites it. `--exclude '*.part'`: an upload still in flight
   is not backed up. There is no box copy, so there is no shrink brake to false-alarm (deleting 2 of 3 notes,
@@ -706,7 +706,7 @@ What it does, and the two things that are non-negotiable about how:
   state (`state/last_audio_count`, `state/audio_high_water`) left by mirror mode are removed.
   **Removing a recording from Drive by hand** — meant as removal, so skip Drive's trash (a plain `deletefile`
   moves it to the trash, where Google keeps it up to 30 more days):
-  `rclone deletefile --drive-use-trash=false gdrive:hopper-dashboard-backups/audio/<yyyy>/<mm>/<note id>.<ext>`.
+  `rclone deletefile --drive-use-trash=false gdrive:Hopper/hopper-dashboard-backups/audio/<yyyy>/<mm>/<note id>.<ext>`.
   **Audio, `BACKUP_AUDIO_MODE=mirror`:** the 2026-09-19 behaviour, kept available. It mirrors the
   container, deletions included, so Delete and the 180-day privacy ceiling reach Drive. Each run `docker
   cp`s the tree into a **fresh** staging directory (copying into a persistent one would resurrect deleted
@@ -716,7 +716,7 @@ What it does, and the two things that are non-negotiable about how:
   them from Drive** — without asking while that is within the brakes below (at most
   `AUDIO_MAX_DROP_FILES` files and `AUDIO_MAX_DROP_PCT` of the baseline; measured: 3 of 40 went, logged
   one by one); beyond them it refuses and needs `AUDIO_ALLOW_MASS_DELETE=<count it leaves>`. If that is
-  not what you want, list first: `rclone lsf gdrive:hopper-dashboard-backups/audio --recursive` against
+  not what you want, list first: `rclone lsf gdrive:Hopper/hopper-dashboard-backups/audio --recursive` against
   the container's tree. The baseline comes from the Drive listing (a successful copy-mode run removed
   mirror mode's stored count). Any other value of `BACKUP_AUDIO_MODE` is refused before the run starts.
 - **One run at a time.** The whole run holds `flock -n -E 75` on `state/backup.lock`. A second run (the
@@ -789,7 +789,7 @@ What it does, and the two things that are non-negotiable about how:
   `DAILY_RETENTION`, `SNAPSHOT_MAX_AGE_DAYS`, `AUDIO_MAX_DROP_FILES` and `AUDIO_DROP_WINDOW_MIN` must each be an integer ≥ 1 (and
   at most 9 digits) or the run dies with a named error; `AUDIO_MAX_DROP_PCT` must be 1–99. A value of `0`
   (or `" "`) is NOT caught by `${VAR:-60}` — it is non-empty — and would make every prune slice cover the
-  whole list, deleting every snapshot on the box AND in `gdrive:hopper-dashboard-backups` on a single tick.
+  whole list, deleting every snapshot on the box AND in `gdrive:Hopper/hopper-dashboard-backups` on a single tick.
 - **These guards are tested by running the real script**, not by grepping it: `tests/test_deploy_backup.py`
   puts a fake `docker` and a fake `rclone` (`tests/fakes/`) on `PATH`, drives `deploy/box/backup.sh`
   end-to-end against a fake container and a fake remote, and asserts on what is left in the remote
@@ -850,7 +850,7 @@ export V=$(docker volume inspect hopper-dashboard_hopper-dashboard-data -f '{{.M
   sudo rm -f "$V/inbox.db-wal" "$V/inbox.db-shm"
   sudo cp ~/hopper-dashboard-backups/snapshots/inbox_<ts>.db "$V/inbox.db"
   sudo chown 10001:10001 "$V/inbox.db"
-  rclone copy gdrive:hopper-dashboard-backups/audio ~/audio-restore
+  rclone copy gdrive:Hopper/hopper-dashboard-backups/audio ~/audio-restore
   sudo install -d -o 10001 -g 10001 -m 0700 "$V/inbox" "$V/inbox/audio"
   sudo cp -a --remove-destination ~/audio-restore/. "$V/inbox/audio/"
   sudo chown -R 10001:10001 "$V/inbox/audio"
@@ -995,8 +995,8 @@ after every login/wake.
 The probe posts:
 - `pa-backup` — last line of `~/Library/Logs/hopper-backup.log` as an `ok`/`fail` run (**once per new line**,
   deduped via `~/.config/hopper-dashboard/state.json`) + a `metric` ping covering **all three trees the backup
-  script copies** (`~/personal-assistant` → `gdrive:Backups/personal-assistant`, the Hopper memory dir →
-  `gdrive:Backups/hopper-memory`, `~/.claude` → `gdrive:Backups/claude-config`, each with the script's exact
+  script copies** (`~/personal-assistant` → `gdrive:Hopper/Backups/personal-assistant`, the Hopper memory dir →
+  `gdrive:Hopper/Backups/hopper-memory`, `~/.claude` → `gdrive:Hopper/Backups/claude-config`, each with the script's exact
   filter list; the tiny `dotfiles` allowlist copy is not checked). Reported **separately**: `missing_files`/
   `missing_bytes` (never uploaded → the dashboard's `STALE_DEST`) and `differ_files`/`differ_bytes` (edited
   locally since the 03:00 copy → informational lag on the card), summed plus per-tree `*_<tree>` keys,
@@ -1331,7 +1331,7 @@ script, but that is per-repo work).
       `https://hub.graham-williams.com/login`, and the new one is accepted. Check the other four apps
       still take the house word — nothing about them changed, but confirm rather than assume.
 - [ ] **Backup** (§2b): `deploy/box/backup.sh` run by hand leaves `dashboard_<ts>.db` **and** `inbox_<ts>.db`
-      in `~/hopper-dashboard-backups/snapshots/`, `rclone lsf gdrive:hopper-dashboard-backups` lists both
+      in `~/hopper-dashboard-backups/snapshots/`, `rclone lsf gdrive:Hopper/hopper-dashboard-backups` lists both
       plus `daily/`, and `hopper-dashboard-backup` reads `OK` within 5 minutes of the timer's first tick.
 - [ ] **Transcription** (§4b): record a short voice note at `/inbox`; within ~5 minutes its row shows a
       Whisper transcript. `tail ~/Library/Logs/hopper-inbox-transcribe.log` shows `queue: 1 item(s)` then

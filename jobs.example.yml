@@ -84,11 +84,11 @@ jobs:
     kind: db_snapshot
     protects: km-tracker SQLite (prod game-night history)
     method: systemd timer every 5 min → sqlite backup API → sha256 dedup → rclone copy (additive) → Drive
-    destination: gdrive:km-tracker-backups
+    destination: gdrive:Hopper/km-tracker-backups
     cadence_s: 300
     grace_s: 900
     probe:
-      rclone_path: gdrive:km-tracker-backups
+      rclone_path: gdrive:Hopper/km-tracker-backups
       state_dir: /state/km
 
   - id: todoist-points-backup
@@ -99,11 +99,11 @@ jobs:
     kind: db_snapshot
     protects: todoist-points ledger SQLite (points earned/spent)
     method: systemd timer every 5 min → sqlite backup API → sha256 dedup → rclone copy (additive) → Drive
-    destination: gdrive:todoist-points-backups
+    destination: gdrive:Hopper/todoist-points-backups
     cadence_s: 300
     grace_s: 900
     probe:
-      rclone_path: gdrive:todoist-points-backups
+      rclone_path: gdrive:Hopper/todoist-points-backups
       state_dir: /state/todoist
 
   - id: box-containers
@@ -224,11 +224,11 @@ jobs:
     kind: db_snapshot
     protects: dashboard.db (board history) + inbox.db (voice-note transcripts, triage state) + the audio tree
     method: systemd timer every 5 min → sqlite backup API INSIDE the container → sha256 dedup → rclone copy (additive) → Drive
-    destination: gdrive:hopper-dashboard-backups
+    destination: gdrive:Hopper/hopper-dashboard-backups
     cadence_s: 300
     grace_s: 900
     probe:
-      rclone_path: gdrive-ro:hopper-dashboard-backups
+      rclone_path: gdrive-ro:Hopper/hopper-dashboard-backups
       # No state_dir: unlike km/todoist this app's backup state lives in
       # ~/hopper-dashboard-backups/state, which is not bind-mounted into the container. The
       # destination listing alone answers "is there a recent snapshot on Drive", which is the
@@ -294,8 +294,8 @@ jobs:
     machine: mac
     kind: rclone_copy_tree
     protects: Hopper's docs, memory, scripts and logs (~/personal-assistant)
-    method: nightly launchd rclone copy → gdrive:Backups; Mac probe reports missing (never uploaded) vs differ (edited since) via rclone check
-    destination: gdrive:Backups
+    method: nightly launchd rclone copy → gdrive:Hopper/Backups; Mac probe reports missing (never uploaded) vs differ (edited since) via rclone check
+    destination: gdrive:Hopper/Backups
     cadence_s: 86400
     grace_s: 50520              # 14 h + 2 min: a missed 03:00 run fires on wake; only LATE if the whole next day
                                 # passes. Mac sibling jobs keep grace_s >= mac-probe's + 120 so their deadline can
@@ -304,9 +304,9 @@ jobs:
     # says only "N objects". Uncomment to have the container list the destination itself (newest + count,
     # plus a "Destination probes" table on the job page). The box remote MUST be able to see the path —
     # the read-only gdrive-ro (scope drive.readonly, DEPLOY.md §1b) can; a drive.file-scope remote cannot.
-    # Check first: RCLONE_CONFIG=~/.config/rclone/dashboard-ro.conf rclone lsd gdrive-ro:Backups
+    # Check first: RCLONE_CONFIG=~/.config/rclone/dashboard-ro.conf rclone lsd gdrive-ro:Hopper/Backups
     #
-    # interval_s is REQUIRED IN PRACTICE on a big tree. gdrive:Backups is ~1000 objects, and a
+    # interval_s is REQUIRED IN PRACTICE on a big tree. gdrive:Hopper/Backups is ~1000 objects, and a
     # recursive listing that size pages slowly and draws Drive `rateLimitExceeded` / hits the rclone
     # timeout. Probed every 300 s cycle it failed 21 times in 1159 probes, and each failure used to
     # flip `dashboard-probes` straight to FAIL — 27 flips in 4 days with nothing broken, which is the
@@ -317,7 +317,7 @@ jobs:
     # probes OF THIS JOB, so a persistent failure here still reaches FAIL — on the 2nd probe, i.e.
     # one interval later, not one cycle later (and PROBE_NO_SUCCESS_S caps the wait at an hour).
     # probe:
-    #   rclone_path: gdrive-ro:Backups
+    #   rclone_path: gdrive-ro:Hopper/Backups
     #   interval_s: 1800
 
   - id: drive-mirror

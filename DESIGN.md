@@ -44,7 +44,7 @@ Inputs:
    `km-tracker-backups/` and `todoist-points-backups/`, so the missing/differ verdicts for `Backups/` (Hopper
    docs) and `Gremlins/` (Minecraft) run in the MAC probe (input 3) and arrive as metrics. The container's
    read-only `gdrive-ro` remote (scope `drive.readonly`, DEPLOY.md §1b) CAN list those folders, so a
-   `rclone_copy_tree` or `manual` job may *optionally* carry `probe.rclone_path` (e.g. `gdrive-ro:Backups`)
+   `rclone_copy_tree` or `manual` job may *optionally* carry `probe.rclone_path` (e.g. `gdrive-ro:Hopper/Backups`)
    to get newest-object time + count from the box; without it the card shows only the Mac-reported count.
    Per job type:
    - `rclone_copy_tree`: `rclone check --one-way <src> <dst>` semantics → missing/differ counts. For Mac-sourced
@@ -861,11 +861,11 @@ jobs:
     kind: db_snapshot             # db_snapshot | rclone_copy_tree | drive_mirror | container | manual | probe
     protects: km-tracker SQLite (prod)
     method: sqlite backup API → sha256 dedup → rclone copy (additive)
-    destination: gdrive:km-tracker-backups
+    destination: gdrive:Hopper/km-tracker-backups
     cadence_s: 300
     grace_s: 600
     probe:                        # required for db_snapshot; optional for rclone_copy_tree / manual (box lists the dest)
-      rclone_path: gdrive:km-tracker-backups
+      rclone_path: gdrive:Hopper/km-tracker-backups
       state_dir: /state/km        # bind-mounted :ro host state dir
       interval_s: 1800            # optional: probe THIS dest every 1800 s instead of every PROBE_INTERVAL_S
                                   # cycle (big trees; see "Probe cadence and flap damping")

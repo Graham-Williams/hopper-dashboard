@@ -39,7 +39,7 @@ PA_BACKUP_FILTERS: List[str] = [
 ]
 
 # Filters copied VERBATIM from the third `rclone copy` in scripts/backup-personal-assistant.sh
-# (~/.claude → gdrive:Backups/claude-config). Secrets (sessions/**, *.key) and churn dirs are excluded
+# (~/.claude → gdrive:Hopper/Backups/claude-config). Secrets (sessions/**, *.key) and churn dirs are excluded
 # there for good reasons; the check must mirror them or it would report "missing" forever.
 CLAUDE_CONFIG_FILTERS: List[str] = [
     "- sessions/**",
@@ -70,7 +70,7 @@ PA_BACKUP_TREES: List[Tuple[str, str, str, List[str]]] = [
 ]
 
 # Excludes copied from scripts/offload-recordings.sh (COMMON array) + its --min-age default.
-OFFLOAD_EXCLUDES: List[str] = [".DS_Store", ".tmp*/**", "delete-after-confirm/**"]
+OFFLOAD_EXCLUDES: List[str] = [".DS_Store", ".tmp*/**"]
 OFFLOAD_MIN_AGE = "15m"
 
 # Fallback if the offload script can't be read/parsed. Keep in sync with its PAIRS array.
