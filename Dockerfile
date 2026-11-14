@@ -6,7 +6,7 @@
 #
 # Base image pinned by digest (supply chain). Refresh with:
 #   docker buildx imagetools inspect python:3.12-slim   → Digest: sha256:…
-FROM python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1
+FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b
 
 # --- rclone (pinned; SHA256 from https://downloads.rclone.org/<ver>/SHA256SUMS)
 # (named RCLONE_REL, not RCLONE_VERSION: rclone reads RCLONE_* env vars as flags, so
